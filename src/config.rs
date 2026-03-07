@@ -122,6 +122,18 @@ fn default_post_tool_evaluator_model() -> String {
     String::new()
 }
 
+fn default_delegate_tool_enabled() -> bool {
+    true
+}
+
+fn default_delegate_max_iterations() -> usize {
+    10
+}
+
+fn default_delegate_model() -> String {
+    String::new()
+}
+
 fn default_cursor_agent_tmux_session_prefix() -> String {
     "microclaw-cursor".into()
 }
@@ -325,6 +337,15 @@ pub struct Config {
     /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_post_tool_evaluator_model")]
     pub post_tool_evaluator_model: String,
+    /// Enable the delegate tool for sub-agent task delegation. Default true.
+    #[serde(default = "default_delegate_tool_enabled")]
+    pub delegate_tool_enabled: bool,
+    /// Maximum tool iterations for delegated sub-agent tasks. Default 10.
+    #[serde(default = "default_delegate_max_iterations")]
+    pub delegate_max_iterations: usize,
+    /// Optional model override for delegate sub-agent. If empty, use main model.
+    #[serde(default = "default_delegate_model")]
+    pub delegate_model: String,
     /// Tmux session name prefix for cursor_agent when detach=true (e.g. microclaw-cursor).
     #[serde(default = "default_cursor_agent_tmux_session_prefix")]
     pub cursor_agent_tmux_session_prefix: String,
@@ -629,6 +650,15 @@ impl Config {
                 default_post_tool_evaluator_enabled(),
             ),
             post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
+            delegate_tool_enabled: Self::env_bool(
+                "DELEGATE_TOOL_ENABLED",
+                default_delegate_tool_enabled(),
+            ),
+            delegate_max_iterations: Self::env_usize(
+                "DELEGATE_MAX_ITERATIONS",
+                default_delegate_max_iterations(),
+            ),
+            delegate_model: Self::env("DELEGATE_MODEL").unwrap_or_default(),
             cursor_agent_tmux_session_prefix: Self::env("CURSOR_AGENT_TMUX_SESSION_PREFIX")
                 .unwrap_or_else(default_cursor_agent_tmux_session_prefix),
             cursor_agent_tmux_enabled: Self::env_bool(
@@ -870,6 +900,9 @@ mod tests {
             tool_skill_agent_model: String::new(),
             post_tool_evaluator_enabled: false,
             post_tool_evaluator_model: String::new(),
+            delegate_tool_enabled: true,
+            delegate_max_iterations: 10,
+            delegate_model: String::new(),
             cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,

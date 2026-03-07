@@ -2014,7 +2014,7 @@ mod tests {
         }
     }
 
-    fn test_state(llm: Box<dyn LlmProvider>) -> Arc<AppState> {
+    fn test_state(llm: Arc<dyn LlmProvider>) -> Arc<AppState> {
         let mut cfg = Config {
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
@@ -2067,6 +2067,9 @@ mod tests {
             tool_skill_agent_model: String::new(),
             post_tool_evaluator_enabled: false,
             post_tool_evaluator_model: String::new(),
+            delegate_tool_enabled: true,
+            delegate_max_iterations: 10,
+            delegate_model: String::new(),
             cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
@@ -2092,12 +2095,13 @@ mod tests {
             },
             llm,
             tools: ToolRegistry::new(&cfg, bot, db),
+            discord_http: None,
         };
         Arc::new(state)
     }
 
     fn test_web_state(
-        llm: Box<dyn LlmProvider>,
+        llm: Arc<dyn LlmProvider>,
         auth_token: Option<String>,
         limits: WebLimits,
     ) -> WebState {
@@ -2114,7 +2118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_then_stream_done() {
-        let web_state = test_web_state(Box::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -2150,7 +2154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_slash_command_via_send_stream_returns_done_with_response() {
-        let web_state = test_web_state(Box::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -2198,7 +2202,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_failure_requires_header() {
         let web_state = test_web_state(
-            Box::new(DummyLlm),
+            Arc::new(DummyLlm),
             Some("secret-token".into()),
             WebLimits::default(),
         );
@@ -2332,7 +2336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconnect_from_last_event_id_gets_non_empty_replay() {
-        let web_state = test_web_state(Box::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -2399,7 +2403,7 @@ mod tests {
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Box::new(DummyLlm), None, limits);
+        let web_state = test_web_state(Arc::new(DummyLlm), None, limits);
         let app = build_router(web_state);
 
         let mk_req = |msg: &str| {
@@ -2427,7 +2431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_db_paths_use_call_blocking_in_web_flow() {
-        let state = test_state(Box::new(DummyLlm));
+        let state = test_state(Arc::new(DummyLlm));
         let chat_id = 12345_i64;
         let cid = chat_id;
         let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(cid)).await.unwrap_or(0);

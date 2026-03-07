@@ -79,7 +79,6 @@ The agent loop branches only on these three; any other value is treated like a f
 - **Tool trait**: `name()`, `definition()`, `execute(input) -> ToolResult`.
 - **Definitions**: `ToolDefinition` (name, description, input_schema) is sent to the LLM API so the model can choose tools.
 - **Auth injection**: `execute_with_auth` injects `__microclaw_auth` into the tool input (`caller_channel`, `caller_chat_id`, `caller_persona_id`, `control_chat_ids`).
-- **High-risk approval**: `bash` and `cursor_agent` require an approval token for web or control chats; the tool input can include `__microclaw_approval.token` to confirm.
 - **Tool and Skill Agent (TSA)**: When `tool_skill_agent_enabled` is true, every tool use is gated by `tool_skill_agent::evaluate_tool_use()` before execution. TSA can allow or deny (with reason/suggestion). Direct `write_file`/`edit_file` under the skills directory is always denied; creation must go through `build_skill` or `cursor_agent`.
 
 ### Cursor agent and skill creation

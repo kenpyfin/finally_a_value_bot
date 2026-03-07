@@ -102,17 +102,16 @@ return "max iterations reached"                            // Safety cap
 
 ### 2.3 Tool Execution Pipeline
 
-Each tool call goes through three gates:
+Each tool call goes through two gates:
 
 ```
 1. TSA (Tool Skill Agent)     — optional LLM-based gating: should this tool be called?
-2. Auth (approval tokens)     — high-risk tools (bash) require a 2-step approval token
-3. Execution with timeout     — 120s timeout per tool; timeout → error result
+2. Execution with timeout     — 120s timeout per tool; timeout → error result
 ```
 
 **TSA** (`evaluate_tool_use`): A separate LLM call that evaluates whether a tool call is appropriate given the conversation. Can deny with a reason. Only active when `tool_skill_agent_enabled = true`.
 
-**Auth** (`execute_with_auth`): For high-risk tools (`bash`), the system issues an approval token. The LLM must re-call the tool with that token to proceed. This is a 2-round handshake.
+**Auth** (`execute_with_auth`): Injects auth context (`caller_channel`, `caller_chat_id`, etc.) into tool input so tools can enforce permissions.
 
 **Timeout handling**: If a tool times out, the error is fed back to the LLM, which can try an alternative. After 3+ timeouts, the loop bails entirely.
 
@@ -223,13 +222,12 @@ def agent_loop(user_message: str, config: Config) -> str:
 | **Message compaction** | Prevents context overflow on long conversations |
 | **Skills in system prompt** | Agent knows HOW to invoke skills without discovery |
 | **TSA gating (optional)** | Extra safety layer — a second LLM evaluates tool calls |
-| **Approval tokens for bash** | Prevents unsafe bash execution without confirmation |
 
 ### What You Need to Build
 
 1. **LLM Provider** — abstraction over Claude/OpenAI/etc. with `send_message(system, messages, tools)`
 2. **Tool Registry** — register tools, generate JSON Schema definitions, execute by name
-3. **Tool Auth** — approval tokens for high-risk tools, auth context injection
+3. **Tool Auth** — auth context injection into tool input
 4. **Session Store** — save/load message arrays (JSON in SQLite works)
 5. **System Prompt Builder** — assemble identity, capabilities, skills, memory, principles
 6. **Skills Manager** — discover SKILL.md files, build catalog with invocation details

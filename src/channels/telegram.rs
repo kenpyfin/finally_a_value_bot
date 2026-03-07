@@ -42,7 +42,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub memory: MemoryManager,
     pub skills: SkillManager,
-    pub llm: Box<dyn LlmProvider>,
+    pub llm: Arc<dyn LlmProvider>,
     pub tools: ToolRegistry,
     /// When Discord is enabled, used by deliver_to_contact to send to bound Discord channels.
     pub discord_http: Option<Arc<SerenityHttp>>,
@@ -119,8 +119,17 @@ pub async fn run_bot(
         error!("Failed to set Telegram bot commands: {}", e);
     }
 
-    let llm = crate::llm::create_provider(&config);
+    let llm: Arc<dyn LlmProvider> = Arc::from(crate::llm::create_provider(&config));
     let mut tools = ToolRegistry::new(&config, bot.clone(), db.clone());
+
+    if config.delegate_tool_enabled {
+        tools.add_tool(Box::new(crate::tools::delegate::DelegateTool::new(
+            config.clone(),
+            bot.clone(),
+            db.clone(),
+            llm.clone(),
+        )));
+    }
 
     let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
     info!(
@@ -984,18 +993,37 @@ pub async fn process_with_agent_with_events(
     // Both timeouts are critical to ensure the bot always sends a response.
     const LLM_ROUND_TIMEOUT_SECS: u64 = 180;
     const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 120;
+
+    let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
+    info!(
+        "Main agent loop starting: chat_id={}, persona_id={}, channel={}, max_iterations={}, tools=[{}], messages_in_context={}, system_prompt_len={}",
+        chat_id,
+        persona_id,
+        context.caller_channel,
+        state.config.max_tool_iterations,
+        tool_names_list.join(", "),
+        messages.len(),
+        system_prompt.len()
+    );
+
     for iteration in 0..state.config.max_tool_iterations {
         if let Some(tx) = event_tx {
             let _ = tx.send(AgentEvent::Iteration {
                 iteration: iteration + 1,
             });
         }
+
+        info!(
+            "Main agent iteration {}/{}: sending LLM request ({} messages in context)",
+            iteration + 1,
+            state.config.max_tool_iterations,
+            messages.len()
+        );
+
+        let llm_start = std::time::Instant::now();
         let response = {
             let messages = messages.clone();
             let tool_defs = tool_defs.clone();
-            // Always use the non-streaming send_message path for reliability.
-            // Tool progress events are emitted separately (see ToolStart below),
-            // so event_tx does not need to drive streaming here.
             match tokio::time::timeout(
                 std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
                 state.llm.send_message(&system_prompt, messages, Some(tool_defs)),
@@ -1003,12 +1031,22 @@ pub async fn process_with_agent_with_events(
             .await
             {
                 Ok(Ok(r)) => r,
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    info!(
+                        "Main agent iteration {}/{}: LLM error after {}ms: {}",
+                        iteration + 1,
+                        state.config.max_tool_iterations,
+                        llm_start.elapsed().as_millis(),
+                        e
+                    );
+                    return Err(e.into());
+                }
                 Err(_) => {
                     info!(
-                        "LLM round timed out after {}s (iteration {}); sending fallback reply",
-                        LLM_ROUND_TIMEOUT_SECS,
-                        iteration + 1
+                        "Main agent iteration {}/{}: LLM timed out after {}s",
+                        iteration + 1,
+                        state.config.max_tool_iterations,
+                        LLM_ROUND_TIMEOUT_SECS
                     );
                     return Ok("The request took too long after the last step. Please try again or break your request into smaller steps.".to_string());
                 }
@@ -1017,21 +1055,37 @@ pub async fn process_with_agent_with_events(
 
         let stop_reason = response.stop_reason.as_deref().unwrap_or("end_turn");
 
-        if stop_reason == "end_turn" || stop_reason == "max_tokens" {
-            let text = response
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ResponseContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
+        // Extract any assistant text from this response
+        let assistant_text: String = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ResponseContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
 
-            // Add final assistant message and save session (keep full text including thinking)
+        let assistant_text_preview = if assistant_text.len() > 200 {
+            format!("{}...", &assistant_text[..assistant_text.floor_char_boundary(200)])
+        } else {
+            assistant_text.clone()
+        };
+
+        info!(
+            "Main agent iteration {}/{}: stop_reason={}, llm_ms={}, text_len={}, text_preview=\"{}\"",
+            iteration + 1,
+            state.config.max_tool_iterations,
+            stop_reason,
+            llm_start.elapsed().as_millis(),
+            assistant_text.len(),
+            assistant_text_preview.replace('\n', "\\n")
+        );
+
+        if stop_reason == "end_turn" || stop_reason == "max_tokens" {
             messages.push(Message {
                 role: "assistant".into(),
-                content: MessageContent::Text(text.clone()),
+                content: MessageContent::Text(assistant_text.clone()),
             });
             strip_images_for_session(&mut messages);
             if let Ok(json) = serde_json::to_string(&messages) {
@@ -1039,13 +1093,11 @@ pub async fn process_with_agent_with_events(
                     .await;
             }
 
-            // Strip <think> blocks unless show_thinking is enabled
             let display_text = if state.config.show_thinking {
-                text
+                assistant_text
             } else {
-                strip_thinking(&text)
+                strip_thinking(&assistant_text)
             };
-            // Ensure we never return empty when the turn is done — user should always get a reply
             let final_text = if display_text.trim().is_empty() {
                 "Done.".to_string()
             } else {
@@ -1057,13 +1109,38 @@ pub async fn process_with_agent_with_events(
                 });
             }
             info!(
-                "Agent loop end_turn: returning response ({} chars)",
-                final_text.len()
+                "Main agent finished: stop_reason={}, final_response_len={}, total_iterations={}",
+                stop_reason,
+                final_text.len(),
+                iteration + 1
             );
             return Ok(final_text);
         }
 
         if stop_reason == "tool_use" {
+            let tool_calls: Vec<(&str, &serde_json::Value)> = response
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ResponseContentBlock::ToolUse { name, input, .. } => {
+                        Some((name.as_str(), input))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            info!(
+                "Main agent iteration {}/{}: {} tool call(s): [{}]",
+                iteration + 1,
+                state.config.max_tool_iterations,
+                tool_calls.len(),
+                tool_calls
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+
             let assistant_content: Vec<ContentBlock> = response
                 .content
                 .iter()
@@ -1103,11 +1180,32 @@ pub async fn process_with_agent_with_events(
                             input: input.clone(),
                         });
                     }
-                    info!("Executing tool: {} (iteration {})", name, iteration + 1);
+
+                    let input_str = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
+                    let input_preview = if input_str.len() > 300 {
+                        format!("{}...", &input_str[..300])
+                    } else {
+                        input_str
+                    };
+                    info!(
+                        "Main agent iteration {}/{}: executing tool={}, input={}",
+                        iteration + 1,
+                        state.config.max_tool_iterations,
+                        name,
+                        input_preview
+                    );
+
                     let started = std::time::Instant::now();
 
                     // TSA: allow or deny before execution
                     let tsa_deny = if state.config.tool_skill_agent_enabled {
+                        info!(
+                            "Main agent iteration {}/{}: TSA evaluating tool={}",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            name
+                        );
+                        let tsa_start = std::time::Instant::now();
                         match evaluate_tool_use(
                             &state.config,
                             name,
@@ -1122,11 +1220,36 @@ pub async fn process_with_agent_with_events(
                                 if let Some(ref sug) = tsa_result.suggestion {
                                     msg.push_str(&format!(" {}", sug));
                                 }
+                                info!(
+                                    "Main agent iteration {}/{}: TSA DENIED tool={} in {}ms, reason=\"{}\"",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    name,
+                                    tsa_start.elapsed().as_millis(),
+                                    tsa_result.reason
+                                );
                                 Some(crate::tools::ToolResult::error(msg).with_error_type("tsa_deny"))
                             }
-                            Ok(_) => None,
+                            Ok(tsa_result) => {
+                                info!(
+                                    "Main agent iteration {}/{}: TSA ALLOWED tool={} in {}ms, reason=\"{}\"",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    name,
+                                    tsa_start.elapsed().as_millis(),
+                                    tsa_result.reason
+                                );
+                                None
+                            }
                             Err(e) => {
-                                info!("TSA evaluation failed, allowing tool: {}", e);
+                                info!(
+                                    "Main agent iteration {}/{}: TSA evaluation FAILED for tool={} in {}ms, allowing: {}",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    name,
+                                    tsa_start.elapsed().as_millis(),
+                                    e
+                                );
                                 None
                             }
                         }
@@ -1146,8 +1269,11 @@ pub async fn process_with_agent_with_events(
                             Ok(tool_result) => tool_result,
                             Err(_) => {
                             info!(
-                                "Tool {} timed out after {}s (iteration {})",
-                                name, TOOL_EXECUTION_TIMEOUT_SECS, iteration + 1
+                                "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
+                                iteration + 1,
+                                state.config.max_tool_iterations,
+                                name,
+                                TOOL_EXECUTION_TIMEOUT_SECS
                             );
                             iteration_timed_out = true;
                             let error_content = format!(
@@ -1165,6 +1291,26 @@ pub async fn process_with_agent_with_events(
                             }
                         }
                     } };
+
+                    let result_preview = if result.content.len() > 300 {
+                        format!(
+                            "{}...",
+                            &result.content[..result.content.floor_char_boundary(300)]
+                        )
+                    } else {
+                        result.content.clone()
+                    };
+                    info!(
+                        "Main agent iteration {}/{}: tool={} {}completed in {}ms, result_len={}, is_error={}, preview=\"{}\"",
+                        iteration + 1,
+                        state.config.max_tool_iterations,
+                        name,
+                        if result.is_error { "FAILED " } else { "" },
+                        started.elapsed().as_millis(),
+                        result.content.len(),
+                        result.is_error,
+                        result_preview.replace('\n', "\\n")
+                    );
 
                     if let Some(tx) = event_tx {
                         let preview = if result.content.chars().count() > 160 {
@@ -1200,6 +1346,14 @@ pub async fn process_with_agent_with_events(
 
             // Post-Tool Evaluator: check if task is complete after tool execution
             if !iteration_timed_out {
+                if state.config.post_tool_evaluator_enabled {
+                    info!(
+                        "Main agent iteration {}/{}: PTE evaluating task completion",
+                        iteration + 1,
+                        state.config.max_tool_iterations
+                    );
+                }
+                let pte_start = std::time::Instant::now();
                 match evaluate_completion(
                     &state.config,
                     &principles_content,
@@ -1211,10 +1365,13 @@ pub async fn process_with_agent_with_events(
                 {
                     Ok(pte_result) if pte_result.action == PteAction::Complete => {
                         info!(
-                            "PTE: task complete ({}), synthesizing final response",
+                            "Main agent iteration {}/{}: PTE decision=COMPLETE in {}ms, reason=\"{}\" — synthesizing final response",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            pte_start.elapsed().as_millis(),
                             pte_result.reason
                         );
-                        // Do one final LLM call WITHOUT tools to synthesize response
+                        let synth_start = std::time::Instant::now();
                         let final_response = match tokio::time::timeout(
                             std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
                             state.llm.send_message(&system_prompt, messages.clone(), None),
@@ -1222,9 +1379,23 @@ pub async fn process_with_agent_with_events(
                         .await
                         {
                             Ok(Ok(r)) => r,
-                            Ok(Err(e)) => return Err(e.into()),
+                            Ok(Err(e)) => {
+                                info!(
+                                    "Main agent iteration {}/{}: PTE synthesis LLM error after {}ms: {}",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    synth_start.elapsed().as_millis(),
+                                    e
+                                );
+                                return Err(e.into());
+                            }
                             Err(_) => {
-                                info!("PTE final LLM call timed out, falling back to generic response");
+                                info!(
+                                    "Main agent iteration {}/{}: PTE synthesis LLM timed out after {}s",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    LLM_ROUND_TIMEOUT_SECS
+                                );
                                 return Ok("Task completed, but I couldn't generate a final summary in time.".to_string());
                             }
                         };
@@ -1238,6 +1409,14 @@ pub async fn process_with_agent_with_events(
                             })
                             .collect::<Vec<_>>()
                             .join("");
+
+                        info!(
+                            "Main agent iteration {}/{}: PTE synthesis completed in {}ms, response_len={}",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            synth_start.elapsed().as_millis(),
+                            text.len()
+                        );
 
                         messages.push(Message {
                             role: "assistant".into(),
@@ -1267,17 +1446,31 @@ pub async fn process_with_agent_with_events(
                             });
                         }
                         info!(
-                            "Agent loop PTE complete: returning response ({} chars)",
-                            final_text.len()
+                            "Main agent finished (PTE complete): final_response_len={}, total_iterations={}",
+                            final_text.len(),
+                            iteration + 1
                         );
                         return Ok(final_text);
                     }
-                    Ok(_) => {
-                        // PteAction::Continue — fall through to next iteration
+                    Ok(pte_result) => {
+                        if state.config.post_tool_evaluator_enabled {
+                            info!(
+                                "Main agent iteration {}/{}: PTE decision=CONTINUE in {}ms, reason=\"{}\"",
+                                iteration + 1,
+                                state.config.max_tool_iterations,
+                                pte_start.elapsed().as_millis(),
+                                pte_result.reason
+                            );
+                        }
                     }
                     Err(e) => {
-                        // PTE evaluation failed — log and continue (fail-open)
-                        info!("PTE evaluation failed, continuing: {}", e);
+                        info!(
+                            "Main agent iteration {}/{}: PTE evaluation FAILED in {}ms, continuing: {}",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            pte_start.elapsed().as_millis(),
+                            e
+                        );
                     }
                 }
             }
@@ -1286,10 +1479,10 @@ pub async fn process_with_agent_with_events(
             // and break out if we're getting repeated timeouts
             if iteration_timed_out {
                 if iteration > 3 {
-                    // Too many timeouts, bail out gracefully
                     info!(
-                        "Multiple tool timeouts detected (iteration {}), stopping agent loop",
-                        iteration + 1
+                        "Main agent iteration {}/{}: multiple tool timeouts detected, stopping agent loop",
+                        iteration + 1,
+                        state.config.max_tool_iterations
                     );
                     let timeout_msg = "I encountered repeated timeouts while trying to complete your request. This usually means a tool or service is not responding. Please try again later or break your request into smaller, simpler steps.".to_string();
                     messages.push(Message {
@@ -1308,27 +1501,28 @@ pub async fn process_with_agent_with_events(
                     }
                     return Ok(timeout_msg);
                 }
-                // Otherwise, continue to next iteration to let LLM handle the timeout error
+                info!(
+                    "Main agent iteration {}/{}: tool timeout detected, continuing to let LLM handle the error",
+                    iteration + 1,
+                    state.config.max_tool_iterations
+                );
             }
 
             continue;
         }
 
         // Unknown stop reason
-        let text = response
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ResponseContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
+        info!(
+            "Main agent iteration {}/{}: unknown stop_reason={}, returning text ({} chars)",
+            iteration + 1,
+            state.config.max_tool_iterations,
+            stop_reason,
+            assistant_text.len()
+        );
 
-        // Save session even on unknown stop reason
         messages.push(Message {
             role: "assistant".into(),
-            content: MessageContent::Text(text.clone()),
+            content: MessageContent::Text(assistant_text.clone()),
         });
         strip_images_for_session(&mut messages);
         if let Ok(json) = serde_json::to_string(&messages) {
@@ -1336,19 +1530,21 @@ pub async fn process_with_agent_with_events(
                 call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
         }
 
-        return Ok(if text.is_empty() {
+        return Ok(if assistant_text.is_empty() {
             "(no response)".into()
         } else {
             if let Some(tx) = event_tx {
-                let _ = tx.send(AgentEvent::FinalResponse { text: text.clone() });
+                let _ = tx.send(AgentEvent::FinalResponse { text: assistant_text.clone() });
             }
-            text
+            assistant_text
         });
     }
 
-    // Max iterations reached — cap session with an assistant message so the
-    // conversation doesn't end on a tool_result (which would cause
-    // "tool call result does not follow tool call" on the next resume).
+    // Max iterations reached
+    info!(
+        "Main agent reached max iterations ({}), stopping",
+        state.config.max_tool_iterations
+    );
     let max_iter_msg = "I reached the maximum number of tool iterations. Here's what I was working on — please try breaking your request into smaller steps.".to_string();
     messages.push(Message {
         role: "assistant".into(),
