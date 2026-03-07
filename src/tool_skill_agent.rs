@@ -7,7 +7,6 @@ use crate::error::MicroClawError;
 use crate::llm;
 use crate::tools::ToolAuthContext;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,9 +29,10 @@ const TSA_SYSTEM: &str = r#"You are a tool and skill gatekeeper. Given a convers
 
 Rules:
 - Allow if the tool is clearly relevant to the user's request and not redundant or unsafe.
-- Deny if: the tool is irrelevant, the same call was just made, the request is trying to write or edit files under the skills directory (users must use build_skill or cursor_agent for creating skills), or the action is unsafe for this context.
-- For write_file or edit_file: if the path is under a "skills" directory (e.g. .../skills/... or .../workspace/skills/...), deny and suggest using build_skill or cursor_agent to create or update skills.
-- For sync_skills: allow only when the user clearly asked to add or update skills from an external source.
+- Allow write_file and edit_file anywhere in the repo (including the skills directory) when used for self-improvement, creating or updating skills, or at the user's request.
+- Allow cursor_agent when the task benefits from an agent (editing, creating skills, or multi-step work in the repo).
+- Deny only if: the tool is irrelevant, the same call was just made redundantly, or the action is unsafe for this context.
+- For sync_skills: allow when the user asked to add or update skills from an external source, or when it supports self-improvement.
 - For activate_skill: allow when the skill is relevant to the current task; deny if irrelevant or spammy.
 - Keep reason and suggestion concise (one sentence each)."#;
 
@@ -56,18 +56,6 @@ fn build_context_snippet(messages: &[Message], max_messages: usize, max_chars_pe
     out
 }
 
-/// Fast path: deny write_file/edit_file when path is under skills dir (no LLM call).
-fn is_skills_dir_write(tool_name: &str, tool_input: &serde_json::Value, _skills_dir_absolute: &Path) -> bool {
-    if tool_name != "write_file" && tool_name != "edit_file" {
-        return false;
-    }
-    let path = tool_input.get("path").and_then(|v| v.as_str());
-    let Some(path_str) = path else { return false };
-    let normalized = path_str.replace('\\', "/");
-    // Match .../skills/... or .../workspace/skills/... (creation of skill files)
-    normalized.contains("/skills/") || normalized.ends_with("/skills") || normalized.contains("skills/SKILL.md")
-}
-
 /// Evaluate whether to allow or deny this tool use. Call before execute_with_auth.
 pub async fn evaluate_tool_use(
     config: &Config,
@@ -76,16 +64,6 @@ pub async fn evaluate_tool_use(
     messages: &[Message],
     _auth: Option<&ToolAuthContext>,
 ) -> Result<TsaResult, MicroClawError> {
-    let skills_dir = config.skills_data_dir_absolute();
-    if is_skills_dir_write(tool_name, tool_input, &skills_dir) {
-        info!("TSA: deny write/edit under skills dir (use build_skill or cursor_agent)");
-        return Ok(TsaResult {
-            decision: TsaDecision::Deny,
-            reason: "Writing or editing files under the skills directory is not allowed directly.".into(),
-            suggestion: Some("Use the build_skill tool (or cursor_agent with a creation task) to create or update skills.".into()),
-        });
-    }
-
     if !config.tool_skill_agent_enabled {
         return Ok(TsaResult {
             decision: TsaDecision::Allow,

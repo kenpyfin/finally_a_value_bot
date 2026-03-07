@@ -433,6 +433,7 @@ fn default_config() -> Config {
         web_rate_window_seconds: 10,
         web_run_history_limit: 512,
         web_session_idle_ttl_seconds: 300,
+        universal_chat_id: None,
         browser_managed: false,
         browser_executable_path: None,
         browser_cdp_port_base: 9222,
@@ -448,8 +449,11 @@ fn default_config() -> Config {
         orchestrator_model: String::new(),
         tool_skill_agent_enabled: true,
         tool_skill_agent_model: String::new(),
+        post_tool_evaluator_enabled: false,
+        post_tool_evaluator_model: String::new(),
         cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
         cursor_agent_tmux_enabled: true,
+        cursor_agent_runner_url: None,
     }
 }
 

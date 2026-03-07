@@ -548,6 +548,56 @@ impl Database {
         Ok(messages)
     }
 
+    pub fn get_messages_for_date_range(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+             FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2
+               AND (?3 IS NULL OR timestamp >= ?3)
+               AND (?4 IS NULL OR timestamp <= ?4)
+             ORDER BY timestamp ASC
+             LIMIT ?5",
+        )?;
+        let messages = stmt
+            .query_map(
+                params![chat_id, persona_id, from_date, to_date, limit as i64],
+                |row| {
+                    Ok(StoredMessage {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        persona_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        content: row.get(4)?,
+                        is_from_bot: row.get::<_, i32>(5)? != 0,
+                        timestamp: row.get(6)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
+    pub fn get_message_days(&self, chat_id: i64, persona_id: i64) -> Result<Vec<String>, MicroClawError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT date(timestamp) AS d FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY d DESC",
+        )?;
+        let days: Vec<String> = stmt
+            .query_map(params![chat_id, persona_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(days)
+    }
+
     pub fn get_chats_by_type(
         &self,
         chat_type: &str,

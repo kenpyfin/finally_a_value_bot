@@ -196,6 +196,7 @@ impl SkillManager {
 
     /// Build a compact skills catalog for the system prompt.
     /// Returns empty string if no skills are available.
+    /// Includes truncated usage instructions so the agent knows how to invoke each skill.
     pub fn build_skills_catalog(&self) -> String {
         let skills = self.discover_skills();
         if skills.is_empty() {
@@ -203,7 +204,21 @@ impl SkillManager {
         }
         let mut catalog = String::from("<available_skills>\n");
         for skill in &skills {
-            catalog.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            catalog.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+            // Include invocation details from SKILL.md body
+            if let Some((_meta, body)) = self.load_skill(&skill.name) {
+                if !body.is_empty() {
+                    let truncated = if body.len() > 500 {
+                        let boundary = body.floor_char_boundary(500);
+                        format!("{}...", &body[..boundary])
+                    } else {
+                        body
+                    };
+                    for line in truncated.lines() {
+                        catalog.push_str(&format!("  {}\n", line));
+                    }
+                }
+            }
         }
         catalog.push_str("</available_skills>");
         catalog

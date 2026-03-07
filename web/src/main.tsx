@@ -37,7 +37,7 @@ import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
-import type { SessionItem, Persona, ScheduleTask, ChannelBinding } from './types'
+import type { Persona, ScheduleTask, ChannelBinding } from './types'
 
 type ConfigPayload = Record<string, unknown>
 
@@ -177,16 +177,6 @@ function saveUiTheme(value: UiTheme): void {
   localStorage.setItem('microclaw_ui_theme', value)
 }
 
-function writeSessionToUrl(sessionKey: string): void {
-  if (typeof window === 'undefined') return
-  const url = new URL(window.location.href)
-  url.searchParams.set('session', sessionKey)
-  window.history.replaceState(null, '', url.toString())
-}
-
-/** Stable default for web-only sessions; backend maps this to a fixed chat_id. */
-const DEFAULT_WEB_SESSION_KEY = 'main'
-
 const PERSONA_STORAGE_KEY = 'microclaw_selected_persona_id'
 
 function readStoredPersonaId(): number | null {
@@ -208,31 +198,6 @@ function writeStoredPersonaId(id: number): void {
   } catch {
     // ignore
   }
-}
-
-function getInitialSessionKey(): string {
-  if (typeof window === 'undefined') return DEFAULT_WEB_SESSION_KEY
-  const fromUrl = new URLSearchParams(window.location.search).get('session')?.trim()
-  return fromUrl || DEFAULT_WEB_SESSION_KEY
-}
-
-function pickLatestSessionKey(items: SessionItem[]): string {
-  // Prefer web sessions so we don't land the user in a Telegram (read-only) chat.
-  const webItems = items.filter((item) => item.chat_type === 'web')
-  const candidates = webItems.length > 0 ? webItems : items
-
-  if (candidates.length === 0) return DEFAULT_WEB_SESSION_KEY
-
-  const parsed = candidates
-    .map((item) => ({ item, ts: Date.parse(item.last_message_time || '') }))
-    .filter((v) => Number.isFinite(v.ts))
-
-  if (parsed.length > 0) {
-    parsed.sort((a, b) => b.ts - a.ts)
-    return parsed[0]?.item.session_key ?? DEFAULT_WEB_SESSION_KEY
-  }
-
-  return candidates[candidates.length - 1]?.session_key ?? DEFAULT_WEB_SESSION_KEY
 }
 
 if (typeof document !== 'undefined') {
@@ -600,11 +565,10 @@ function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
 function App() {
   const [appearance, setAppearance] = useState<Appearance>(readAppearance())
   const [uiTheme, setUiTheme] = useState<UiTheme>(readUiTheme())
-  const [sessions, setSessions] = useState<SessionItem[]>([])
-  const [extraSessions, setExtraSessions] = useState<SessionItem[]>([])
-  const [sessionKey, setSessionKey] = useState<string>(() => DEFAULT_WEB_SESSION_KEY)
+  const [chatId, setChatId] = useState<number | null>(null)
   const [historySeed, setHistorySeed] = useState<ThreadMessageLike[]>([])
-  const [historyCountBySession, setHistoryCountBySession] = useState<Record<string, number>>({})
+  const [historyByDay, setHistoryByDay] = useState<Record<string, ThreadMessageLike[]>>({})
+  const [loadingOlder, setLoadingOlder] = useState(false)
   const [runtimeNonce, setRuntimeNonce] = useState<number>(0)
   const [error, setError] = useState<string>('')
   const [statusText, setStatusText] = useState<string>('Idle')
@@ -631,16 +595,14 @@ function App() {
     return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
   }, [])
 
-  // Single chat: always use default session key (one chat synced across all channels).
-  const effectiveSessionKey = sessionKey || DEFAULT_WEB_SESSION_KEY
-
   const selectedSessionLabel = 'Chat'
   const selectedSessionReadOnly = false
 
   /** Loads personas and applies stored preference; returns the chosen persona id and name for history/switch. */
-  async function loadPersonas(target = effectiveSessionKey): Promise<{ id: number; name: string } | null> {
+  async function loadPersonas(cid: number | null = chatId): Promise<{ id: number; name: string } | null> {
+    if (cid == null) return null
     try {
-      const query = new URLSearchParams({ session_key: target })
+      const query = new URLSearchParams({ chat_id: String(cid) })
       const data = await api<{ personas?: { id: number; name: string; is_active: boolean }[] }>(`/api/personas?${query.toString()}`)
       const list = Array.isArray(data.personas) ? data.personas : []
       const personaList = list.map((p) => ({ id: p.id, name: p.name, is_active: p.is_active }))
@@ -669,32 +631,65 @@ function App() {
   }
 
   async function switchPersona(personaName: string): Promise<void> {
+    if (chatId == null) return
     await api('/api/personas/switch', {
       method: 'POST',
-      body: JSON.stringify({ session_key: effectiveSessionKey, persona_name: personaName }),
+      body: JSON.stringify({ chat_id: chatId, persona_name: personaName }),
     })
     const p = personas.find((x) => x.name === personaName)
     if (p) writeStoredPersonaId(p.id)
-    await loadPersonas(effectiveSessionKey)
-    await loadHistory(effectiveSessionKey, p?.id ?? undefined)
+    await loadPersonas(chatId)
+    await loadHistory(chatId, p?.id ?? undefined)
     setRuntimeNonce((x) => x + 1)
   }
 
-  async function loadSessions(): Promise<void> {
-    const data = await api<{ sessions?: SessionItem[] }>('/api/sessions')
-    setSessions(Array.isArray(data.sessions) ? data.sessions : [])
-  }
-
-  async function loadHistory(target = effectiveSessionKey, personaId?: number | null): Promise<void> {
-    const query = new URLSearchParams({ session_key: target })
+  async function loadHistory(cid: number | null = chatId, personaId?: number | null, day?: string | null): Promise<void> {
+    if (cid == null) return
+    const query = new URLSearchParams({ chat_id: String(cid) })
     if (personaId != null && personaId > 0) query.set('persona_id', String(personaId))
-    query.set('limit', '2000')
+    if (day) query.set('day', day)
+    else query.set('limit', '500')
     const data = await api<{ messages?: BackendMessage[] }>(`/api/history?${query.toString()}`)
     const rawMessages = Array.isArray(data.messages) ? data.messages : []
     const mapped = mapBackendHistory(rawMessages)
-    setHistorySeed(mapped)
-    setHistoryCountBySession((prev) => ({ ...prev, [target]: rawMessages.length }))
+    if (day) {
+      setHistoryByDay((prev) => {
+        const next = { ...prev, [day]: mapped }
+        const allDays = Object.keys(next).sort()
+        const combined = allDays.flatMap((d) => (next[d] ?? []))
+        setHistorySeed(combined)
+        return next
+      })
+    } else {
+      setHistoryByDay({})
+      setHistorySeed(mapped)
+    }
     setRuntimeNonce((x) => x + 1)
+  }
+
+  async function loadOlderDay(): Promise<void> {
+    if (chatId == null || loadingOlder) return
+    setLoadingOlder(true)
+    try {
+      const daysRes = await api<{ days?: string[] }>(`/api/history/days?chat_id=${chatId}${activePersonaId ? `&persona_id=${activePersonaId}` : ''}`)
+      const allDays = Array.isArray(daysRes.days) ? daysRes.days : []
+      if (allDays.length === 0) return
+      const loadedDays = Object.keys(historyByDay).sort()
+      const oldestLoaded = loadedDays.length > 0
+        ? loadedDays[0]
+        : (() => {
+            const first = historySeed[0] as { createdAt?: Date } | undefined
+            if (first?.createdAt) {
+              return new Date(first.createdAt).toISOString().slice(0, 10)
+            }
+            return allDays[0]
+          })()
+      const idx = allDays.indexOf(oldestLoaded)
+      const nextOlder = idx >= 0 && idx < allDays.length - 1 ? allDays[idx + 1] : null
+      if (nextOlder) await loadHistory(chatId, activePersonaId ?? undefined, nextOlder)
+    } finally {
+      setLoadingOlder(false)
+    }
   }
 
   const adapter = useMemo<ChatModelAdapter>(
@@ -714,11 +709,11 @@ function App() {
             throw new Error('This chat is read-only. Switch to a web session or create a new chat to send messages.')
           }
 
-          const sendBody: { session_key: string; persona_id?: number; sender_name: string; message: string } = {
-            session_key: effectiveSessionKey,
+          const sendBody: { chat_id?: number; persona_id?: number; sender_name: string; message: string } = {
             sender_name: 'web-user',
             message: userText,
           }
+          if (chatId != null) sendBody.chat_id = chatId
           if (activePersonaId != null && activePersonaId > 0) sendBody.persona_id = activePersonaId
           const sendResponse = await api<{ run_id?: string }>('/api/send_stream', {
             method: 'POST',
@@ -888,7 +883,7 @@ function App() {
                 )
                 if (status.done === true) {
                   setStatusText('Done')
-                  await loadHistory(effectiveSessionKey)
+                  await loadHistory(chatId)
                   break
                 }
               } catch {
@@ -899,71 +894,44 @@ function App() {
           }
         } finally {
           setSending(false)
-          void loadSessions()
-          void loadHistory(effectiveSessionKey, activePersonaId ?? undefined)
+          void loadHistory(chatId, activePersonaId ?? undefined)
         }
       },
     }),
-    [effectiveSessionKey, selectedSessionReadOnly],
+    [chatId, selectedSessionReadOnly, activePersonaId],
   )
 
   function toggleAppearance(): void {
     setAppearance((prev) => (prev === 'dark' ? 'light' : 'dark'))
   }
 
-  async function onResetSessionByKey(targetSession: string): Promise<void> {
+  async function onCreatePersona(): Promise<void> {
+    if (chatId == null) return
+    const name = window.prompt('Persona name (e.g. work, creative):')
+    if (name == null || !name.trim()) return
     try {
-      await api('/api/reset', {
+      await api<{ persona_id?: number }>('/api/personas/create', {
         method: 'POST',
-        body: JSON.stringify({ session_key: targetSession }),
+        body: JSON.stringify({ chat_id: chatId, name: name.trim() }),
       })
-      if (targetSession === effectiveSessionKey) {
-        await loadHistory(targetSession)
-      }
-      await loadSessions()
-      setStatusText('Context cleared')
+      await loadPersonas(chatId)
+      setStatusText(`Persona "${name.trim()}" created`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  async function onRefreshSessionByKey(targetSession: string, personaId?: number | null): Promise<void> {
+  async function onDeletePersona(personaId: number): Promise<void> {
+    if (chatId == null) return
+    if (!window.confirm('Delete this persona? Its messages and session will be removed.')) return
     try {
-      if (targetSession === effectiveSessionKey) {
-        await loadHistory(targetSession, personaId ?? undefined)
-      }
-      await loadSessions()
-      setStatusText('Chat refreshed')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  async function onDeleteSessionByKey(targetSession: string): Promise<void> {
-    try {
-      const resp = await api<{ deleted?: boolean }>('/api/delete_session', {
+      await api('/api/personas/delete', {
         method: 'POST',
-        body: JSON.stringify({ session_key: targetSession }),
+        body: JSON.stringify({ chat_id: chatId, persona_id: personaId }),
       })
-
-      if (resp.deleted === false) {
-        setStatusText('No session data found to delete.')
-      }
-
-      setExtraSessions((prev) => prev.filter((s) => s.session_key !== targetSession))
-      setHistoryCountBySession((prev) => {
-        const next = { ...prev }
-        delete next[targetSession]
-        return next
-      })
-
-      if (targetSession === effectiveSessionKey) {
-        await loadHistory(DEFAULT_WEB_SESSION_KEY)
-      }
-      await loadSessions()
-      if (resp.deleted !== false) {
-        setStatusText('Session deleted')
-      }
+      await loadPersonas(chatId)
+      if (activePersonaId === personaId) await loadHistory(chatId)
+      setStatusText('Persona deleted')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -1077,16 +1045,17 @@ function App() {
     ;(async () => {
       try {
         setError('')
-        const data = await api<{ sessions?: SessionItem[] }>('/api/sessions')
-        const loaded = Array.isArray(data.sessions) ? data.sessions : []
-        setSessions(loaded)
-
-        const latestSession = pickLatestSessionKey(loaded)
-        const initialSession = latestSession
-
-        setSessionKey(initialSession)
-        writeSessionToUrl(initialSession)
-        await loadHistory(initialSession)
+        const data = await api<{ chat_id?: number; persona_id?: number }>('/api/chat')
+        const cid = typeof data.chat_id === 'number' ? data.chat_id : null
+        const pid = typeof data.persona_id === 'number' ? data.persona_id : null
+        setChatId(cid)
+        if (pid != null) setActivePersonaId(pid)
+        if (cid != null) {
+          const chosen = await loadPersonas(cid)
+          loadBindings(cid).catch(() => {})
+          loadSchedules(cid).catch(() => {})
+          await loadHistory(cid, chosen?.id ?? pid)
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
       }
@@ -1094,9 +1063,10 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  async function loadSchedules(target = effectiveSessionKey): Promise<void> {
+  async function loadSchedules(cid: number | null = chatId): Promise<void> {
+    if (cid == null) return
     try {
-      const query = new URLSearchParams({ session_key: target })
+      const query = new URLSearchParams({ chat_id: String(cid) })
       const data = await api<{ tasks?: ScheduleTask[] }>(`/api/schedules?${query.toString()}`)
       setSchedules(Array.isArray(data.tasks) ? data.tasks : [])
     } catch {
@@ -1104,9 +1074,10 @@ function App() {
     }
   }
 
-  async function loadBindings(target = effectiveSessionKey): Promise<void> {
+  async function loadBindings(cid: number | null = chatId): Promise<void> {
+    if (cid == null) return
     try {
-      const query = new URLSearchParams({ session_key: target })
+      const query = new URLSearchParams({ chat_id: String(cid) })
       const data = await api<{ bindings?: ChannelBinding[] }>(`/api/contacts/bindings?${query.toString()}`)
       setBindings(Array.isArray(data.bindings) ? data.bindings : [])
     } catch {
@@ -1117,34 +1088,32 @@ function App() {
   async function bindToContact(contactChatId: number): Promise<void> {
     await api('/api/contacts/bind', {
       method: 'POST',
-      body: JSON.stringify({ session_key: effectiveSessionKey, contact_chat_id: contactChatId }),
+      body: JSON.stringify({ contact_chat_id: contactChatId }),
     })
-    await loadBindings(effectiveSessionKey)
-    await loadSessions()
-    await loadHistory(effectiveSessionKey)
+    await loadBindings(chatId)
+    await loadHistory(chatId)
     setRuntimeNonce((x) => x + 1)
   }
 
   async function unlinkContact(): Promise<void> {
     await api('/api/contacts/unlink', {
       method: 'POST',
-      body: JSON.stringify({ session_key: effectiveSessionKey }),
+      body: JSON.stringify({}),
     })
-    await loadBindings(effectiveSessionKey)
-    await loadSessions()
+    await loadBindings(chatId)
   }
 
   async function createSchedule(prompt: string, scheduleType: string, scheduleValue: string): Promise<void> {
     await api('/api/schedules', {
       method: 'POST',
       body: JSON.stringify({
-        session_key: effectiveSessionKey,
+        chat_id: chatId ?? undefined,
         prompt,
         schedule_type: scheduleType,
         schedule_value: scheduleValue,
       }),
     })
-    await loadSchedules(effectiveSessionKey)
+    await loadSchedules(chatId)
   }
 
   async function updateScheduleStatus(taskId: number, status: string): Promise<void> {
@@ -1152,35 +1121,36 @@ function App() {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     })
-    await loadSchedules(effectiveSessionKey)
+    await loadSchedules(chatId)
   }
 
   useEffect(() => {
+    if (chatId == null) return
     let cancelled = false
     async function init() {
-      const chosen = await loadPersonas(effectiveSessionKey)
+      const chosen = await loadPersonas(chatId)
       if (cancelled) return
-      loadBindings(effectiveSessionKey).catch(() => {})
-      loadSchedules(effectiveSessionKey).catch(() => {})
+      loadBindings(chatId).catch(() => {})
+      loadSchedules(chatId).catch(() => {})
       if (chosen) {
         try {
           await api('/api/personas/switch', {
             method: 'POST',
-            body: JSON.stringify({ session_key: effectiveSessionKey, persona_name: chosen.name }),
+            body: JSON.stringify({ chat_id: chatId ?? undefined, persona_name: chosen.name }),
           })
         } catch {
           // ignore; we still load history for the chosen persona
         }
       }
-      loadHistory(effectiveSessionKey, chosen?.id).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      loadHistory(chatId, chosen?.id).catch((e) => setError(e instanceof Error ? e.message : String(e)))
     }
     init()
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveSessionKey])
+  }, [chatId])
 
 
-  const runtimeKey = `${effectiveSessionKey}-${activePersonaId ?? 0}-${runtimeNonce}`
+  const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
   const currentProvider = String(configDraft.llm_provider || DEFAULT_CONFIG_VALUES.llm_provider).trim().toLowerCase()
   const providerOptions = Array.from(
@@ -1247,9 +1217,8 @@ function App() {
             personas={personas}
             selectedPersonaId={activePersonaId}
             onPersonaSelect={(name) => void switchPersona(name)}
-            onRefreshChat={() => void onRefreshSessionByKey(effectiveSessionKey, activePersonaId)}
-            onResetChat={() => void onResetSessionByKey(effectiveSessionKey)}
-            onDeleteChat={() => void onDeleteSessionByKey(effectiveSessionKey)}
+            onCreatePersona={() => void onCreatePersona()}
+            onDeletePersona={(id) => void onDeletePersona(id)}
             onOpenConfig={openConfig}
           />
 
@@ -1352,8 +1321,15 @@ function App() {
                 ) : null}
               </div>
 
-              <div className="min-h-0 flex-1 px-1 pb-1">
-                <ThreadPane key={runtimeKey} adapter={adapter} initialMessages={historySeed} runtimeKey={runtimeKey} />
+              <div className="min-h-0 flex-1 px-1 pb-1 flex flex-col">
+                <div className="flex justify-center py-2">
+                  <Button size="1" variant="soft" onClick={() => void loadOlderDay()} disabled={loadingOlder}>
+                    {loadingOlder ? 'Loading…' : 'Load older'}
+                  </Button>
+                </div>
+                <div className="min-h-0 flex-1">
+                  <ThreadPane key={runtimeKey} adapter={adapter} initialMessages={historySeed} runtimeKey={runtimeKey} />
+                </div>
               </div>
             </div>
           </main>

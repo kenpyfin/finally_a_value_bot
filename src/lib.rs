@@ -1,7 +1,6 @@
 pub mod builtin_skills;
 pub mod channel;
 pub mod channels;
-pub mod orchestrator;
 pub mod persona;
 pub mod slash_commands;
 pub mod claude;
@@ -20,6 +19,7 @@ pub mod setup;
 pub mod skills;
 pub mod social_oauth;
 pub mod tool_skill_agent;
+pub mod post_tool_evaluator;
 pub mod tools;
 pub mod transcribe;
 pub mod web;

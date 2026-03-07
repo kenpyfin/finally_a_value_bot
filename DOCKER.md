@@ -54,6 +54,16 @@ To use the ORIGIN Obsidian vault and vault semantic search:
 
 The image includes agent-browser (npm) and Chromium (Playwright). Browser automation runs in headless mode only; no GUI. The `shm_size: "1gb"` setting is required for Chromium stability. The image sets `AGENT_BROWSER_PATH=/usr/local/bin/agent-browser` so the browser tool finds it. If you see "browser function is not installed" or "command not found", rebuild the image: `docker compose build --no-cache` (or `./deploy.sh`) so the `npm install -g agent-browser && agent-browser install` step runs again.
 
+## Cursor Agent in Docker
+
+The image does **not** install cursor-agent or tmux. cursor-agent is designed for desktop use with Cursor IDE auth and is typically not available in headless containers.
+
+**Options:**
+
+1. **Fallback (no setup)**: When cursor-agent is unavailable, `build_skill` falls back to direct file creation — it writes SKILL.md from the provided name, description, and instructions. Skill creation works in Docker without cursor-agent.
+
+2. **Host runner**: To run cursor-agent from Docker, use a host runner. Install cursor-agent and tmux on the **host**, run the reference runner (see `scripts/cursor-agent-runner.sh`), and set `CURSOR_AGENT_RUNNER_URL` in `.env` (e.g. `http://host.docker.internal:3847`). The bot will POST spawn requests to the runner, which executes cursor-agent on the host. On Linux, `extra_hosts: host.docker.internal:host-gateway` in docker-compose allows the container to reach the host (already configured).
+
 ## Refresh / Update
 
 To pull latest code and redeploy (full rebuild):

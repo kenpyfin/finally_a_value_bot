@@ -11,7 +11,10 @@ services:
     environment:
       - MICROCLAW_CONFIG=/app/.env
       - MICROCLAW_WORKSPACE_DIR=/app/workspace
+      - MICROCLAW_IN_DOCKER=1
       - HOME=/root
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "10961:10961"
     shm_size: "1gb"

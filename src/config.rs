@@ -99,7 +99,7 @@ fn default_cursor_agent_timeout_secs() -> u64 {
 }
 
 fn default_orchestrator_enabled() -> bool {
-    false
+    true
 }
 
 fn default_orchestrator_model() -> String {
@@ -107,10 +107,18 @@ fn default_orchestrator_model() -> String {
 }
 
 fn default_tool_skill_agent_enabled() -> bool {
-    true
+    false
 }
 
 fn default_tool_skill_agent_model() -> String {
+    String::new()
+}
+
+fn default_post_tool_evaluator_enabled() -> bool {
+    false
+}
+
+fn default_post_tool_evaluator_model() -> String {
     String::new()
 }
 
@@ -268,6 +276,9 @@ pub struct Config {
     pub web_run_history_limit: usize,
     #[serde(default = "default_web_session_idle_ttl_seconds")]
     pub web_session_idle_ttl_seconds: u64,
+    /// When set, web UI uses this chat_id for all requests (single universal contact across channels). Env: UNIVERSAL_CHAT_ID.
+    #[serde(default)]
+    pub universal_chat_id: Option<i64>,
     #[serde(default = "default_browser_managed")]
     pub browser_managed: bool,
     #[serde(default)]
@@ -296,24 +307,33 @@ pub struct Config {
     /// Optional vault/vector DB config for ORIGIN Obsidian vault integration.
     #[serde(default)]
     pub vault: Option<VaultConfig>,
-    /// [Unused] Legacy: plan-first orchestrator. Default false; main chat acts as orchestrator via sub_agent tool.
+    /// When true, use orchestrator-first flow: orchestrator plans (direct or delegate), sub-agents run tools; no tools in main context. Default true.
     #[serde(default = "default_orchestrator_enabled")]
     pub orchestrator_enabled: bool,
     /// Optional model override for orchestrator (e.g. faster/cheaper). If empty, use main model.
     #[serde(default = "default_orchestrator_model")]
     pub orchestrator_model: String,
-    /// Enable Tool and Skill Agent: gate all tool/skill use and creation before execution.
+    /// [Legacy] When true and orchestrator disabled, gate tool use via TSA. Default false; orchestrator-first flow does not use TSA.
     #[serde(default = "default_tool_skill_agent_enabled")]
     pub tool_skill_agent_enabled: bool,
     /// Optional model for TSA (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_tool_skill_agent_model")]
     pub tool_skill_agent_model: String,
+    /// Post-Tool Evaluator (PTE): evaluate task completion after each tool iteration. Default false.
+    #[serde(default = "default_post_tool_evaluator_enabled")]
+    pub post_tool_evaluator_enabled: bool,
+    /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
+    #[serde(default = "default_post_tool_evaluator_model")]
+    pub post_tool_evaluator_model: String,
     /// Tmux session name prefix for cursor_agent when detach=true (e.g. microclaw-cursor).
     #[serde(default = "default_cursor_agent_tmux_session_prefix")]
     pub cursor_agent_tmux_session_prefix: String,
     /// Allow spawning cursor_agent in tmux when detach=true. Set false in Docker or when tmux unavailable.
     #[serde(default = "default_cursor_agent_tmux_enabled")]
     pub cursor_agent_tmux_enabled: bool,
+    /// URL of a host runner that executes cursor-agent (e.g. http://host.docker.internal:3847). When set, the bot POSTs spawn requests instead of running cursor-agent locally.
+    #[serde(default)]
+    pub cursor_agent_runner_url: Option<String>,
 }
 
 impl Config {
@@ -575,6 +595,7 @@ impl Config {
                 "WEB_SESSION_IDLE_TTL_SECONDS",
                 default_web_session_idle_ttl_seconds(),
             ),
+            universal_chat_id: Self::env("UNIVERSAL_CHAT_ID").and_then(|s| s.parse().ok()),
             browser_managed: Self::env_bool("BROWSER_MANAGED", default_browser_managed()),
             browser_executable_path: Self::env("BROWSER_EXECUTABLE_PATH"),
             browser_cdp_port_base: Self::env_u16(
@@ -603,12 +624,19 @@ impl Config {
                 default_tool_skill_agent_enabled(),
             ),
             tool_skill_agent_model: Self::env("TOOL_SKILL_AGENT_MODEL").unwrap_or_default(),
+            post_tool_evaluator_enabled: Self::env_bool(
+                "POST_TOOL_EVALUATOR_ENABLED",
+                default_post_tool_evaluator_enabled(),
+            ),
+            post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
             cursor_agent_tmux_session_prefix: Self::env("CURSOR_AGENT_TMUX_SESSION_PREFIX")
                 .unwrap_or_else(default_cursor_agent_tmux_session_prefix),
             cursor_agent_tmux_enabled: Self::env_bool(
                 "CURSOR_AGENT_TMUX_ENABLED",
                 default_cursor_agent_tmux_enabled(),
             ),
+            cursor_agent_runner_url: Self::env("CURSOR_AGENT_RUNNER_URL")
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 
@@ -824,6 +852,7 @@ mod tests {
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
             web_session_idle_ttl_seconds: 300,
+            universal_chat_id: None,
             browser_managed: false,
             browser_executable_path: None,
             browser_cdp_port_base: 9222,
@@ -839,8 +868,11 @@ mod tests {
             orchestrator_model: String::new(),
             tool_skill_agent_enabled: true,
             tool_skill_agent_model: String::new(),
+            post_tool_evaluator_enabled: false,
+            post_tool_evaluator_model: String::new(),
             cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
             cursor_agent_tmux_enabled: true,
+            cursor_agent_runner_url: None,
         }
     }
 

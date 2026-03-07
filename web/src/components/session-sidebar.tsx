@@ -11,9 +11,8 @@ type SessionSidebarProps = {
   personas: Persona[]
   selectedPersonaId: number | null
   onPersonaSelect: (personaName: string) => void
-  onRefreshChat: () => void
-  onResetChat: () => void
-  onDeleteChat: () => void
+  onCreatePersona: () => void
+  onDeletePersona: (personaId: number) => void
   onOpenConfig: () => Promise<void>
 }
 
@@ -26,17 +25,14 @@ export function SessionSidebar({
   personas,
   selectedPersonaId,
   onPersonaSelect,
-  onRefreshChat,
-  onResetChat,
-  onDeleteChat,
+  onCreatePersona,
+  onDeletePersona,
   onOpenConfig,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
-  const [chatMenuOpen, setChatMenuOpen] = useState(false)
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
   const themeMenuRef = useRef<HTMLDivElement | null>(null)
   const themeButtonRef = useRef<HTMLButtonElement | null>(null)
-  const chatMenuRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
@@ -45,16 +41,11 @@ export function SessionSidebar({
 
       if (themeButtonRef.current?.contains(target)) return
       if (themeMenuRef.current?.contains(target)) return
-      if (chatMenuRef.current?.contains(target)) return
 
-      setChatMenuOpen(false)
       setThemeMenuOpen(false)
     }
 
-    const closeOnScroll = () => {
-      setChatMenuOpen(false)
-      setThemeMenuOpen(false)
-    }
+    const closeOnScroll = () => setThemeMenuOpen(false)
 
     window.addEventListener('pointerdown', onPointerDown)
     window.addEventListener('scroll', closeOnScroll, true)
@@ -163,50 +154,9 @@ export function SessionSidebar({
         <Text size="2" weight="medium" color="gray">
           Persona
         </Text>
-        <div className="relative" ref={chatMenuRef}>
-          <button
-            type="button"
-            onClick={() => setChatMenuOpen((o) => !o)}
-            className={
-              isDark
-                ? 'rounded-md border border-[color:var(--mc-border-soft)] px-2 py-1 text-xs text-slate-400 hover:bg-[color:var(--mc-bg-panel)]'
-                : 'rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-100'
-            }
-          >
-            ⋮
-          </button>
-          {chatMenuOpen ? (
-            <div
-              className={
-                isDark
-                  ? 'absolute right-0 top-8 z-50 min-w-[140px] rounded-lg border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] p-1 shadow-xl'
-                  : 'absolute right-0 top-8 z-50 min-w-[140px] rounded-lg border border-slate-200 bg-white p-1 shadow-xl'
-              }
-            >
-              <button
-                type="button"
-                className="w-full rounded-md px-3 py-2 text-left text-sm hover:bg-black/5"
-                onClick={() => { onRefreshChat(); setChatMenuOpen(false) }}
-              >
-                Refresh
-              </button>
-              <button
-                type="button"
-                className="w-full rounded-md px-3 py-2 text-left text-sm text-amber-700 hover:bg-amber-50"
-                onClick={() => { onResetChat(); setChatMenuOpen(false) }}
-              >
-                Clear context
-              </button>
-              <button
-                type="button"
-                className="w-full rounded-md px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
-                onClick={() => { onDeleteChat(); setChatMenuOpen(false) }}
-              >
-                Delete chat
-              </button>
-            </div>
-          ) : null}
-        </div>
+        <Button size="1" variant="soft" onClick={onCreatePersona} title="New persona">
+          + New
+        </Button>
       </Flex>
 
       <Separator size="4" className="my-2" />
@@ -224,18 +174,16 @@ export function SessionSidebar({
               <Text size="1" color="gray">Loading…</Text>
             ) : (
               personas.map((p) => (
-                <button
+                <div
                   key={p.id}
-                  type="button"
-                  onClick={() => onPersonaSelect(p.name)}
                   className={
                     selectedPersonaId === p.id
                       ? isDark
-                        ? 'flex w-full items-center justify-between rounded-lg border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2 text-left text-sm shadow-sm'
-                        : 'flex w-full items-center justify-between rounded-lg border bg-white px-3 py-2 text-left text-sm shadow-sm'
+                        ? 'flex w-full items-center justify-between gap-1 rounded-lg border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2 shadow-sm'
+                        : 'flex w-full items-center justify-between gap-1 rounded-lg border bg-white px-3 py-2 shadow-sm'
                       : isDark
-                        ? 'flex w-full items-center justify-between rounded-lg border border-transparent px-3 py-2 text-left text-sm text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
-                        : 'flex w-full items-center justify-between rounded-lg border border-transparent px-3 py-2 text-left text-sm text-slate-600 hover:border-slate-200 hover:bg-white'
+                        ? 'flex w-full items-center justify-between gap-1 rounded-lg border border-transparent px-3 py-2 text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
+                        : 'flex w-full items-center justify-between gap-1 rounded-lg border border-transparent px-3 py-2 text-slate-600 hover:border-slate-200 hover:bg-white'
                   }
                   style={
                     !isDark && selectedPersonaId === p.id
@@ -243,13 +191,44 @@ export function SessionSidebar({
                       : undefined
                   }
                 >
-                  <span className="font-medium">{p.name}</span>
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 text-left text-sm font-medium"
+                    onClick={() => onPersonaSelect(p.name)}
+                  >
+                    {p.name}
+                  </button>
                   {p.is_active ? <Badge size="1" variant="soft">active</Badge> : null}
-                </button>
+                  {p.name !== 'default' ? (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onDeletePersona(p.id) }}
+                      title={`Delete persona "${p.name}"`}
+                      className={
+                        isDark
+                          ? 'rounded p-1 text-slate-400 hover:bg-red-900/30 hover:text-red-400'
+                          : 'rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600'
+                      }
+                      aria-label={`Delete ${p.name}`}
+                    >
+                      🗑
+                    </button>
+                  ) : null}
+                </div>
               ))
             )}
           </div>
         </ScrollArea>
+      </div>
+
+      <div className={isDark ? 'mt-4 rounded-lg border border-[color:var(--mc-border-soft)] p-3' : 'mt-4 rounded-lg border border-slate-200 p-3'}>
+        <Text size="2" weight="bold" className="mb-2 block">Human–AI relationship</Text>
+        <img
+          src="/human-ai-relationship.png"
+          alt="Human and AI collaboration"
+          className="w-full rounded-md border border-black/10 object-contain"
+          loading="lazy"
+        />
       </div>
 
       <div className={isDark ? 'mt-4 border-t border-[color:var(--mc-border-soft)] pt-3' : 'mt-4 border-t border-slate-200 pt-3'}>

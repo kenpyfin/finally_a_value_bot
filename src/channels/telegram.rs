@@ -15,6 +15,7 @@ use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::skills::SkillManager;
 use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
+use crate::post_tool_evaluator::{evaluate_completion, PteAction};
 use crate::tools::{ToolAuthContext, ToolRegistry};
 
 /// Escape XML special characters in user-supplied content to prevent prompt injection.
@@ -976,8 +977,7 @@ pub async fn process_with_agent_with_events(
         control_chat_ids: state.config.control_chat_ids.clone(),
     };
 
-    // Main agent loop: the chat agent is the single orchestrator. It can call sub_agent when it
-    // wants to delegate; no separate plan-first layer.
+    // Main agent loop: chat agent has tools and executes directly.
     // Agentic tool-use loop. Timeouts prevent hangs:
     // - LLM round timeout: prevents hanging if LLM doesn't respond
     // - Tool execution timeout: prevents hanging on slow/unresponsive tools (e.g., browser, bash)
@@ -1198,6 +1198,90 @@ pub async fn process_with_agent_with_events(
                 content: MessageContent::Blocks(tool_results),
             });
 
+            // Post-Tool Evaluator: check if task is complete after tool execution
+            if !iteration_timed_out {
+                match evaluate_completion(
+                    &state.config,
+                    &principles_content,
+                    &memory_context,
+                    &messages,
+                    iteration,
+                )
+                .await
+                {
+                    Ok(pte_result) if pte_result.action == PteAction::Complete => {
+                        info!(
+                            "PTE: task complete ({}), synthesizing final response",
+                            pte_result.reason
+                        );
+                        // Do one final LLM call WITHOUT tools to synthesize response
+                        let final_response = match tokio::time::timeout(
+                            std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
+                            state.llm.send_message(&system_prompt, messages.clone(), None),
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(e)) => return Err(e.into()),
+                            Err(_) => {
+                                info!("PTE final LLM call timed out, falling back to generic response");
+                                return Ok("Task completed, but I couldn't generate a final summary in time.".to_string());
+                            }
+                        };
+
+                        let text = final_response
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ResponseContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+
+                        messages.push(Message {
+                            role: "assistant".into(),
+                            content: MessageContent::Text(text.clone()),
+                        });
+                        strip_images_for_session(&mut messages);
+                        if let Ok(json) = serde_json::to_string(&messages) {
+                            let _ = call_blocking(state.db.clone(), move |db| {
+                                db.save_session(chat_id, persona_id, &json)
+                            })
+                            .await;
+                        }
+
+                        let display_text = if state.config.show_thinking {
+                            text
+                        } else {
+                            strip_thinking(&text)
+                        };
+                        let final_text = if display_text.trim().is_empty() {
+                            "Done.".to_string()
+                        } else {
+                            display_text
+                        };
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(AgentEvent::FinalResponse {
+                                text: final_text.clone(),
+                            });
+                        }
+                        info!(
+                            "Agent loop PTE complete: returning response ({} chars)",
+                            final_text.len()
+                        );
+                        return Ok(final_text);
+                    }
+                    Ok(_) => {
+                        // PteAction::Continue — fall through to next iteration
+                    }
+                    Err(e) => {
+                        // PTE evaluation failed — log and continue (fail-open)
+                        info!("PTE evaluation failed, continuing: {}", e);
+                    }
+                }
+            }
+
             // If we hit a tool timeout, give the LLM a chance to respond
             // and break out if we're getting repeated timeouts
             if iteration_timed_out {
@@ -1334,7 +1418,6 @@ fn build_system_prompt(
 - Schedule tasks (schedule_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history)
 - Export chat history to markdown (export_chat)
 - Understand images sent by users (they appear as image content blocks)
-- Delegate self-contained sub-tasks to a parallel agent (sub_agent)
 - Run the Cursor CLI agent (cursor_agent) for research or code tasks; use detach: true to spawn in tmux and return immediately (then attach with tmux attach -t <session>); use cursor_agent_send to send keys to a running session; use list_cursor_agent_runs to see runs and session names
 - Activate agent skills (activate_skill) for specialized tasks. **To create or update a skill, use the build_skill tool only** — do not use write_file or edit_file under the skills directory. build_skill runs cursor-agent (in tmux when available) to create the skill folder and SKILL.md. Store credentials in the skill folder (e.g. .env there). Do not add on-demand tools only in your workspace or TOOLS.md — skills are the only way to add on-demand tools.
 - Read and update tiered memory (read_tiered_memory, write_tiered_memory) — per-persona MEMORY.md with Tier 1 (long-term principles-like), Tier 2 (active projects), Tier 3 (recent focus/mood); evaluate conversation flow and update tiers when appropriate; Tier 1 only on explicit user ask, Tier 3 often (e.g. daily). Not a todo list.
@@ -1347,7 +1430,7 @@ fn build_system_prompt(
         skills_dir_display = skills_dir_display
     );
     let mut prompt = format!(
-        r#"You are {bot_username}, a helpful AI assistant on Telegram. You can execute tools to help users with tasks.
+        r#"You are {bot_username}, a helpful smart assistant. You can execute tools to help users with tasks.
 
 **Time and timezone (prioritize this):** Your configured timezone is **{timezone}**. Current date and time in that timezone: **{current_time_in_tz}**. Always interpret "now", "today", "tomorrow", and any relative or scheduled times in this timezone unless the user explicitly specifies another. Use this timezone for schedule_task (it defaults to this) and when answering questions about current time or date.
 
@@ -1355,7 +1438,6 @@ You have access to the following capabilities:
 {caps}
 
 The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when calling send_message, schedule, export_chat, tiered memory, or memory(chat_daily) tools.
-Permission model: you may only operate on the current chat unless this chat is configured as a control chat. If you try cross-chat operations without permission, tools will return a permission error.
 
 When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list. Use write_memory with scope 'chat_daily' to append to the daily log (today and yesterday are injected at session start). Principles are in AGENTS.md at workspace root; do not overwrite them.
 
@@ -1513,11 +1595,7 @@ fn format_tool_status(name: &str, input: &serde_json::Value) -> String {
                 return format!("🔍 Grep: {pat}");
             }
         }
-        "sub_agent" => {
-            if let Some(task) = str_field("task") {
-                return format!("🤖 Sub-agent: {task}");
-            }
-        }
+
         "activate_skill" => {
             if let Some(skill) = str_field("skill_name") {
                 return format!("⚡ Skill: {skill}");
@@ -1747,9 +1825,9 @@ async fn send_response_result_impl(
         markdown_to_telegram_html(text)
     };
 
-    let send_one = |b: &Bot, cid: ChatId, txt: &str| {
+    let send_one = |b: &Bot, cid: ChatId, txt: &str, as_plain: bool| {
         let mut req = b.send_message(cid, txt);
-        if !plain_text {
+        if !plain_text && !as_plain {
             req = req.parse_mode(ParseMode::Html);
         }
         if let Some(tid) = thread_id {
@@ -1759,11 +1837,12 @@ async fn send_response_result_impl(
     };
 
     if formatted.len() <= MAX_LEN {
-        send_one(bot, chat_id, &formatted).await?;
+        send_one(bot, chat_id, &formatted, false).await?;
         return Ok(());
     }
 
-    let mut remaining = formatted.as_str();
+    // Chunked: send original text as plain so we never split inside an HTML tag (Telegram "Unmatched end tag").
+    let mut remaining = text;
     while !remaining.is_empty() {
         let chunk_len = if remaining.len() <= MAX_LEN {
             remaining.len()
@@ -1772,7 +1851,7 @@ async fn send_response_result_impl(
         };
 
         let chunk = &remaining[..chunk_len];
-        send_one(bot, chat_id, chunk).await?;
+        send_one(bot, chat_id, chunk, true).await?;
         remaining = &remaining[chunk_len..];
 
         if remaining.starts_with('\n') {
@@ -2547,11 +2626,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_system_prompt_mentions_sub_agent() {
-        let prompt = build_system_prompt("testbot", "", "microclaw.data/AGENTS.md", "", 12345, 1, "", "./tmp/shared", "./microclaw.data/skills", None, "UTC", "2025-02-24 12:00:00 UTC");
-        assert!(prompt.contains("sub_agent"));
-    }
+
 
     #[test]
     fn test_sanitize_xml() {

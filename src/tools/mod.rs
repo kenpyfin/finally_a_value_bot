@@ -16,9 +16,9 @@ pub mod search_history;
 pub mod search_vault;
 pub mod send_message;
 pub mod social_feed;
-pub mod sub_agent;
 pub mod sync_skills;
 pub mod tiered_memory;
+pub mod vault_add;
 pub mod web_fetch;
 pub mod web_html;
 pub mod web_search;
@@ -100,11 +100,13 @@ impl ToolRisk {
 
 pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
-        "bash" | "cursor_agent" => ToolRisk::High,
-        "write_file"
+        "bash" => ToolRisk::High,
+        "cursor_agent"
+        | "write_file"
         | "edit_file"
         | "write_memory"
         | "write_tiered_memory"
+        | "add_vault_item"
         | "send_message"
         | "sync_skills"
         | "schedule_task"
@@ -319,7 +321,6 @@ impl ToolRegistry {
             Box::new(schedule::CancelTaskTool::new(db.clone())),
             Box::new(schedule::GetTaskHistoryTool::new(db.clone())),
             Box::new(export_chat::ExportChatTool::new(db.clone(), &config.runtime_data_dir())),
-            Box::new(sub_agent::SubAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::CursorAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
             Box::new(cursor_agent::CursorAgentSendTool::new(config)),
@@ -356,8 +357,13 @@ impl ToolRegistry {
                     db_url,
                     collection,
                 )));
+                tools.push(Box::new(vault_add::AddVaultItemTool::new(
+                    embed_url,
+                    db_url,
+                    collection,
+                )));
                 tracing::info!(
-                    "search_vault tool registered (native: collection={}, db={})",
+                    "search_vault and add_vault_item tools registered (native: collection={}, db={})",
                     collection,
                     db_url
                 );
@@ -391,46 +397,6 @@ impl ToolRegistry {
         }
         if !social_added.is_empty() {
             tracing::info!("Social feed tools registered: {}", social_added.join(", "));
-        }
-        ToolRegistry { tools }
-    }
-
-    /// Create a restricted tool registry for sub-agents (no side-effect or recursive tools).
-    /// Pass `db` to enable `search_chat_history` in sub-agents.
-    pub fn new_sub_agent(config: &Config, db: Option<Arc<Database>>) -> Self {
-        let working_dir = PathBuf::from(config.working_dir());
-        if let Err(e) = std::fs::create_dir_all(&working_dir) {
-            tracing::warn!(
-                "Failed to create working_dir '{}': {}",
-                working_dir.display(),
-                e
-            );
-        }
-        let workspace_root = config.workspace_root_absolute();
-        let primary_skills = workspace_root.join("skills");
-        let shared_skills = workspace_root.join("shared").join("skills");
-        let mut tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(bash::BashTool::new(config.working_dir())),
-            Box::new(browser::BrowserTool::new(
-                &config.runtime_data_dir(),
-                config.agent_browser_path.clone(),
-            )),
-            Box::new(read_file::ReadFileTool::new(config.working_dir())),
-            Box::new(write_file::WriteFileTool::new(config.working_dir())),
-            Box::new(edit_file::EditFileTool::new(config.working_dir())),
-            Box::new(glob::GlobTool::new(config.working_dir())),
-            Box::new(grep::GrepTool::new(config.working_dir())),
-            Box::new(memory::ReadMemoryTool::new(&config.runtime_data_dir(), config.working_dir())),
-            Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.runtime_data_dir())),
-            Box::new(web_fetch::WebFetchTool),
-            Box::new(web_search::WebSearchTool),
-            Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
-                &primary_skills,
-                &shared_skills,
-            ])),
-        ];
-        if let Some(db) = db {
-            tools.push(Box::new(search_history::SearchHistoryTool::new(db)));
         }
         ToolRegistry { tools }
     }
