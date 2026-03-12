@@ -114,7 +114,7 @@ mod tests {
         assert_eq!(parse("/scheduled_job"), Some(SlashCommand::Schedule));
         // Telegram group commands with @botname
         assert_eq!(parse("/schedule@MyBot"), Some(SlashCommand::Schedule));
-        assert_eq!(parse("/jobs@HomeBot"), Some(SlashCommand::Schedule));
+        assert_eq!(parse("/jobs@FinallyAValueBot"), Some(SlashCommand::Schedule));
     }
 
     #[test]

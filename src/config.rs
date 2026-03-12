@@ -1,4 +1,4 @@
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -135,7 +135,7 @@ fn default_delegate_model() -> String {
 }
 
 fn default_cursor_agent_tmux_session_prefix() -> String {
-    "microclaw-cursor".into()
+    "finally_a_value_bot-cursor".into()
 }
 
 fn default_cursor_agent_tmux_enabled() -> bool {
@@ -346,7 +346,7 @@ pub struct Config {
     /// Optional model override for delegate sub-agent. If empty, use main model.
     #[serde(default = "default_delegate_model")]
     pub delegate_model: String,
-    /// Tmux session name prefix for cursor_agent when detach=true (e.g. microclaw-cursor).
+    /// Tmux session name prefix for cursor_agent when detach=true (e.g. finally_a_value_bot-cursor).
     #[serde(default = "default_cursor_agent_tmux_session_prefix")]
     pub cursor_agent_tmux_session_prefix: String,
     /// Allow spawning cursor_agent in tmux when detach=true. Set false in Docker or when tmux unavailable.
@@ -401,15 +401,15 @@ impl Config {
         }
     }
 
-    /// Resolve path to .env file. MICROCLAW_CONFIG can override (points to .env).
-    pub fn resolve_config_path() -> Result<Option<PathBuf>, MicroClawError> {
-        if let Ok(custom) = std::env::var("MICROCLAW_CONFIG") {
+    /// Resolve path to .env file. FINALLY_A_VALUE_BOT_CONFIG can override (points to .env).
+    pub fn resolve_config_path() -> Result<Option<PathBuf>, FinallyAValueBotError> {
+        if let Ok(custom) = std::env::var("FINALLY_A_VALUE_BOT_CONFIG") {
             let p = std::path::Path::new(&custom);
             if p.exists() {
                 return Ok(Some(PathBuf::from(custom)));
             }
-            return Err(MicroClawError::Config(format!(
-                "MICROCLAW_CONFIG points to non-existent file: {custom}"
+            return Err(FinallyAValueBotError::Config(format!(
+                "FINALLY_A_VALUE_BOT_CONFIG points to non-existent file: {custom}"
             )));
         }
         if std::path::Path::new("./.env").exists() {
@@ -484,16 +484,16 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Load config from environment (.env file + process env). Load .env from MICROCLAW_CONFIG path or ./
-    pub fn load() -> Result<Self, MicroClawError> {
+    /// Load config from environment (.env file + process env). Load .env from FINALLY_A_VALUE_BOT_CONFIG path or ./
+    pub fn load() -> Result<Self, FinallyAValueBotError> {
         let env_path = Self::resolve_config_path()?;
         let load_path = env_path.as_deref().unwrap_or(std::path::Path::new("./.env"));
         if load_path.exists() {
             dotenvy::from_path(load_path)
-                .map_err(|e| MicroClawError::Config(format!("Failed to load .env: {e}")))?;
+                .map_err(|e| FinallyAValueBotError::Config(format!("Failed to load .env: {e}")))?;
         } else if env_path.is_none() {
-            return Err(MicroClawError::Config(
-                "No .env found. Run `microclaw setup` to create one.".into(),
+            return Err(FinallyAValueBotError::Config(
+                "No .env found. Run `finally_a_value_bot setup` to create one.".into(),
             ));
         }
 
@@ -503,10 +503,10 @@ impl Config {
     }
 
     /// Load config from a specific .env file path (e.g. for config wizard).
-    pub fn load_from_path(path: &std::path::Path) -> Result<Self, MicroClawError> {
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self, FinallyAValueBotError> {
         if path.exists() {
             dotenvy::from_path(path)
-                .map_err(|e| MicroClawError::Config(format!("Failed to load .env: {e}")))?;
+                .map_err(|e| FinallyAValueBotError::Config(format!("Failed to load .env: {e}")))?;
         }
         let mut config = Self::load_from_env();
         config.post_deserialize()?;
@@ -671,7 +671,7 @@ impl Config {
     }
 
     /// Apply post-deserialization normalization and validation.
-    pub(crate) fn post_deserialize(&mut self) -> Result<(), MicroClawError> {
+    pub(crate) fn post_deserialize(&mut self) -> Result<(), FinallyAValueBotError> {
         self.llm_provider = self.llm_provider.trim().to_lowercase();
 
         // Apply provider-specific default model if empty
@@ -687,7 +687,7 @@ impl Config {
         // Validate timezone
         self.timezone
             .parse::<chrono_tz::Tz>()
-            .map_err(|_| MicroClawError::Config(format!("Invalid timezone: {}", self.timezone)))?;
+            .map_err(|_| FinallyAValueBotError::Config(format!("Invalid timezone: {}", self.timezone)))?;
 
         // Filter empty llm_base_url
         if let Some(ref url) = self.llm_base_url {
@@ -695,7 +695,7 @@ impl Config {
                 self.llm_base_url = None;
             }
         }
-        if let Ok(dir) = std::env::var("MICROCLAW_WORKSPACE_DIR") {
+        if let Ok(dir) = std::env::var("FINALLY_A_VALUE_BOT_WORKSPACE_DIR") {
             let trimmed = dir.trim();
             if !trimmed.is_empty() {
                 self.workspace_dir = trimmed.to_string();
@@ -713,7 +713,7 @@ impl Config {
             }
         }
         if self.web_enabled && !is_local_web_host(&self.web_host) && self.web_auth_token.is_none() {
-            return Err(MicroClawError::Config(
+            return Err(FinallyAValueBotError::Config(
                 "web_auth_token is required when web_enabled=true and web_host is not local".into(),
             ));
         }
@@ -770,12 +770,12 @@ impl Config {
 
         // Validate required fields
         if self.telegram_bot_token.is_empty() && self.discord_bot_token.is_none() {
-            return Err(MicroClawError::Config(
+            return Err(FinallyAValueBotError::Config(
                 "At least one of telegram_bot_token or discord_bot_token must be set".into(),
             ));
         }
         if self.api_key.is_empty() && self.llm_provider != "ollama" {
-            return Err(MicroClawError::Config("api_key is required".into()));
+            return Err(FinallyAValueBotError::Config("api_key is required".into()));
         }
 
         Ok(())
@@ -783,15 +783,15 @@ impl Config {
 
     /// Save config as YAML to the given path (legacy; prefer save_env).
     #[allow(dead_code)]
-    pub fn save_yaml(&self, path: &str) -> Result<(), MicroClawError> {
+    pub fn save_yaml(&self, path: &str) -> Result<(), FinallyAValueBotError> {
         let content = serde_yaml::to_string(self)
-            .map_err(|e| MicroClawError::Config(format!("Failed to serialize config: {e}")))?;
+            .map_err(|e| FinallyAValueBotError::Config(format!("Failed to serialize config: {e}")))?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
     /// Save config as .env to the given path.
-    pub fn save_env(&self, path: &std::path::Path) -> Result<(), MicroClawError> {
+    pub fn save_env(&self, path: &std::path::Path) -> Result<(), FinallyAValueBotError> {
         fn esc(s: &str) -> String {
             if s.contains(' ') || s.contains('"') || s.contains('#') || s.is_empty() {
                 format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -800,7 +800,7 @@ impl Config {
             }
         }
         let mut lines = Vec::new();
-        lines.push("# MicroClaw configuration".into());
+        lines.push("# FinallyAValueBot configuration".into());
         lines.push("".into());
         lines.push("# Telegram".into());
         lines.push(format!("TELEGRAM_BOT_TOKEN={}", esc(&self.telegram_bot_token)));
@@ -903,7 +903,7 @@ mod tests {
             delegate_tool_enabled: true,
             delegate_max_iterations: 10,
             delegate_model: String::new(),
-            cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+            cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
         }
@@ -1122,7 +1122,7 @@ discord_allowed_channels: [111, 222]
     fn test_config_save_yaml() {
         let config = test_config();
         let dir = std::env::temp_dir();
-        let path = dir.join("microclaw_test_config.yaml");
+        let path = dir.join("finally_a_value_bot_test_config.yaml");
         config.save_yaml(path.to_str().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("telegram_bot_token"));

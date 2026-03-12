@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::fmt::writer::MakeWriter;
 
-pub const LOG_FILE_PREFIX: &str = "microclaw-";
+pub const LOG_FILE_PREFIX: &str = "finally_a_value_bot-";
 pub const LOG_FILE_SUFFIX: &str = ".log";
 pub const LOG_RETENTION_DAYS: i64 = 30;
 
@@ -209,13 +209,13 @@ mod tests {
     use uuid::Uuid;
 
     fn test_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("microclaw_logging_test_{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("finally_a_value_bot_logging_test_{}", Uuid::new_v4()))
     }
 
     #[test]
     fn test_parse_log_filename_time() {
-        assert!(parse_log_filename_time("microclaw-2026-02-08-10.log").is_some());
-        assert!(parse_log_filename_time("microclaw-2026-02-08.log").is_none());
+        assert!(parse_log_filename_time("finally_a_value_bot-2026-02-08-10.log").is_some());
+        assert!(parse_log_filename_time("finally_a_value_bot-2026-02-08.log").is_none());
         assert!(parse_log_filename_time("other-2026-02-08-10.log").is_none());
     }
 
@@ -223,16 +223,16 @@ mod tests {
     fn test_cleanup_old_logs_keeps_recent_removes_old() {
         let dir = test_dir();
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("microclaw-2025-01-01-00.log"), "old").unwrap();
-        fs::write(dir.join("microclaw-2026-02-08-10.log"), "new").unwrap();
+        fs::write(dir.join("finally_a_value_bot-2025-01-01-00.log"), "old").unwrap();
+        fs::write(dir.join("finally_a_value_bot-2026-02-08-10.log"), "new").unwrap();
 
         let now = DateTime::parse_from_rfc3339("2026-02-08T11:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         cleanup_old_logs(&dir, now, 30).unwrap();
 
-        assert!(!dir.join("microclaw-2025-01-01-00.log").exists());
-        assert!(dir.join("microclaw-2026-02-08-10.log").exists());
+        assert!(!dir.join("finally_a_value_bot-2025-01-01-00.log").exists());
+        assert!(dir.join("finally_a_value_bot-2026-02-08-10.log").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -240,8 +240,8 @@ mod tests {
     fn test_read_last_lines_from_logs() {
         let dir = test_dir();
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("microclaw-2026-02-08-09.log"), "a\nb\n").unwrap();
-        fs::write(dir.join("microclaw-2026-02-08-10.log"), "c\nd\n").unwrap();
+        fs::write(dir.join("finally_a_value_bot-2026-02-08-09.log"), "a\nb\n").unwrap();
+        fs::write(dir.join("finally_a_value_bot-2026-02-08-10.log"), "c\nd\n").unwrap();
 
         let lines = read_last_lines_from_logs(&dir, 3).unwrap();
         assert_eq!(lines, vec!["b", "c", "d"]);

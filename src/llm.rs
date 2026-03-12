@@ -13,7 +13,7 @@ use crate::claude::{
     ResponseContentBlock, ToolDefinition, Usage,
 };
 use crate::config::Config;
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 
 /// Remove orphaned `ToolResult` blocks whose `tool_use_id` does not match any
 /// `ToolUse` block in the conversation.  This can happen after session
@@ -155,7 +155,7 @@ pub trait LlmProvider: Send + Sync {
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<MessagesResponse, MicroClawError>;
+    ) -> Result<MessagesResponse, FinallyAValueBotError>;
 
     async fn send_message_stream(
         &self,
@@ -163,7 +163,7 @@ pub trait LlmProvider: Send + Sync {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let response = self.send_message(system, messages, tools).await?;
         if let Some(tx) = text_tx {
             for block in &response.content {
@@ -233,7 +233,7 @@ impl AnthropicProvider {
         &self,
         request: &MessagesRequest,
         text_tx: Option<&UnboundedSender<String>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let mut streamed_request = request.clone();
         streamed_request.stream = Some(true);
 
@@ -251,12 +251,12 @@ impl AnthropicProvider {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
-                return Err(MicroClawError::LlmApi(format!(
+                return Err(FinallyAValueBotError::LlmApi(format!(
                     "{}: {}",
                     api_err.error.error_type, api_err.error.message
                 )));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {body}")));
+            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {body}")));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -615,7 +615,7 @@ impl LlmProvider for AnthropicProvider {
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
 
         let request = MessagesRequest {
@@ -646,7 +646,7 @@ impl LlmProvider for AnthropicProvider {
             if status.is_success() {
                 let body = response.text().await?;
                 let parsed: MessagesResponse = serde_json::from_str(&body).map_err(|e| {
-                    MicroClawError::LlmApi(format!("Failed to parse response: {e}\nBody: {body}"))
+                    FinallyAValueBotError::LlmApi(format!("Failed to parse response: {e}\nBody: {body}"))
                 })?;
                 return Ok(parsed);
             }
@@ -664,12 +664,12 @@ impl LlmProvider for AnthropicProvider {
 
             let body = response.text().await.unwrap_or_default();
             if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
-                return Err(MicroClawError::LlmApi(format!(
+                return Err(FinallyAValueBotError::LlmApi(format!(
                     "{}: {}",
                     api_err.error.error_type, api_err.error.message
                 )));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {body}")));
+            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {body}")));
         }
     }
 
@@ -679,7 +679,7 @@ impl LlmProvider for AnthropicProvider {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
         let request = MessagesRequest {
             model: self.model.clone(),
@@ -813,7 +813,7 @@ impl LlmProvider for OpenAiProvider {
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let oai_messages = translate_messages_to_oai(system, &messages);
 
         let mut body = json!({
@@ -847,7 +847,7 @@ impl LlmProvider for OpenAiProvider {
             if status.is_success() {
                 let text = response.text().await?;
                 let oai: OaiResponse = serde_json::from_str(&text).map_err(|e| {
-                    MicroClawError::LlmApi(format!(
+                    FinallyAValueBotError::LlmApi(format!(
                         "Failed to parse OpenAI response: {e}\nBody: {text}"
                     ))
                 })?;
@@ -868,9 +868,9 @@ impl LlmProvider for OpenAiProvider {
             let text = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
                 let msg = format_oai_error(status, &err.error, &text);
-                return Err(MicroClawError::LlmApi(msg));
+                return Err(FinallyAValueBotError::LlmApi(msg));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {text}")));
         }
     }
 
@@ -880,7 +880,7 @@ impl LlmProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let oai_messages = translate_messages_to_oai(system, &messages);
 
         let mut body = json!({
@@ -910,9 +910,9 @@ impl LlmProvider for OpenAiProvider {
             let text = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
                 let msg = format_oai_error(status, &err.error, &text);
-                return Err(MicroClawError::LlmApi(msg));
+                return Err(FinallyAValueBotError::LlmApi(msg));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {text}")));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -1027,6 +1027,7 @@ struct GeminiError {
 struct GeminiErrorDetail {
     code: i32,
     message: String,
+    #[allow(dead_code)]
     #[serde(default)]
     status: Option<String>,
 }
@@ -1038,7 +1039,7 @@ impl LlmProvider for GeminiProvider {
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
         let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
 
@@ -1074,12 +1075,12 @@ impl LlmProvider for GeminiProvider {
 
             let body = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<GeminiError>(&body) {
-                return Err(MicroClawError::LlmApi(format!(
+                return Err(FinallyAValueBotError::LlmApi(format!(
                     "Gemini API error {}: {}",
                     err.error.code, err.error.message
                 )));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {body}")));
+            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {body}")));
         }
     }
 
@@ -1089,7 +1090,7 @@ impl LlmProvider for GeminiProvider {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
-    ) -> Result<MessagesResponse, MicroClawError> {
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
         let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
 
@@ -1105,12 +1106,12 @@ impl LlmProvider for GeminiProvider {
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<GeminiError>(&text) {
-                return Err(MicroClawError::LlmApi(format!(
+                return Err(FinallyAValueBotError::LlmApi(format!(
                     "Gemini API error {}: {}",
                     err.error.code, err.error.message
                 )));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {text}")));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -1405,9 +1406,9 @@ fn translate_messages_to_gemini(messages: &[Message]) -> Vec<serde_json::Value> 
     out
 }
 
-fn parse_gemini_response(body: &str) -> Result<MessagesResponse, MicroClawError> {
+fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBotError> {
     let v: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| MicroClawError::LlmApi(format!("Failed to parse Gemini response: {e}\nBody: {body}")))?;
+        .map_err(|e| FinallyAValueBotError::LlmApi(format!("Failed to parse Gemini response: {e}\nBody: {body}")))?;
 
     let mut content = Vec::new();
     let mut stop_reason: Option<String> = None;
@@ -2340,7 +2341,7 @@ mod tests {
             delegate_tool_enabled: true,
             delegate_max_iterations: 10,
             delegate_model: String::new(),
-            cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+            cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
         };
@@ -2404,7 +2405,7 @@ mod tests {
             delegate_tool_enabled: true,
             delegate_max_iterations: 10,
             delegate_model: String::new(),
-            cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+            cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
         };
@@ -2781,7 +2782,7 @@ mod tests {
             delegate_tool_enabled: true,
             delegate_max_iterations: 10,
             delegate_model: String::new(),
-            cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+            cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
         };

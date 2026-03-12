@@ -3,7 +3,7 @@
 
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 use crate::llm;
 use crate::tools::ToolAuthContext;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub async fn evaluate_tool_use(
     tool_input: &serde_json::Value,
     messages: &[Message],
     _auth: Option<&ToolAuthContext>,
-) -> Result<TsaResult, MicroClawError> {
+) -> Result<TsaResult, FinallyAValueBotError> {
     if !config.tool_skill_agent_enabled {
         return Ok(TsaResult {
             decision: TsaDecision::Allow,
@@ -122,7 +122,7 @@ pub async fn evaluate_tool_use(
     Ok(parsed)
 }
 
-fn parse_tsa_response(text: &str) -> Result<TsaResult, MicroClawError> {
+fn parse_tsa_response(text: &str) -> Result<TsaResult, FinallyAValueBotError> {
     let trimmed = text.trim();
     let json_str = if let Some(start) = trimmed.find('{') {
         if let Some(end) = trimmed.rfind('}') {
@@ -141,7 +141,7 @@ fn parse_tsa_response(text: &str) -> Result<TsaResult, MicroClawError> {
         suggestion: Option<String>,
     }
     let raw: Raw = serde_json::from_str(json_str).map_err(|e| {
-        MicroClawError::Config(format!(
+        FinallyAValueBotError::Config(format!(
             "TSA failed to parse JSON: {e}. Raw: {}",
             json_str.chars().take(300).collect::<String>()
         ))

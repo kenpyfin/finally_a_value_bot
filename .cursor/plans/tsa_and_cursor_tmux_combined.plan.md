@@ -85,8 +85,8 @@ This plan merges two efforts: (1) a **Tool and Skill Agent (TSA)** that gates al
 - **Input**: Add optional `detach: boolean` (default `false`).
 - **When detach = true**:
   - Spawn with `tmux new-session -d -s <session_name> -c <workdir> -- <cursor_agent_cli> -p "..." [--model ...] --output-format text`.
-  - Session name: configurable prefix (e.g. `microclaw-cursor`) + unique suffix (run id or timestamp). Config: `cursor_agent_tmux_session_prefix` (default `microclaw-cursor`).
-  - Return immediately with message: "Spawned in tmux session `microclaw-cursor-123`. Attach: `tmux attach -t microclaw-cursor-123`. Use cursor_agent_send to redirect."
+  - Session name: configurable prefix (e.g. `finally-a-value-bot-cursor`) + unique suffix (run id or timestamp). Config: `cursor_agent_tmux_session_prefix` (default `finally-a-value-bot-cursor`).
+  - Return immediately with message: "Spawned in tmux session `finally-a-value-bot-cursor-123`. Attach: `tmux attach -t finally-a-value-bot-cursor-123`. Use cursor_agent_send to redirect."
   - Insert run in DB with `tmux_session` set; list_cursor_agent_runs shows "running" / session name.
 - **When detach = false**: Unchanged (block until done, then return output).
 
@@ -103,7 +103,7 @@ This plan merges two efforts: (1) a **Tool and Skill Agent (TSA)** that gates al
 
 ### Docker
 
-- **Option A (in code)**: When `detach: true`, if in Docker (e.g. env `MICROCLAW_IN_DOCKER=1` or `/.dockerenv`) or config `cursor_agent_tmux_enabled: false`, skip tmux and return: "Tmux spawn is not available in this environment. Run the bot on a host with tmux and cursor-agent, or use detach: false."
+- **Option A (in code)**: When `detach: true`, if in Docker (e.g. env `FINALLY_A_VALUE_BOT_IN_DOCKER=1` or `/.dockerenv`) or config `cursor_agent_tmux_enabled: false`, skip tmux and return: "Tmux spawn is not available in this environment. Run the bot on a host with tmux and cursor-agent, or use detach: false."
 - **Option B (docs)**: Document a host-runner (HTTP spawn API) for bot-in-Docker setups that want tmux on the host.
 - Config: optional `cursor_agent_tmux_enabled` to force-disable; `cursor_agent_tmux_session_prefix` for session names.
 
@@ -124,7 +124,7 @@ This plan merges two efforts: (1) a **Tool and Skill Agent (TSA)** that gates al
 
 - **Purpose**: Single entry point for "create or update a skill." Ensures creation uses cursor_agent and detach when possible.
 - **Input**: e.g. `name`, `description`, `instructions` (or high-level spec), optional `update_existing: bool`.
-- **Behavior**: Build a prompt for cursor_agent (e.g. "Create a MicroClaw skill at {skills_dir}/{name}/ with SKILL.md containing this description and instructions; put credentials in .env in that folder. Follow the skill template..."). Call cursor_agent with that prompt and **detach: true** when tmux is available (otherwise detach: false). Return the same style of message as cursor_agent (session name + attach instructions, or inline output).
+- **Behavior**: Build a prompt for cursor_agent (e.g. "Create a FinallyAValueBot skill at {skills_dir}/{name}/ with SKILL.md containing this description and instructions; put credentials in .env in that folder. Follow the skill template..."). Call cursor_agent with that prompt and **detach: true** when tmux is available (otherwise detach: false). Return the same style of message as cursor_agent (session name + attach instructions, or inline output).
 - **TSA**: Allows build_skill when the conversation clearly indicates the user asked to create or update a skill/tool. Denies direct write_file/edit_file under skills dir (see Part 1).
 
 ### System prompt / AGENTS.md

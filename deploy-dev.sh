@@ -5,7 +5,7 @@ log() {
   printf '%s\n' "$*"
 }
 
-log "Deploying MicroClaw (dev: incremental build, no cache invalidation)..."
+log "Deploying FinallyAValueBot (dev: incremental build, no cache invalidation)..."
 
 log "Building and starting containers..."
 docker compose build
@@ -30,5 +30,5 @@ if [ -f .env ] && grep -q '^CURSOR_AGENT_RUNNER_URL=' .env 2>/dev/null; then
 fi
 
 log ""
-log "MicroClaw deployed."
+log "FinallyAValueBot deployed."
 log "Web UI: http://localhost:10961"

@@ -1,4 +1,4 @@
-# MicroClaw Agent Loop — Architecture Review & Recreation Guide
+# FinallyAValueBot Agent Loop — Architecture Review & Recreation Guide
 
 ## Overview
 
@@ -24,7 +24,7 @@ Before the loop starts, the system builds everything the LLM needs to know.
 
 ### 1.1 System Prompt Construction
 
-[build_system_prompt()](file:///home/ken/big_storage/projects/home-bot/src/channels/telegram.rs#L1295-L1411) assembles these sections in order:
+[build_system_prompt()](file:///home/ken/big_storage/projects/finally-a-value-bot/src/channels/telegram.rs#L1295-L1411) assembles these sections in order:
 
 | Section | Source | Purpose |
 |---------|--------|---------|
@@ -46,7 +46,7 @@ Then: `trim_to_recent_balanced()` keeps a small recent window, and `compact_mess
 
 ### 1.3 Tool Registry
 
-[ToolRegistry::new()](file:///home/ken/big_storage/projects/home-bot/src/tools/mod.rs#L281-L403) registers all tools:
+[ToolRegistry::new()](file:///home/ken/big_storage/projects/finally-a-value-bot/src/tools/mod.rs#L281-L403) registers all tools:
 
 ```
 bash, browser, read_file, write_file, edit_file, glob, grep,
@@ -63,7 +63,7 @@ fetch_tiktok/instagram/linkedin_feed (conditional)
 
 ## Phase 2: The Agent Loop
 
-[Lines 986–1282](file:///home/ken/big_storage/projects/home-bot/src/channels/telegram.rs#L986-L1282) — the core loop.
+[Lines 986–1282](file:///home/ken/big_storage/projects/finally-a-value-bot/src/channels/telegram.rs#L986-L1282) — the core loop.
 
 ```
 for iteration in 0..max_tool_iterations:

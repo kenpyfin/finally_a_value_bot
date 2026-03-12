@@ -91,7 +91,7 @@ impl BrowserTool {
         } else {
             chat_id.to_string()
         };
-        format!("microclaw-chat-{normalized}")
+        format!("finally_a_value_bot-chat-{normalized}")
     }
 }
 
@@ -164,7 +164,7 @@ impl Tool for BrowserTool {
 
         let session_name = caller_chat_id
             .map(Self::session_name_for_chat)
-            .unwrap_or_else(|| "microclaw".to_string());
+            .unwrap_or_else(|| "finally_a_value_bot".to_string());
 
         args.push("--session".to_string());
         args.push(session_name);
@@ -222,11 +222,11 @@ impl Tool for BrowserTool {
                     result_text = format!("Command completed with exit code {exit_code}");
                 }
 
-                // Detect wrong binary (microclaw-browser expects --port, not open/snapshot)
-                let wrong_binary = stderr.contains("microclaw-browser") || stderr.contains("missing --port");
+                // Detect wrong binary (finally_a_value_bot-browser expects --port, not open/snapshot)
+                let wrong_binary = stderr.contains("finally_a_value_bot-browser") || stderr.contains("missing --port");
                 if wrong_binary {
                     result_text = format!(
-                        "Wrong agent-browser binary. The program at '{}' appears to be microclaw-browser (Rust), not the npm agent-browser. The browser tool requires the npm agent-browser CLI (open, snapshot, click, etc.). Fix: set AGENT_BROWSER_PATH in .env to the npm binary, e.g. \"/opt/homebrew/bin/agent-browser\" or \"~/.local/bin/agent-browser\". Raw output:\n\n{}",
+                        "Wrong agent-browser binary. The program at '{}' appears to be finally_a_value_bot-browser (Rust), not the npm agent-browser. The browser tool requires the npm agent-browser CLI (open, snapshot, click, etc.). Fix: set AGENT_BROWSER_PATH in .env to the npm binary, e.g. \"/opt/homebrew/bin/agent-browser\" or \"~/.local/bin/agent-browser\". Raw output:\n\n{}",
                         program,
                         result_text
                     );
@@ -313,11 +313,11 @@ mod tests {
     fn test_browser_session_name_for_chat() {
         assert_eq!(
             BrowserTool::session_name_for_chat(12345),
-            "microclaw-chat-12345"
+            "finally_a_value_bot-chat-12345"
         );
         assert_eq!(
             BrowserTool::session_name_for_chat(-100987),
-            "microclaw-chat-neg100987"
+            "finally_a_value_bot-chat-neg100987"
         );
     }
 

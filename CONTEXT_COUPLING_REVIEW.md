@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document analyzes how user messages flow through MicroClaw and how they are coupled with contextual information before being sent to the LLM (Language Model). The flow is orchestrated across multiple channels (Telegram, Discord, WhatsApp) but uses a unified message processing pipeline.
+This document analyzes how user messages flow through FinallyAValueBot and how they are coupled with contextual information before being sent to the LLM (Language Model). The flow is orchestrated across multiple channels (Telegram, Discord, WhatsApp) but uses a unified message processing pipeline.
 
 ---
 

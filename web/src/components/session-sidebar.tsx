@@ -64,13 +64,13 @@ export function SessionSidebar({
         <div className="flex items-center gap-2">
           <img
             src="/icon.png"
-            alt="MicroClaw"
+            alt="FinallyAValueBot"
             className="h-7 w-7 rounded-md border border-black/10 object-cover"
             loading="eager"
             decoding="async"
           />
           <Text size="5" weight="bold">
-            MicroClaw
+            FinallyAValueBot
           </Text>
         </div>
         <div className="relative flex items-center gap-2">
@@ -237,12 +237,12 @@ export function SessionSidebar({
         </Button>
         <div className="mt-3 flex flex-col items-center gap-1">
           <a
-            href="https://microclaw.ai"
+            href="https://finally-a-value-bot.ai"
             target="_blank"
             rel="noreferrer"
             className={isDark ? 'text-xs text-slate-400 hover:text-slate-200' : 'text-xs text-slate-600 hover:text-slate-900'}
           >
-            microclaw.ai
+            finally-a-value-bot.ai
           </a>
         </div>
       </div>

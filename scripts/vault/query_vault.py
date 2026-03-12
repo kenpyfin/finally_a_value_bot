@@ -12,7 +12,7 @@ load_dotenv(SCRIPT_DIR / ".env")
 load_dotenv(Path.cwd() / ".env")
 
 def _default_vault_db_path() -> str:
-    root = os.environ.get("WORKSPACE_DIR") or os.environ.get("MICROCLAW_WORKSPACE_DIR") or os.getcwd()
+    root = os.environ.get("WORKSPACE_DIR") or os.environ.get("FINALLY_A_VALUE_BOT_WORKSPACE_DIR") or os.getcwd()
     return os.path.abspath(os.path.join(root, "shared", "vault_db"))
 
 def _default_embed_url() -> str:

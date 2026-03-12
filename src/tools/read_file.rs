@@ -99,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_success() {
-        let dir = std::env::temp_dir().join(format!("microclaw_rf_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_rf_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("test.txt");
         std::fs::write(&file, "line1\nline2\nline3\nline4\nline5").unwrap();
@@ -117,7 +117,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_with_offset_and_limit() {
-        let dir = std::env::temp_dir().join(format!("microclaw_rf2_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_rf2_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("test.txt");
         std::fs::write(&file, "a\nb\nc\nd\ne").unwrap();
@@ -153,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_resolves_relative_to_working_dir() {
-        let root = std::env::temp_dir().join(format!("microclaw_rf3_{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("finally_a_value_bot_rf3_{}", uuid::Uuid::new_v4()));
         let work = root.join("workspace");
         let shared = work.join("shared");
         std::fs::create_dir_all(&shared).unwrap();

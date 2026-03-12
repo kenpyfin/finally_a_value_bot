@@ -183,7 +183,7 @@ mod tests {
     use super::*;
 
     fn test_memory_manager() -> (MemoryManager, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("microclaw_mem_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_mem_test_{}", uuid::Uuid::new_v4()));
         let dir_str = dir.to_str().unwrap();
         let mm = MemoryManager::new(dir_str, dir_str);
         (mm, dir)

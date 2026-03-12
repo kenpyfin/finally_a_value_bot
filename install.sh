@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${MICROCLAW_REPO:-microclaw/microclaw}"
-BIN_NAME="microclaw"
+REPO="${FINALLY_A_VALUE_BOT_REPO:-finally-a-value-bot/finally-a-value-bot}"
+BIN_NAME="finally-a-value-bot"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 
-log() {
-  printf '%s\n' "$*"
-}
-
-err() {
-  printf 'Error: %s\n' "$*" >&2
-}
+log_info() { printf "\x1b[34m[INFO]\x1b[0m %s\n" "$*"; }
+log_success() { printf "\x1b[32m[SUCCESS]\x1b[0m %s\n" "$*"; }
+log_warn() { printf "\x1b[33m[WARN]\x1b[0m %s\n" "$*"; }
+log_error() { printf "\x1b[31m[ERROR]\x1b[0m %s\n" "$*" >&2; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+check_deps() {
+  local deps=("curl" "git" "tar")
+  local missing=()
+  for dep in "${deps[@]}"; do
+    if ! need_cmd "$dep"; then
+      missing+=("$dep")
+    fi
+  done
+
+  if [ "${#missing[@]}" -ne 0 ]; then
+    log_error "Missing required dependencies: ${missing[*]}"
+    log_info "Please install them and try again."
+    exit 1
+  fi
 }
 
 detect_os() {
@@ -40,8 +53,8 @@ detect_arch() {
 }
 
 detect_install_dir() {
-  if [ -n "${MICROCLAW_INSTALL_DIR:-}" ]; then
-    echo "$MICROCLAW_INSTALL_DIR"
+  if [ -n "${FINALLY_A_VALUE_BOT_INSTALL_DIR:-}" ]; then
+    echo "$FINALLY_A_VALUE_BOT_INSTALL_DIR"
     return
   fi
   if [ -w "/usr/local/bin" ]; then
@@ -68,8 +81,8 @@ download_release_json() {
 
 extract_asset_url() {
   # Match assets like:
-  #   microclaw-0.0.5-aarch64-apple-darwin.tar.gz
-  #   microclaw-v0.0.5-aarch64-unknown-linux-gnu.tar.gz
+  #   finally-a-value-bot-0.0.5-aarch64-apple-darwin.tar.gz
+  #   finally-a-value-bot-v0.0.5-aarch64-unknown-linux-gnu.tar.gz
   # and keep fallback matching looser suffixes.
   local release_json="$1"
   local os="$2"
@@ -97,7 +110,7 @@ extract_asset_url() {
   printf '%s\n' "$release_json" \
     | grep -Eo 'https://[^"]+' \
     | grep '/releases/download/' \
-    | grep -E "/${BIN_NAME}-v?[0-9]+\.[0-9]+\.[0-9]+-.*(apple-darwin|unknown-linux-gnu|unknown-linux-musl|pc-windows-msvc)\.(tar\.gz|zip)$" \
+    | grep -E "/${BIN_NAME}-v?[0-9]+\.[0-9]+\.[0-9]+-.*(apple-darwin|(unknown-)?linux-gnu|(unknown-)?linux-musl|(pc-)?windows-msvc)\.(tar\.gz|zip)$" \
     | grep -Ei "(${arch_regex}).*(${os_regex})|(${os_regex}).*(${arch_regex})" \
     | head -n1
 }
@@ -163,8 +176,63 @@ install_from_archive() {
     if need_cmd sudo; then
       sudo cp "$bin_path" "$install_dir/$BIN_NAME"
     else
-      err "No write permission for $install_dir and sudo not available"
+      log_error "No write permission for $install_dir and sudo not available"
       return 1
+    fi
+  fi
+}
+
+setup_systemd() {
+  local install_dir="$1"
+  local finally-a-value-bot_cmd="${install_dir}/${BIN_NAME}"
+  local service_name="finally-a-value-bot"
+  local service_file="/etc/systemd/system/${service_name}.service"
+  local user_name
+  user_name=$(id -un)
+  local project_dir
+  project_dir=$(pwd)
+
+  if [ "$(uname -s)" != "Linux" ]; then
+    return 0
+  fi
+
+  if ! need_cmd systemctl; then
+    return 0
+  fi
+
+  printf "\n"
+  log_info "Optionally, you can install FinallyAValueBot as a systemd service."
+  printf "Install systemd service? [y/N] "
+  read -r install_svc
+  install_svc="$(echo "${install_svc:-n}" | tr '[:upper:]' '[:lower:]')"
+
+  if [ "$install_svc" = "y" ] || [ "$install_svc" = "yes" ]; then
+    local tmp_svc
+    tmp_svc=$(mktemp)
+    cat <<EOF > "$tmp_svc"
+[Unit]
+Description=FinallyAValueBot Bot
+After=network.target
+
+[Service]
+Type=simple
+User=$user_name
+WorkingDirectory=$project_dir
+ExecStart=$finally-a-value-bot_cmd start
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    log_info "Installing service to $service_file (requires sudo)..."
+    if sudo mv "$tmp_svc" "$service_file" && sudo systemctl daemon-reload; then
+      log_success "Service installed and reloaded."
+      log_info "To start: sudo systemctl start $service_name"
+      log_info "To enable on boot: sudo systemctl enable $service_name"
+    else
+      log_error "Failed to install systemd service."
     fi
   fi
 }
@@ -172,78 +240,94 @@ install_from_archive() {
 main() {
   local os arch install_dir release_json asset_url tmpdir archive asset_filename
 
+  check_deps
   os="$(detect_os)"
   arch="$(detect_arch)"
   install_dir="$(detect_install_dir)"
 
-  log "Installing ${BIN_NAME} for ${os}/${arch}..."
-  release_json="$(download_release_json)"
-  asset_url="$(extract_asset_url "$release_json" "$os" "$arch" || true)"
-  if [ -z "$asset_url" ]; then
-    err "No prebuilt binary found for ${os}/${arch} in the latest GitHub release."
-    err "Use a separate install method instead:"
-    err "  Homebrew (macOS): brew tap everettjf/tap && brew install microclaw"
-    err "  Build from source: https://github.com/${REPO}"
-    exit 1
-  fi
-
-  tmpdir="$(mktemp -d)"
-  trap 'if [ -n "${tmpdir:-}" ]; then rm -rf "$tmpdir"; fi' EXIT
-  asset_filename="${asset_url##*/}"
-  asset_filename="${asset_filename%%\?*}"
-  if [ -z "$asset_filename" ] || [ "$asset_filename" = "$asset_url" ]; then
-    asset_filename="${BIN_NAME}.archive"
-  fi
-  archive="$tmpdir/$asset_filename"
-  log "Downloading: $asset_url"
-  download_file "$asset_url" "$archive"
-  install_from_archive "$archive" "$install_dir" "$tmpdir"
-
-  log ""
-  log "Installed ${BIN_NAME}."
-  if [ "$install_dir" = "$HOME/.local/bin" ]; then
-    log "Make sure '$HOME/.local/bin' is in PATH."
-    log "Example: export PATH=\"\$HOME/.local/bin:\$PATH\""
-  fi
-
-  # Use full path so setup/start work even if install_dir is not on PATH yet
-  local microclaw_cmd="${install_dir}/${BIN_NAME}"
-
-  if [ -t 0 ]; then
-    log ""
-    printf "Run setup now in this directory? (Telegram, LLM, workspace, optional vault) [Y/n] "
-    read -r run_setup
-    run_setup="$(echo "${run_setup:-y}" | tr '[:upper:]' '[:lower:]')"
-    if [ "$run_setup" != "n" ] && [ "$run_setup" != "no" ]; then
-      if [ -x "$microclaw_cmd" ]; then
-        log ""
-        "$microclaw_cmd" setup || true
-        log ""
-        printf "Start the bot now? [y/N] "
-        read -r run_start
-        run_start="$(echo "${run_start:-n}" | tr '[:upper:]' '[:lower:]')"
-        if [ "$run_start" = "y" ] || [ "$run_start" = "yes" ]; then
-          log ""
-          "$microclaw_cmd" start
-        else
-          log "Run: ${BIN_NAME} start"
+  if [ -f "Cargo.toml" ]; then
+    log_info "Building ${BIN_NAME} from source (Cargo.toml found)..."
+    if ! need_cmd cargo; then
+      log_warn "cargo is required to build from source but was not found."
+      printf "Would you like to install Rust (via rustup)? [Y/n] "
+      read -r install_rust
+      install_rust="$(echo "${install_rust:-y}" | tr '[:upper:]' '[:lower:]')"
+      if [ "$install_rust" != "n" ] && [ "$install_rust" != "no" ]; then
+        log_info "Installing Rust..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        if [ -f "$HOME/.cargo/env" ]; then
+          source "$HOME/.cargo/env"
         fi
       else
-        log "Run: ${BIN_NAME} setup   # then ${BIN_NAME} start"
+        log_error "Cannot build without cargo. Exiting."
+        exit 1
       fi
+    fi
+    cargo build --release
+    local bin_path="target/release/${BIN_NAME}"
+    if [ ! -x "$bin_path" ]; then
+      log_error "Failed to build ${BIN_NAME} executable."
+      exit 1
+    fi
+    if [ -w "$install_dir" ]; then
+      cp "$bin_path" "$install_dir/$BIN_NAME"
     else
-      log ""
-      log "When ready: cd to your project dir, then ${BIN_NAME} setup && ${BIN_NAME} start"
+      if need_cmd sudo; then
+        sudo cp "$bin_path" "$install_dir/$BIN_NAME"
+      else
+        log_error "No write permission for $install_dir and sudo not available"
+        exit 1
+      fi
     fi
   else
-    log ""
-    log "Next steps:"
-    log "  1) cd to your project directory (or where you want the default workspace)"
-    log "  2) ${BIN_NAME} setup   # Configure Telegram, LLM, workspace; optional ORIGIN vault and vector DB (shared/vault_db)"
-    log "  3) ${BIN_NAME} start   # Start the bot (default workspace: ./workspace)"
+    log_info "Installing ${BIN_NAME} for ${os}/${arch} from GitHub releases..."
+    release_json="$(download_release_json)"
+    asset_url="$(extract_asset_url "$release_json" "$os" "$arch" || true)"
+    if [ -z "$asset_url" ]; then
+      log_error "No prebuilt binary found for ${os}/${arch} in the latest GitHub release."
+      log_info "Use a separate install method instead:"
+      log_info "  Homebrew (macOS): brew tap everettjf/tap && brew install finally-a-value-bot"
+      log_info "  Build from source: https://github.com/${REPO}"
+      exit 1
+    fi
+
+    tmpdir="$(mktemp -d)"
+    trap 'if [ -n "${tmpdir:-}" ]; then rm -rf "$tmpdir"; fi' EXIT
+    asset_filename="${asset_url##*/}"
+    asset_filename="${asset_filename%%\?*}"
+    if [ -z "$asset_filename" ] || [ "$asset_filename" = "$asset_url" ]; then
+      asset_filename="${BIN_NAME}.archive"
+    fi
+    archive="$tmpdir/$asset_filename"
+    log_info "Downloading: $asset_url"
+    download_file "$asset_url" "$archive"
+    install_from_archive "$archive" "$install_dir" "$tmpdir"
   fi
-  log ""
-  log "Run: ${BIN_NAME} help"
+
+  log_success "Installed ${BIN_NAME}."
+  if [ "$install_dir" = "$HOME/.local/bin" ]; then
+    log_info "Make sure '$HOME/.local/bin' is in PATH."
+    log_info "Example: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  fi
+
+  local finally-a-value-bot_cmd="${install_dir}/${BIN_NAME}"
+
+  if [ ! -f .env ] && [ -f .env.example ]; then
+    cp .env.example .env
+    log_success "Copied .env.example to .env"
+  fi
+
+  if [ -t 0 ]; then
+    setup_systemd "$install_dir"
+  fi
+
+  printf "\n"
+  log_info "Next steps:"
+  log_info "  1) Navigate to your project directory if not already there"
+  log_info "  2) Edit your .env file to configure Telegram, LLM keys, and workspace"
+  log_info "  3) Start the bot: ${BIN_NAME} start"
+  printf "\n"
+  log_info "Run: ${BIN_NAME} help for more options."
 }
 
 main "$@"

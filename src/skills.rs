@@ -519,7 +519,7 @@ Instructions.
     #[test]
     fn test_build_skills_catalog_empty() {
         let dir =
-            std::env::temp_dir().join(format!("microclaw_skills_test_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("finally_a_value_bot_skills_test_{}", uuid::Uuid::new_v4()));
         let sm = SkillManager::new(dir.to_str().unwrap());
         let catalog = sm.build_skills_catalog();
         assert!(catalog.is_empty());

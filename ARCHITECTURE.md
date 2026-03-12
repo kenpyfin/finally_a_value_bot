@@ -1,6 +1,6 @@
-# MicroClaw Architecture
+# FinallyAValueBot Architecture
 
-This document describes the core architecture of MicroClaw: the agentic loop, tool system, skills, sub-agents, and how they connect.
+This document describes the core architecture of FinallyAValueBot: the agentic loop, tool system, skills, sub-agents, and how they connect.
 
 See also: [CLAUDE.md](CLAUDE.md) (overview and quick reference), [DEVELOP.md](DEVELOP.md) (development guide), [DOCKER.md](DOCKER.md) (deployment).
 
@@ -78,7 +78,7 @@ The agent loop branches only on these three; any other value is treated like a f
 - **Registry**: `src/tools/mod.rs` — `ToolRegistry` holds `Vec<Box<dyn Tool>>`.
 - **Tool trait**: `name()`, `definition()`, `execute(input) -> ToolResult`.
 - **Definitions**: `ToolDefinition` (name, description, input_schema) is sent to the LLM API so the model can choose tools.
-- **Auth injection**: `execute_with_auth` injects `__microclaw_auth` into the tool input (`caller_channel`, `caller_chat_id`, `caller_persona_id`, `control_chat_ids`).
+- **Auth injection**: `execute_with_auth` injects `__finally-a-value-bot_auth` into the tool input (`caller_channel`, `caller_chat_id`, `caller_persona_id`, `control_chat_ids`).
 - **Tool and Skill Agent (TSA)**: When `tool_skill_agent_enabled` is true, every tool use is gated by `tool_skill_agent::evaluate_tool_use()` before execution. TSA can allow or deny (with reason/suggestion). Direct `write_file`/`edit_file` under the skills directory is always denied; creation must go through `build_skill` or `cursor_agent`.
 
 ### Cursor agent and skill creation

@@ -84,7 +84,7 @@ pub async fn run_ephemeral_loop(
     max_iterations: usize,
     llm_timeout_secs: u64,
     tool_timeout_secs: u64,
-) -> Result<String, MicroClawError>
+) -> Result<String, FinallyAValueBotError>
 ```
 
 - **Behavior:** Same as current loop: iterate; on `end_turn`/`max_tokens` return text; on `tool_use` run `tools.execute_with_auth`, append results, continue. Do **not** save session, call TSA, or call PTE.

@@ -22,7 +22,7 @@ pub struct CursorAgentTool {
 }
 
 fn in_docker() -> bool {
-    std::env::var("MICROCLAW_IN_DOCKER").as_deref() == Ok("1")
+    std::env::var("FINALLY_A_VALUE_BOT_IN_DOCKER").as_deref() == Ok("1")
         || std::path::Path::new("/.dockerenv").exists()
 }
 
@@ -187,7 +187,7 @@ impl CursorAgentTool {
             .cursor_agent_tmux_session_prefix
             .trim();
         let prefix = if prefix.is_empty() {
-            "microclaw-cursor"
+            "finally_a_value_bot-cursor"
         } else {
             prefix
         };
@@ -585,7 +585,7 @@ impl Tool for CursorAgentSendTool {
                 json!({
                     "tmux_session": {
                         "type": "string",
-                        "description": "The tmux session name (e.g. microclaw-cursor-1234567890). Use list_cursor_agent_runs to see running sessions."
+                        "description": "The tmux session name (e.g. finally_a_value_bot-cursor-1234567890). Use list_cursor_agent_runs to see running sessions."
                     },
                     "keys": {
                         "type": "string",
@@ -607,7 +607,7 @@ impl Tool for CursorAgentSendTool {
             .config
             .cursor_agent_tmux_session_prefix
             .trim();
-        let prefix = if prefix.is_empty() { "microclaw-cursor" } else { prefix };
+        let prefix = if prefix.is_empty() { "finally_a_value_bot-cursor" } else { prefix };
         if !session.starts_with(prefix) {
             return ToolResult::error(format!(
                 "Session name must start with '{}' (got '{}'). Only cursor-agent sessions are allowed.",
@@ -660,7 +660,7 @@ impl Tool for BuildSkillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "build_skill".into(),
-            description: "Create or update a MicroClaw skill by running cursor-agent. Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.".into(),
+            description: "Create or update a FinallyAValueBot skill by running cursor-agent. Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.".into(),
             input_schema: schema_object(
                 json!({
                     "name": {
@@ -699,7 +699,7 @@ impl Tool for BuildSkillTool {
         let skills_dir = self.config.skills_data_dir_absolute();
         let skills_dir_display = skills_dir.to_string_lossy();
         let prompt = format!(
-            r#"Create or update a MicroClaw agent skill.
+            r#"Create or update a FinallyAValueBot agent skill.
 
 Skills directory: {}
 Create (or update) the skill at: {}/{}/
@@ -725,8 +725,8 @@ Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{
         let cursor_tool = CursorAgentTool::new(&self.config, self.db.clone());
         let mut cursor_input = serde_json::json!({ "prompt": prompt });
         cursor_input["detach"] = serde_json::json!(true);
-        if let Some(auth) = input.get("__microclaw_auth") {
-            cursor_input["__microclaw_auth"] = auth.clone();
+        if let Some(auth) = input.get("__finally_a_value_bot_auth") {
+            cursor_input["__finally_a_value_bot_auth"] = auth.clone();
         }
         let result = cursor_tool.execute(cursor_input).await;
 

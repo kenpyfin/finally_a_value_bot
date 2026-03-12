@@ -99,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_glob_finds_files() {
-        let dir = std::env::temp_dir().join(format!("microclaw_glob_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_glob_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "").unwrap();
         std::fs::write(dir.join("b.txt"), "").unwrap();
@@ -119,7 +119,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_glob_no_matches() {
-        let dir = std::env::temp_dir().join(format!("microclaw_glob2_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_glob2_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let tool = GlobTool::new(".");
@@ -142,7 +142,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_glob_defaults_to_working_dir() {
-        let root = std::env::temp_dir().join(format!("microclaw_glob3_{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("finally_a_value_bot_glob3_{}", uuid::Uuid::new_v4()));
         let work = root.join("workspace");
         let shared = work.join("shared");
         std::fs::create_dir_all(&shared).unwrap();

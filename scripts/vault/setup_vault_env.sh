@@ -2,7 +2,7 @@
 # Create vault Python venv with ChromaDB and embedding support.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE="${WORKSPACE_DIR:-${MICROCLAW_WORKSPACE_DIR:-/app/workspace}}"
+WORKSPACE="${WORKSPACE_DIR:-${FINALLY_A_VALUE_BOT_WORKSPACE_DIR:-/app/workspace}}"
 VENV_DIR="$WORKSPACE/shared/.venv-vault"
 
 echo "Creating vault venv at $VENV_DIR"

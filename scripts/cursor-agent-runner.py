@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cursor-agent host runner. Listens for POST /spawn from the MicroClaw bot (in Docker).
+"""Cursor-agent host runner. Listens for POST /spawn from the FinallyAValueBot bot (in Docker).
 Requires: cursor-agent CLI and tmux on the host.
 API: POST /spawn
   Body: {"prompt": "...", "workdir": "...", "model": "...", "detach": bool}
@@ -14,7 +14,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 3847
 CURSOR_AGENT = "cursor-agent"
-SESSION_PREFIX = "microclaw-cursor"
+SESSION_PREFIX = "finally-a-value-bot-cursor"
 
 # Derive the project root from this script's location (scripts/cursor-agent-runner.py → project root)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -2,7 +2,7 @@
 //! Used by the delegate tool and potentially other sub-agent invocations.
 
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock};
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 use crate::llm::LlmProvider;
 use crate::tools::{ToolAuthContext, ToolRegistry};
 use tracing::info;
@@ -21,7 +21,7 @@ pub async fn run_ephemeral_loop(
     max_iterations: usize,
     llm_timeout_secs: u64,
     tool_timeout_secs: u64,
-) -> Result<String, MicroClawError> {
+) -> Result<String, FinallyAValueBotError> {
     let tool_defs = tools.definitions();
     let tool_names: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
     info!(
@@ -64,7 +64,7 @@ pub async fn run_ephemeral_loop(
                     max_iterations,
                     llm_timeout_secs
                 );
-                return Err(MicroClawError::Config(format!(
+                return Err(FinallyAValueBotError::Config(format!(
                     "Sub-agent LLM call timed out after {}s (iteration {})",
                     llm_timeout_secs,
                     iteration + 1

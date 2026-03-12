@@ -86,7 +86,21 @@ pub async fn deliver_and_store_bot_message(
                         .map_err(|e| format!("Failed to store message: {e}"))?;
                     return Ok(());
                 }
-                return Err(format!("Failed to send message: {e}"));
+
+                // Fallback for parse errors
+                if err_str.contains("can't parse entities") {
+                    tracing::warn!(
+                        target: "channel",
+                        chat_id = chat_id,
+                        error = %err_str,
+                        "Telegram HTML parse failed, retrying as plain text"
+                    );
+                    if let Err(e2) = bot.send_message(ChatId(chat_id), text).await {
+                        return Err(format!("Failed to send plain text message after HTML failure: {e2}"));
+                    }
+                } else {
+                    return Err(format!("Failed to send message: {e}"));
+                }
             }
         }
         call_blocking(db.clone(), move |d| d.store_message(&msg))
@@ -139,7 +153,12 @@ pub async fn deliver_to_contact(
                                 && !err_str.contains("Chat not found")
                                 && !err_str.contains("user is deactivated")
                             {
-                                tracing::warn!(target: "channel", chat_id = chat_id, error = %err_str, "Telegram delivery to bound channel failed");
+                                if err_str.contains("can't parse entities") {
+                                    tracing::warn!(target: "channel", chat_id = chat_id, error = %err_str, "Telegram HTML parse failed for bound channel, retrying as plain text");
+                                    let _ = bot.send_message(ChatId(chat_id), text).await;
+                                } else {
+                                    tracing::warn!(target: "channel", chat_id = chat_id, error = %err_str, "Telegram delivery to bound channel failed");
+                                }
                             }
                         }
                     }

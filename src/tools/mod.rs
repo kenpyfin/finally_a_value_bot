@@ -1,4 +1,5 @@
 pub mod activate_skill;
+pub mod agent_history;
 pub mod bash;
 pub mod browser;
 pub mod command_runner;
@@ -142,7 +143,7 @@ impl ToolAuthContext {
     }
 }
 
-const AUTH_CONTEXT_KEY: &str = "__microclaw_auth";
+const AUTH_CONTEXT_KEY: &str = "__finally_a_value_bot_auth";
 
 pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthContext> {
     let ctx = input.get(AUTH_CONTEXT_KEY)?;
@@ -299,6 +300,7 @@ impl ToolRegistry {
             Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.runtime_data_dir())),
             Box::new(tiered_memory::WriteTieredMemoryTool::new(&config.runtime_data_dir())),
             Box::new(search_history::SearchHistoryTool::new(db.clone())),
+            Box::new(agent_history::ReadAgentHistoryTool::new(&config.runtime_data_dir())),
         ];
 
         let mut tools: Vec<Box<dyn Tool>> = tools;
@@ -459,7 +461,7 @@ mod tests {
     #[test]
     fn test_auth_context_from_input() {
         let input = json!({
-            "__microclaw_auth": {
+            "__finally_a_value_bot_auth": {
                 "caller_channel": "telegram",
                 "caller_chat_id": 123,
                 "control_chat_ids": [123, 999]
@@ -475,7 +477,7 @@ mod tests {
     #[test]
     fn test_authorize_chat_access_denied() {
         let input = json!({
-            "__microclaw_auth": {
+            "__finally_a_value_bot_auth": {
                 "caller_channel": "telegram",
                 "caller_chat_id": 100,
                 "control_chat_ids": []

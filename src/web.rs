@@ -379,6 +379,7 @@ struct PersonaDeleteRequest {
 
 #[derive(Debug, Deserialize)]
 struct ContactsBindRequest {
+    #[allow(dead_code)]
     chat_id: Option<i64>,
     /// Canonical chat_id of the contact to bind web to (e.g. from Telegram).
     contact_chat_id: i64,
@@ -386,6 +387,7 @@ struct ContactsBindRequest {
 
 #[derive(Debug, Deserialize)]
 struct ContactsUnlinkRequest {
+    #[allow(dead_code)]
     chat_id: Option<i64>,
 }
 
@@ -405,6 +407,7 @@ struct ScheduleCreateRequest {
 #[derive(Debug, Deserialize)]
 struct DeleteSessionRequest {
     chat_id: Option<i64>,
+    #[allow(dead_code)]
     persona_id: Option<i64>,
 }
 
@@ -1892,7 +1895,7 @@ mod tests {
     use crate::config::Config;
     use crate::db::call_blocking;
     use crate::llm::LlmProvider;
-    use crate::{claude::ResponseContentBlock, error::MicroClawError};
+    use crate::{claude::ResponseContentBlock, error::FinallyAValueBotError};
     use crate::{db::Database, memory::MemoryManager, skills::SkillManager, tools::ToolRegistry};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1931,7 +1934,7 @@ mod tests {
             _system: &str,
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
-        ) -> Result<crate::claude::MessagesResponse, crate::error::MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, crate::error::FinallyAValueBotError> {
             Ok(crate::claude::MessagesResponse {
                 content: vec![crate::claude::ResponseContentBlock::Text {
                     text: "hello from llm".into(),
@@ -1947,7 +1950,7 @@ mod tests {
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
             text_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-        ) -> Result<crate::claude::MessagesResponse, crate::error::MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, crate::error::FinallyAValueBotError> {
             if let Some(tx) = text_tx {
                 let _ = tx.send("hello ".into());
                 let _ = tx.send("from llm".into());
@@ -1967,7 +1970,7 @@ mod tests {
             _system: &str,
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
-        ) -> Result<crate::claude::MessagesResponse, MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, FinallyAValueBotError> {
             tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
             Ok(crate::claude::MessagesResponse {
                 content: vec![ResponseContentBlock::Text {
@@ -1990,7 +1993,7 @@ mod tests {
             _system: &str,
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
-        ) -> Result<crate::claude::MessagesResponse, MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, FinallyAValueBotError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 return Ok(crate::claude::MessagesResponse {
@@ -2070,11 +2073,11 @@ mod tests {
             delegate_tool_enabled: true,
             delegate_max_iterations: 10,
             delegate_model: String::new(),
-            cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+            cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
         };
-        let dir = std::env::temp_dir().join(format!("microclaw_webtest_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_webtest_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         cfg.workspace_dir = dir.to_string_lossy().to_string();
         let runtime_dir = cfg.runtime_data_dir();

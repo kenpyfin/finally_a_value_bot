@@ -1,5 +1,5 @@
-# MicroClaw configuration (legacy YAML format)
-# Use .env instead: cp .env.example .env and run microclaw setup.
+# FinallyAValueBot configuration (legacy YAML format)
+# Use .env instead: cp .env.example .env and run finally-a-value-bot setup.
 
 # Telegram bot token from @BotFather
 telegram_bot_token: ""
@@ -25,7 +25,7 @@ max_history_messages: 50
 max_document_size_mb: 100
 # Workspace directory (optional). Single root for runtime, skills, and tool workspace.
 # Layout: workspace_dir/runtime, workspace_dir/skills, workspace_dir/shared. Copy this folder to migrate.
-# Omit or leave empty: default ./workspace (or MICROCLAW_WORKSPACE_DIR in Docker).
+# Omit or leave empty: default ./workspace (or FINALLY_A_VALUE_BOT_WORKSPACE_DIR in Docker).
 # Default default to copy ./workspace to the container
 # workspace_dir: "./workspace"
 # IANA timezone for scheduling (e.g. "US/Eastern", "Europe/London")

@@ -3,7 +3,7 @@
 
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 use crate::llm;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -156,7 +156,7 @@ pub async fn evaluate_completion(
     memory_context: &str,
     messages: &[Message],
     iteration: usize,
-) -> Result<PteResult, MicroClawError> {
+) -> Result<PteResult, FinallyAValueBotError> {
     if !config.post_tool_evaluator_enabled {
         return Ok(PteResult {
             action: PteAction::Continue,
@@ -205,7 +205,7 @@ pub async fn evaluate_completion(
     Ok(parsed)
 }
 
-fn parse_pte_response(text: &str) -> Result<PteResult, MicroClawError> {
+fn parse_pte_response(text: &str) -> Result<PteResult, FinallyAValueBotError> {
     let trimmed = text.trim();
     let json_str = if let Some(start) = trimmed.find('{') {
         if let Some(end) = trimmed.rfind('}') {
@@ -223,7 +223,7 @@ fn parse_pte_response(text: &str) -> Result<PteResult, MicroClawError> {
         reason: Option<String>,
     }
     let raw: Raw = serde_json::from_str(json_str).map_err(|e| {
-        MicroClawError::Config(format!(
+        FinallyAValueBotError::Config(format!(
             "PTE failed to parse JSON: {e}. Raw: {}",
             json_str.chars().take(300).collect::<String>()
         ))

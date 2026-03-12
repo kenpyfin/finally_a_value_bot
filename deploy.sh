@@ -5,7 +5,7 @@ log() {
   printf '%s\n' "$*"
 }
 
-log "Deploying MicroClaw..."
+log "Deploying FinallyAValueBot..."
 
 # Optional: git pull if run from a clone
 if [ -d .git ]; then
@@ -37,5 +37,5 @@ if [ -f .env ] && grep -q '^CURSOR_AGENT_RUNNER_URL=' .env 2>/dev/null; then
 fi
 
 log ""
-log "MicroClaw deployed."
+log "FinallyAValueBot deployed."
 log "Web UI: http://localhost:10961"

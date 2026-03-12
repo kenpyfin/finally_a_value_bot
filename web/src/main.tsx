@@ -160,24 +160,24 @@ function defaultModelForProvider(providerRaw: string): string {
 }
 
 function readAppearance(): Appearance {
-  const saved = localStorage.getItem('microclaw_appearance')
+  const saved = localStorage.getItem('finally-a-value-bot_appearance')
   return saved === 'light' ? 'light' : 'dark'
 }
 
 function saveAppearance(value: Appearance): void {
-  localStorage.setItem('microclaw_appearance', value)
+  localStorage.setItem('finally-a-value-bot_appearance', value)
 }
 
 function readUiTheme(): UiTheme {
-  const saved = localStorage.getItem('microclaw_ui_theme') as UiTheme | null
+  const saved = localStorage.getItem('finally-a-value-bot_ui_theme') as UiTheme | null
   return UI_THEME_OPTIONS.some((t) => t.key === saved) ? (saved as UiTheme) : 'green'
 }
 
 function saveUiTheme(value: UiTheme): void {
-  localStorage.setItem('microclaw_ui_theme', value)
+  localStorage.setItem('finally-a-value-bot_ui_theme', value)
 }
 
-const PERSONA_STORAGE_KEY = 'microclaw_selected_persona_id'
+const PERSONA_STORAGE_KEY = 'finally-a-value-bot_selected_persona_id'
 
 function readStoredPersonaId(): number | null {
   if (typeof window === 'undefined') return null
@@ -552,7 +552,7 @@ function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
           }}
           strings={{
             composer: {
-              input: { placeholder: 'Message MicroClaw...' },
+              input: { placeholder: 'Message FinallyAValueBot...' },
             },
           }}
           assistantAvatar={{ fallback: 'M' }}
@@ -1025,7 +1025,7 @@ function App() {
       if (apiKey) payload.api_key = apiKey
 
       await api('/api/config', { method: 'PUT', body: JSON.stringify(payload) })
-      setSaveStatus('Saved. Restart microclaw to apply changes.')
+      setSaveStatus('Saved. Restart finally-a-value-bot to apply changes.')
     } catch (e) {
       setSaveStatus(`Save failed: ${e instanceof Error ? e.message : String(e)}`)
     }

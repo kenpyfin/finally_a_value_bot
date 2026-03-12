@@ -269,7 +269,7 @@ mod tests {
     use serde_json::json;
 
     fn test_dir() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("microclaw_memtool_{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!("finally_a_value_bot_memtool_{}", uuid::Uuid::new_v4()))
     }
 
     fn test_tools(dir: &std::path::Path) -> (ReadMemoryTool, WriteMemoryTool) {
@@ -310,7 +310,7 @@ mod tests {
             .execute(json!({
                 "scope": "global",
                 "content": "user prefers Rust",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "caller_persona_id": 1,
                     "control_chat_ids": [100]
@@ -327,7 +327,7 @@ mod tests {
         let dir = test_dir();
         let (read_tool, write_tool) = test_tools(&dir);
         let auth = json!({
-            "__microclaw_auth": {
+            "__finally_a_value_bot_auth": {
                 "caller_chat_id": 42,
                 "caller_persona_id": 1,
                 "control_chat_ids": []
@@ -335,15 +335,15 @@ mod tests {
         });
 
         let mut write_input = json!({"scope": "chat", "chat_id": 42, "persona_id": 1, "content": "chat 42 persona 1 notes"});
-        if let (Some(obj), Some(auth_obj)) = (write_input.as_object_mut(), auth.get("__microclaw_auth")) {
-            obj.insert("__microclaw_auth".to_string(), auth_obj.clone());
+        if let (Some(obj), Some(auth_obj)) = (write_input.as_object_mut(), auth.get("__finally_a_value_bot_auth")) {
+            obj.insert("__finally_a_value_bot_auth".to_string(), auth_obj.clone());
         }
         let result = write_tool.execute(write_input).await;
         assert!(!result.is_error);
 
         let mut read_input = json!({"scope": "chat", "chat_id": 42, "persona_id": 1});
-        if let (Some(obj), Some(auth_obj)) = (read_input.as_object_mut(), auth.get("__microclaw_auth")) {
-            obj.insert("__microclaw_auth".to_string(), auth_obj.clone());
+        if let (Some(obj), Some(auth_obj)) = (read_input.as_object_mut(), auth.get("__finally_a_value_bot_auth")) {
+            obj.insert("__finally_a_value_bot_auth".to_string(), auth_obj.clone());
         }
         let result = read_tool.execute(read_input).await;
         assert!(!result.is_error);
@@ -403,7 +403,7 @@ mod tests {
                 "scope": "chat",
                 "chat_id": 200,
                 "persona_id": 2,
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "caller_persona_id": 1,
                     "control_chat_ids": []
@@ -425,7 +425,7 @@ mod tests {
                 "chat_id": 200,
                 "persona_id": 2,
                 "content": "chat200",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "caller_persona_id": 1,
                     "control_chat_ids": [100]
@@ -437,7 +437,7 @@ mod tests {
                 "scope": "chat",
                 "chat_id": 200,
                 "persona_id": 2,
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "caller_persona_id": 1,
                     "control_chat_ids": [100]

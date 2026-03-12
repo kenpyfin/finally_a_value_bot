@@ -6,7 +6,7 @@ use chrono::Utc;
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 
 #[derive(Clone, Copy)]
 struct ProviderPreset {
@@ -151,7 +151,7 @@ fn find_provider_preset(provider: &str) -> Option<&'static ProviderPreset> {
 }
 
 fn resolve_config_path() -> PathBuf {
-    if let Ok(custom) = std::env::var("MICROCLAW_CONFIG") {
+    if let Ok(custom) = std::env::var("FINALLY_A_VALUE_BOT_CONFIG") {
         return PathBuf::from(custom);
     }
     if Path::new("./.env").exists() {
@@ -169,7 +169,7 @@ fn prompt_line(
     prompt: &str,
     default: Option<&str>,
     required: bool,
-) -> Result<Option<String>, MicroClawError> {
+) -> Result<Option<String>, FinallyAValueBotError> {
     loop {
         let suffix = match default {
             Some(d) if !d.is_empty() => format!(" [{d}]"),
@@ -199,7 +199,7 @@ fn prompt_line(
     }
 }
 
-fn prompt_provider(default_provider: &str) -> Result<Option<String>, MicroClawError> {
+fn prompt_provider(default_provider: &str) -> Result<Option<String>, FinallyAValueBotError> {
     println!();
     println!("Select LLM provider (press Enter for default):");
     let default_idx = PROVIDER_PRESETS
@@ -281,7 +281,7 @@ fn prompt_model(
     provider: &str,
     default_model: &str,
     base_url: &str,
-) -> Result<Option<String>, MicroClawError> {
+) -> Result<Option<String>, FinallyAValueBotError> {
     let mut options: Vec<String> = find_provider_preset(provider)
         .map(|p| p.models.iter().map(|m| m.to_string()).collect())
         .unwrap_or_else(|| vec![default_model.to_string()]);
@@ -296,7 +296,7 @@ fn prompt_model(
             options = installed;
         } else {
             println!("No local Ollama models detected (or Ollama not reachable).");
-            println!("Tip: run `ollama pull llama3.2` then re-run `microclaw config`.");
+            println!("Tip: run `ollama pull llama3.2` then re-run `finally_a_value_bot config`.");
         }
     }
 
@@ -339,7 +339,7 @@ fn escape_env_val(s: &str) -> String {
     }
 }
 
-fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, MicroClawError> {
+fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, FinallyAValueBotError> {
     let mut backup = None;
     if path.exists() {
         let ts = Utc::now().format("%Y%m%d%H%M%S");
@@ -353,7 +353,7 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Micr
     }
 
     let mut lines = Vec::new();
-    lines.push("# MicroClaw configuration".into());
+    lines.push("# FinallyAValueBot configuration".into());
     lines.push("".into());
     lines.push("# Telegram".into());
     lines.push(format!("TELEGRAM_BOT_TOKEN={}", escape_env_val(&config.telegram_bot_token)));
@@ -454,17 +454,17 @@ fn default_config() -> Config {
         delegate_tool_enabled: true,
         delegate_max_iterations: 10,
         delegate_model: String::new(),
-        cursor_agent_tmux_session_prefix: "microclaw-cursor".into(),
+        cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
         cursor_agent_tmux_enabled: true,
         cursor_agent_runner_url: None,
     }
 }
 
-pub fn run_config_wizard() -> Result<bool, MicroClawError> {
+pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
     let config_path = resolve_config_path();
     let existing = load_existing_config(&config_path).unwrap_or_else(default_config);
 
-    println!("MicroClaw interactive config");
+    println!("FinallyAValueBot interactive config");
     println!("Press Enter to accept default values. Type 'q' to cancel.");
     println!("Config path: {}", config_path.display());
 
