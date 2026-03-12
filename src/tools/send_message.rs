@@ -397,7 +397,7 @@ mod tests {
     use serde_json::json;
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("microclaw_sendmsg_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_sendmsg_{}", uuid::Uuid::new_v4()));
         let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
         (db, dir)
     }
@@ -414,7 +414,7 @@ mod tests {
             .execute(json!({
                 "chat_id": 200,
                 "text": "hello",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": []
                 }
@@ -435,7 +435,7 @@ mod tests {
             .execute(json!({
                 "chat_id": 999,
                 "text": "hello web",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 999,
                     "control_chat_ids": []
                 }
@@ -462,7 +462,7 @@ mod tests {
             .execute(json!({
                 "chat_id": 200,
                 "text": "hello",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": [100]
                 }

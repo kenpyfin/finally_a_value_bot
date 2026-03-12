@@ -94,7 +94,7 @@ mod tests {
 
     fn test_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "microclaw_activate_skill_test_{}",
+            "finally_a_value_bot_activate_skill_test_{}",
             uuid::Uuid::new_v4()
         ))
     }

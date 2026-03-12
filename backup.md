@@ -2,7 +2,7 @@
 
 ## Project overview
 
-MicroClaw is a Rust Telegram bot that connects Claude AI to Telegram chats with agentic tool execution, web browsing, scheduled tasks, and persistent memory. Inspired by [nanoclaw](https://github.com/gavrielc/nanoclaw/) (TypeScript/WhatsApp), incorporating some of its design ideas and using Telegram as the messaging platform.
+FinallyAValueBot is a Rust Telegram bot that connects Claude AI to Telegram chats with agentic tool execution, web browsing, scheduled tasks, and persistent memory. Inspired by [nanoclaw](https://github.com/gavrielc/nanoclaw/) (TypeScript/WhatsApp), incorporating some of its design ideas and using Telegram as the messaging platform.
 
 ## Tech stack
 
@@ -20,8 +20,8 @@ MicroClaw is a Rust Telegram bot that connects Claude AI to Telegram chats with 
 ```
 src/
     main.rs          -- Entry point. Initializes config, DB, memory manager, starts bot.
-    config.rs        -- Loads all settings from microclaw.config.yaml.
-    error.rs         -- MicroClawError enum (thiserror). All error variants for the app.
+    config.rs        -- Loads all settings from finally-a-value-bot.config.yaml.
+    error.rs         -- FinallyAValueBotError enum (thiserror). All error variants for the app.
     telegram.rs      -- Telegram message handler. Contains the agentic tool-use loop
                         (process_with_claude), session resume (load/save full message
                         state), context compaction (summarize old messages), continuous
@@ -146,7 +146,7 @@ Memory content is injected into the system prompt wrapped in `<global_memory>` /
 
 Three tools: `fetch_tiktok_feed`, `fetch_instagram_feed`, `fetch_linkedin_feed`. Each fetches the user's own feed via official platform APIs. Requires one-time OAuth authorization per user per platform.
 
-- **Setup:** Add `social` block to `microclaw.config.yaml` with `base_url` (reachable for OAuth callbacks) and per-platform `client_id`/`client_secret`. Register apps at TikTok/Instagram/Meta/LinkedIn developer portals.
+- **Setup:** Add `social` block to `finally-a-value-bot.config.yaml` with `base_url` (reachable for OAuth callbacks) and per-platform `client_id`/`client_secret`. Register apps at TikTok/Instagram/Meta/LinkedIn developer portals.
 - **OAuth flow:** When the user asks for their feed and no token exists, the tool returns an authorize URL. User clicks, authorizes on the platform, and is redirected to `/api/oauth/callback/{platform}`. Tokens are stored in `social_oauth_tokens` table.
 - **Limitations:** Only own-feed is supported (public profile by username is not available in these APIs). X (Twitter) is excluded due to paid API requirements.
 
@@ -184,11 +184,11 @@ Direct HTTP to `https://api.anthropic.com/v1/messages` with:
 ```sh
 cargo build              # dev build
 cargo build --release    # release build
-cargo run -- start       # run (requires microclaw.config.yaml)
+cargo run -- start       # run (requires finally-a-value-bot.config.yaml)
 cargo run -- help        # CLI help
 ```
 
-Requires a `microclaw.config.yaml` with `telegram_bot_token`, `api_key`, and `bot_username`.
+Requires a `finally-a-value-bot.config.yaml` with `telegram_bot_token`, `api_key`, and `bot_username`.
 
 ## Adding a new tool
 
@@ -200,15 +200,15 @@ Requires a `microclaw.config.yaml` with `telegram_bot_token`, `api_key`, and `bo
 
 ## Common tasks
 
-- **Change the model:** set `model` in `microclaw.config.yaml`
-- **Increase context:** set `max_history_messages` higher in `microclaw.config.yaml` (costs more tokens)
-- **Increase tool iterations:** set `max_tool_iterations` higher in `microclaw.config.yaml` (default: 100)
+- **Change the model:** set `model` in `finally-a-value-bot.config.yaml`
+- **Increase context:** set `max_history_messages` higher in `finally-a-value-bot.config.yaml` (costs more tokens)
+- **Increase tool iterations:** set `max_tool_iterations` higher in `finally-a-value-bot.config.yaml` (default: 100)
 - **Debug logging:** run with `RUST_LOG=debug cargo run -- start`
-- **Reset memory:** delete files under `microclaw.data/runtime/groups/`
-- **Reset all data:** delete the `microclaw.data/` directory
-- **Cancel all tasks:** `sqlite3 microclaw.data/runtime/microclaw.db "UPDATE scheduled_tasks SET status='cancelled' WHERE status='active';"`
-- **Tune compaction:** set `max_session_messages` (default 40) and `compact_keep_recent` (default 20) in `microclaw.config.yaml`
-- **Reset a chat session:** send `/reset` in chat, or `sqlite3 microclaw.data/runtime/microclaw.db "DELETE FROM sessions WHERE chat_id=XXXX;"` — the bot replies that stored memory (AGENTS.md) is unchanged. Session = chat history only; the workspace (tools, files, builds under `working_dir`) is persistent by default.
+- **Reset memory:** delete files under `finally-a-value-bot.data/runtime/groups/`
+- **Reset all data:** delete the `finally-a-value-bot.data/` directory
+- **Cancel all tasks:** `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "UPDATE scheduled_tasks SET status='cancelled' WHERE status='active';"`
+- **Tune compaction:** set `max_session_messages` (default 40) and `compact_keep_recent` (default 20) in `finally-a-value-bot.config.yaml`
+- **Reset a chat session:** send `/reset` in chat, or `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "DELETE FROM sessions WHERE chat_id=XXXX;"` — the bot replies that stored memory (AGENTS.md) is unchanged. Session = chat history only; the workspace (tools, files, builds under `working_dir`) is persistent by default.
 - **Make the bot remember something:** say e.g. "remember this" or "save this to memory" so it uses the `write_memory` tool; that content then persists across resets and restarts.
 - **Workspace:** File/bash/search tools use a single shared directory (`working_dir/shared`). Tools and builds there persist regardless of session or /reset; there is no per-chat workspace.
 - **Making new sessions aware of workspace tools:** The bot injects `working_dir/shared/WORKSPACE.md` and `working_dir/shared/TOOLS.md` into the system prompt at session start (if present). Document your custom scripts, tools, and rules there so every new session knows they exist and how to use them. You can also use `write_memory` to record tool descriptions; the bot is instructed to update these when it creates new tools.

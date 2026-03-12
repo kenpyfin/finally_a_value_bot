@@ -2,9 +2,9 @@
 .env
 .env.local
 .env.*.local
-microclaw.config.yaml
-microclaw.config.yaml.*
-microclaw.data/*
+finally-a-value-bot.config.yaml
+finally-a-value-bot.config.yaml.*
+finally-a-value-bot.data/*
 website/
 tmp/
 working_dir/

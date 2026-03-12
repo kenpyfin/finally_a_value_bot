@@ -1,53 +1,21 @@
-# Workspace: mount host ./workspace as /app/workspace; MICROCLAW_WORKSPACE_DIR points there.
-# Config: copy .env.example to .env and fill in values. Run: microclaw setup
+# Workspace: mount host ./workspace as /app/workspace; FINALLY_A_VALUE_BOT_WORKSPACE_DIR points there.
+# Config: copy .env.example to .env and fill in values. Run: finally-a-value-bot setup
 services:
-  microclaw:
+  finally-a-value-bot:
     build: .
-    container_name: microclaw
+    container_name: finally-a-value-bot
     env_file: .env
     volumes:
       - ./.env:/app/.env:ro
       - ./workspace:/app/workspace
     environment:
-      - MICROCLAW_CONFIG=/app/.env
-      - MICROCLAW_WORKSPACE_DIR=/app/workspace
+      - FINALLY_A_VALUE_BOT_CONFIG=/app/.env
+      - FINALLY_A_VALUE_BOT_WORKSPACE_DIR=/app/workspace
+      - FINALLY_A_VALUE_BOT_IN_DOCKER=1
       - HOME=/root
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "10961:10961"
     shm_size: "1gb"
     restart: unless-stopped
-
-  # Optional: sync ORIGIN vault from git every 15 minutes.
-  # Set VAULT_ORIGIN_VAULT_REPO in .env to enable; then: docker compose --profile sync up -d
-  sync:
-    image: alpine:3.19
-    container_name: microclaw-sync
-    working_dir: /app
-    env_file: .env
-    volumes:
-      - ./workspace:/app/workspace
-    environment:
-      - ORIGIN_VAULT_PATH=/app/workspace/shared/ORIGIN
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        apk add --no-cache git
-        export HOME=$${HOME:-/root}
-        if [ -n "$${GIT_USERNAME:-}" ] && [ -n "$${GIT_TOKEN:-}" ]; then
-          git config --global credential.helper '!f() { echo "username=$$GIT_USERNAME"; echo "password=$$GIT_TOKEN"; }; f'
-        fi
-        VAULT="$${ORIGIN_VAULT_PATH:-/app/workspace/shared/ORIGIN}"
-        REPO="$${VAULT_ORIGIN_VAULT_REPO:-}"
-        while true; do
-          if [ -n "$$REPO" ]; then
-            if [ ! -d "$$VAULT/.git" ]; then
-              mkdir -p "$$(dirname "$$VAULT")"
-              git clone "$$REPO" "$$VAULT" 2>/dev/null || true
-            else
-              (cd "$$VAULT" && git pull --rebase) 2>/dev/null || true
-            fi
-          fi
-          sleep 900
-        done
-    profiles:
-      - sync

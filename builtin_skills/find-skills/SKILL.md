@@ -1,6 +1,6 @@
 ---
 name: find-skills
-description: Find reusable skills from the vercel-labs/skills registry (especially by task keywords), evaluate fit, and suggest how to install/adapt them for MicroClaw.
+description: Find reusable skills from the vercel-labs/skills registry (especially by task keywords), evaluate fit, and suggest how to install/adapt them for FinallyAValueBot.
 license: Proprietary. LICENSE.txt has complete terms
 compatibility:
   os:
@@ -31,7 +31,7 @@ Primary source:
    - Required tools/dependencies
    - Any platform assumptions
 4. Recommend one best-fit skill and one fallback.
-5. If none fit exactly, propose adaptation steps for MicroClaw.
+5. If none fit exactly, propose adaptation steps for FinallyAValueBot.
 
 ## Useful commands
 
@@ -60,11 +60,11 @@ When returning results, use this structure:
 1. Best match
 2. Why it fits
 3. Requirements
-4. Install/adapt steps for MicroClaw
+4. Install/adapt steps for FinallyAValueBot
 5. Alternative options
 
-## MicroClaw adaptation hints
+## FinallyAValueBot adaptation hints
 
 - Convert upstream skill metadata to local `SKILL.md` frontmatter (`name`, `description`, optional `platforms`/`deps`).
 - Keep instructions actionable with `bash`, file tools, and existing MCP tools.
-- If upstream skill assumes another runtime, add a short "MicroClaw notes" section describing equivalent commands.
+- If upstream skill assumes another runtime, add a short "FinallyAValueBot notes" section describing equivalent commands.

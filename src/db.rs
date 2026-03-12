@@ -2,20 +2,20 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 
 pub struct Database {
     conn: Mutex<Connection>,
 }
 
-pub async fn call_blocking<T, F>(db: std::sync::Arc<Database>, f: F) -> Result<T, MicroClawError>
+pub async fn call_blocking<T, F>(db: std::sync::Arc<Database>, f: F) -> Result<T, FinallyAValueBotError>
 where
     T: Send + 'static,
-    F: FnOnce(&Database) -> Result<T, MicroClawError> + Send + 'static,
+    F: FnOnce(&Database) -> Result<T, FinallyAValueBotError> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || f(db.as_ref()))
         .await
-        .map_err(|e| MicroClawError::ToolExecution(format!("DB task join error: {e}")))?
+        .map_err(|e| FinallyAValueBotError::ToolExecution(format!("DB task join error: {e}")))?
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +83,13 @@ pub struct ScheduledTask {
 }
 
 #[derive(Debug, Clone)]
+pub struct ChannelBinding {
+    pub canonical_chat_id: i64,
+    pub channel_type: String,
+    pub channel_handle: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
     pub chat_id: i64,
@@ -95,11 +102,13 @@ pub struct CursorAgentRun {
     pub exit_code: Option<i32>,
     pub output_preview: Option<String>,
     pub output_path: Option<String>,
+    /// When set, run was spawned in tmux (detach=true); session may still be running.
+    pub tmux_session: Option<String>,
 }
 
 impl Database {
-    pub fn new(data_dir: &str) -> Result<Self, MicroClawError> {
-        let db_path = Path::new(data_dir).join("microclaw.db");
+    pub fn new(data_dir: &str) -> Result<Self, FinallyAValueBotError> {
+        let db_path = Path::new(data_dir).join("finally_a_value_bot.db");
         std::fs::create_dir_all(data_dir)?;
 
         let conn = Connection::open(db_path)?;
@@ -210,18 +219,30 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_chat_id
                 ON cursor_agent_runs(chat_id);
             CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_finished_at
-                ON cursor_agent_runs(finished_at DESC);",
+                ON cursor_agent_runs(finished_at DESC);
+
+            CREATE TABLE IF NOT EXISTS channel_bindings (
+                canonical_chat_id INTEGER NOT NULL,
+                channel_type TEXT NOT NULL,
+                channel_handle TEXT NOT NULL,
+                PRIMARY KEY (channel_type, channel_handle),
+                FOREIGN KEY (canonical_chat_id) REFERENCES chats(chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
+                ON channel_bindings(canonical_chat_id);",
         )?;
 
         Self::migrate_persona_schema(&conn)?;
+        Self::migrate_channel_bindings(&conn)?;
         Self::migrate_fts(&conn)?;
+        Self::migrate_cursor_agent_runs_tmux(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
         })
     }
 
-    fn migrate_persona_schema(conn: &Connection) -> Result<(), MicroClawError> {
+    fn migrate_persona_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
         // Check if messages has persona_id (new schema)
         let has_persona = conn
             .prepare("PRAGMA table_info(messages)")
@@ -342,7 +363,7 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_fts(conn: &Connection) -> Result<(), MicroClawError> {
+    fn migrate_fts(conn: &Connection) -> Result<(), FinallyAValueBotError> {
         // Create FTS5 virtual table and triggers (after all table migrations)
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -374,12 +395,64 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_cursor_agent_runs_tmux(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        let has_tmux = conn
+            .prepare("PRAGMA table_info(cursor_agent_runs)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows
+                    .filter_map(|r| r.ok())
+                    .any(|c| c == "tmux_session"))
+            })
+            .unwrap_or(false);
+        if !has_tmux {
+            conn.execute("ALTER TABLE cursor_agent_runs ADD COLUMN tmux_session TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn migrate_channel_bindings(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_bindings (
+                canonical_chat_id INTEGER NOT NULL,
+                channel_type TEXT NOT NULL,
+                channel_handle TEXT NOT NULL,
+                PRIMARY KEY (channel_type, channel_handle)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
+                ON channel_bindings(canonical_chat_id);",
+        )?;
+        // Backfill: each existing chat gets one binding (canonical = chat_id)
+        let mut stmt = conn.prepare("SELECT chat_id, chat_type, chat_title FROM chats")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (chat_id, chat_type, chat_title) = row?;
+            let (ch_type, handle) = match chat_type.as_str() {
+                "telegram" => ("telegram", chat_id.to_string()),
+                "discord" => ("discord", chat_id.to_string()),
+                "web" => ("web", chat_title.unwrap_or_else(|| chat_id.to_string())),
+                _ => continue,
+            };
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
+                params![chat_id, ch_type, handle],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn upsert_chat(
         &self,
         chat_id: i64,
         chat_title: Option<&str>,
         chat_type: &str,
-    ) -> Result<(), MicroClawError> {
+    ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -394,7 +467,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn store_message(&self, msg: &StoredMessage) -> Result<(), MicroClawError> {
+    pub fn store_message(&self, msg: &StoredMessage) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp)
@@ -417,7 +490,7 @@ impl Database {
         chat_id: i64,
         persona_id: i64,
         limit: usize,
-    ) -> Result<Vec<StoredMessage>, MicroClawError> {
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
@@ -451,7 +524,7 @@ impl Database {
         &self,
         chat_id: i64,
         persona_id: i64,
-    ) -> Result<Vec<StoredMessage>, MicroClawError> {
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
@@ -475,11 +548,61 @@ impl Database {
         Ok(messages)
     }
 
+    pub fn get_messages_for_date_range(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+             FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2
+               AND (?3 IS NULL OR timestamp >= ?3)
+               AND (?4 IS NULL OR timestamp <= ?4)
+             ORDER BY timestamp ASC
+             LIMIT ?5",
+        )?;
+        let messages = stmt
+            .query_map(
+                params![chat_id, persona_id, from_date, to_date, limit as i64],
+                |row| {
+                    Ok(StoredMessage {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        persona_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        content: row.get(4)?,
+                        is_from_bot: row.get::<_, i32>(5)? != 0,
+                        timestamp: row.get(6)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
+    pub fn get_message_days(&self, chat_id: i64, persona_id: i64) -> Result<Vec<String>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT date(timestamp) AS d FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY d DESC",
+        )?;
+        let days: Vec<String> = stmt
+            .query_map(params![chat_id, persona_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(days)
+    }
+
     pub fn get_chats_by_type(
         &self,
         chat_type: &str,
         limit: usize,
-    ) -> Result<Vec<ChatSummary>, MicroClawError> {
+    ) -> Result<Vec<ChatSummary>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT
@@ -513,7 +636,7 @@ impl Database {
         Ok(chats)
     }
 
-    pub fn get_recent_chats(&self, limit: usize) -> Result<Vec<ChatSummary>, MicroClawError> {
+    pub fn get_recent_chats(&self, limit: usize) -> Result<Vec<ChatSummary>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT
@@ -546,7 +669,7 @@ impl Database {
         Ok(chats)
     }
 
-    pub fn get_chat_type(&self, chat_id: i64) -> Result<Option<String>, MicroClawError> {
+    pub fn get_chat_type(&self, chat_id: i64) -> Result<Option<String>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT chat_type FROM chats WHERE chat_id = ?1",
@@ -560,6 +683,89 @@ impl Database {
         }
     }
 
+    // --- Channel bindings (unified contact) ---
+
+    /// Resolve (channel_type, channel_handle) to canonical_chat_id. If no binding exists, creates one:
+    /// - telegram/discord: use handle (as i64) as canonical_chat_id, ensure chat exists, insert binding.
+    /// - web: use create_with_canonical_id as the new canonical (caller provides e.g. hash-based id), ensure chat exists, insert binding.
+    pub fn resolve_canonical_chat_id(
+        &self,
+        channel_type: &str,
+        channel_handle: &str,
+        create_with_canonical_id: Option<i64>,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(canonical) = conn
+            .query_row(
+                "SELECT canonical_chat_id FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
+                params![channel_type, channel_handle],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        {
+            return Ok(canonical);
+        }
+        let canonical = match channel_type {
+            "telegram" | "discord" => channel_handle
+                .parse::<i64>()
+                .map_err(|_| FinallyAValueBotError::ToolExecution(format!("invalid handle for {}: {}", channel_type, channel_handle)))?,
+            "web" => create_with_canonical_id
+                .ok_or_else(|| FinallyAValueBotError::ToolExecution("web resolve requires create_with_canonical_id".into()))?,
+            _ => return Err(FinallyAValueBotError::ToolExecution(format!("unknown channel_type: {}", channel_type))),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, chat_title, chat_type, last_message_time) VALUES (?1, NULL, ?2, ?3)",
+            params![canonical, channel_type, now],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
+            params![canonical, channel_type, channel_handle],
+        )?;
+        Ok(canonical)
+    }
+
+    /// Add a binding from (channel_type, channel_handle) to canonical_chat_id. If that (type, handle) already exists, updates to this contact.
+    pub fn link_channel(
+        &self,
+        canonical_chat_id: i64,
+        channel_type: &str,
+        channel_handle: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
+            params![canonical_chat_id, channel_type, channel_handle],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the binding for (channel_type, channel_handle).
+    pub fn unlink_channel(&self, channel_type: &str, channel_handle: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
+            params![channel_type, channel_handle],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// List all channel bindings for this contact (canonical_chat_id).
+    pub fn list_bindings_for_contact(&self, canonical_chat_id: i64) -> Result<Vec<ChannelBinding>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_chat_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![canonical_chat_id], |row| {
+            Ok(ChannelBinding {
+                canonical_chat_id: row.get(0)?,
+                channel_type: row.get(1)?,
+                channel_handle: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Get messages since the bot's last response in this chat/persona.
     /// Falls back to `fallback_limit` most recent messages if bot never responded.
     pub fn get_messages_since_last_bot_response(
@@ -568,7 +774,7 @@ impl Database {
         persona_id: i64,
         max: usize,
         fallback: usize,
-    ) -> Result<Vec<StoredMessage>, MicroClawError> {
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
 
         // Find timestamp of last bot message
@@ -641,7 +847,7 @@ impl Database {
         schedule_type: &str,
         schedule_value: &str,
         next_run: &str,
-    ) -> Result<i64, MicroClawError> {
+    ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -652,7 +858,63 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn get_due_tasks(&self, now: &str) -> Result<Vec<ScheduledTask>, MicroClawError> {
+    pub fn ensure_indexing_task(
+        &self,
+        chat_id: i64,
+        prompt: &str,
+        cron_expr: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduled_tasks WHERE prompt = ?1 AND status = 'active')",
+            params![prompt],
+            |row| row.get(0),
+        )?;
+
+        if !exists {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
+                 VALUES (?1, ?2, 'cron', ?3, ?4, 'active', ?4)",
+                params![chat_id, prompt, cron_expr, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_onboarding_task(
+        &self,
+        chat_id: i64,
+        prompt: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        // Only seed if no messages exist yet (fresh install)
+        let message_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if message_count == 0 {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM scheduled_tasks WHERE prompt = ?1 AND status = 'active')",
+                params![prompt],
+                |row| row.get(0),
+            )?;
+
+            if !exists {
+                let now = chrono::Utc::now().to_rfc3339();
+                conn.execute(
+                    "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
+                     VALUES (?1, ?2, 'once', ?3, ?3, 'active', ?3)",
+                    params![chat_id, prompt, now],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_due_tasks(&self, now: &str) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -677,7 +939,7 @@ impl Database {
         Ok(tasks)
     }
 
-    pub fn get_all_active_tasks(&self) -> Result<Vec<ScheduledTask>, MicroClawError> {
+    pub fn get_all_active_tasks(&self) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -704,7 +966,7 @@ impl Database {
     }
 
     /// All scheduled tasks for /schedule and list_scheduled_tasks: active, paused, and completed (all chats/personas).
-    pub fn get_all_scheduled_tasks_for_display(&self) -> Result<Vec<ScheduledTask>, MicroClawError> {
+    pub fn get_all_scheduled_tasks_for_display(&self) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -730,7 +992,7 @@ impl Database {
         Ok(tasks)
     }
 
-    pub fn get_tasks_for_chat(&self, chat_id: i64) -> Result<Vec<ScheduledTask>, MicroClawError> {
+    pub fn get_tasks_for_chat(&self, chat_id: i64) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -756,7 +1018,7 @@ impl Database {
         Ok(tasks)
     }
 
-    pub fn get_task_by_id(&self, task_id: i64) -> Result<Option<ScheduledTask>, MicroClawError> {
+    pub fn get_task_by_id(&self, task_id: i64) -> Result<Option<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -784,7 +1046,7 @@ impl Database {
         }
     }
 
-    pub fn update_task_status(&self, task_id: i64, status: &str) -> Result<bool, MicroClawError> {
+    pub fn update_task_status(&self, task_id: i64, status: &str) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2",
@@ -798,7 +1060,7 @@ impl Database {
         task_id: i64,
         last_run: &str,
         next_run: Option<&str>,
-    ) -> Result<(), MicroClawError> {
+    ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         match next_run {
             Some(next) => {
@@ -830,7 +1092,7 @@ impl Database {
         duration_ms: i64,
         success: bool,
         result_summary: Option<&str>,
-    ) -> Result<i64, MicroClawError> {
+    ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO task_run_logs (task_id, chat_id, started_at, finished_at, duration_ms, success, result_summary)
@@ -852,7 +1114,7 @@ impl Database {
         &self,
         task_id: i64,
         limit: usize,
-    ) -> Result<Vec<TaskRunLog>, MicroClawError> {
+    ) -> Result<Vec<TaskRunLog>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, task_id, chat_id, started_at, finished_at, duration_ms, success, result_summary
@@ -892,11 +1154,12 @@ impl Database {
         exit_code: Option<i32>,
         output_preview: Option<&str>,
         output_path: Option<&str>,
-    ) -> Result<i64, MicroClawError> {
+        tmux_session: Option<&str>,
+    ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO cursor_agent_runs (chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO cursor_agent_runs (chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path, tmux_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 chat_id,
                 channel,
@@ -908,6 +1171,7 @@ impl Database {
                 exit_code,
                 output_preview,
                 output_path,
+                tmux_session,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -918,12 +1182,12 @@ impl Database {
         &self,
         chat_id: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<CursorAgentRun>, MicroClawError> {
+    ) -> Result<Vec<CursorAgentRun>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let runs: Vec<CursorAgentRun> = match chat_id {
             Some(cid) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path
+                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path, tmux_session
                      FROM cursor_agent_runs WHERE chat_id = ?1 ORDER BY finished_at DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![cid, limit as i64], |row| {
@@ -939,13 +1203,14 @@ impl Database {
                         exit_code: row.get(8)?,
                         output_preview: row.get(9)?,
                         output_path: row.get(10)?,
+                        tmux_session: row.get(11)?,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path
+                    "SELECT id, chat_id, channel, prompt_preview, workdir, started_at, finished_at, success, exit_code, output_preview, output_path, tmux_session
                      FROM cursor_agent_runs ORDER BY finished_at DESC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![limit as i64], |row| {
@@ -961,6 +1226,7 @@ impl Database {
                         exit_code: row.get(8)?,
                         output_preview: row.get(9)?,
                         output_path: row.get(10)?,
+                        tmux_session: row.get(11)?,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
@@ -970,7 +1236,7 @@ impl Database {
     }
 
     #[allow(dead_code)]
-    pub fn delete_task(&self, task_id: i64) -> Result<bool, MicroClawError> {
+    pub fn delete_task(&self, task_id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM scheduled_tasks WHERE id = ?1",
@@ -986,7 +1252,7 @@ impl Database {
         chat_id: i64,
         persona_id: i64,
         messages_json: &str,
-    ) -> Result<(), MicroClawError> {
+    ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -1004,7 +1270,7 @@ impl Database {
         &self,
         chat_id: i64,
         persona_id: i64,
-    ) -> Result<Option<(String, String)>, MicroClawError> {
+    ) -> Result<Option<(String, String)>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT messages_json, updated_at FROM sessions WHERE chat_id = ?1 AND persona_id = ?2",
@@ -1018,7 +1284,7 @@ impl Database {
         }
     }
 
-    pub fn delete_session(&self, chat_id: i64, persona_id: i64) -> Result<bool, MicroClawError> {
+    pub fn delete_session(&self, chat_id: i64, persona_id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM sessions WHERE chat_id = ?1 AND persona_id = ?2",
@@ -1027,7 +1293,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn delete_chat_data(&self, chat_id: i64) -> Result<bool, MicroClawError> {
+    pub fn delete_chat_data(&self, chat_id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         let mut affected = 0usize;
@@ -1044,6 +1310,7 @@ impl Database {
             "DELETE FROM social_oauth_tokens WHERE chat_id = ?1",
             params![chat_id],
         )?;
+        affected += tx.execute("DELETE FROM channel_bindings WHERE canonical_chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM chats WHERE chat_id = ?1", params![chat_id])?;
 
         tx.commit()?;
@@ -1059,7 +1326,7 @@ impl Database {
         access_token: &str,
         refresh_token: Option<&str>,
         expires_at: Option<&str>,
-    ) -> Result<(), MicroClawError> {
+    ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO social_oauth_tokens (platform, chat_id, access_token, refresh_token, expires_at)
@@ -1077,7 +1344,7 @@ impl Database {
         &self,
         platform: &str,
         chat_id: i64,
-    ) -> Result<Option<SocialOAuthToken>, MicroClawError> {
+    ) -> Result<Option<SocialOAuthToken>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT platform, chat_id, access_token, refresh_token, expires_at
@@ -1101,7 +1368,7 @@ impl Database {
         }
     }
 
-    pub fn delete_social_token(&self, platform: &str, chat_id: i64) -> Result<bool, MicroClawError> {
+    pub fn delete_social_token(&self, platform: &str, chat_id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM social_oauth_tokens WHERE platform = ?1 AND chat_id = ?2",
@@ -1118,7 +1385,7 @@ impl Database {
         platform: &str,
         chat_id: i64,
         expires_at: &str,
-    ) -> Result<(), MicroClawError> {
+    ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO oauth_pending_states (state_token, platform, chat_id, expires_at)
@@ -1131,7 +1398,7 @@ impl Database {
     pub fn consume_oauth_pending_state(
         &self,
         state_token: &str,
-    ) -> Result<Option<(String, i64)>, MicroClawError> {
+    ) -> Result<Option<(String, i64)>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT platform, chat_id FROM oauth_pending_states
@@ -1153,7 +1420,7 @@ impl Database {
         chat_id: i64,
         persona_id: i64,
         since: &str,
-    ) -> Result<Vec<StoredMessage>, MicroClawError> {
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
@@ -1179,7 +1446,7 @@ impl Database {
 
     // --- Personas ---
 
-    pub fn get_or_create_default_persona(&self, chat_id: i64) -> Result<i64, MicroClawError> {
+    pub fn get_or_create_default_persona(&self, chat_id: i64) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result: Option<i64> = conn
             .query_row(
@@ -1213,7 +1480,7 @@ impl Database {
         Ok(persona_id)
     }
 
-    pub fn get_active_persona_id(&self, chat_id: i64) -> Result<Option<i64>, MicroClawError> {
+    pub fn get_active_persona_id(&self, chat_id: i64) -> Result<Option<i64>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT active_persona_id FROM chats WHERE chat_id = ?1",
@@ -1229,7 +1496,7 @@ impl Database {
     }
 
     /// Resolve the persona to use for this run: active when set, else create/set default.
-    pub fn get_current_persona_id(&self, chat_id: i64) -> Result<i64, MicroClawError> {
+    pub fn get_current_persona_id(&self, chat_id: i64) -> Result<i64, FinallyAValueBotError> {
         if let Ok(Some(pid)) = self.get_active_persona_id(chat_id) {
             return Ok(pid);
         }
@@ -1240,7 +1507,7 @@ impl Database {
         &self,
         chat_id: i64,
         persona_id: i64,
-    ) -> Result<bool, MicroClawError> {
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "UPDATE chats SET active_persona_id = ?1 WHERE chat_id = ?2",
@@ -1249,7 +1516,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn list_personas(&self, chat_id: i64) -> Result<Vec<Persona>, MicroClawError> {
+    pub fn list_personas(&self, chat_id: i64) -> Result<Vec<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 ORDER BY id",
@@ -1272,7 +1539,7 @@ impl Database {
         chat_id: i64,
         name: &str,
         model_override: Option<&str>,
-    ) -> Result<i64, MicroClawError> {
+    ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO personas (chat_id, name, model_override) VALUES (?1, ?2, ?3)",
@@ -1285,7 +1552,7 @@ impl Database {
         &self,
         chat_id: i64,
         name: &str,
-    ) -> Result<Option<Persona>, MicroClawError> {
+    ) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 AND name = ?2",
@@ -1306,7 +1573,7 @@ impl Database {
         }
     }
 
-    pub fn get_persona(&self, id: i64) -> Result<Option<Persona>, MicroClawError> {
+    pub fn get_persona(&self, id: i64) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT id, chat_id, name, model_override FROM personas WHERE id = ?1",
@@ -1327,7 +1594,7 @@ impl Database {
         }
     }
 
-    pub fn delete_persona(&self, chat_id: i64, persona_id: i64) -> Result<bool, MicroClawError> {
+    pub fn delete_persona(&self, chat_id: i64, persona_id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let name: String = conn
             .query_row(
@@ -1335,9 +1602,9 @@ impl Database {
                 params![persona_id, chat_id],
                 |row| row.get(0),
             )
-            .map_err(|_| MicroClawError::ToolExecution("Persona not found".into()))?;
+            .map_err(|_| FinallyAValueBotError::ToolExecution("Persona not found".into()))?;
         if name == "default" {
-            return Err(MicroClawError::ToolExecution(
+            return Err(FinallyAValueBotError::ToolExecution(
                 "Cannot delete the default persona".into(),
             ));
         }
@@ -1367,7 +1634,7 @@ impl Database {
         chat_id: i64,
         persona_id: i64,
         model_override: Option<&str>,
-    ) -> Result<bool, MicroClawError> {
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "UPDATE personas SET model_override = ?1 WHERE id = ?2 AND chat_id = ?3",
@@ -1386,7 +1653,7 @@ impl Database {
         limit: usize,
         from_date: Option<&str>,
         to_date: Option<&str>,
-    ) -> Result<Vec<StoredMessage>, MicroClawError> {
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT m.id, m.chat_id, m.persona_id, m.sender_name, m.content, m.is_from_bot, m.timestamp
@@ -1425,7 +1692,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> (Database, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("microclaw_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_test_{}", uuid::Uuid::new_v4()));
         let db = Database::new(dir.to_str().unwrap()).unwrap();
         (db, dir)
     }

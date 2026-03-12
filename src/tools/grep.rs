@@ -164,7 +164,7 @@ mod tests {
     use serde_json::json;
 
     fn setup_grep_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("microclaw_grep_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_grep_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("hello.rs"),
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_grep_file_function() {
-        let dir = std::env::temp_dir().join(format!("microclaw_gf_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_gf_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("test.txt");
         std::fs::write(&file, "foo bar\nbaz qux\nfoo again\n").unwrap();
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_grep_recursive_skips_hidden_dirs() {
-        let dir = std::env::temp_dir().join(format!("microclaw_gr_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_gr_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".hidden")).unwrap();
         std::fs::write(dir.join(".hidden").join("secret.txt"), "match_me").unwrap();
         std::fs::write(dir.join("visible.txt"), "match_me").unwrap();
@@ -276,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grep_defaults_to_working_dir() {
-        let root = std::env::temp_dir().join(format!("microclaw_grep2_{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("finally_a_value_bot_grep2_{}", uuid::Uuid::new_v4()));
         let work = root.join("workspace");
         let shared = work.join("shared");
         std::fs::create_dir_all(&shared).unwrap();

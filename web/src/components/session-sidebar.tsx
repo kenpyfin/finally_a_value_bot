@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Badge, Button, Flex, ScrollArea, Separator, Text } from '@radix-ui/themes'
-import type { SessionItem } from '../types'
+import type { Persona } from '../types'
 
 type SessionSidebarProps = {
   appearance: 'dark' | 'light'
@@ -8,14 +8,12 @@ type SessionSidebarProps = {
   uiTheme: string
   onUiThemeChange: (theme: string) => void
   uiThemeOptions: Array<{ key: string; label: string; color: string }>
-  sessionItems: SessionItem[]
-  selectedSessionKey: string
-  onSessionSelect: (key: string) => void
-  onRefreshSession: (key: string) => void
-  onResetSession: (key: string) => void
-  onDeleteSession: (key: string) => void
+  personas: Persona[]
+  selectedPersonaId: number | null
+  onPersonaSelect: (personaName: string) => void
+  onCreatePersona: () => void
+  onDeletePersona: (personaId: number) => void
   onOpenConfig: () => Promise<void>
-  onNewSession: () => void
 }
 
 export function SessionSidebar({
@@ -24,21 +22,17 @@ export function SessionSidebar({
   uiTheme,
   onUiThemeChange,
   uiThemeOptions,
-  sessionItems,
-  selectedSessionKey,
-  onSessionSelect,
-  onRefreshSession,
-  onResetSession,
-  onDeleteSession,
+  personas,
+  selectedPersonaId,
+  onPersonaSelect,
+  onCreatePersona,
+  onDeletePersona,
   onOpenConfig,
-  onNewSession,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
-  const [menu, setMenu] = useState<{ x: number; y: number; key: string } | null>(null)
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
   const themeMenuRef = useRef<HTMLDivElement | null>(null)
   const themeButtonRef = useRef<HTMLButtonElement | null>(null)
-  const sessionMenuRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
@@ -47,16 +41,11 @@ export function SessionSidebar({
 
       if (themeButtonRef.current?.contains(target)) return
       if (themeMenuRef.current?.contains(target)) return
-      if (sessionMenuRef.current?.contains(target)) return
 
-      setMenu(null)
       setThemeMenuOpen(false)
     }
 
-    const closeOnScroll = () => {
-      setMenu(null)
-      setThemeMenuOpen(false)
-    }
+    const closeOnScroll = () => setThemeMenuOpen(false)
 
     window.addEventListener('pointerdown', onPointerDown)
     window.addEventListener('scroll', closeOnScroll, true)
@@ -75,13 +64,13 @@ export function SessionSidebar({
         <div className="flex items-center gap-2">
           <img
             src="/icon.png"
-            alt="MicroClaw"
+            alt="FinallyAValueBot"
             className="h-7 w-7 rounded-md border border-black/10 object-cover"
             loading="eager"
             decoding="async"
           />
           <Text size="5" weight="bold">
-            MicroClaw
+            FinallyAValueBot
           </Text>
         </div>
         <div className="relative flex items-center gap-2">
@@ -161,25 +150,16 @@ export function SessionSidebar({
         </div>
       </Flex>
 
-      <Flex direction="column" gap="2" className="mb-4">
-        <button
-          type="button"
-          onClick={onNewSession}
-          className="inline-flex h-9 w-full items-center justify-center rounded-md border border-transparent text-[15px] font-medium transition hover:brightness-110 active:brightness-95"
-          style={isDark ? { backgroundColor: 'var(--mc-accent)', color: '#06110f' } : { backgroundColor: 'var(--mc-accent)', color: '#ffffff' }}
-        >
-          New Session
-        </button>
-      </Flex>
-
-      <Separator size="4" className="my-4" />
-
       <Flex justify="between" align="center" className="mb-2">
         <Text size="2" weight="medium" color="gray">
-          Sessions
+          Persona
         </Text>
-        <Badge variant="surface">{sessionItems.length}</Badge>
+        <Button size="1" variant="soft" onClick={onCreatePersona} title="New persona">
+          + New
+        </Button>
       </Flex>
+
+      <Separator size="4" className="my-2" />
 
       <div
         className={
@@ -189,47 +169,66 @@ export function SessionSidebar({
         }
       >
         <ScrollArea type="auto" style={{ height: '100%' }}>
-          <div className="mb-2">
-            <Text size="1" color="gray">
-              Chats
-            </Text>
-          </div>
-          <div className="flex flex-col gap-1.5 pr-1">
-            {sessionItems.map((item) => (
-              <button
-                key={item.session_key}
-                type="button"
-                onClick={() => onSessionSelect(item.session_key)}
-                onContextMenu={(e) => {
-                  e.preventDefault()
-                  setMenu({ x: e.clientX, y: e.clientY, key: item.session_key })
-                }}
-                className={
-                  selectedSessionKey === item.session_key
-                    ? isDark
-                      ? 'flex w-full flex-col items-start rounded-lg border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2 text-left shadow-sm'
-                      : 'flex w-full flex-col items-start rounded-lg border bg-white px-3 py-2 text-left shadow-sm'
-                    : isDark
-                      ? 'flex w-full flex-col items-start rounded-lg border border-transparent px-3 py-2 text-left text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
-                      : 'flex w-full flex-col items-start rounded-lg border border-transparent px-3 py-2 text-left text-slate-600 hover:border-slate-200 hover:bg-white'
-                }
-                style={
-                  !isDark && selectedSessionKey === item.session_key
-                    ? {
-                        borderColor: 'color-mix(in srgb, var(--mc-accent) 36%, #94a3b8)',
-                        boxShadow: '0 4px 12px color-mix(in srgb, var(--mc-accent) 12%, transparent)',
+          <div className="flex flex-col gap-1 pr-1">
+            {personas.length === 0 ? (
+              <Text size="1" color="gray">Loading…</Text>
+            ) : (
+              personas.map((p) => (
+                <div
+                  key={p.id}
+                  className={
+                    selectedPersonaId === p.id
+                      ? isDark
+                        ? 'flex w-full items-center justify-between gap-1 rounded-lg border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2 shadow-sm'
+                        : 'flex w-full items-center justify-between gap-1 rounded-lg border bg-white px-3 py-2 shadow-sm'
+                      : isDark
+                        ? 'flex w-full items-center justify-between gap-1 rounded-lg border border-transparent px-3 py-2 text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
+                        : 'flex w-full items-center justify-between gap-1 rounded-lg border border-transparent px-3 py-2 text-slate-600 hover:border-slate-200 hover:bg-white'
+                  }
+                  style={
+                    !isDark && selectedPersonaId === p.id
+                      ? { borderColor: 'color-mix(in srgb, var(--mc-accent) 36%, #94a3b8)' }
+                      : undefined
+                  }
+                >
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 text-left text-sm font-medium"
+                    onClick={() => onPersonaSelect(p.name)}
+                  >
+                    {p.name}
+                  </button>
+                  {p.is_active ? <Badge size="1" variant="soft">active</Badge> : null}
+                  {p.name !== 'default' ? (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onDeletePersona(p.id) }}
+                      title={`Delete persona "${p.name}"`}
+                      className={
+                        isDark
+                          ? 'rounded p-1 text-slate-400 hover:bg-red-900/30 hover:text-red-400'
+                          : 'rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600'
                       }
-                    : undefined
-                }
-              >
-                <span className="max-w-[220px] truncate text-sm font-medium">{item.label}</span>
-                <span className={isDark ? 'mt-0.5 text-[11px] uppercase tracking-wide text-slate-500' : 'mt-0.5 text-[11px] uppercase tracking-wide text-slate-400'}>
-                  {item.chat_type !== 'web' ? 'Read-only' : item.chat_type}
-                </span>
-              </button>
-            ))}
+                      aria-label={`Delete ${p.name}`}
+                    >
+                      🗑
+                    </button>
+                  ) : null}
+                </div>
+              ))
+            )}
           </div>
         </ScrollArea>
+      </div>
+
+      <div className={isDark ? 'mt-4 rounded-lg border border-[color:var(--mc-border-soft)] p-3' : 'mt-4 rounded-lg border border-slate-200 p-3'}>
+        <Text size="2" weight="bold" className="mb-2 block">Human–AI relationship</Text>
+        <img
+          src="/human-ai-relationship.png"
+          alt="Human and AI collaboration"
+          className="w-full rounded-md border border-black/10 object-contain"
+          loading="lazy"
+        />
       </div>
 
       <div className={isDark ? 'mt-4 border-t border-[color:var(--mc-border-soft)] pt-3' : 'mt-4 border-t border-slate-200 pt-3'}>
@@ -238,71 +237,16 @@ export function SessionSidebar({
         </Button>
         <div className="mt-3 flex flex-col items-center gap-1">
           <a
-            href="https://microclaw.ai"
+            href="https://finally-a-value-bot.ai"
             target="_blank"
             rel="noreferrer"
             className={isDark ? 'text-xs text-slate-400 hover:text-slate-200' : 'text-xs text-slate-600 hover:text-slate-900'}
           >
-            microclaw.ai
+            finally-a-value-bot.ai
           </a>
         </div>
       </div>
 
-      {menu ? (
-        <div
-          ref={sessionMenuRef}
-          className={
-            isDark
-              ? 'fixed z-50 min-w-[170px] rounded-lg border border-emerald-900/80 bg-[#092018] p-1.5 shadow-xl'
-              : 'fixed z-50 min-w-[170px] rounded-lg border border-slate-300 bg-white p-1.5 shadow-xl'
-          }
-          style={{ left: menu.x, top: menu.y }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            type="button"
-            className={
-              isDark
-                ? 'flex w-full rounded-md px-3 py-2 text-left text-sm text-slate-100 hover:bg-emerald-900/50'
-                : 'flex w-full rounded-md px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100'
-            }
-            onClick={() => {
-              onRefreshSession(menu.key)
-              setMenu(null)
-            }}
-          >
-            Refresh
-          </button>
-          <button
-            type="button"
-            className={
-              isDark
-                ? 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-amber-300 hover:bg-amber-900/20'
-                : 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-amber-700 hover:bg-amber-50'
-            }
-            onClick={() => {
-              onResetSession(menu.key)
-              setMenu(null)
-            }}
-          >
-            Clear Context
-          </button>
-          <button
-            type="button"
-            className={
-              isDark
-                ? 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-red-300 hover:bg-red-900/20'
-                : 'mt-1 flex w-full rounded-md px-3 py-2 text-left text-sm text-red-700 hover:bg-red-50'
-            }
-            onClick={() => {
-              onDeleteSession(menu.key)
-              setMenu(null)
-            }}
-          >
-            Delete
-          </button>
-        </div>
-      ) : null}
     </aside>
   )
 }

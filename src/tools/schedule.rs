@@ -41,7 +41,8 @@ fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> Str
     output
 }
 
-fn compute_next_run(cron_expr: &str, tz_name: &str) -> Result<String, String> {
+/// Compute next run time for a cron expression (used by schedule_task and web API).
+pub(crate) fn compute_next_run(cron_expr: &str, tz_name: &str) -> Result<String, String> {
     let tz: chrono_tz::Tz = tz_name
         .parse()
         .map_err(|_| format!("Invalid timezone: {tz_name}"))?;
@@ -516,7 +517,7 @@ mod tests {
     use serde_json::json;
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("microclaw_sched_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_sched_{}", uuid::Uuid::new_v4()));
         let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
         (db, dir)
     }
@@ -793,7 +794,7 @@ mod tests {
                 "prompt": "say hi",
                 "schedule_type": "once",
                 "schedule_value": "2099-12-31T23:59:59+00:00",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": []
                 }
@@ -814,7 +815,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "task_id": task_id,
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": []
                 }
@@ -837,7 +838,7 @@ mod tests {
                 "prompt": "say hi",
                 "schedule_type": "once",
                 "schedule_value": "2099-12-31T23:59:59+00:00",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": [100]
                 }
@@ -860,7 +861,7 @@ mod tests {
                 "prompt": "say hi",
                 "schedule_type": "once",
                 "schedule_value": "2099-12-31T23:59:59+00:00",
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": [100]
                 }
@@ -882,7 +883,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "task_id": task_id,
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": [100]
                 }

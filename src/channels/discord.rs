@@ -27,7 +27,21 @@ impl EventHandler for Handler {
 
         let text = msg.content.clone();
         let channel_id = msg.channel_id.get() as i64;
+        let channel_handle = channel_id.to_string();
         let sender_name = msg.author.name.clone();
+
+        // Resolve to unified contact (canonical_chat_id); for Discord, handle == canonical.
+        let canonical_chat_id = match call_blocking(self.app_state.db.clone(), move |db| {
+            db.resolve_canonical_chat_id("discord", &channel_handle, None)
+        })
+        .await
+        {
+            Ok(cid) => cid,
+            Err(e) => {
+                error!("Discord resolve_canonical_chat_id: {e}");
+                return;
+            }
+        };
 
         // Check allowed channels (empty = all)
         if !self.app_state.config.discord_allowed_channels.is_empty()
@@ -44,9 +58,9 @@ impl EventHandler for Handler {
         if let Some(cmd) = parse_slash_command(&text) {
             match cmd {
                 SlashCommand::Reset => {
-                    let pid = call_blocking(self.app_state.db.clone(), move |db| db.get_current_persona_id(channel_id)).await.unwrap_or(0);
+                    let pid = call_blocking(self.app_state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
                     if pid > 0 {
-                        let _ = call_blocking(self.app_state.db.clone(), move |db| db.delete_session(channel_id, pid)).await;
+                        let _ = call_blocking(self.app_state.db.clone(), move |db| db.delete_session(canonical_chat_id, pid)).await;
                     }
                     let _ = msg
                         .channel_id
@@ -61,7 +75,7 @@ impl EventHandler for Handler {
                     let _ = msg.channel_id.say(&ctx.http, &formatted).await;
                 }
                 SlashCommand::Persona => {
-                    let resp = crate::persona::handle_persona_command(self.app_state.db.clone(), channel_id, text.trim(), Some(&self.app_state.config)).await;
+                    let resp = crate::persona::handle_persona_command(self.app_state.db.clone(), canonical_chat_id, text.trim(), Some(&self.app_state.config)).await;
                     let _ = msg.channel_id.say(&ctx.http, resp).await;
                 }
                 SlashCommand::Schedule => {
@@ -73,13 +87,13 @@ impl EventHandler for Handler {
                     let _ = msg.channel_id.say(&ctx.http, &text).await;
                 }
                 SlashCommand::Archive => {
-                    let pid = call_blocking(self.app_state.db.clone(), move |db| db.get_current_persona_id(channel_id)).await.unwrap_or(0);
+                    let pid = call_blocking(self.app_state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
                     if pid == 0 {
                         let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
                     } else {
                         let pid_f = pid;
                         if let Ok(Some((json, _))) = call_blocking(self.app_state.db.clone(), move |db| {
-                            db.load_session(channel_id, pid_f)
+                            db.load_session(canonical_chat_id, pid_f)
                         })
                         .await
                         {
@@ -87,7 +101,7 @@ impl EventHandler for Handler {
                             if messages.is_empty() {
                                 let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
                             } else {
-                                archive_conversation(&self.app_state.config.runtime_data_dir(), channel_id, &messages);
+                                archive_conversation(&self.app_state.config.runtime_data_dir(), canonical_chat_id, &messages);
                                 let _ = msg
                                     .channel_id
                                     .say(&ctx.http, format!("Archived {} messages.", messages.len()))
@@ -106,8 +120,8 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Resolve persona
-        let persona_id = call_blocking(self.app_state.db.clone(), move |db| db.get_current_persona_id(channel_id)).await.unwrap_or(0);
+        // Resolve persona for this contact
+        let persona_id = call_blocking(self.app_state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
         if persona_id == 0 {
             return;
         }
@@ -115,13 +129,13 @@ impl EventHandler for Handler {
         // Store the chat and message
         let title = format!("discord-{}", msg.channel_id.get());
         let _ = call_blocking(self.app_state.db.clone(), move |db| {
-            db.upsert_chat(channel_id, Some(&title), "discord")
+            db.upsert_chat(canonical_chat_id, Some(&title), "discord")
         })
         .await;
 
         let stored = StoredMessage {
             id: msg.id.get().to_string(),
-            chat_id: channel_id,
+            chat_id: canonical_chat_id,
             persona_id,
             sender_name: sender_name.clone(),
             content: text.clone(),
@@ -163,7 +177,7 @@ impl EventHandler for Handler {
             &self.app_state,
             AgentRequestContext {
                 caller_channel: "discord",
-                chat_id: channel_id,
+                chat_id: canonical_chat_id,
                 chat_type: if msg.guild_id.is_some() {
                     "group"
                 } else {
@@ -179,22 +193,20 @@ impl EventHandler for Handler {
             Ok(response) => {
                 drop(typing);
                 if !response.is_empty() {
-                    send_discord_response(&ctx, msg.channel_id, &response).await;
-
-                    // Store bot response
-                    let bot_msg = StoredMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        chat_id: channel_id,
+                    if let Err(e) = crate::channel::deliver_to_contact(
+                        self.app_state.db.clone(),
+                        Some(&self.app_state.bot),
+                        self.app_state.discord_http.as_deref(),
+                        &self.app_state.config.bot_username,
+                        canonical_chat_id,
                         persona_id,
-                        sender_name: self.app_state.config.bot_username.clone(),
-                        content: response,
-                        is_from_bot: true,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let _ = call_blocking(self.app_state.db.clone(), move |db| {
-                        db.store_message(&bot_msg)
-                    })
-                    .await;
+                        &response,
+                    )
+                    .await
+                    {
+                        tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Discord only");
+                        send_discord_response(&ctx, msg.channel_id, &response).await;
+                    }
                 }
             }
             Err(e) => {

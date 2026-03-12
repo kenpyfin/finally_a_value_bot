@@ -40,7 +40,7 @@ mod tests {
 
     fn temp_root() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "microclaw_builtin_skills_test_{}",
+            "finally_a_value_bot_builtin_skills_test_{}",
             uuid::Uuid::new_v4()
         ))
     }

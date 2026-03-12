@@ -32,7 +32,7 @@ isProject: false
 ### Principles (single source)
 
 - **Only** `data_dir/groups/AGENTS.md` is loaded and injected as "Principles (highest priority)".
-- Do **not** load or merge `working_dir/shared/AGENTS.md` into principles. Display path in prompt: `groups/AGENTS.md` (or full path like `microclaw.data/runtime/groups/AGENTS.md`).
+- Do **not** load or merge `working_dir/shared/AGENTS.md` into principles. Display path in prompt: `groups/AGENTS.md` (or full path like `finally-a-value-bot.data/runtime/groups/AGENTS.md`).
 
 ### Per-persona tiered memory
 
@@ -187,7 +187,7 @@ These locations reference the old TODO system, per-chat/global AGENTS.md, or mem
 
 ### Config and comments
 
-- **[microclaw.config.example.yaml](microclaw.config.example.yaml):** Line 46 comment: "memory global/export/todo" → "memory/export/tiered memory" or similar (no global write, no todo).
+- **[finally-a-value-bot.config.example.yaml](finally-a-value-bot.config.example.yaml):** Line 46 comment: "memory global/export/todo" → "memory/export/tiered memory" or similar (no global write, no todo).
 
 ### Memory tool tests ([src/tools/memory.rs](src/tools/memory.rs))
 

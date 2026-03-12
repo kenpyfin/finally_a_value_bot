@@ -53,7 +53,7 @@ async fn fetch_url(url: &str) -> Result<String, String> {
 
     let resp = client
         .get(url)
-        .header("User-Agent", "MicroClaw/1.0")
+        .header("User-Agent", "FinallyAValueBot/1.0")
         .send()
         .await
         .map_err(|e| e.to_string())?;

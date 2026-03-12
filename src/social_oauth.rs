@@ -1,7 +1,7 @@
 //! OAuth 2.0 helpers for social media platforms (TikTok, Instagram, LinkedIn).
 
 use crate::config::Config;
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 
 /// Build the OAuth redirect base URL from config. Uses social.base_url if set,
 /// otherwise derives from web_host:web_port (for local dev).
@@ -32,7 +32,7 @@ pub fn authorize_url(
     config: &Config,
     platform: &str,
     state: &str,
-) -> Result<Option<String>, MicroClawError> {
+) -> Result<Option<String>, FinallyAValueBotError> {
     let Some(base) = oauth_base_url(config) else {
         return Ok(None);
     };
@@ -47,7 +47,7 @@ pub fn authorize_url(
                 } else {
                     None
                 }
-            }).ok_or_else(|| MicroClawError::Config("TikTok OAuth not configured".into()))?;
+            }).ok_or_else(|| FinallyAValueBotError::Config("TikTok OAuth not configured".into()))?;
             let client_id = cfg.client_id.as_deref().unwrap_or("");
             if client_id.is_empty() {
                 return Ok(None);
@@ -68,7 +68,7 @@ pub fn authorize_url(
                 } else {
                     None
                 }
-            }).ok_or_else(|| MicroClawError::Config("Instagram OAuth not configured".into()))?;
+            }).ok_or_else(|| FinallyAValueBotError::Config("Instagram OAuth not configured".into()))?;
             let client_id = cfg.client_id.as_deref().unwrap_or("");
             if client_id.is_empty() {
                 return Ok(None);
@@ -89,7 +89,7 @@ pub fn authorize_url(
                 } else {
                     None
                 }
-            }).ok_or_else(|| MicroClawError::Config("LinkedIn OAuth not configured".into()))?;
+            }).ok_or_else(|| FinallyAValueBotError::Config("LinkedIn OAuth not configured".into()))?;
             let client_id = cfg.client_id.as_deref().unwrap_or("");
             if client_id.is_empty() {
                 return Ok(None);
@@ -123,22 +123,22 @@ pub async fn exchange_code(
     platform: &str,
     code: &str,
     redirect_uri: &str,
-) -> Result<TokenResult, MicroClawError> {
+) -> Result<TokenResult, FinallyAValueBotError> {
     let social = config.social.as_ref().ok_or_else(|| {
-        MicroClawError::Config("Social OAuth not configured".into())
+        FinallyAValueBotError::Config("Social OAuth not configured".into())
     })?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| MicroClawError::ToolExecution(e.to_string()))?;
+        .map_err(|e| FinallyAValueBotError::ToolExecution(e.to_string()))?;
 
     match platform {
         "tiktok" => {
             let client_key = social.tiktok.client_id.as_deref()
-                .ok_or_else(|| MicroClawError::Config("TikTok client_id not set".into()))?;
+                .ok_or_else(|| FinallyAValueBotError::Config("TikTok client_id not set".into()))?;
             let client_secret = social.tiktok.client_secret.as_deref()
-                .ok_or_else(|| MicroClawError::Config("TikTok client_secret not set".into()))?;
+                .ok_or_else(|| FinallyAValueBotError::Config("TikTok client_secret not set".into()))?;
 
             let params = [
                 ("client_key", client_key),
@@ -153,30 +153,30 @@ pub async fn exchange_code(
                 .form(&params)
                 .send()
                 .await
-                .map_err(|e| MicroClawError::ToolExecution(e.to_string()))?;
+                .map_err(|e| FinallyAValueBotError::ToolExecution(e.to_string()))?;
 
             let status = resp.status();
             let body: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| MicroClawError::ToolExecution(e.to_string()))?;
+                .map_err(|e| FinallyAValueBotError::ToolExecution(e.to_string()))?;
 
             if !status.is_success() {
                 let err_msg = body
                     .get("error_description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Token exchange failed");
-                return Err(MicroClawError::ToolExecution(err_msg.to_string()));
+                return Err(FinallyAValueBotError::ToolExecution(err_msg.to_string()));
             }
 
             let data = body.get("data").and_then(|d| d.as_object()).ok_or_else(|| {
-                MicroClawError::ToolExecution("Invalid TikTok token response".into())
+                FinallyAValueBotError::ToolExecution("Invalid TikTok token response".into())
             })?;
 
             let access_token = data
                 .get("access_token")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| MicroClawError::ToolExecution("No access_token in response".into()))?
+                .ok_or_else(|| FinallyAValueBotError::ToolExecution("No access_token in response".into()))?
                 .to_string();
 
             let refresh_token = data.get("refresh_token").and_then(|v| v.as_str()).map(String::from);
@@ -197,9 +197,9 @@ pub async fn exchange_code(
         }
         "instagram" => {
             let client_id = social.instagram.client_id.as_deref()
-                .ok_or_else(|| MicroClawError::Config("Instagram client_id not set".into()))?;
+                .ok_or_else(|| FinallyAValueBotError::Config("Instagram client_id not set".into()))?;
             let client_secret = social.instagram.client_secret.as_deref()
-                .ok_or_else(|| MicroClawError::Config("Instagram client_secret not set".into()))?;
+                .ok_or_else(|| FinallyAValueBotError::Config("Instagram client_secret not set".into()))?;
 
             let params = [
                 ("client_id", client_id),
@@ -214,13 +214,13 @@ pub async fn exchange_code(
                 .form(&params)
                 .send()
                 .await
-                .map_err(|e| MicroClawError::ToolExecution(e.to_string()))?;
+                .map_err(|e| FinallyAValueBotError::ToolExecution(e.to_string()))?;
 
             let status = resp.status();
             let body: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| MicroClawError::ToolExecution(e.to_string()))?;
+                .map_err(|e| FinallyAValueBotError::ToolExecution(e.to_string()))?;
 
             if !status.is_success() {
                 let err_msg = body
@@ -228,13 +228,13 @@ pub async fn exchange_code(
                     .and_then(|v| v.as_str())
                     .or_else(|| body.get("error").and_then(|v| v.as_str()))
                     .unwrap_or("Token exchange failed");
-                return Err(MicroClawError::ToolExecution(err_msg.to_string()));
+                return Err(FinallyAValueBotError::ToolExecution(err_msg.to_string()));
             }
 
             let access_token = body
                 .get("access_token")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| MicroClawError::ToolExecution("No access_token in response".into()))?
+                .ok_or_else(|| FinallyAValueBotError::ToolExecution("No access_token in response".into()))?
                 .to_string();
 
             Ok(TokenResult {
@@ -245,9 +245,9 @@ pub async fn exchange_code(
         }
         "linkedin" => {
             let client_id = social.linkedin.client_id.as_deref()
-                .ok_or_else(|| MicroClawError::Config("LinkedIn client_id not set".into()))?;
+                .ok_or_else(|| FinallyAValueBotError::Config("LinkedIn client_id not set".into()))?;
             let client_secret = social.linkedin.client_secret.as_deref()
-                .ok_or_else(|| MicroClawError::Config("LinkedIn client_secret not set".into()))?;
+                .ok_or_else(|| FinallyAValueBotError::Config("LinkedIn client_secret not set".into()))?;
 
             let params = [
                 ("grant_type", "authorization_code"),
@@ -262,13 +262,13 @@ pub async fn exchange_code(
                 .form(&params)
                 .send()
                 .await
-                .map_err(|e| MicroClawError::ToolExecution(e.to_string()))?;
+                .map_err(|e| FinallyAValueBotError::ToolExecution(e.to_string()))?;
 
             let status = resp.status();
             let body: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| MicroClawError::ToolExecution(e.to_string()))?;
+                .map_err(|e| FinallyAValueBotError::ToolExecution(e.to_string()))?;
 
             if !status.is_success() {
                 let err_msg = body
@@ -276,13 +276,13 @@ pub async fn exchange_code(
                     .and_then(|v| v.as_str())
                     .or_else(|| body.get("error").and_then(|v| v.as_str()))
                     .unwrap_or("Token exchange failed");
-                return Err(MicroClawError::ToolExecution(err_msg.to_string()));
+                return Err(FinallyAValueBotError::ToolExecution(err_msg.to_string()));
             }
 
             let access_token = body
                 .get("access_token")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| MicroClawError::ToolExecution("No access_token in response".into()))?
+                .ok_or_else(|| FinallyAValueBotError::ToolExecution("No access_token in response".into()))?
                 .to_string();
 
             let refresh_token = body.get("refresh_token").and_then(|v| v.as_str()).map(String::from);
@@ -301,6 +301,6 @@ pub async fn exchange_code(
                 expires_at,
             })
         }
-        _ => Err(MicroClawError::Config(format!("Unknown platform: {platform}"))),
+        _ => Err(FinallyAValueBotError::Config(format!("Unknown platform: {platform}"))),
     }
 }

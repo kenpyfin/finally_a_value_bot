@@ -1,13 +1,13 @@
 # Docker Deployment
 
-MicroClaw can run in Docker with agent-browser (headless Chromium) support.
+FinallyAValueBot can run in Docker with agent-browser (headless Chromium) support.
 
 ## Quick Start
 
 1. Copy and edit config:
    ```bash
    cp .env.example .env
-   # Edit .env with your tokens, API keys, etc. (or run microclaw setup)
+   # Edit .env with your tokens, API keys, etc. (or run finally-a-value-bot setup)
    ```
 
 2. Ensure the workspace directory exists (default `./workspace`). The container entrypoint creates `workspace/shared/vault_db` for the vector DB on first run:
@@ -26,7 +26,7 @@ MicroClaw can run in Docker with agent-browser (headless Chromium) support.
 
 When running in Docker, set these in `.env` if needed:
 
-- **WORKSPACE_DIR**: Not required; compose sets `MICROCLAW_WORKSPACE_DIR=/app/workspace` (host `./workspace` is mounted there).
+- **WORKSPACE_DIR**: Not required; compose sets `FINALLY_A_VALUE_BOT_WORKSPACE_DIR=/app/workspace` (host `./workspace` is mounted there).
 - **AGENT_BROWSER_PATH**: `/usr/local/bin/agent-browser` (override host path)
 - **WEB_HOST**: `0.0.0.0` (to accept connections from host)
 - **WEB_AUTH_TOKEN**: Required when web_host is not localhost
@@ -43,16 +43,15 @@ To use the ORIGIN Obsidian vault and vault semantic search:
 
 1. Configure vault vars in `.env`: `VAULT_ORIGIN_VAULT_PATH=shared/ORIGIN`, `VAULT_VECTOR_DB_PATH=shared/vault_db`. See `.env.example`.
 2. The container entrypoint ensures `workspace/shared/vault_db` exists and creates the vault Python venv (`.venv-vault` with ChromaDB) at startup if missing. Populate the index by running the index-vault skill after adding vault content.
-3. Clone the vault into `workspace/shared/ORIGIN` or use the sync service.
-4. **Optional sync from git**: set `VAULT_ORIGIN_VAULT_REPO` in `.env`, then run:
-   ```bash
-   docker compose --profile sync up -d
-   ```
-   The sync service reads `.env` and pulls into `workspace/shared/ORIGIN` every 15 minutes.
+3. Clone the vault into `workspace/shared/ORIGIN`. Vault updates are now handled by a scheduled task within the agent (see `src/main.rs`).
 
 ## Agent-Browser
 
 The image includes agent-browser (npm) and Chromium (Playwright). Browser automation runs in headless mode only; no GUI. The `shm_size: "1gb"` setting is required for Chromium stability. The image sets `AGENT_BROWSER_PATH=/usr/local/bin/agent-browser` so the browser tool finds it. If you see "browser function is not installed" or "command not found", rebuild the image: `docker compose build --no-cache` (or `./deploy.sh`) so the `npm install -g agent-browser && agent-browser install` step runs again.
+
+## Cursor Agent
+
+The Docker image does **not** install `cursor-agent`. Development tasks are best handled using the `cursor-agent` skill, which guides the agent in using the CLI on the host or in a suitable environment.
 
 ## Refresh / Update
 

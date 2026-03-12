@@ -123,7 +123,7 @@ mod tests {
     use crate::db::{Database, StoredMessage};
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("microclaw_export_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_export_{}", uuid::Uuid::new_v4()));
         let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
         (db, dir)
     }
@@ -202,7 +202,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "chat_id": 200,
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": []
                 }
@@ -233,7 +233,7 @@ mod tests {
             .execute(json!({
                 "chat_id": 200,
                 "path": out_path.to_str().unwrap(),
-                "__microclaw_auth": {
+                "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": [100]
                 }

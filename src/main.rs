@@ -1,7 +1,7 @@
-use microclaw::claude::{Message, MessageContent};
-use microclaw::config::Config;
-use microclaw::error::MicroClawError;
-use microclaw::{
+use finally_a_value_bot::claude::{Message, MessageContent};
+use finally_a_value_bot::config::Config;
+use finally_a_value_bot::error::FinallyAValueBotError;
+use finally_a_value_bot::{
     builtin_skills, config_wizard, db, doctor, gateway, logging, mcp, memory, setup, skills,
     telegram,
 };
@@ -12,10 +12,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
     println!(
-        r#"MicroClaw v{VERSION} — Agentic AI assistant for Telegram, WhatsApp & Discord
+        r#"FinallyAValueBot v{VERSION} — Agentic AI assistant for Telegram, WhatsApp & Discord
 
 USAGE:
-    microclaw <COMMAND>
+    finally_a_value_bot <COMMAND>
 
 COMMANDS:
     start       Start the bot (Telegram + optional WhatsApp/Discord)
@@ -45,18 +45,18 @@ FEATURES:
     - Sensitive path blacklisting for file tools
 
 SETUP:
-    1. Run: microclaw config
-       (or run microclaw start and follow auto-config on first launch)
-    2. Copy .env.example to .env and fill in required values (or run microclaw setup):
+    1. Run: finally_a_value_bot config
+       (or run finally_a_value_bot start and follow auto-config on first launch)
+    2. Copy .env.example to .env and fill in required values (or run finally_a_value_bot setup):
 
        api_key               LLM API key (optional when llm_provider=ollama)
        At least one channel token must be set (Telegram or Discord)
 
-    3. Run: microclaw start
+    3. Run: finally_a_value_bot start
 
 CONFIG FILE (.env):
-    MicroClaw reads configuration from .env in the current directory.
-    Copy .env.example to .env and fill in values. Override path with MICROCLAW_CONFIG.
+    FinallyAValueBot reads configuration from .env in the current directory.
+    Copy .env.example to .env and fill in values. Override path with FINALLY_A_VALUE_BOT_CONFIG.
 
     Core fields:
       llm_provider           Provider preset (default: anthropic)
@@ -92,34 +92,34 @@ MCP (optional):
     See https://modelcontextprotocol.io for details.
 
 EXAMPLES:
-    microclaw start               Start the bot
-    microclaw gateway install     Install and enable gateway service
-    microclaw gateway status      Show gateway service status
-    microclaw gateway logs 100    Show last 100 lines of gateway logs
-    microclaw config              Run interactive Q&A config flow
-    microclaw doctor              Run preflight diagnostics
-    microclaw doctor --json       Output diagnostics as JSON
-    microclaw test-llm            Test LLM API connection (no tools)
-    microclaw test-llm --with-tools   Test LLM with full tool list (like Telegram)
-    microclaw setup               Run full-screen setup wizard
-    microclaw version             Show version
-    microclaw help                Show this message
+    finally_a_value_bot start               Start the bot
+    finally_a_value_bot gateway install     Install and enable gateway service
+    finally_a_value_bot gateway status      Show gateway service status
+    finally_a_value_bot gateway logs 100    Show last 100 lines of gateway logs
+    finally_a_value_bot config              Run interactive Q&A config flow
+    finally_a_value_bot doctor              Run preflight diagnostics
+    finally_a_value_bot doctor --json       Output diagnostics as JSON
+    finally_a_value_bot test-llm            Test LLM API connection (no tools)
+    finally_a_value_bot test-llm --with-tools   Test LLM with full tool list (like Telegram)
+    finally_a_value_bot setup               Run full-screen setup wizard
+    finally_a_value_bot version             Show version
+    finally_a_value_bot help                Show this message
 
 ABOUT:
-    https://microclaw.ai"#
+    https://finally_a_value_bot.ai"#
     );
 }
 
 fn print_version() {
-    println!("microclaw {VERSION}");
+    println!("finally_a_value_bot {VERSION}");
 }
 
 async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
     let config = match Config::load() {
         Ok(c) => c,
-        Err(MicroClawError::Config(e)) => {
+        Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config error: {e}");
-            eprintln!("Set MICROCLAW_CONFIG or create .env (copy from .env.example)");
+            eprintln!("Set FINALLY_A_VALUE_BOT_CONFIG or create .env (copy from .env.example)");
             std::process::exit(1);
         }
         Err(e) => {
@@ -127,7 +127,7 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
-    let provider = microclaw::llm::create_provider(&config);
+    let provider = finally_a_value_bot::llm::create_provider(&config);
     let messages = vec![Message {
         role: "user".into(),
         content: MessageContent::Text("Reply with exactly: OK".into()),
@@ -147,7 +147,7 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
             &config.telegram_bot_token
         };
         let bot = teloxide::Bot::new(token);
-        let tools = microclaw::tools::ToolRegistry::new(&config, bot, db.clone());
+        let tools = finally_a_value_bot::tools::ToolRegistry::new(&config, bot, db.clone());
         let defs = tools.definitions();
         println!("Testing with {} tools (same as Telegram).", defs.len());
         Some(defs)
@@ -170,7 +170,7 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    microclaw::claude::ResponseContentBlock::Text { text } => Some(text.as_str()),
+                    finally_a_value_bot::claude::ResponseContentBlock::Text { text } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -391,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
         Some("setup") => {
             let saved = setup::run_setup_wizard()?;
             if saved {
-                println!("Setup saved to microclaw.config.yaml");
+                println!("Setup saved to finally_a_value_bot.config.yaml");
             } else {
                 println!("Setup canceled");
             }
@@ -432,7 +432,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = match Config::load() {
         Ok(c) => c,
-        Err(MicroClawError::Config(e)) => {
+        Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config missing/invalid: {e}");
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 eprintln!("Launching interactive config...");
@@ -451,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => return Err(e.into()),
     };
-    info!("Starting MicroClaw bot...");
+    info!("Starting FinallyAValueBot bot...");
 
     let data_root_dir = config.data_root_dir();
     let runtime_data_dir = config.runtime_data_dir();
@@ -461,7 +461,7 @@ async fn main() -> anyhow::Result<()> {
     migrate_agents_md_to_workspace_root(Path::new(config.working_dir()), Path::new(&runtime_data_dir));
     builtin_skills::ensure_builtin_skills(&data_root_dir)?;
 
-    if std::env::var("MICROCLAW_GATEWAY").is_ok() {
+    if std::env::var("FINALLY_A_VALUE_BOT_GATEWAY").is_ok() {
         logging::init_logging(&runtime_data_dir)?;
     } else {
         logging::init_console_logging();
@@ -469,6 +469,23 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
+
+    // Ensure 4x daily indexing schedule exists
+    if let Err(e) = db.ensure_indexing_task(
+        997894126,
+        "Run the vault indexing script: /app/workspace/shared/test-venv/bin/python3 /app/workspace/skills/index-vault/index_vault.py. When finished, send a message to the user confirming the indexing status.",
+        "0 0 */6 * * *"
+    ) {
+        tracing::warn!("Failed to seed indexing schedule: {}", e);
+    }
+
+    // Seed onboarding task for fresh installations
+    if let Err(e) = db.ensure_onboarding_task(
+        997894126,
+        "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. I've already set up a 4x daily indexing schedule for your vault. How can I help you get started? Please tell me about your projects or what you'd like me to track."
+    ) {
+        tracing::warn!("Failed to seed onboarding task: {}", e);
+    }
 
     let principles_path = config.vault.as_ref().and_then(|v| v.principles_path.clone());
     let memory_manager = memory::MemoryManager::with_principles_path(

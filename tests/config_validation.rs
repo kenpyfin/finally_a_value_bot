@@ -1,6 +1,6 @@
 //! Integration tests for configuration loading and validation.
 
-use microclaw::config::Config;
+use finally_a_value_bot::config::Config;
 
 /// Helper to create a minimal valid config for testing.
 fn minimal_config() -> Config {
@@ -83,7 +83,7 @@ llm_base_url: https://custom.api.com/v1
 max_tokens: 4096
 max_tool_iterations: 10
 max_history_messages: 100
-workspace_dir: /data/microclaw
+workspace_dir: /data/finally_a_value_bot
 openai_api_key: sk-whisper
 timezone: Asia/Shanghai
 allowed_groups:
@@ -113,7 +113,7 @@ discord_allowed_channels:
     assert_eq!(config.max_tokens, 4096);
     assert_eq!(config.max_tool_iterations, 10);
     assert_eq!(config.max_history_messages, 100);
-    assert_eq!(config.workspace_dir, "/data/microclaw");
+    assert_eq!(config.workspace_dir, "/data/finally_a_value_bot");
     assert_eq!(config.openai_api_key.as_deref(), Some("sk-whisper"));
     assert_eq!(config.timezone, "Asia/Shanghai");
     assert_eq!(config.allowed_groups, vec![111, 222]);

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tracing::{error, info};
 
-use crate::channel::deliver_and_store_bot_message;
+use crate::channel::deliver_to_contact;
 use crate::db::call_blocking;
 use crate::telegram::{AgentRequestContext, AppState};
 
@@ -110,9 +110,10 @@ async fn run_due_tasks(state: &Arc<AppState>) {
         {
             Ok(response) => {
                 if !response.is_empty() {
-                    let _ = deliver_and_store_bot_message(
-                        &state.bot,
+                    let _ = deliver_to_contact(
                         state.db.clone(),
+                        Some(&state.bot),
+                        state.discord_http.as_deref(),
                         &state.config.bot_username,
                         chat_id,
                         persona_id,
@@ -130,9 +131,10 @@ async fn run_due_tasks(state: &Arc<AppState>) {
             Err(e) => {
                 error!("Scheduler: task #{} failed: {e}", task_id);
                 let err_text = format!("Scheduled task #{} failed: {e}", task_id);
-                let _ = deliver_and_store_bot_message(
-                    &state.bot,
+                let _ = deliver_to_contact(
                     state.db.clone(),
+                    Some(&state.bot),
+                    state.discord_http.as_deref(),
                     &state.config.bot_username,
                     chat_id,
                     persona_id,

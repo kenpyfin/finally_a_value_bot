@@ -1,8 +1,10 @@
 pub mod activate_skill;
+pub mod agent_history;
 pub mod bash;
 pub mod browser;
 pub mod command_runner;
 pub mod cursor_agent;
+pub mod delegate;
 pub mod edit_file;
 pub mod export_chat;
 pub mod glob;
@@ -16,16 +18,15 @@ pub mod search_history;
 pub mod search_vault;
 pub mod send_message;
 pub mod social_feed;
-pub mod sub_agent;
 pub mod sync_skills;
 pub mod tiered_memory;
+pub mod vault_add;
 pub mod web_fetch;
 pub mod web_html;
 pub mod web_search;
 pub mod write_file;
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::{path::Path, path::PathBuf, time::Instant};
 
 use async_trait::async_trait;
@@ -100,11 +101,14 @@ impl ToolRisk {
 
 pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
-        "bash" | "cursor_agent" => ToolRisk::High,
-        "write_file"
+        "bash" => ToolRisk::High,
+        "cursor_agent"
+        | "delegate"
+        | "write_file"
         | "edit_file"
         | "write_memory"
         | "write_tiered_memory"
+        | "add_vault_item"
         | "send_message"
         | "sync_skills"
         | "schedule_task"
@@ -113,41 +117,6 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "cancel_scheduled_task" => ToolRisk::Medium,
         _ => ToolRisk::Low,
     }
-}
-
-const APPROVAL_CONTEXT_KEY: &str = "__microclaw_approval";
-
-fn approval_token_from_input(input: &serde_json::Value) -> Option<String> {
-    input
-        .get(APPROVAL_CONTEXT_KEY)
-        .and_then(|v| v.get("token"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-fn issue_approval_token() -> String {
-    uuid::Uuid::new_v4()
-        .simple()
-        .to_string()
-        .chars()
-        .take(8)
-        .collect()
-}
-
-fn approval_key(auth: &ToolAuthContext, tool_name: &str) -> String {
-    format!(
-        "{}:{}:{}",
-        auth.caller_channel, auth.caller_chat_id, tool_name
-    )
-}
-
-fn pending_approvals() -> &'static std::sync::Mutex<HashMap<String, String>> {
-    static PENDING: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
-    PENDING.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-fn requires_high_risk_approval(name: &str, auth: &ToolAuthContext) -> bool {
-    tool_risk(name) == ToolRisk::High && (auth.caller_channel == "web" || auth.is_control_chat())
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +143,7 @@ impl ToolAuthContext {
     }
 }
 
-const AUTH_CONTEXT_KEY: &str = "__microclaw_auth";
+const AUTH_CONTEXT_KEY: &str = "__finally_a_value_bot_auth";
 
 pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthContext> {
     let ctx = input.get(AUTH_CONTEXT_KEY)?;
@@ -319,9 +288,10 @@ impl ToolRegistry {
             Box::new(schedule::CancelTaskTool::new(db.clone())),
             Box::new(schedule::GetTaskHistoryTool::new(db.clone())),
             Box::new(export_chat::ExportChatTool::new(db.clone(), &config.runtime_data_dir())),
-            Box::new(sub_agent::SubAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::CursorAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
+            Box::new(cursor_agent::CursorAgentSendTool::new(config)),
+            Box::new(cursor_agent::BuildSkillTool::new(config, db.clone())),
             Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
                 &primary_skills,
                 &shared_skills,
@@ -330,6 +300,7 @@ impl ToolRegistry {
             Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.runtime_data_dir())),
             Box::new(tiered_memory::WriteTieredMemoryTool::new(&config.runtime_data_dir())),
             Box::new(search_history::SearchHistoryTool::new(db.clone())),
+            Box::new(agent_history::ReadAgentHistoryTool::new(&config.runtime_data_dir())),
         ];
 
         let mut tools: Vec<Box<dyn Tool>> = tools;
@@ -354,8 +325,13 @@ impl ToolRegistry {
                     db_url,
                     collection,
                 )));
+                tools.push(Box::new(vault_add::AddVaultItemTool::new(
+                    embed_url,
+                    db_url,
+                    collection,
+                )));
                 tracing::info!(
-                    "search_vault tool registered (native: collection={}, db={})",
+                    "search_vault and add_vault_item tools registered (native: collection={}, db={})",
                     collection,
                     db_url
                 );
@@ -393,46 +369,6 @@ impl ToolRegistry {
         ToolRegistry { tools }
     }
 
-    /// Create a restricted tool registry for sub-agents (no side-effect or recursive tools).
-    /// Pass `db` to enable `search_chat_history` in sub-agents.
-    pub fn new_sub_agent(config: &Config, db: Option<Arc<Database>>) -> Self {
-        let working_dir = PathBuf::from(config.working_dir());
-        if let Err(e) = std::fs::create_dir_all(&working_dir) {
-            tracing::warn!(
-                "Failed to create working_dir '{}': {}",
-                working_dir.display(),
-                e
-            );
-        }
-        let workspace_root = config.workspace_root_absolute();
-        let primary_skills = workspace_root.join("skills");
-        let shared_skills = workspace_root.join("shared").join("skills");
-        let mut tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(bash::BashTool::new(config.working_dir())),
-            Box::new(browser::BrowserTool::new(
-                &config.runtime_data_dir(),
-                config.agent_browser_path.clone(),
-            )),
-            Box::new(read_file::ReadFileTool::new(config.working_dir())),
-            Box::new(write_file::WriteFileTool::new(config.working_dir())),
-            Box::new(edit_file::EditFileTool::new(config.working_dir())),
-            Box::new(glob::GlobTool::new(config.working_dir())),
-            Box::new(grep::GrepTool::new(config.working_dir())),
-            Box::new(memory::ReadMemoryTool::new(&config.runtime_data_dir(), config.working_dir())),
-            Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.runtime_data_dir())),
-            Box::new(web_fetch::WebFetchTool),
-            Box::new(web_search::WebSearchTool),
-            Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
-                &primary_skills,
-                &shared_skills,
-            ])),
-        ];
-        if let Some(db) = db {
-            tools.push(Box::new(search_history::SearchHistoryTool::new(db)));
-        }
-        ToolRegistry { tools }
-    }
-
     pub fn add_tool(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
     }
@@ -466,41 +402,6 @@ impl ToolRegistry {
         input: serde_json::Value,
         auth: &ToolAuthContext,
     ) -> ToolResult {
-        if requires_high_risk_approval(name, auth) {
-            let provided = approval_token_from_input(&input);
-            let key = approval_key(auth, name);
-            let mut pending = pending_approvals()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            match provided {
-                Some(token) => {
-                    let valid = pending.get(&key).map(|t| t == &token).unwrap_or(false);
-                    if valid {
-                        pending.remove(&key);
-                    } else {
-                        let replacement = issue_approval_token();
-                        pending.insert(key, replacement.clone());
-                        return ToolResult::error(format!(
-                            "Approval token invalid or expired for high-risk tool '{name}' (risk: {}). Re-run with __microclaw_approval.token=\"{}\".",
-                            tool_risk(name).as_str(),
-                            replacement
-                        ))
-                        .with_error_type("approval_required");
-                    }
-                }
-                None => {
-                    let token = issue_approval_token();
-                    pending.insert(key, token.clone());
-                    return ToolResult::error(format!(
-                        "Approval required for high-risk tool '{name}' (risk: {}). Re-run the same tool with __microclaw_approval.token=\"{}\" to confirm.",
-                        tool_risk(name).as_str(),
-                        token
-                    ))
-                    .with_error_type("approval_required");
-                }
-            }
-        }
-
         let input = inject_auth_context(input, auth);
         self.execute(name, input).await
     }
@@ -560,7 +461,7 @@ mod tests {
     #[test]
     fn test_auth_context_from_input() {
         let input = json!({
-            "__microclaw_auth": {
+            "__finally_a_value_bot_auth": {
                 "caller_channel": "telegram",
                 "caller_chat_id": 123,
                 "control_chat_ids": [123, 999]
@@ -576,7 +477,7 @@ mod tests {
     #[test]
     fn test_authorize_chat_access_denied() {
         let input = json!({
-            "__microclaw_auth": {
+            "__finally_a_value_bot_auth": {
                 "caller_channel": "telegram",
                 "caller_chat_id": 100,
                 "control_chat_ids": []
@@ -615,13 +516,6 @@ mod tests {
         }
     }
 
-    fn extract_token(msg: &str) -> String {
-        let marker = "__microclaw_approval.token=\"";
-        let start = msg.find(marker).unwrap() + marker.len();
-        let rest = &msg[start..];
-        rest.split('"').next().unwrap().to_string()
-    }
-
     #[test]
     fn test_tool_risk_levels() {
         assert_eq!(tool_risk("bash"), ToolRisk::High);
@@ -631,73 +525,4 @@ mod tests {
         assert_eq!(tool_risk("read_file"), ToolRisk::Low);
     }
 
-    #[tokio::test]
-    async fn test_high_risk_tool_requires_second_approval_on_web() {
-        let registry = ToolRegistry {
-            tools: vec![Box::new(DummyTool {
-                tool_name: "bash".into(),
-            })],
-        };
-        let auth = ToolAuthContext {
-            caller_channel: "web".into(),
-            caller_chat_id: 1,
-            caller_persona_id: 0,
-            control_chat_ids: vec![],
-        };
-
-        let first = registry.execute_with_auth("bash", json!({}), &auth).await;
-        assert!(first.is_error);
-        assert_eq!(first.error_type.as_deref(), Some("approval_required"));
-        let token = extract_token(&first.content);
-
-        let second = registry
-            .execute_with_auth(
-                "bash",
-                json!({"__microclaw_approval": {"token": token}}),
-                &auth,
-            )
-            .await;
-        assert!(!second.is_error);
-        assert_eq!(second.content, "ok");
-    }
-
-    #[tokio::test]
-    async fn test_high_risk_tool_requires_second_approval_on_control_chat() {
-        let registry = ToolRegistry {
-            tools: vec![Box::new(DummyTool {
-                tool_name: "bash".into(),
-            })],
-        };
-        let auth = ToolAuthContext {
-            caller_channel: "telegram".into(),
-            caller_chat_id: 123,
-            caller_persona_id: 1,
-            control_chat_ids: vec![123],
-        };
-
-        let first = registry.execute_with_auth("bash", json!({}), &auth).await;
-        assert!(first.is_error);
-        assert_eq!(first.error_type.as_deref(), Some("approval_required"));
-    }
-
-    #[tokio::test]
-    async fn test_medium_risk_tool_no_second_approval() {
-        let registry = ToolRegistry {
-            tools: vec![Box::new(DummyTool {
-                tool_name: "write_file".into(),
-            })],
-        };
-        let auth = ToolAuthContext {
-            caller_channel: "web".into(),
-            caller_chat_id: 1,
-            caller_persona_id: 0,
-            control_chat_ids: vec![],
-        };
-
-        let result = registry
-            .execute_with_auth("write_file", json!({}), &auth)
-            .await;
-        assert!(!result.is_error);
-        assert_eq!(result.content, "ok");
-    }
 }

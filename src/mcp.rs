@@ -444,7 +444,7 @@ impl McpServer {
             "protocolVersion": self.requested_protocol,
             "capabilities": {},
             "clientInfo": {
-                "name": "microclaw",
+                "name": "finally_a_value_bot",
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
@@ -618,7 +618,7 @@ impl McpServer {
             "protocolVersion": self.requested_protocol,
             "capabilities": {},
             "clientInfo": {
-                "name": "microclaw",
+                "name": "finally_a_value_bot",
                 "version": env!("CARGO_PKG_VERSION")
             }
         });

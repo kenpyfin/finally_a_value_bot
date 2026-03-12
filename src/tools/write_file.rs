@@ -87,7 +87,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_file_success() {
-        let dir = std::env::temp_dir().join(format!("microclaw_wf_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_wf_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("out.txt");
 
@@ -106,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_file_creates_parent_dirs() {
-        let dir = std::env::temp_dir().join(format!("microclaw_wf2_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_wf2_{}", uuid::Uuid::new_v4()));
         let file = dir.join("sub").join("dir").join("file.txt");
 
         let tool = WriteFileTool::new(".");
@@ -134,7 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_file_resolves_relative_to_working_dir() {
-        let root = std::env::temp_dir().join(format!("microclaw_wf3_{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("finally_a_value_bot_wf3_{}", uuid::Uuid::new_v4()));
         let work = root.join("workspace");
         std::fs::create_dir_all(&work).unwrap();
 

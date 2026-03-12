@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::DefaultTerminal;
 
-use crate::error::MicroClawError;
+use crate::error::FinallyAValueBotError;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProviderProtocol {
@@ -316,7 +316,7 @@ impl SetupApp {
                     value: existing
                         .get("DATA_DIR")
                         .cloned()
-                        .unwrap_or_else(|| "./microclaw.data".into()),
+                        .unwrap_or_else(|| "./finally_a_value_bot.data".into()),
                     required: false,
                     secret: false,
                 },
@@ -433,24 +433,24 @@ impl SetupApp {
         out
     }
 
-    fn validate_local(&self) -> Result<(), MicroClawError> {
+    fn validate_local(&self) -> Result<(), FinallyAValueBotError> {
         for field in &self.fields {
             if field.key == "LLM_API_KEY" && self.field_value("LLM_PROVIDER") == "ollama" {
                 continue;
             }
             if field.required && field.value.trim().is_empty() {
-                return Err(MicroClawError::Config(format!("{} is required", field.key)));
+                return Err(FinallyAValueBotError::Config(format!("{} is required", field.key)));
             }
         }
 
         let provider = self.field_value("LLM_PROVIDER");
         if provider.is_empty() {
-            return Err(MicroClawError::Config("LLM_PROVIDER is required".into()));
+            return Err(FinallyAValueBotError::Config("LLM_PROVIDER is required".into()));
         }
 
         let username = self.field_value("BOT_USERNAME");
         if username.starts_with('@') {
-            return Err(MicroClawError::Config(
+            return Err(FinallyAValueBotError::Config(
                 "BOT_USERNAME should not include '@'".into(),
             ));
         }
@@ -462,7 +462,7 @@ impl SetupApp {
             timezone
         };
         tz.parse::<chrono_tz::Tz>()
-            .map_err(|_| MicroClawError::Config(format!("Invalid TIMEZONE: {tz}")))?;
+            .map_err(|_| FinallyAValueBotError::Config(format!("Invalid TIMEZONE: {tz}")))?;
 
         let workspace_dir = self.field_value("WORKSPACE_DIR");
         let dir = if workspace_dir.trim().is_empty() {
@@ -481,7 +481,7 @@ impl SetupApp {
         Ok(())
     }
 
-    fn validate_online(&self) -> Result<Vec<String>, MicroClawError> {
+    fn validate_online(&self) -> Result<Vec<String>, FinallyAValueBotError> {
         let tg_token = self.field_value("TELEGRAM_BOT_TOKEN");
         let env_username = self
             .field_value("BOT_USERNAME")
@@ -502,7 +502,7 @@ impl SetupApp {
             )
         })
         .join()
-        .map_err(|_| MicroClawError::Config("Validation thread panicked".into()))?
+        .map_err(|_| FinallyAValueBotError::Config("Validation thread panicked".into()))?
     }
 
     fn set_provider(&mut self, provider: &str) {
@@ -690,7 +690,7 @@ impl SetupApp {
             "LLM_BASE_URL" => find_provider_preset(&provider)
                 .map(|p| p.default_base_url.to_string())
                 .unwrap_or_default(),
-            "DATA_DIR" => "./microclaw.data".into(),
+            "DATA_DIR" => "./finally_a_value_bot.data".into(),
             "TIMEZONE" => "UTC".into(),
             "WORKING_DIR" => "./workspace".into(),
             "VAULT_GIT_URL" => String::new(),
@@ -747,7 +747,7 @@ fn perform_online_validation(
     api_key: &str,
     base_url: &str,
     model: &str,
-) -> Result<Vec<String>, MicroClawError> {
+) -> Result<Vec<String>, FinallyAValueBotError> {
     let mut checks = Vec::new();
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -760,7 +760,7 @@ fn perform_online_validation(
         .json()?;
     let ok = tg_resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     if !ok {
-        return Err(MicroClawError::Config(
+        return Err(FinallyAValueBotError::Config(
             "Telegram getMe failed (check TELEGRAM_BOT_TOKEN)".into(),
         ));
     }
@@ -820,7 +820,7 @@ fn perform_online_validation(
                         .map(|s| s.to_string())
                 })
                 .unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(MicroClawError::Config(format!(
+            return Err(FinallyAValueBotError::Config(format!(
                 "LLM validation failed: {detail}"
             )));
         }
@@ -863,7 +863,7 @@ fn perform_online_validation(
                         .map(|s| s.to_string())
                 })
                 .unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(MicroClawError::Config(format!(
+            return Err(FinallyAValueBotError::Config(format!(
                 "LLM validation failed: {detail}"
             )));
         }
@@ -880,7 +880,7 @@ fn mask_secret(s: &str) -> String {
     format!("{}***{}", &s[..3], &s[s.len() - 2..])
 }
 
-fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Option<String>, MicroClawError> {
+fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Option<String>, FinallyAValueBotError> {
     let mut backup = None;
     if path.exists() {
         let ts = Utc::now().format("%Y%m%d%H%M%S").to_string();
@@ -920,7 +920,7 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
     }
 
     let mut lines = Vec::new();
-    lines.push("# MicroClaw configuration".into());
+    lines.push("# FinallyAValueBot configuration".into());
     lines.push("".into());
     lines.push("# Telegram".into());
     lines.push(format!("TELEGRAM_BOT_TOKEN={}", escape_env(&get("TELEGRAM_BOT_TOKEN"))));
@@ -984,7 +984,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
             )),
             Line::from(""),
             Line::from("Next:"),
-            Line::from("  1) microclaw start"),
+            Line::from("  1) finally_a_value_bot start"),
             Line::from(""),
             Line::from("Press Enter to finish."),
         ])
@@ -1008,7 +1008,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
 
     let header = Paragraph::new(vec![
         Line::from(Span::styled(
-            "MicroClaw • Interactive Setup",
+            "FinallyAValueBot • Interactive Setup",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1175,7 +1175,7 @@ fn try_save(app: &mut SetupApp) {
     }
 }
 
-fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
+fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, FinallyAValueBotError> {
     let mut app = SetupApp::new();
 
     loop {
@@ -1297,7 +1297,7 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
     }
 }
 
-pub fn run_setup_wizard() -> Result<bool, MicroClawError> {
+pub fn run_setup_wizard() -> Result<bool, FinallyAValueBotError> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1321,7 +1321,7 @@ mod tests {
     #[test]
     fn test_save_config_yaml() {
         let yaml_path = std::env::temp_dir().join(format!(
-            "microclaw_setup_test_{}.yaml",
+            "finally_a_value_bot_setup_test_{}.yaml",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
 

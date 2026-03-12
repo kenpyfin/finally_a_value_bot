@@ -1,5 +1,5 @@
-# Multi-stage build for MicroClaw with agent-browser support
-# Stage 1: Build microclaw binary (Rust) and web assets
+# Multi-stage build for FinallyAValueBot with agent-browser support
+# Stage 1: Build finally-a-value-bot binary (Rust) and web assets
 FROM rust:1-bookworm AS builder
 
 # Install Node.js for web build
@@ -35,8 +35,8 @@ RUN for i in 1 2 3; do apt-get update && apt-get install -y --no-install-recomme
 RUN npm install -g agent-browser && agent-browser install
 ENV AGENT_BROWSER_PATH=/usr/local/bin/agent-browser
 
-# Copy microclaw binary from builder
-COPY --from=builder /build/target/release/microclaw /usr/local/bin/microclaw
+# Copy finally-a-value-bot binary from builder
+COPY --from=builder /build/target/release/finally-a-value-bot /usr/local/bin/finally-a-value-bot
 
 # Built-in vault scripts (query_vault, index_vault)
 COPY scripts/vault/ /app/scripts/vault/
@@ -48,7 +48,7 @@ RUN chmod +x /app/scripts/docker-entrypoint.sh
 WORKDIR /app
 
 # Default config path (override with volume)
-ENV MICROCLAW_CONFIG=/app/microclaw.config.yaml
+ENV FINALLY_A_VALUE_BOT_CONFIG=/app/finally-a-value-bot.config.yaml
 
 # Web UI port
 EXPOSE 10961
@@ -57,4 +57,4 @@ EXPOSE 10961
 ENV NODE_OPTIONS="--max-old-space-size=512"
 
 ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
-CMD ["microclaw", "start"]
+CMD ["finally-a-value-bot", "start"]

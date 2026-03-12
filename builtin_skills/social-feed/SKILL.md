@@ -13,7 +13,7 @@ Use this skill when the user asks to:
 
 ## Available tools
 
-The following tools are available (only if configured in microclaw.config.yaml under `social`):
+The following tools are available (only if configured in finally-a-value-bot.config.yaml under `social`):
 
 | Tool | Platform | Use when |
 |------|----------|----------|

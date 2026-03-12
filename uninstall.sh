@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN_NAME="microclaw"
+BIN_NAME="finally-a-value-bot"
 
-log() {
-  printf '%s\n' "$*"
-}
-
-err() {
-  printf 'Error: %s\n' "$*" >&2
-}
+log_info() { printf "\x1b[34m[INFO]\x1b[0m %s\n" "$*"; }
+log_success() { printf "\x1b[32m[SUCCESS]\x1b[0m %s\n" "$*"; }
+log_warn() { printf "\x1b[33m[WARN]\x1b[0m %s\n" "$*"; }
+log_error() { printf "\x1b[31m[ERROR]\x1b[0m %s\n" "$*" >&2; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
@@ -29,8 +26,8 @@ detect_os() {
 resolve_targets() {
   local out=()
 
-  if [ -n "${MICROCLAW_INSTALL_DIR:-}" ]; then
-    out+=("${MICROCLAW_INSTALL_DIR%/}/$BIN_NAME")
+  if [ -n "${FINALLY_A_VALUE_BOT_INSTALL_DIR:-}" ]; then
+    out+=("${FINALLY_A_VALUE_BOT_INSTALL_DIR%/}/$BIN_NAME")
   fi
 
   if need_cmd "$BIN_NAME"; then
@@ -71,18 +68,39 @@ remove_file() {
   return 0
 }
 
+remove_systemd_service() {
+  local service_name="finally-a-value-bot"
+  local service_file="/etc/systemd/system/${service_name}.service"
+
+  if [ "$(uname -s)" != "Linux" ]; then
+    return 0
+  fi
+
+  if [ -f "$service_file" ]; then
+    log_info "Removing systemd service $service_file (requires sudo)..."
+    if sudo systemctl stop "$service_name" 2>/dev/null && \
+       sudo systemctl disable "$service_name" 2>/dev/null && \
+       sudo rm -f "$service_file" && \
+       sudo systemctl daemon-reload; then
+      log_success "Systemd service removed."
+    else
+      log_error "Failed to remove systemd service."
+    fi
+  fi
+}
+
 main() {
   local os removed=0 failed=0 target
 
   os="$(detect_os)"
-  log "Uninstalling $BIN_NAME on $os..."
+  log_info "Uninstalling $BIN_NAME on $os..."
 
   while IFS= read -r target; do
     if [ -z "$target" ]; then
       continue
     fi
     if remove_file "$target"; then
-      log "Removed: $target"
+      log_info "Removed: $target"
       removed=$((removed + 1))
     else
       rc=$?
@@ -92,20 +110,23 @@ main() {
     fi
   done < <(resolve_targets)
 
+  remove_systemd_service
+
   if [ "$failed" -ne 0 ]; then
     exit 1
   fi
 
   if [ "$removed" -eq 0 ]; then
-    log "$BIN_NAME binary not found. Nothing to uninstall."
+    log_info "$BIN_NAME binary not found. Nothing to uninstall."
     exit 0
   fi
 
-  log ""
-  log "$BIN_NAME has been removed."
-  log "Optional cleanup (not removed automatically):"
-  log "  rm -rf ./microclaw.data/runtime"
-  log "  rm -f ./microclaw.config.yaml ./microclaw.config.yml"
+  printf "\n"
+  log_success "$BIN_NAME has been removed."
+  log_info "Optional cleanup (not removed automatically):"
+  log_info "  rm -rf ./finally-a-value-bot.data/runtime"
+  log_info "  rm -f ./finally-a-value-bot.config.yaml ./finally-a-value-bot.config.yml"
+  log_info "  rm -rf ./workspace"
 }
 
 main "$@"

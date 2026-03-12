@@ -176,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_uses_working_dir() {
-        let root = std::env::temp_dir().join(format!("microclaw_bash_{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("finally_a_value_bot_bash_{}", uuid::Uuid::new_v4()));
         let work = root.join("workspace");
         std::fs::create_dir_all(&work).unwrap();
 

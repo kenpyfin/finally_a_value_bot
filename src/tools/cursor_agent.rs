@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,11 +21,244 @@ pub struct CursorAgentTool {
     db: Arc<Database>,
 }
 
+fn in_docker() -> bool {
+    std::env::var("FINALLY_A_VALUE_BOT_IN_DOCKER").as_deref() == Ok("1")
+        || std::path::Path::new("/.dockerenv").exists()
+}
+
 impl CursorAgentTool {
     pub fn new(config: &Config, db: Arc<Database>) -> Self {
         Self {
             config: config.clone(),
             db,
+        }
+    }
+
+    /// Execute cursor-agent via host runner (HTTP POST). Used when CURSOR_AGENT_RUNNER_URL is set (e.g. in Docker).
+    async fn execute_via_runner(
+        &self,
+        url: &str,
+        prompt: &str,
+        workdir_str: &str,
+        model: &str,
+        detach: bool,
+        auth: Option<&crate::tools::ToolAuthContext>,
+    ) -> ToolResult {
+        #[derive(Serialize)]
+        struct SpawnRequest<'a> {
+            prompt: &'a str,
+            workdir: &'a str,
+            model: &'a str,
+            detach: bool,
+        }
+        #[derive(Deserialize)]
+        struct SpawnResponse {
+            success: Option<bool>,
+            session_name: Option<String>,
+            output: Option<String>,
+            error: Option<String>,
+        }
+        let body = SpawnRequest {
+            prompt,
+            workdir: workdir_str,
+            model: if model.is_empty() { "" } else { model },
+            detach,
+        };
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                self.config.cursor_agent_timeout_secs + 10,
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return ToolResult::error(format!("Failed to create HTTP client: {}", e)),
+        };
+        let res = match client.post(url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ToolResult::error(format!(
+                    "Runner request failed: {}. Is the host runner running and reachable?",
+                    e
+                ));
+            }
+        };
+        let status = res.status();
+        let text = match res.text().await {
+            Ok(t) => t,
+            Err(e) => return ToolResult::error(format!("Failed to read runner response: {}", e)),
+        };
+        if !status.is_success() {
+            return ToolResult::error(format!(
+                "Runner returned {}: {}",
+                status.as_u16(),
+                text.chars().take(500).collect::<String>()
+            ));
+        }
+        let parsed: SpawnResponse = match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                return ToolResult::error(format!(
+                    "Failed to parse runner response: {}. Response: {}",
+                    e,
+                    text.chars().take(300).collect::<String>()
+                ));
+            }
+        };
+        if parsed.error.as_deref() == Some("") || parsed.success == Some(false) {
+            let err = parsed
+                .error
+                .unwrap_or_else(|| "Unknown runner error".into());
+            return ToolResult::error(err);
+        }
+        if detach {
+            if let Some(session_name) = parsed.session_name {
+                if let Some(a) = auth {
+                    let db = self.db.clone();
+                    let chat_id = a.caller_chat_id;
+                    let channel = a.caller_channel.clone();
+                    let prompt_preview: String = if prompt.len() <= PROMPT_PREVIEW_LEN {
+                        prompt.to_string()
+                    } else {
+                        format!("{}...", &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)])
+                    };
+                    let started_at = chrono::Utc::now().to_rfc3339();
+                    let output_preview = format!(
+                        "Spawned in tmux session: {}. Attach: tmux attach -t {}",
+                        session_name, session_name
+                    );
+                    let workdir_owned = workdir_str.to_string();
+                    let session_name_for_db = session_name.clone();
+                    let _ = crate::db::call_blocking(db, move |database| {
+                        database.insert_cursor_agent_run(
+                            chat_id,
+                            &channel,
+                            &prompt_preview,
+                            Some(workdir_owned.as_str()),
+                            &started_at,
+                            &started_at,
+                            true,
+                            None,
+                            Some(&output_preview),
+                            None::<&str>,
+                            Some(session_name_for_db.as_str()),
+                        )
+                    })
+                    .await;
+                }
+                ToolResult::success(format!(
+                    "Spawned cursor-agent in tmux session `{}`. Attach with: tmux attach -t {}\n\
+                     Use the cursor_agent_send tool to send keys.",
+                    session_name, session_name
+                ))
+            } else {
+                ToolResult::error("Runner did not return session_name for detach=true".into())
+            }
+        } else {
+            let output = parsed
+                .output
+                .unwrap_or_else(|| "Runner returned no output".into());
+            if parsed.success == Some(false) {
+                ToolResult::error(output)
+                    .with_error_type("process_exit")
+            } else {
+                ToolResult::success(output)
+            }
+        }
+    }
+
+    /// Spawn cursor-agent in a tmux session; return immediately with attach instructions.
+    async fn execute_detached(
+        &self,
+        prompt: &str,
+        workdir_str: &str,
+        model: &str,
+        auth: Option<&crate::tools::ToolAuthContext>,
+    ) -> ToolResult {
+        if !self.config.cursor_agent_tmux_enabled || in_docker() {
+            return ToolResult::error(
+                "Tmux spawn is not available in this environment (Docker or tmux disabled). \
+                 Run the bot on a host with tmux and cursor-agent, or use detach: false for inline runs."
+                    .into(),
+            )
+            .with_error_type("tmux_unavailable");
+        }
+        let prefix = self
+            .config
+            .cursor_agent_tmux_session_prefix
+            .trim();
+        let prefix = if prefix.is_empty() {
+            "finally_a_value_bot-cursor"
+        } else {
+            prefix
+        };
+        let session_name = format!("{}-{}", prefix, chrono::Utc::now().timestamp_millis());
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let prompt_preview: String = if prompt.len() <= PROMPT_PREVIEW_LEN {
+            prompt.to_string()
+        } else {
+            format!("{}...", &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)])
+        };
+        let cli_path = self.config.cursor_agent_cli_path.trim();
+        let mut tmux_cmd = tokio::process::Command::new("tmux");
+        tmux_cmd
+            .args(["new-session", "-d", "-s", &session_name, "-c", workdir_str, "--"])
+            .arg(cli_path)
+            .arg("-p")
+            .arg(prompt)
+            .arg("--output-format")
+            .arg("text");
+        if !model.is_empty() {
+            tmux_cmd.arg("--model").arg(model);
+        }
+        let spawn_result = tmux_cmd.spawn();
+        let (ok, msg) = match spawn_result {
+            Ok(_) => {
+                if let Some(a) = auth {
+                    let db = self.db.clone();
+                    let chat_id = a.caller_chat_id;
+                    let channel = a.caller_channel.clone();
+                    let workdir_owned = workdir_str.to_string();
+                    let session_name_for_db = session_name.clone();
+                    let output_preview = format!(
+                        "Spawned in tmux session: {}. Attach: tmux attach -t {}",
+                        session_name, session_name
+                    );
+                    let _ = crate::db::call_blocking(db, move |database| {
+                        database.insert_cursor_agent_run(
+                            chat_id,
+                            &channel,
+                            &prompt_preview,
+                            Some(workdir_owned.as_str()),
+                            &started_at,
+                            &started_at,
+                            true,
+                            None,
+                            Some(&output_preview),
+                            None::<&str>,
+                            Some(session_name_for_db.as_str()),
+                        )
+                    })
+                    .await;
+                }
+                let m = format!(
+                    "Spawned cursor-agent in tmux session `{}`. Attach with: tmux attach -t {}\n\
+                     Use the cursor_agent_send tool to send keys (e.g. redirect the agent mid-task).",
+                    session_name, session_name
+                );
+                (true, m)
+            }
+            Err(ref e) => {
+                let m = format!(
+                    "Failed to spawn tmux session for cursor-agent: {}. Ensure tmux is installed and in PATH.",
+                    e
+                );
+                (false, m)
+            }
+        };
+        if ok {
+            ToolResult::success(msg)
+        } else {
+            ToolResult::error(msg).with_error_type("spawn_error")
         }
     }
 }
@@ -52,6 +286,10 @@ impl Tool for CursorAgentTool {
                     "model": {
                         "type": "string",
                         "description": "Override model for this run (e.g. gpt-5). Omit to use config default or Cursor auto"
+                    },
+                    "detach": {
+                        "type": "boolean",
+                        "description": "If true, spawn cursor-agent in a tmux session and return immediately. Attach with tmux attach -t <session>. Not available in Docker."
                     }
                 }),
                 &["prompt"],
@@ -96,9 +334,25 @@ impl Tool for CursorAgentTool {
             .unwrap_or_else(|| self.config.cursor_agent_model.as_str())
             .trim();
 
+        let detach = input.get("detach").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // When runner URL is set (e.g. Docker), POST to host instead of running locally
+        if let Some(ref runner_url) = self.config.cursor_agent_runner_url {
+            let url = runner_url.trim().trim_end_matches('/').to_string() + "/spawn";
+            return self
+                .execute_via_runner(&url, prompt, &workdir_str_storage, model, detach, auth.as_ref())
+                .await;
+        }
+
         let cli_path = self.config.cursor_agent_cli_path.trim();
         if cli_path.is_empty() {
             return ToolResult::error("cursor_agent_cli_path is not configured".into());
+        }
+
+        if detach {
+            return self
+                .execute_detached(prompt, &workdir_str_storage, model, auth.as_ref())
+                .await;
         }
 
         info!("Running cursor-agent (timeout {}s)", timeout_secs);
@@ -182,6 +436,7 @@ impl Tool for CursorAgentTool {
                     success,
                     Some(exit_code),
                     Some(&output_preview),
+                    None::<&str>,
                     None::<&str>,
                 )
             })
@@ -270,7 +525,13 @@ impl Tool for ListCursorAgentRunsTool {
                 }
                 let mut out = String::new();
                 for r in &runs {
-                    let status = if r.success { "ok" } else { "failed" };
+                    let status = if r.tmux_session.is_some() {
+                        "running"
+                    } else if r.success {
+                        "ok"
+                    } else {
+                        "failed"
+                    };
                     let code = r
                         .exit_code
                         .map(|c| format!(" exit_code={}", c))
@@ -281,6 +542,9 @@ impl Tool for ListCursorAgentRunsTool {
                         "#{} {} {} {} | prompt: {}{}\n",
                         r.id, r.finished_at, status, code, preview, suffix
                     ));
+                    if let Some(ref sess) = r.tmux_session {
+                        out.push_str(&format!("  session: {} | Attach: tmux attach -t {}\n", sess, sess));
+                    }
                     if let Some(ref prev) = r.output_preview {
                         let first_line = prev.lines().next().unwrap_or("");
                         out.push_str(&format!("  -> {}\n", &first_line[..first_line.len().min(80)]));
@@ -288,7 +552,265 @@ impl Tool for ListCursorAgentRunsTool {
                 }
                 ToolResult::success(out)
             }
-            Err(e) => ToolResult::error(format!("Failed to list cursor-agent runs: {e}")),
+            Err(e) =>                 ToolResult::error(format!("Failed to list cursor-agent runs: {e}")),
         }
     }
+}
+
+// --- cursor_agent_send ---
+
+pub struct CursorAgentSendTool {
+    config: Config,
+}
+
+impl CursorAgentSendTool {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CursorAgentSendTool {
+    fn name(&self) -> &str {
+        "cursor_agent_send"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "cursor_agent_send".into(),
+            description: "Send keys to a running cursor-agent tmux session (from a run with detach: true). Use to redirect the agent mid-task (e.g. 'Focus on the API first').".into(),
+            input_schema: schema_object(
+                json!({
+                    "tmux_session": {
+                        "type": "string",
+                        "description": "The tmux session name (e.g. finally_a_value_bot-cursor-1234567890). Use list_cursor_agent_runs to see running sessions."
+                    },
+                    "keys": {
+                        "type": "string",
+                        "description": "Text to send; newline = Enter. Restrict to printable characters and newlines."
+                    }
+                }),
+                &["tmux_session", "keys"],
+            ),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> ToolResult {
+        let session = input.get("tmux_session").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let keys = input.get("keys").and_then(|v| v.as_str()).unwrap_or("");
+        if session.is_empty() {
+            return ToolResult::error("Missing tmux_session".into());
+        }
+        let prefix = self
+            .config
+            .cursor_agent_tmux_session_prefix
+            .trim();
+        let prefix = if prefix.is_empty() { "finally_a_value_bot-cursor" } else { prefix };
+        if !session.starts_with(prefix) {
+            return ToolResult::error(format!(
+                "Session name must start with '{}' (got '{}'). Only cursor-agent sessions are allowed.",
+                prefix, session
+            ));
+        }
+        // Sanitize keys: allow printable ASCII and newlines
+        let safe_keys: String = keys
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '\n' || *c == '\t')
+            .collect();
+        let mut cmd = tokio::process::Command::new("tmux");
+        cmd.args(["send-keys", "-t", session, &safe_keys, "Enter"]);
+        match cmd.output().await {
+            Ok(output) => {
+                if output.status.success() {
+                    ToolResult::success(format!("Sent keys to session {}", session))
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    ToolResult::error(format!("tmux send-keys failed: {}", stderr))
+                }
+            }
+            Err(e) => ToolResult::error(format!("Failed to run tmux send-keys: {}", e)),
+        }
+    }
+}
+
+// --- build_skill ---
+
+pub struct BuildSkillTool {
+    config: Config,
+    db: Arc<Database>,
+}
+
+impl BuildSkillTool {
+    pub fn new(config: &Config, db: Arc<Database>) -> Self {
+        Self {
+            config: config.clone(),
+            db,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for BuildSkillTool {
+    fn name(&self) -> &str {
+        "build_skill"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "build_skill".into(),
+            description: "Create or update a FinallyAValueBot skill by running cursor-agent. Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.".into(),
+            input_schema: schema_object(
+                json!({
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name (folder name under skills dir)"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the skill"
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Full markdown instructions for the skill (when to use, how to invoke, steps)"
+                    }
+                }),
+                &["name", "description", "instructions"],
+            ),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> ToolResult {
+        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let description = input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let instructions = input
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() {
+            return ToolResult::error("Missing name".into());
+        }
+        let skills_dir = self.config.skills_data_dir_absolute();
+        let skills_dir_display = skills_dir.to_string_lossy();
+        let prompt = format!(
+            r#"Create or update a FinallyAValueBot agent skill.
+
+Skills directory: {}
+Create (or update) the skill at: {}/{}/
+
+Requirements:
+1. Create the folder {}/{} if it does not exist.
+2. Create or overwrite SKILL.md with YAML frontmatter (name, description, platforms, deps, source) and a body.
+
+Description for this skill: {}
+Instructions (markdown body): {}
+
+Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{} so they are available to all personas. Follow the existing skill format (see other skills in the same directory for examples)."#,
+            skills_dir_display,
+            skills_dir_display,
+            name,
+            skills_dir_display,
+            name,
+            description,
+            instructions,
+            skills_dir_display,
+            name,
+        );
+        let cursor_tool = CursorAgentTool::new(&self.config, self.db.clone());
+        let mut cursor_input = serde_json::json!({ "prompt": prompt });
+        cursor_input["detach"] = serde_json::json!(true);
+        if let Some(auth) = input.get("__finally_a_value_bot_auth") {
+            cursor_input["__finally_a_value_bot_auth"] = auth.clone();
+        }
+        let result = cursor_tool.execute(cursor_input).await;
+
+        // Fallback: when cursor-agent is unavailable (Docker, runner down, etc.), create skill directly
+        if result.is_error && is_cursor_agent_unavailable(&result.content) {
+            info!(
+                "build_skill: cursor-agent unavailable, falling back to direct file creation"
+            );
+            return create_skill_via_write(&skills_dir, name, description, instructions).await;
+        }
+
+        result
+    }
+}
+
+fn is_cursor_agent_unavailable(error_content: &str) -> bool {
+    let lower = error_content.to_lowercase();
+    lower.contains("cursor-agent")
+        || lower.contains("cursor_agent")
+        || lower.contains("tmux spawn is not available")
+        || lower.contains("runner request failed")
+        || lower.contains("runner did not return")
+        || lower.contains("not found")
+        || lower.contains("not configured")
+        || lower.contains("no such file")
+        || lower.contains("failed to execute")
+        || lower.contains("failed to run")
+        || lower.contains("command not found")
+}
+
+async fn create_skill_via_write(
+    skills_dir: &std::path::Path,
+    name: &str,
+    description: &str,
+    instructions: &str,
+) -> ToolResult {
+    let skill_dir = skills_dir.join(name);
+    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
+        return ToolResult::error(format!("Failed to create skill directory: {}", e));
+    }
+
+    let safe_name = name.replace('"', "'");
+    let yaml_desc = if description.is_empty() {
+        format!("Skill: {}", name)
+    } else {
+        description.replace('\n', " ").trim().to_string()
+    };
+    let body = instructions.trim();
+    let content = format!(
+        r#"---
+name: {}
+description: {}
+platforms:
+  - linux
+  - darwin
+deps: []
+---
+
+# {}
+
+{}
+
+---
+
+Put credentials in `{}/.env` if needed.
+"#,
+        safe_name,
+        yaml_desc,
+        name,
+        body,
+        skill_dir.display()
+    );
+
+    let skill_md = skill_dir.join("SKILL.md");
+    if let Err(e) = tokio::fs::write(&skill_md, content).await {
+        return ToolResult::error(format!("Failed to write SKILL.md: {}", e));
+    }
+
+    info!("build_skill fallback: created {} at {}", name, skill_md.display());
+    ToolResult::success(format!(
+        "Created skill '{}' at {}/SKILL.md (cursor-agent unavailable; used direct file creation). \
+         Add credentials to {}/.env if needed.",
+        name,
+        skill_dir.display(),
+        skill_dir.display()
+    ))
 }

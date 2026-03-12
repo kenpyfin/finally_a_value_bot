@@ -1,10 +1,10 @@
 param(
-  [string]$Repo = $(if ($env:MICROCLAW_REPO) { $env:MICROCLAW_REPO } else { 'microclaw/microclaw' }),
-  [string]$InstallDir = $(if ($env:MICROCLAW_INSTALL_DIR) { $env:MICROCLAW_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.local\bin' })
+  [string]$Repo = $(if ($env:FINALLY_A_VALUE_BOT_REPO) { $env:FINALLY_A_VALUE_BOT_REPO } else { 'finally-a-value-bot/finally-a-value-bot' }),
+  [string]$InstallDir = $(if ($env:FINALLY_A_VALUE_BOT_INSTALL_DIR) { $env:FINALLY_A_VALUE_BOT_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.local\bin' })
 )
 
 $ErrorActionPreference = 'Stop'
-$BinName = 'microclaw.exe'
+$BinName = 'finally-a-value-bot.exe'
 $ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
 
 function Write-Info([string]$msg) {
@@ -21,8 +21,8 @@ function Resolve-Arch {
 
 function Select-AssetUrl([object]$release, [string]$arch) {
   $patterns = @(
-    "microclaw-v?[0-9]+\.[0-9]+\.[0-9]+-$arch-pc-windows-msvc\.zip$",
-    "microclaw-v?[0-9]+\.[0-9]+\.[0-9]+-.*$arch.*windows.*\.zip$"
+    "finally-a-value-bot-v?[0-9]+\.[0-9]+\.[0-9]+-$arch-pc-windows-msvc\.zip$",
+    "finally-a-value-bot-v?[0-9]+\.[0-9]+\.[0-9]+-.*$arch.*windows.*\.zip$"
   )
 
   foreach ($p in $patterns) {
@@ -70,18 +70,18 @@ function Ensure-UserPathContains([string]$dir) {
 }
 
 $arch = Resolve-Arch
-Write-Info "Installing microclaw for windows/$arch..."
+Write-Info "Installing finally-a-value-bot for windows/$arch..."
 
-$release = Invoke-RestMethod -Uri $ApiUrl -Headers @{ 'User-Agent' = 'microclaw-install-script' }
+$release = Invoke-RestMethod -Uri $ApiUrl -Headers @{ 'User-Agent' = 'finally-a-value-bot-install-script' }
 $assetUrl = Select-AssetUrl -release $release -arch $arch
 if (-not $assetUrl) {
   throw "No prebuilt binary found for windows/$arch in the latest GitHub release."
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$tmpDir = New-Item -ItemType Directory -Force -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("microclaw-install-" + [guid]::NewGuid().ToString()))
+$tmpDir = New-Item -ItemType Directory -Force -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("finally-a-value-bot-install-" + [guid]::NewGuid().ToString()))
 try {
-  $archivePath = Join-Path $tmpDir.FullName 'microclaw.zip'
+  $archivePath = Join-Path $tmpDir.FullName 'finally-a-value-bot.zip'
   Write-Info "Downloading: $assetUrl"
   Invoke-WebRequest -Uri $assetUrl -OutFile $archivePath
 
@@ -96,7 +96,7 @@ try {
 
   $pathUpdated = Ensure-UserPathContains $InstallDir
 
-  Write-Info "Installed microclaw to: $targetPath"
+  Write-Info "Installed finally-a-value-bot to: $targetPath"
   if ($pathUpdated) {
     Write-Info "Added '$InstallDir' to your user PATH."
     Write-Info "Open a new terminal if command lookup does not refresh immediately."
@@ -104,10 +104,10 @@ try {
     Write-Info "PATH already contains '$InstallDir'."
   }
 
-  if (Get-Command microclaw -ErrorAction SilentlyContinue) {
-    Write-Info "Run: microclaw help"
+  if (Get-Command finally-a-value-bot -ErrorAction SilentlyContinue) {
+    Write-Info "Run: finally-a-value-bot help"
   } else {
-    Write-Info "If 'microclaw' is not found, open a new terminal and run: microclaw help"
+    Write-Info "If 'finally-a-value-bot' is not found, open a new terminal and run: finally-a-value-bot help"
   }
 
   if (-not (Get-Command agent-browser.cmd -ErrorAction SilentlyContinue) -and -not (Get-Command agent-browser -ErrorAction SilentlyContinue)) {

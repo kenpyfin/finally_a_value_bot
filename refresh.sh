@@ -6,13 +6,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-BIN_NAME="microclaw"
+BIN_NAME="finally-a-value-bot"
 BIN="${BIN:-$ROOT_DIR/target/release/$BIN_NAME}"
 
 # Same install-dir logic as install.sh so refresh updates the same place install put the binary.
 detect_install_dir() {
-  if [ -n "${MICROCLAW_INSTALL_DIR:-}" ]; then
-    echo "$MICROCLAW_INSTALL_DIR"
+  if [ -n "${FINALLY_A_VALUE_BOT_INSTALL_DIR:-}" ]; then
+    echo "$FINALLY_A_VALUE_BOT_INSTALL_DIR"
     return
   fi
   if [ -w "/usr/local/bin" ]; then
@@ -32,10 +32,10 @@ Usage:
   ./refresh.sh [--help]
 
 Builds the release binary, installs it to the same directory install.sh uses
-(MICROCLAW_INSTALL_DIR, or /usr/local/bin if writable, or ~/.local/bin), then
-restarts the gateway. After this, "microclaw start" runs the new code.
+(FINALLY_A_VALUE_BOT_INSTALL_DIR, or /usr/local/bin if writable, or ~/.local/bin), then
+restarts the gateway. After this, "finally-a-value-bot start" runs the new code.
 
-Override: BIN=/path/to/microclaw ./refresh.sh  or  MICROCLAW_INSTALL_DIR=/path ./refresh.sh
+Override: BIN=/path/to/finally-a-value-bot ./refresh.sh  or  FINALLY_A_VALUE_BOT_INSTALL_DIR=/path ./refresh.sh
 EOF
 }
 
@@ -62,7 +62,7 @@ fi
 
 if [ "$(uname -s)" = "Darwin" ]; then
   # On macOS, a copied binary in ~/.local/bin can be killed when run (path-based security).
-  # Use a symlink so 'microclaw' runs the binary at repo path, which works.
+  # Use a symlink so 'finally-a-value-bot' runs the binary at repo path, which works.
   $USE_SUDO rm -f "$INSTALL_PATH"
   $USE_SUDO ln -sf "$ROOT_DIR/target/release/$BIN_NAME" "$INSTALL_PATH"
   echo "Linked $INSTALL_PATH -> $ROOT_DIR/target/release/$BIN_NAME"
@@ -95,6 +95,6 @@ fi
 echo ""
 echo "Done."
 echo ""
-echo "Note: The gateway is now running the new binary. On macOS, 'microclaw' in PATH is a"
-echo "      symlink to the repo binary so it runs correctly. You do not need 'microclaw start'"
-echo "      unless you want the bot in the foreground; then run: microclaw gateway stop first."
+echo "Note: The gateway is now running the new binary. On macOS, 'finally-a-value-bot' in PATH is a"
+echo "      symlink to the repo binary so it runs correctly. You do not need 'finally-a-value-bot start'"
+echo "      unless you want the bot in the foreground; then run: finally-a-value-bot gateway stop first."

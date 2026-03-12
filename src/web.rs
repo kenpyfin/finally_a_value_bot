@@ -1,5 +1,4 @@
-use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
@@ -16,9 +15,9 @@ use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info};
 
-use crate::channel::deliver_and_store_bot_message;
+use crate::channel::deliver_to_contact;
 use crate::config::Config;
-use crate::db::{call_blocking, ChatSummary, Persona, StoredMessage};
+use crate::db::{call_blocking, Persona, StoredMessage};
 use crate::social_oauth;
 use crate::claude::Message;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
@@ -319,33 +318,6 @@ fn require_auth(
     }
 }
 
-fn normalize_session_key(session_key: Option<&str>) -> String {
-    let key = session_key.unwrap_or("main").trim();
-    if key.is_empty() {
-        "main".into()
-    } else {
-        key.into()
-    }
-}
-
-fn session_key_to_chat_id(session_key: &str) -> i64 {
-    // Stable mapping into i64 space; we mark these chats with chat_type="web".
-    let mut hasher = DefaultHasher::new();
-    format!("web:{session_key}").hash(&mut hasher);
-    let hash = hasher.finish();
-    (hash & 0x3FFF_FFFF_FFFF_FFFF) as i64
-}
-
-#[derive(Debug, Serialize)]
-struct SessionItem {
-    session_key: String,
-    label: String,
-    chat_id: i64,
-    chat_type: String,
-    last_message_time: String,
-    last_message_preview: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct HistoryItem {
     id: String,
@@ -357,13 +329,16 @@ struct HistoryItem {
 
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
-    session_key: Option<String>,
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
     limit: Option<usize>,
+    day: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SendRequest {
-    session_key: Option<String>,
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
     sender_name: Option<String>,
     message: String,
 }
@@ -376,18 +351,69 @@ struct StreamQuery {
 
 #[derive(Debug, Deserialize)]
 struct ResetRequest {
-    session_key: Option<String>,
+    chat_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PersonasQuery {
-    session_key: Option<String>,
+    chat_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PersonasSwitchRequest {
-    session_key: Option<String>,
+    chat_id: Option<i64>,
     persona_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonaCreateRequest {
+    chat_id: Option<i64>,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonaDeleteRequest {
+    chat_id: Option<i64>,
+    persona_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContactsBindRequest {
+    #[allow(dead_code)]
+    chat_id: Option<i64>,
+    /// Canonical chat_id of the contact to bind web to (e.g. from Telegram).
+    contact_chat_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContactsUnlinkRequest {
+    #[allow(dead_code)]
+    chat_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SchedulesQuery {
+    chat_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleCreateRequest {
+    chat_id: Option<i64>,
+    prompt: String,
+    schedule_type: String,  // "cron" | "once"
+    schedule_value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteSessionRequest {
+    chat_id: Option<i64>,
+    #[allow(dead_code)]
+    persona_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleUpdateRequest {
+    status: String, // "paused" | "active" | "cancelled"
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,106 +587,48 @@ async fn api_update_config(
     })))
 }
 
-fn map_chat_to_session(chat: ChatSummary) -> SessionItem {
-    let source = match chat.chat_type.as_str() {
-        "web" => "web",
-        "discord" => "discord",
-        "whatsapp" => "whatsapp",
-        "telegram_private" | "telegram_group" | "telegram_supergroup" | "telegram_channel" => {
-            "telegram"
-        }
-        // Backward compatibility for old rows written before source-specific chat_type.
-        "private" | "group" | "supergroup" | "channel" => {
-            if chat
-                .chat_title
-                .as_deref()
-                .is_some_and(|t| t.starts_with("discord-"))
-            {
-                "discord"
-            } else {
-                "telegram"
-            }
-        }
-        _ => chat.chat_type.as_str(),
-    };
+/// Single universal chat; no multi-chat concept. Web always uses this chat.
+const DEFAULT_UNIVERSAL_CHAT_ID: i64 = 997894126;
 
-    let fallback = format!("{}:{}", source, chat.chat_id);
-    let mut label = chat.chat_title.clone().unwrap_or_else(|| fallback.clone());
-
-    if label.starts_with("private:")
-        || label.starts_with("group:")
-        || label.starts_with("supergroup:")
-        || label.starts_with("channel:")
-    {
-        label = fallback.clone();
-    }
-
-    let session_key = if source == "web" {
-        chat.chat_title
-            .as_deref()
-            .map(|t| normalize_session_key(Some(t)))
-            .unwrap_or_else(|| format!("chat:{}", chat.chat_id))
-    } else {
-        format!("chat:{}", chat.chat_id)
-    };
-
-    SessionItem {
-        session_key,
-        label,
-        chat_id: chat.chat_id,
-        chat_type: source.to_string(),
-        last_message_time: chat.last_message_time,
-        last_message_preview: chat.last_message_preview,
-    }
+/// Resolve chat_id for web requests. Always returns the single universal chat.
+/// chat_id in request is ignored; there is only one conversation across all channels.
+fn resolve_chat_id_for_web(_chat_id: Option<i64>, config: &Config) -> Result<i64, (StatusCode, String)> {
+    Ok(config.universal_chat_id.unwrap_or(DEFAULT_UNIVERSAL_CHAT_ID))
 }
 
-fn parse_chat_id_from_session_key(session_key: &str) -> Option<i64> {
-    session_key
-        .strip_prefix("chat:")
-        .and_then(|s| s.parse::<i64>().ok())
-}
-
-fn resolve_chat_id(session_key: &str) -> i64 {
-    parse_chat_id_from_session_key(session_key)
-        .unwrap_or_else(|| session_key_to_chat_id(session_key))
-}
-
-async fn resolve_chat_id_for_session_key(
+/// Ensure web binding exists for the single universal chat. Creates chat on first use.
+async fn ensure_web_binding_for_universal(
     state: &WebState,
-    session_key: &str,
-) -> Result<i64, (StatusCode, String)> {
-    if let Some(parsed) = parse_chat_id_from_session_key(session_key) {
-        return Ok(parsed);
-    }
-
-    let key = session_key.to_string();
-    let by_title = call_blocking(state.app_state.db.clone(), move |db| {
-        db.get_recent_chats(4000)
+    chat_id: i64,
+) -> Result<(), (StatusCode, String)> {
+    let cid = chat_id;
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.resolve_canonical_chat_id("web", "default", Some(cid))
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .into_iter()
-    .find(|c| c.chat_title.as_deref() == Some(key.as_str()))
-    .map(|c| c.chat_id);
-
-    Ok(by_title.unwrap_or_else(|| resolve_chat_id(session_key)))
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(())
 }
 
-async fn api_sessions(
+async fn api_chat(
     headers: HeaderMap,
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
 
-    let chats = call_blocking(state.app_state.db.clone(), |db| db.get_recent_chats(400))
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let cid = chat_id;
+    let persona_id = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let sessions = chats
-        .into_iter()
-        .map(map_chat_to_session)
-        .collect::<Vec<_>>();
-    Ok(Json(json!({ "ok": true, "sessions": sessions })))
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "persona_id": persona_id,
+    })))
 }
 
 async fn api_history(
@@ -670,26 +638,38 @@ async fn api_history(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
 
-    let session_key = normalize_session_key(query.session_key.as_deref());
-    let chat_id = resolve_chat_id(&session_key);
-    let cid = chat_id;
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
 
-    let persona_id = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = query.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
     let cid2 = chat_id;
     let pid = persona_id;
-    let mut messages = call_blocking(state.app_state.db.clone(), move |db| {
-        db.get_all_messages(cid2, pid)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if let Some(limit) = query.limit {
-        if messages.len() > limit {
-            messages = messages[messages.len() - limit..].to_vec();
+    let messages = if let Some(ref day) = query.day {
+        let (from_date, to_date) = day_range(day);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_messages_for_date_range(cid2, pid, Some(from_date.as_str()), Some(to_date.as_str()), 2000)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        let mut msgs = call_blocking(state.app_state.db.clone(), move |db| db.get_all_messages(cid2, pid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Some(limit) = query.limit {
+            if msgs.len() > limit {
+                msgs = msgs[msgs.len() - limit..].to_vec();
+            }
         }
-    }
+        msgs
+    };
 
     let items: Vec<HistoryItem> = messages
         .into_iter()
@@ -704,9 +684,57 @@ async fn api_history(
 
     Ok(Json(json!({
         "ok": true,
-        "session_key": session_key,
         "chat_id": chat_id,
+        "persona_id": persona_id,
         "messages": items,
+    })))
+}
+
+/// Return (from_date, to_date) as ISO strings for a given day (YYYY-MM-DD).
+fn day_range(day: &str) -> (String, String) {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+        let start: chrono::DateTime<chrono::Utc> = chrono::DateTime::from_naive_utc_and_offset(
+            d.and_hms_opt(0, 0, 0).unwrap(),
+            chrono::Utc,
+        );
+        let end: chrono::DateTime<chrono::Utc> = chrono::DateTime::from_naive_utc_and_offset(
+            d.and_hms_opt(23, 59, 59).unwrap(),
+            chrono::Utc,
+        );
+        return (start.to_rfc3339(), end.to_rfc3339());
+    }
+    ("".into(), "".into())
+}
+
+async fn api_history_days(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = query.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let cid2 = chat_id;
+    let pid = persona_id;
+    let days = call_blocking(state.app_state.db.clone(), move |db| db.get_message_days(cid2, pid))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "persona_id": persona_id,
+        "days": days,
     })))
 }
 
@@ -717,12 +745,13 @@ async fn api_send(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let start = Instant::now();
-    let session_key = normalize_session_key(body.session_key.as_deref());
-    if let Err((status, msg)) = state.request_hub.begin(&session_key, &state.limits).await {
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let key = format!("chat:{}", chat_id);
+    if let Err((status, msg)) = state.request_hub.begin(&key, &state.limits).await {
         info!(
             target: "web",
             endpoint = "/api/send",
-            session_key = %session_key,
+            chat_id = chat_id,
             status = status.as_u16(),
             reason = %msg,
             "Request rejected by limiter"
@@ -730,14 +759,11 @@ async fn api_send(
         return Err((status, msg));
     }
     let result = send_and_store_response(state.clone(), body).await;
-    state
-        .request_hub
-        .end_with_limits(&session_key, &state.limits)
-        .await;
+    state.request_hub.end_with_limits(&key, &state.limits).await;
     info!(
         target: "web",
         endpoint = "/api/send",
-        session_key = %session_key,
+        chat_id = chat_id,
         ok = result.is_ok(),
         latency_ms = start.elapsed().as_millis(),
         "Completed request"
@@ -758,12 +784,13 @@ async fn api_send_stream(
         return Err((StatusCode::BAD_REQUEST, "message is required".into()));
     }
 
-    let session_key = normalize_session_key(body.session_key.as_deref());
-    if let Err((status, msg)) = state.request_hub.begin(&session_key, &state.limits).await {
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let key = format!("chat:{}", chat_id);
+    if let Err((status, msg)) = state.request_hub.begin(&key, &state.limits).await {
         info!(
             target: "web",
             endpoint = "/api/send_stream",
-            session_key = %session_key,
+            chat_id = chat_id,
             status = status.as_u16(),
             reason = %msg,
             "Request rejected by limiter"
@@ -775,16 +802,12 @@ async fn api_send_stream(
     state.run_hub.create(&run_id).await;
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();
-    let lock = state
-        .session_hub
-        .lock_for(&session_key, &state.limits)
-        .await;
+    let lock = state.session_hub.lock_for(&key, &state.limits).await;
     let limits = state.limits.clone();
-    let session_key_for_release = session_key.clone();
-    info!(
-        target: "web",
-        endpoint = "/api/send_stream",
-        session_key = %session_key,
+    let key_for_release = key.clone();
+        info!(
+            target: "web",
+            endpoint = "/api/send_stream",
         run_id = %run_id,
         latency_ms = start.elapsed().as_millis(),
         "Accepted stream run"
@@ -908,12 +931,12 @@ async fn api_send_stream(
         let _ = forward.await;
         state_for_task
             .request_hub
-            .end_with_limits(&session_key_for_release, &limits)
+            .end_with_limits(&key_for_release, &limits)
             .await;
         info!(
             target: "web",
             endpoint = "/api/send_stream",
-            session_key = %session_key_for_release,
+            chat_id = chat_id,
             run_id = %run_id_for_task,
             latency_ms = run_start.elapsed().as_millis(),
             "Stream run finished"
@@ -1038,11 +1061,9 @@ async fn send_and_store_response(
     state: WebState,
     body: SendRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let session_key = normalize_session_key(body.session_key.as_deref());
-    let lock = state
-        .session_hub
-        .lock_for(&session_key, &state.limits)
-        .await;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let key = format!("chat:{}", chat_id);
+    let lock = state.session_hub.lock_for(&key, &state.limits).await;
     let _guard = lock.lock().await;
     send_and_store_response_with_events(state, body, None).await
 }
@@ -1059,35 +1080,21 @@ async fn send_and_store_response_with_events(
 
     // Single entry point: parse slash command first. If command, run backend handler and return — never send to LLM.
     if let Some(cmd) = parse_slash_command(&text) {
-        let session_key = normalize_session_key(body.session_key.as_deref());
-        let chat_id = resolve_chat_id(&session_key);
-        let parsed_chat_id = parse_chat_id_from_session_key(&session_key);
-        if let Some(explicit_chat_id) = parsed_chat_id {
-            let chat_type = call_blocking(state.app_state.db.clone(), move |db| {
-                db.get_chat_type(explicit_chat_id)
-            })
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            if !matches!(chat_type.as_deref(), Some("web")) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "this channel is read-only in Web UI; use source channel to send".into(),
-                ));
-            }
-        } else {
-            let session_key_for_chat = session_key.clone();
-            call_blocking(state.app_state.db.clone(), move |db| {
-                db.upsert_chat(chat_id, Some(&session_key_for_chat), "web")
-            })
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-        let cid = chat_id;
-        let persona_id = call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(cid)
+        let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+        ensure_web_binding_for_universal(&state, chat_id).await?;
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.upsert_chat(chat_id, Some("default"), "web")
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let cid = chat_id;
+        let persona_id = if let Some(pid) = body.persona_id {
+            pid
+        } else {
+            call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
 
         let resp = match cmd {
             SlashCommand::Reset => {
@@ -1136,9 +1143,10 @@ async fn send_and_store_response_with_events(
             }
         };
 
-        deliver_and_store_bot_message(
-            &state.app_state.bot,
+        deliver_to_contact(
             state.app_state.db.clone(),
+            Some(&state.app_state.bot),
+            state.app_state.discord_http.as_deref(),
             &state.app_state.config.bot_username,
             chat_id,
             persona_id,
@@ -1148,16 +1156,14 @@ async fn send_and_store_response_with_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(Json(json!({
             "ok": true,
-            "session_key": session_key,
             "chat_id": chat_id,
             "response": resp,
         })));
     }
 
     // Not a slash command: normal flow — resolve, store message, run agent
-    let session_key = normalize_session_key(body.session_key.as_deref());
-    let chat_id = resolve_chat_id(&session_key);
-    let parsed_chat_id = parse_chat_id_from_session_key(&session_key);
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
     let sender_name = body
         .sender_name
         .as_deref()
@@ -1166,34 +1172,22 @@ async fn send_and_store_response_with_events(
         .unwrap_or("web-user")
         .to_string();
 
-    if let Some(explicit_chat_id) = parsed_chat_id {
-        let chat_type = call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_chat_type(explicit_chat_id)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        if !matches!(chat_type.as_deref(), Some("web")) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "this channel is read-only in Web UI; use source channel to send".into(),
-            ));
-        }
-    } else {
-        let session_key_for_chat = session_key.clone();
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.upsert_chat(chat_id, Some(&session_key_for_chat), "web")
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-
-    let cid = chat_id;
-    let persona_id = call_blocking(state.app_state.db.clone(), move |db| {
-        db.get_current_persona_id(cid)
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.upsert_chat(chat_id, Some("default"), "web")
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
 
     let user_msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1241,9 +1235,10 @@ async fn send_and_store_response_with_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
-    deliver_and_store_bot_message(
-        &state.app_state.bot,
+    deliver_to_contact(
         state.app_state.db.clone(),
+        Some(&state.app_state.bot),
+        state.app_state.discord_http.as_deref(),
         &state.app_state.config.bot_username,
         chat_id,
         persona_id,
@@ -1254,12 +1249,12 @@ async fn send_and_store_response_with_events(
 
     Ok(Json(json!({
         "ok": true,
-        "session_key": session_key,
         "chat_id": chat_id,
         "response": response,
     })))
 }
 
+/// Clear context: delete only the current persona's session for this contact (per-persona reset).
 async fn api_reset(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -1267,41 +1262,17 @@ async fn api_reset(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
 
-    let session_key = normalize_session_key(body.session_key.as_deref());
-    let chat_id = resolve_chat_id_for_session_key(&state, &session_key).await?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
 
-    let chat_type = call_blocking(state.app_state.db.clone(), move |db| {
-        db.get_chat_type(chat_id)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let deleted = if matches!(chat_type.as_deref(), Some("web")) {
-        let deleted = call_blocking(state.app_state.db.clone(), move |db| {
-            db.delete_chat_data(chat_id)
-        })
+    let cid = chat_id;
+    let pid = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Keep the web session entry in the session list after clearing context.
-        let session_key_for_chat = session_key.clone();
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.upsert_chat(chat_id, Some(&session_key_for_chat), "web")
-        })
+    let cid2 = chat_id;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| db.delete_session(cid2, pid))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        deleted
-    } else {
-        let cid = chat_id;
-        let pid = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let cid2 = chat_id;
-        call_blocking(state.app_state.db.clone(), move |db| db.delete_session(cid2, pid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
 
     Ok(Json(json!({
         "ok": true,
@@ -1313,12 +1284,12 @@ async fn api_reset(
 async fn api_delete_session(
     headers: HeaderMap,
     State(state): State<WebState>,
-    Json(body): Json<ResetRequest>,
+    Json(body): Json<DeleteSessionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
 
-    let session_key = normalize_session_key(body.session_key.as_deref());
-    let chat_id = resolve_chat_id_for_session_key(&state, &session_key).await?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
 
     let deleted = call_blocking(state.app_state.db.clone(), move |db| {
         db.delete_chat_data(chat_id)
@@ -1340,8 +1311,8 @@ async fn api_personas(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
 
-    let session_key = normalize_session_key(query.session_key.as_deref());
-    let chat_id = resolve_chat_id_for_session_key(&state, &session_key).await?;
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
     let cid = chat_id;
 
     let personas: Vec<Persona> = call_blocking(state.app_state.db.clone(), move |db| db.list_personas(cid))
@@ -1367,7 +1338,6 @@ async fn api_personas(
 
     Ok(Json(json!({
         "ok": true,
-        "session_key": session_key,
         "chat_id": chat_id,
         "personas": items,
     })))
@@ -1380,8 +1350,8 @@ async fn api_personas_switch(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
 
-    let session_key = normalize_session_key(body.session_key.as_deref());
-    let chat_id = resolve_chat_id_for_session_key(&state, &session_key).await?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
     let persona_name = body.persona_name.clone();
     let persona_name_for_msg = persona_name.clone();
 
@@ -1414,6 +1384,239 @@ async fn api_personas_switch(
     Ok(Json(json!({
         "ok": true,
         "message": format!("Switched to {}", persona_name_for_msg),
+    })))
+}
+
+async fn api_personas_create(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<PersonaCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Persona name cannot be empty".into()));
+    }
+    let name_owned = name.to_string();
+    let persona_id = call_blocking(state.app_state.db.clone(), move |db| {
+        db.create_persona(chat_id, &name_owned, None)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": persona_id,
+        "message": format!("Persona '{}' created", name),
+    })))
+}
+
+async fn api_personas_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<PersonaDeleteRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let persona_id = body.persona_id;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_persona(chat_id, persona_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "deleted": deleted,
+        "message": if deleted { "Persona deleted" } else { "Persona not found or cannot delete default" },
+    })))
+}
+
+async fn api_contacts_bind(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ContactsBindRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let contact_chat_id = body.contact_chat_id;
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.link_channel(contact_chat_id, "web", "default")
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Web bound to contact",
+        "contact_chat_id": contact_chat_id,
+    })))
+}
+
+async fn api_contacts_unlink(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(_body): Json<ContactsUnlinkRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let removed = call_blocking(state.app_state.db.clone(), move |db| {
+        db.unlink_channel("web", "default")
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "removed": removed,
+        "message": if removed { "Web unlinked from contact" } else { "No binding found" },
+    })))
+}
+
+async fn api_schedules_list(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<SchedulesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let tasks = call_blocking(state.app_state.db.clone(), move |db| db.get_tasks_for_chat(chat_id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let items: Vec<serde_json::Value> = tasks
+        .into_iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "chat_id": t.chat_id,
+                "prompt": t.prompt,
+                "schedule_type": t.schedule_type,
+                "schedule_value": t.schedule_value,
+                "next_run": t.next_run,
+                "last_run": t.last_run,
+                "status": t.status,
+                "created_at": t.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "tasks": items,
+    })))
+}
+
+async fn api_schedules_create(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ScheduleCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let tz = state.app_state.config.timezone.as_str();
+
+    let next_run = match body.schedule_type.as_str() {
+        "cron" => crate::tools::schedule::compute_next_run(&body.schedule_value, tz)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        "once" => {
+            if chrono::DateTime::parse_from_rfc3339(&body.schedule_value).is_err() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid ISO 8601 timestamp for one-time schedule".into(),
+                ));
+            }
+            body.schedule_value.clone()
+        }
+        _ => return Err((StatusCode::BAD_REQUEST, "schedule_type must be 'cron' or 'once'".into())),
+    };
+
+    let prompt = body.prompt;
+    let schedule_type = body.schedule_type;
+    let schedule_value = body.schedule_value;
+    let next_run_for_db = next_run.clone();
+    let id = call_blocking(state.app_state.db.clone(), move |db| {
+        db.create_scheduled_task(chat_id, &prompt, &schedule_type, &schedule_value, &next_run_for_db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "message": "Schedule created",
+        "next_run": next_run,
+    })))
+}
+
+async fn api_schedules_update(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    axum::extract::Path(task_id): axum::extract::Path<i64>,
+    Json(body): Json<ScheduleUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let status = match body.status.as_str() {
+        "paused" => "paused",
+        "active" | "resumed" => "active",
+        "cancelled" => "cancelled",
+        _ => return Err((StatusCode::BAD_REQUEST, "status must be paused, active, or cancelled".into())),
+    };
+
+    let ok = call_blocking(state.app_state.db.clone(), move |db| db.update_task_status(task_id, status))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !ok {
+        return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": format!("Task updated to {}", status),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ContactsBindingsQuery {
+    chat_id: Option<i64>,
+}
+
+async fn api_contacts_bindings(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<ContactsBindingsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let bindings = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_bindings_for_contact(chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let items: Vec<serde_json::Value> = bindings
+        .into_iter()
+        .map(|b| json!({ "channel_type": b.channel_type, "channel_handle": b.channel_handle }))
+        .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "bindings": items,
     })))
 }
 
@@ -1482,7 +1685,6 @@ async fn favicon_file() -> impl IntoResponse {
 #[derive(Debug, Deserialize)]
 struct OAuthAuthorizeQuery {
     chat_id: Option<i64>,
-    session_key: Option<String>,
 }
 
 async fn api_oauth_authorize(
@@ -1498,13 +1700,7 @@ async fn api_oauth_authorize(
         return Err((StatusCode::BAD_REQUEST, "Platform not configured".into()));
     }
 
-    let chat_id = match (query.chat_id, query.session_key) {
-        (Some(id), _) => id,
-        (_, Some(sk)) => {
-            resolve_chat_id_for_session_key(&state, &normalize_session_key(Some(&sk))).await?
-        }
-        _ => return Err((StatusCode::BAD_REQUEST, "Provide chat_id or session_key".into())),
-    };
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
 
     let state_token = uuid::Uuid::new_v4().simple().to_string();
     let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
@@ -1670,8 +1866,14 @@ fn build_router(web_state: WebState) -> Router {
         .route("/favicon.ico", get(favicon_file))
         .route("/api/health", get(api_health))
         .route("/api/config", get(api_get_config).put(api_update_config))
-        .route("/api/sessions", get(api_sessions))
+        .route("/api/chat", get(api_chat))
+        .route("/api/contacts/bind", post(api_contacts_bind))
+        .route("/api/contacts/unlink", post(api_contacts_unlink))
+        .route("/api/contacts/bindings", get(api_contacts_bindings))
+        .route("/api/schedules", get(api_schedules_list).post(api_schedules_create))
+        .route("/api/schedules/:id", patch(api_schedules_update))
         .route("/api/history", get(api_history))
+        .route("/api/history/days", get(api_history_days))
         .route("/api/send", post(api_send))
         .route("/api/send_stream", post(api_send_stream))
         .route("/api/stream", get(api_stream))
@@ -1680,6 +1882,8 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/delete_session", post(api_delete_session))
         .route("/api/personas", get(api_personas))
         .route("/api/personas/switch", post(api_personas_switch))
+        .route("/api/personas/create", post(api_personas_create))
+        .route("/api/personas/delete", post(api_personas_delete))
         .route("/api/oauth/authorize/:platform", get(api_oauth_authorize))
         .route("/api/oauth/callback/:platform", get(api_oauth_callback))
         .with_state(web_state)
@@ -1691,7 +1895,7 @@ mod tests {
     use crate::config::Config;
     use crate::db::call_blocking;
     use crate::llm::LlmProvider;
-    use crate::{claude::ResponseContentBlock, error::MicroClawError};
+    use crate::{claude::ResponseContentBlock, error::FinallyAValueBotError};
     use crate::{db::Database, memory::MemoryManager, skills::SkillManager, tools::ToolRegistry};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1730,7 +1934,7 @@ mod tests {
             _system: &str,
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
-        ) -> Result<crate::claude::MessagesResponse, crate::error::MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, crate::error::FinallyAValueBotError> {
             Ok(crate::claude::MessagesResponse {
                 content: vec![crate::claude::ResponseContentBlock::Text {
                     text: "hello from llm".into(),
@@ -1746,7 +1950,7 @@ mod tests {
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
             text_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-        ) -> Result<crate::claude::MessagesResponse, crate::error::MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, crate::error::FinallyAValueBotError> {
             if let Some(tx) = text_tx {
                 let _ = tx.send("hello ".into());
                 let _ = tx.send("from llm".into());
@@ -1766,7 +1970,7 @@ mod tests {
             _system: &str,
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
-        ) -> Result<crate::claude::MessagesResponse, MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, FinallyAValueBotError> {
             tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
             Ok(crate::claude::MessagesResponse {
                 content: vec![ResponseContentBlock::Text {
@@ -1789,7 +1993,7 @@ mod tests {
             _system: &str,
             _messages: Vec<crate::claude::Message>,
             _tools: Option<Vec<crate::claude::ToolDefinition>>,
-        ) -> Result<crate::claude::MessagesResponse, MicroClawError> {
+        ) -> Result<crate::claude::MessagesResponse, FinallyAValueBotError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 return Ok(crate::claude::MessagesResponse {
@@ -1813,7 +2017,7 @@ mod tests {
         }
     }
 
-    fn test_state(llm: Box<dyn LlmProvider>) -> Arc<AppState> {
+    fn test_state(llm: Arc<dyn LlmProvider>) -> Arc<AppState> {
         let mut cfg = Config {
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
@@ -1848,6 +2052,7 @@ mod tests {
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
             web_session_idle_ttl_seconds: 300,
+            universal_chat_id: Some(997894126),
             browser_managed: false,
             browser_executable_path: None,
             browser_cdp_port_base: 9222,
@@ -1861,8 +2066,18 @@ mod tests {
             vault: None,
             orchestrator_enabled: true,
             orchestrator_model: String::new(),
+            tool_skill_agent_enabled: true,
+            tool_skill_agent_model: String::new(),
+            post_tool_evaluator_enabled: false,
+            post_tool_evaluator_model: String::new(),
+            delegate_tool_enabled: true,
+            delegate_max_iterations: 10,
+            delegate_model: String::new(),
+            cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
+            cursor_agent_tmux_enabled: true,
+            cursor_agent_runner_url: None,
         };
-        let dir = std::env::temp_dir().join(format!("microclaw_webtest_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_webtest_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         cfg.workspace_dir = dir.to_string_lossy().to_string();
         let runtime_dir = cfg.runtime_data_dir();
@@ -1883,12 +2098,13 @@ mod tests {
             },
             llm,
             tools: ToolRegistry::new(&cfg, bot, db),
+            discord_http: None,
         };
         Arc::new(state)
     }
 
     fn test_web_state(
-        llm: Box<dyn LlmProvider>,
+        llm: Arc<dyn LlmProvider>,
         auth_token: Option<String>,
         limits: WebLimits,
     ) -> WebState {
@@ -1905,7 +2121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_then_stream_done() {
-        let web_state = test_web_state(Box::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -1913,7 +2129,7 @@ mod tests {
             .uri("/api/send_stream")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"session_key":"main","sender_name":"u","message":"hi"}"#,
+                r#"{"sender_name":"u","message":"hi"}"#,
             ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -1941,7 +2157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_slash_command_via_send_stream_returns_done_with_response() {
-        let web_state = test_web_state(Box::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -1949,7 +2165,7 @@ mod tests {
             .uri("/api/send_stream")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"session_key":"main","sender_name":"u","message":"/reset"}"#,
+                r#"{"sender_name":"u","message":"/reset"}"#,
             ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -1989,7 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_failure_requires_header() {
         let web_state = test_web_state(
-            Box::new(DummyLlm),
+            Arc::new(DummyLlm),
             Some("secret-token".into()),
             WebLimits::default(),
         );
@@ -2021,7 +2237,7 @@ mod tests {
             .uri("/api/send")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"session_key":"main","sender_name":"u","message":"one"}"#,
+                r#"{"sender_name":"u","message":"one"}"#,
             ))
             .unwrap();
         let req2 = Request::builder()
@@ -2029,7 +2245,7 @@ mod tests {
             .uri("/api/send")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"session_key":"main","sender_name":"u","message":"two"}"#,
+                r#"{"sender_name":"u","message":"two"}"#,
             ))
             .unwrap();
 
@@ -2059,7 +2275,7 @@ mod tests {
             .uri("/api/send_stream")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"session_key":"main","sender_name":"u","message":"do tool"}"#,
+                r#"{"sender_name":"u","message":"do tool"}"#,
             ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -2123,7 +2339,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconnect_from_last_event_id_gets_non_empty_replay() {
-        let web_state = test_web_state(Box::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -2131,7 +2347,7 @@ mod tests {
             .uri("/api/send_stream")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"session_key":"main","sender_name":"u","message":"reconnect"}"#,
+                r#"{"sender_name":"u","message":"reconnect"}"#,
             ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -2190,7 +2406,7 @@ mod tests {
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Box::new(DummyLlm), None, limits);
+        let web_state = test_web_state(Arc::new(DummyLlm), None, limits);
         let app = build_router(web_state);
 
         let mk_req = |msg: &str| {
@@ -2199,7 +2415,7 @@ mod tests {
                 .uri("/api/send")
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    r#"{{"session_key":"main","sender_name":"u","message":"{}"}}"#,
+                    r#"{{"sender_name":"u","message":"{}"}}"#,
                     msg
                 )))
                 .unwrap()
@@ -2218,7 +2434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_db_paths_use_call_blocking_in_web_flow() {
-        let state = test_state(Box::new(DummyLlm));
+        let state = test_state(Arc::new(DummyLlm));
         let chat_id = 12345_i64;
         let cid = chat_id;
         let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(cid)).await.unwrap_or(0);

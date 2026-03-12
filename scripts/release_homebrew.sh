@@ -18,8 +18,8 @@ REPO_DIR="$ROOT_DIR"
 TAP_DIR_DEFAULT="$ROOT_DIR/../../github/homebrew-tap"
 TAP_DIR="${TAP_DIR:-$TAP_DIR_DEFAULT}"
 TAP_REPO="everettjf/homebrew-tap"
-FORMULA_PATH="Formula/microclaw.rb"
-GITHUB_REPO="microclaw/microclaw"
+FORMULA_PATH="Formula/finally-a-value-bot.rb"
+GITHUB_REPO="finally-a-value-bot/finally-a-value-bot"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -61,7 +61,7 @@ build_release_notes() {
   fi
 
   {
-    echo "MicroClaw $new_tag"
+    echo "FinallyAValueBot $new_tag"
     echo
     echo "## Change log"
     if [ -n "$changes" ]; then
@@ -142,7 +142,7 @@ fi
 echo "Building release binary..."
 cargo build --release
 
-BINARY="target/release/microclaw"
+BINARY="target/release/finally-a-value-bot"
 if [ ! -f "$BINARY" ]; then
   echo "Binary not found: $BINARY" >&2
   exit 1
@@ -150,10 +150,10 @@ fi
 
 # --- Create tarball ---
 ARCH="$(detect_arch)"
-TARBALL_NAME="microclaw-$NEW_VERSION-${ARCH}-apple-darwin.tar.gz"
+TARBALL_NAME="finally-a-value-bot-$NEW_VERSION-${ARCH}-apple-darwin.tar.gz"
 TARBALL_PATH="target/release/$TARBALL_NAME"
 
-tar -czf "$TARBALL_PATH" -C target/release microclaw
+tar -czf "$TARBALL_PATH" -C target/release finally-a-value-bot
 echo "Created tarball: $TARBALL_PATH"
 
 SHA256=$(shasum -a 256 "$TARBALL_PATH" | awk '{print $1}')
@@ -201,17 +201,17 @@ class Microclaw < Formula
   license "MIT"
 
   def install
-    bin.install "microclaw"
+    bin.install "finally-a-value-bot"
   end
 
   test do
-    assert_match "MicroClaw", shell_output("#{bin}/microclaw help")
+    assert_match "FinallyAValueBot", shell_output("#{bin}/finally-a-value-bot help")
   end
 end
 RUBY
 
 git add .
-git commit -m "microclaw homebrew release $NEW_VERSION"
+git commit -m "finally-a-value-bot homebrew release $NEW_VERSION"
 git push
 
 echo ""
@@ -219,4 +219,4 @@ echo "Done! Released $TAG and updated Homebrew tap."
 echo ""
 echo "Users can install with:"
 echo "  brew tap everettjf/tap"
-echo "  brew install microclaw"
+echo "  brew install finally-a-value-bot"

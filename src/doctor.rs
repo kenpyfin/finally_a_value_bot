@@ -95,7 +95,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let json_output = args.iter().any(|a| a == "--json");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Usage: microclaw doctor [--json]\n\nChecks PATH, shell/runtime dependencies, browser automation prerequisites, and MCP command dependencies."
+            "Usage: finally_a_value_bot doctor [--json]\n\nChecks PATH, shell/runtime dependencies, browser automation prerequisites, and MCP command dependencies."
         );
         return Ok(());
     }
@@ -153,14 +153,14 @@ fn check_config(report: &mut DoctorReport) {
             "Config file",
             CheckStatus::Warn,
             ".env not found".to_string(),
-            Some("Run `microclaw setup` or copy .env.example to .env.".to_string()),
+            Some("Run `finally_a_value_bot setup` or copy .env.example to .env.".to_string()),
         ),
         Err(err) => report.push(
             "config.file",
             "Config file",
             CheckStatus::Fail,
             err.to_string(),
-            Some("Fix MICROCLAW_CONFIG or create a valid config file.".to_string()),
+            Some("Fix FINALLY_A_VALUE_BOT_CONFIG or create a valid config file.".to_string()),
         ),
     }
 }
@@ -193,21 +193,21 @@ fn check_path(report: &mut DoctorReport) {
                 ),
             );
         }
-    } else if command_exists("microclaw") {
+    } else if command_exists("finally_a_value_bot") {
         report.push(
-            "path.microclaw",
-            "microclaw in PATH",
+            "path.finally_a_value_bot",
+            "finally_a_value_bot in PATH",
             CheckStatus::Pass,
-            "microclaw is discoverable in PATH".to_string(),
+            "finally_a_value_bot is discoverable in PATH".to_string(),
             None,
         );
     } else {
         report.push(
-            "path.microclaw",
-            "microclaw in PATH",
+            "path.finally_a_value_bot",
+            "finally_a_value_bot in PATH",
             CheckStatus::Warn,
-            "microclaw is not discoverable in PATH".to_string(),
-            Some("Add the microclaw binary directory to PATH.".to_string()),
+            "finally_a_value_bot is not discoverable in PATH".to_string(),
+            Some("Add the finally_a_value_bot binary directory to PATH.".to_string()),
         );
     }
 }
@@ -385,7 +385,7 @@ fn check_node_and_browser(report: &mut DoctorReport) {
 fn check_mcp_dependencies(report: &mut DoctorReport) {
     let data_root = match Config::load() {
         Ok(cfg) => cfg.data_root_dir(),
-        Err(_) => PathBuf::from("./microclaw.data"),
+        Err(_) => PathBuf::from("./finally_a_value_bot.data"),
     };
 
     let mcp_path = data_root.join("mcp.json");
@@ -496,7 +496,7 @@ fn check_mcp_dependencies(report: &mut DoctorReport) {
 }
 
 fn print_report(report: &DoctorReport) {
-    println!("MicroClaw Doctor");
+    println!("FinallyAValueBot Doctor");
     println!(
         "Environment: os={} arch={} wsl={}",
         report.platform, report.arch, report.in_wsl
