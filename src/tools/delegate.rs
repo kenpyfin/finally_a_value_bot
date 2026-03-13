@@ -23,7 +23,7 @@ const MAX_RESULT_LEN: usize = 50_000;
 const SUB_AGENT_SYSTEM: &str = "You are a focused task assistant. Complete the following task using the tools available to you. Be thorough but concise. When the task is done, reply with a clear final answer. Do not ask follow-up questions.";
 
 const LLM_TIMEOUT_SECS: u64 = 180;
-const TOOL_TIMEOUT_SECS: u64 = 120;
+const TOOL_TIMEOUT_SECS: u64 = 600;
 
 pub struct DelegateTool {
     config: Config,

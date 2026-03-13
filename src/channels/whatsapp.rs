@@ -140,12 +140,33 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     None => continue,
                 };
 
-                // Use phone number as chat_id
-                let chat_id: i64 = message.from.parse().unwrap_or(0);
-                if chat_id == 0 {
+                // Parse sender phone handle.
+                let parsed_phone_chat_id: i64 = message.from.parse().unwrap_or(0);
+                if parsed_phone_chat_id == 0 {
                     error!("Invalid WhatsApp phone number: {}", message.from);
                     continue;
                 }
+                // Resolve to unified contact (canonical_chat_id).
+                // When UNIVERSAL_CHAT_ID is configured, bind this WhatsApp handle to that canonical contact.
+                let wa_handle = message.from.clone();
+                let universal_chat_id = state.app_state.config.universal_chat_id;
+                let chat_id = match call_blocking(state.app_state.db.clone(), move |db| {
+                    if let Some(cid) = universal_chat_id {
+                        db.upsert_chat(cid, None, "whatsapp")?;
+                        db.link_channel(cid, "whatsapp", &wa_handle)?;
+                        Ok(cid)
+                    } else {
+                        Ok(parsed_phone_chat_id)
+                    }
+                })
+                .await
+                {
+                    Ok(cid) => cid,
+                    Err(e) => {
+                        error!("WhatsApp resolve canonical chat id failed: {e}");
+                        continue;
+                    }
+                };
 
                 // Single entry point: parse slash command first. If command, run backend handler and return — never send to LLM.
                 if let Some(cmd) = parse_slash_command(&text) {

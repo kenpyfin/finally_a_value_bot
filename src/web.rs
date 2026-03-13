@@ -402,6 +402,7 @@ struct ScheduleCreateRequest {
     prompt: String,
     schedule_type: String,  // "cron" | "once"
     schedule_value: String,
+    timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,14 +597,17 @@ fn resolve_chat_id_for_web(_chat_id: Option<i64>, config: &Config) -> Result<i64
     Ok(config.universal_chat_id.unwrap_or(DEFAULT_UNIVERSAL_CHAT_ID))
 }
 
-/// Ensure web binding exists for the single universal chat. Creates chat on first use.
+/// Ensure web/default always points to the configured universal chat.
+/// This allows UNIVERSAL_CHAT_ID changes to take effect on restart.
 async fn ensure_web_binding_for_universal(
     state: &WebState,
     chat_id: i64,
 ) -> Result<(), (StatusCode, String)> {
     let cid = chat_id;
     call_blocking(state.app_state.db.clone(), move |db| {
-        db.resolve_canonical_chat_id("web", "default", Some(cid))
+        db.upsert_chat(cid, None, "web")?;
+        db.link_channel(cid, "web", "default")?;
+        Ok(())
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -843,20 +847,30 @@ async fn api_send_stream(
                             )
                             .await;
                     }
-                    AgentEvent::ToolStart { name, input } => {
+                    AgentEvent::ToolStart {
+                        tool_use_id,
+                        name,
+                        input,
+                    } => {
                         run_hub
                             .publish(
                                 &run_id_for_events,
                                 "tool_start",
-                                json!({"name": name, "input": input}).to_string(),
+                                json!({
+                                    "tool_use_id": tool_use_id,
+                                    "name": name,
+                                    "input": input
+                                })
+                                .to_string(),
                                 run_history_limit,
                             )
                             .await;
                     }
                     AgentEvent::ToolResult {
+                        tool_use_id,
                         name,
                         is_error,
-                        preview,
+                        output,
                         duration_ms,
                         status_code,
                         bytes,
@@ -867,9 +881,10 @@ async fn api_send_stream(
                                 &run_id_for_events,
                                 "tool_result",
                                 json!({
+                                    "tool_use_id": tool_use_id,
                                     "name": name,
                                     "is_error": is_error,
-                                    "preview": preview,
+                                    "output": output,
                                     "duration_ms": duration_ms,
                                     "status_code": status_code,
                                     "bytes": bytes,
@@ -1524,27 +1539,17 @@ async fn api_schedules_create(
 
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
-    let tz = state.app_state.config.timezone.as_str();
-
-    let next_run = match body.schedule_type.as_str() {
-        "cron" => crate::tools::schedule::compute_next_run(&body.schedule_value, tz)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
-        "once" => {
-            if chrono::DateTime::parse_from_rfc3339(&body.schedule_value).is_err() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "Invalid ISO 8601 timestamp for one-time schedule".into(),
-                ));
-            }
-            body.schedule_value.clone()
-        }
-        _ => return Err((StatusCode::BAD_REQUEST, "schedule_type must be 'cron' or 'once'".into())),
-    };
+    let preflight = crate::tools::schedule::preflight_schedule_request(
+        &body.schedule_type,
+        &body.schedule_value,
+        body.timezone.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     let prompt = body.prompt;
     let schedule_type = body.schedule_type;
-    let schedule_value = body.schedule_value;
-    let next_run_for_db = next_run.clone();
+    let schedule_value = preflight.schedule_value.clone();
+    let next_run_for_db = preflight.next_run.clone();
     let id = call_blocking(state.app_state.db.clone(), move |db| {
         db.create_scheduled_task(chat_id, &prompt, &schedule_type, &schedule_value, &next_run_for_db)
     })
@@ -1555,7 +1560,13 @@ async fn api_schedules_create(
         "ok": true,
         "id": id,
         "message": "Schedule created",
-        "next_run": next_run,
+        "next_run": preflight.next_run,
+        "timezone": preflight.timezone_used,
+        "timezone_assumption": if preflight.timezone_defaulted_to_utc {
+            "Timezone not provided. UTC was assumed."
+        } else {
+            "Timezone provided by request."
+        },
     })))
 }
 

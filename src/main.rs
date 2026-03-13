@@ -470,12 +470,21 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
-    // Ensure 4x daily indexing schedule exists
-    if let Err(e) = db.ensure_indexing_task(
-        997894126,
-        "Run the vault indexing script: /app/workspace/shared/test-venv/bin/python3 /app/workspace/skills/index-vault/index_vault.py. When finished, send a message to the user confirming the indexing status.",
-        "0 0 */6 * * *"
-    ) {
+    // Ensure 4x daily indexing schedule exists.
+    // Build the indexing prompt dynamically: use the venv python if available, otherwise python3.
+    let index_script = workspace_root.join("skills").join("index-vault").join("index_vault.py");
+    let venv_python = workspace_root.join("shared").join(".venv-vault").join("bin").join("python");
+    let python_bin = if venv_python.exists() {
+        venv_python.to_string_lossy().to_string()
+    } else {
+        "python3".to_string()
+    };
+    let index_prompt = format!(
+        "Run the vault indexing script: {} {}. When finished, send a message to the user confirming the indexing status.",
+        python_bin,
+        index_script.display()
+    );
+    if let Err(e) = db.ensure_indexing_task(997894126, &index_prompt, "0 0 */6 * * *") {
         tracing::warn!("Failed to seed indexing schedule: {}", e);
     }
 

@@ -21,19 +21,42 @@ Run the install script to download the latest binary:
 curl -fsSL https://raw.githubusercontent.com/finally-a-value-bot/finally-a-value-bot/main/install.sh | bash
 ```
 
-### 2. Setup
+### 2. Configure
 
-Navigate to your workspace directory and run:
+Run the interactive setup wizard — it covers **every** configuration option:
 
 ```bash
 finally-a-value-bot setup
 ```
-This will guide you through configuring your Telegram bot, LLM provider, and workspace paths.
+
+Or manually copy and edit the `.env` file:
+
+```bash
+cp .env.example .env
+# Edit .env with your tokens and preferences
+```
+
+**Required** (at minimum one channel):
+- `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
+- `BOT_USERNAME` — your bot's username (without @)
+- `LLM_PROVIDER` — e.g. `anthropic`, `google`, `openai`, `ollama`
+- `LLM_API_KEY` — your LLM API key
+
+See `.env.example` for all available options (LLM, Discord, WhatsApp, Web UI, Vault, etc.).
 
 ### 3. Start
 
+**Foreground:**
 ```bash
 finally-a-value-bot start
+```
+
+**Background (Systemd/Launchd):**
+The bot includes a built-in gateway manager to handle persistent background execution.
+```bash
+finally-a-value-bot gateway install   # Install and start service
+finally-a-value-bot gateway status    # View status
+finally-a-value-bot gateway logs      # View logs
 ```
 On first run, FinallyAValueBot will send an onboarding message to get you started.
 

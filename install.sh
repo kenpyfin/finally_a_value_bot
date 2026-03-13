@@ -30,6 +30,26 @@ check_deps() {
   fi
 }
 
+build_web_assets_if_available() {
+  # Build web/dist so embedded assets match web/src before Rust compile.
+  if [ ! -d "web" ] || [ ! -f "web/package.json" ]; then
+    return 0
+  fi
+
+  if ! need_cmd npm; then
+    log_warn "npm not found; skipping web asset build. Embedded Web UI may be stale."
+    return 0
+  fi
+
+  log_info "Building Web UI assets..."
+  (
+    cd web
+    npm install
+    npm run build
+  )
+  log_success "Web UI assets built."
+}
+
 detect_os() {
   case "$(uname -s)" in
     Darwin) echo "darwin" ;;
@@ -125,6 +145,28 @@ download_file() {
   fi
 }
 
+install_binary_atomic() {
+  local source_bin="$1"
+  local install_dir="$2"
+  local target_path="${install_dir}/${BIN_NAME}"
+  local tmp_target="${install_dir}/.${BIN_NAME}.new.$$"
+
+  if [ -w "$install_dir" ]; then
+    cp "$source_bin" "$tmp_target"
+    chmod +x "$tmp_target"
+    mv -f "$tmp_target" "$target_path"
+  else
+    if need_cmd sudo; then
+      sudo cp "$source_bin" "$tmp_target"
+      sudo chmod +x "$tmp_target"
+      sudo mv -f "$tmp_target" "$target_path"
+    else
+      log_error "No write permission for $install_dir and sudo not available"
+      return 1
+    fi
+  fi
+}
+
 install_from_archive() {
   local archive="$1"
   local install_dir="$2"
@@ -170,21 +212,12 @@ install_from_archive() {
   fi
 
   chmod +x "$bin_path"
-  if [ -w "$install_dir" ]; then
-    cp "$bin_path" "$install_dir/$BIN_NAME"
-  else
-    if need_cmd sudo; then
-      sudo cp "$bin_path" "$install_dir/$BIN_NAME"
-    else
-      log_error "No write permission for $install_dir and sudo not available"
-      return 1
-    fi
-  fi
+  install_binary_atomic "$bin_path" "$install_dir"
 }
 
 setup_systemd() {
   local install_dir="$1"
-  local finally-a-value-bot_cmd="${install_dir}/${BIN_NAME}"
+  local finally_a_value_bot_cmd="${install_dir}/${BIN_NAME}"
   local service_name="finally-a-value-bot"
   local service_file="/etc/systemd/system/${service_name}.service"
   local user_name
@@ -218,7 +251,7 @@ After=network.target
 Type=simple
 User=$user_name
 WorkingDirectory=$project_dir
-ExecStart=$finally-a-value-bot_cmd start
+ExecStart=$finally_a_value_bot_cmd start
 Restart=always
 RestartSec=10
 
@@ -246,6 +279,7 @@ main() {
   install_dir="$(detect_install_dir)"
 
   if [ -f "Cargo.toml" ]; then
+    build_web_assets_if_available
     log_info "Building ${BIN_NAME} from source (Cargo.toml found)..."
     if ! need_cmd cargo; then
       log_warn "cargo is required to build from source but was not found."
@@ -269,16 +303,7 @@ main() {
       log_error "Failed to build ${BIN_NAME} executable."
       exit 1
     fi
-    if [ -w "$install_dir" ]; then
-      cp "$bin_path" "$install_dir/$BIN_NAME"
-    else
-      if need_cmd sudo; then
-        sudo cp "$bin_path" "$install_dir/$BIN_NAME"
-      else
-        log_error "No write permission for $install_dir and sudo not available"
-        exit 1
-      fi
-    fi
+    install_binary_atomic "$bin_path" "$install_dir"
   else
     log_info "Installing ${BIN_NAME} for ${os}/${arch} from GitHub releases..."
     release_json="$(download_release_json)"
@@ -310,7 +335,7 @@ main() {
     log_info "Example: export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
 
-  local finally-a-value-bot_cmd="${install_dir}/${BIN_NAME}"
+  local finally_a_value_bot_cmd="${install_dir}/${BIN_NAME}"
 
   if [ ! -f .env ] && [ -f .env.example ]; then
     cp .env.example .env

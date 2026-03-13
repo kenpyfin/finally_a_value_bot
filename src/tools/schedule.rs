@@ -9,6 +9,8 @@ use crate::channel::enforce_channel_policy;
 use crate::claude::ToolDefinition;
 use crate::db::{call_blocking, Database, ScheduledTask};
 
+const UTC_TIMEZONE: &str = "UTC";
+
 /// Format scheduled tasks for slash-command or UI display.
 pub fn format_tasks_list(tasks: &[ScheduledTask]) -> String {
     format_tasks_list_impl(tasks, false)
@@ -55,6 +57,61 @@ pub(crate) fn compute_next_run(cron_expr: &str, tz_name: &str) -> Result<String,
     Ok(next.to_rfc3339())
 }
 
+#[derive(Debug, Clone)]
+pub struct SchedulePreflight {
+    pub schedule_value: String,
+    pub next_run: String,
+    pub timezone_used: String,
+    pub timezone_defaulted_to_utc: bool,
+}
+
+fn normalize_cron_expression(schedule_value: &str) -> Result<String, String> {
+    let fields: Vec<&str> = schedule_value.split_whitespace().collect();
+    match fields.len() {
+        6 => Ok(fields.join(" ")),
+        5 => Ok(format!("0 {}", fields.join(" "))),
+        _ => Err(
+            "Invalid cron expression: expected 5 or 6 fields (sec min hour dom month dow)"
+                .to_string(),
+        ),
+    }
+}
+
+pub fn preflight_schedule_request(
+    schedule_type: &str,
+    schedule_value: &str,
+    timezone: Option<&str>,
+) -> Result<SchedulePreflight, String> {
+    let timezone_input = timezone.map(str::trim).filter(|tz| !tz.is_empty());
+    let timezone = timezone_input.unwrap_or(UTC_TIMEZONE);
+    let timezone_defaulted_to_utc = timezone_input.is_none();
+
+    match schedule_type {
+        "cron" => {
+            let normalized = normalize_cron_expression(schedule_value)?;
+            let next_run = compute_next_run(&normalized, timezone)?;
+            Ok(SchedulePreflight {
+                schedule_value: normalized,
+                next_run,
+                timezone_used: timezone.to_string(),
+                timezone_defaulted_to_utc,
+            })
+        }
+        "once" => {
+            if chrono::DateTime::parse_from_rfc3339(schedule_value).is_err() {
+                return Err("Invalid ISO 8601 timestamp for one-time schedule".into());
+            }
+            Ok(SchedulePreflight {
+                schedule_value: schedule_value.to_string(),
+                next_run: schedule_value.to_string(),
+                timezone_used: timezone.to_string(),
+                timezone_defaulted_to_utc,
+            })
+        }
+        _ => Err("schedule_type must be 'cron' or 'once'".into()),
+    }
+}
+
 // --- schedule_task ---
 
 pub struct ScheduleTaskTool {
@@ -80,7 +137,7 @@ impl Tool for ScheduleTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "schedule_task".into(),
-            description: "Schedule a recurring or one-time task. For recurring tasks, provide a 6-field cron expression (sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. The bot will execute the prompt at the scheduled time and send the result to this chat.".into(),
+            description: "Schedule a recurring or one-time task. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, UTC is used.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -102,7 +159,7 @@ impl Tool for ScheduleTaskTool {
                     },
                     "timezone": {
                         "type": "string",
-                        "description": "Optional IANA timezone name (e.g. 'US/Eastern', 'Europe/London'). Defaults to server timezone setting."
+                        "description": "Optional IANA timezone name (e.g. 'US/Eastern', 'Europe/London'). If omitted, defaults to UTC."
                     }
                 }),
                 &["chat_id", "prompt", "schedule_type", "schedule_value"],
@@ -133,32 +190,18 @@ impl Tool for ScheduleTaskTool {
             Some(v) => v,
             None => return ToolResult::error("Missing required parameter: schedule_value".into()),
         };
-        let tz_name = input
-            .get("timezone")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&self.default_timezone);
-
-        let next_run = match schedule_type {
-            "cron" => match compute_next_run(schedule_value, tz_name) {
-                Ok(nr) => nr,
-                Err(e) => return ToolResult::error(e),
-            },
-            "once" => {
-                // Validate the timestamp parses
-                if chrono::DateTime::parse_from_rfc3339(schedule_value).is_err() {
-                    return ToolResult::error(
-                        "Invalid ISO 8601 timestamp for one-time schedule".into(),
-                    );
-                }
-                schedule_value.to_string()
-            }
-            _ => return ToolResult::error("schedule_type must be 'cron' or 'once'".into()),
+        let timezone_input = input.get("timezone").and_then(|v| v.as_str());
+        let _configured_default_timezone = self.default_timezone.trim();
+        let preflight = match preflight_schedule_request(schedule_type, schedule_value, timezone_input)
+        {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
         };
 
         let prompt_owned = prompt.to_string();
         let schedule_type_owned = schedule_type.to_string();
-        let schedule_value_owned = schedule_value.to_string();
-        let next_run_owned = next_run.clone();
+        let schedule_value_owned = preflight.schedule_value.clone();
+        let next_run_owned = preflight.next_run.clone();
         match call_blocking(self.db.clone(), move |db| {
             db.create_scheduled_task(
                 chat_id,
@@ -170,9 +213,16 @@ impl Tool for ScheduleTaskTool {
         })
         .await
         {
-            Ok(id) => ToolResult::success(format!(
-                "Task #{id} scheduled (tz: {tz_name}). Next run: {next_run}"
-            )),
+            Ok(id) => {
+                let mut message = format!(
+                    "Task #{id} scheduled (tz: {}). Next run: {}",
+                    preflight.timezone_used, preflight.next_run
+                );
+                if preflight.timezone_defaulted_to_utc {
+                    message.push_str(" Timezone was not provided, so UTC was assumed.");
+                }
+                ToolResult::success(message)
+            }
             Err(e) => ToolResult::error(format!("Failed to create task: {e}")),
         }
     }

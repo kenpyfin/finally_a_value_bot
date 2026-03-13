@@ -243,6 +243,31 @@ pub fn resolve_tool_working_dir(base_working_dir: &Path) -> PathBuf {
     resolved
 }
 
+/// Auto-detect the vault search command from the built-in search-vault skill.
+/// Looks for `query_vault.py` in the skills directory and a Python venv at `shared/.venv-vault`.
+fn detect_vault_search_command(config: &Config) -> Option<String> {
+    let workspace = config.workspace_root_absolute();
+    let skills_dir = workspace.join("skills");
+
+    let script = skills_dir.join("search-vault").join("query_vault.py");
+    if !script.exists() {
+        return None;
+    }
+
+    let venv_python = workspace.join("shared").join(".venv-vault").join("bin").join("python");
+    let python = if venv_python.exists() {
+        venv_python.to_string_lossy().to_string()
+    } else {
+        "python3".to_string()
+    };
+
+    Some(format!(
+        "{} {} \"{{query}}\"",
+        python,
+        script.display()
+    ))
+}
+
 impl ToolRegistry {
     pub fn new(config: &Config, bot: Bot, db: Arc<Database>) -> Self {
         let working_dir = PathBuf::from(config.working_dir());
@@ -305,7 +330,8 @@ impl ToolRegistry {
 
         let mut tools: Vec<Box<dyn Tool>> = tools;
 
-        // Register SearchVaultTool: native mode (embedding + ChromaDB HTTP) or command mode (vault_search_command)
+        // Register SearchVaultTool: native mode (embedding + ChromaDB HTTP),
+        // explicit command mode (vault_search_command), or auto-detected from built-in skill.
         if let Some(ref vault) = config.vault {
             let use_native = vault.embedding_server_url.is_some() && vault.vector_db_url.is_some();
             let use_command = vault
@@ -345,6 +371,12 @@ impl ToolRegistry {
                     "search_vault tool registered (command: {})",
                     cmd.split_whitespace().next().unwrap_or("…")
                 );
+            } else if let Some(cmd) = detect_vault_search_command(config) {
+                tools.push(Box::new(search_vault::SearchVaultTool::new_command(
+                    &cmd,
+                    config.working_dir(),
+                )));
+                tracing::info!("search_vault tool registered (auto-detected from built-in skill)");
             }
         }
 

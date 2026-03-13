@@ -87,12 +87,21 @@ mod tests {
             "weather",
             "find-skills",
             "social-feed",
+            "search-vault",
+            "index-vault",
+            "create-skill",
         ] {
             let skill_file = skills_root.join(skill).join("SKILL.md");
             assert!(skill_file.exists(), "missing built-in skill: {skill}");
             let content = std::fs::read_to_string(skill_file).unwrap();
             assert!(!content.trim().is_empty(), "empty skill file: {skill}");
         }
+
+        // Verify bundled scripts are also copied
+        let search_script = skills_root.join("search-vault").join("query_vault.py");
+        assert!(search_script.exists(), "missing search-vault/query_vault.py");
+        let index_script = skills_root.join("index-vault").join("index_vault.py");
+        assert!(index_script.exists(), "missing index-vault/index_vault.py");
 
         cleanup(&root);
     }

@@ -30,9 +30,17 @@ impl EventHandler for Handler {
         let channel_handle = channel_id.to_string();
         let sender_name = msg.author.name.clone();
 
-        // Resolve to unified contact (canonical_chat_id); for Discord, handle == canonical.
+        // Resolve to unified contact (canonical_chat_id).
+        // When UNIVERSAL_CHAT_ID is configured, bind this Discord handle to that canonical contact.
+        let universal_chat_id = self.app_state.config.universal_chat_id;
         let canonical_chat_id = match call_blocking(self.app_state.db.clone(), move |db| {
-            db.resolve_canonical_chat_id("discord", &channel_handle, None)
+            if let Some(cid) = universal_chat_id {
+                db.upsert_chat(cid, None, "discord")?;
+                db.link_channel(cid, "discord", &channel_handle)?;
+                Ok(cid)
+            } else {
+                db.resolve_canonical_chat_id("discord", &channel_handle, None)
+            }
         })
         .await
         {

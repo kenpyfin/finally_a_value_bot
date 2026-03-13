@@ -268,20 +268,36 @@ impl SetupApp {
 
         Self {
             fields: vec![
+                // ── Telegram ──
                 Field {
                     key: "TELEGRAM_BOT_TOKEN",
                     label: "Telegram bot token",
                     value: existing.get("TELEGRAM_BOT_TOKEN").cloned().unwrap_or_default(),
-                    required: true,
+                    required: false,
                     secret: true,
                 },
                 Field {
                     key: "BOT_USERNAME",
                     label: "Bot username (without @)",
                     value: existing.get("BOT_USERNAME").cloned().unwrap_or_default(),
-                    required: true,
+                    required: false,
                     secret: false,
                 },
+                Field {
+                    key: "ALLOWED_GROUPS",
+                    label: "Allowed group chat IDs (comma-separated)",
+                    value: existing.get("ALLOWED_GROUPS").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "CONTROL_CHAT_IDS",
+                    label: "Control chat IDs (comma-separated)",
+                    value: existing.get("CONTROL_CHAT_IDS").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── LLM ──
                 Field {
                     key: "LLM_PROVIDER",
                     label: "LLM provider (preset/custom)",
@@ -311,12 +327,21 @@ impl SetupApp {
                     secret: false,
                 },
                 Field {
-                    key: "DATA_DIR",
-                    label: "Data root directory",
+                    key: "OPENAI_API_KEY",
+                    label: "OpenAI API key (voice transcription)",
+                    value: existing.get("OPENAI_API_KEY").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: true,
+                },
+                // ── Runtime ──
+                Field {
+                    key: "WORKSPACE_DIR",
+                    label: "Workspace directory",
                     value: existing
-                        .get("DATA_DIR")
+                        .get("WORKSPACE_DIR")
+                        .or(existing.get("WORKING_DIR"))
                         .cloned()
-                        .unwrap_or_else(|| "./finally_a_value_bot.data".into()),
+                        .unwrap_or_else(|| "./workspace".into()),
                     required: false,
                     secret: false,
                 },
@@ -328,22 +353,238 @@ impl SetupApp {
                     secret: false,
                 },
                 Field {
-                    key: "WORKING_DIR",
-                    label: "Default working directory",
-                    value: existing
-                        .get("WORKING_DIR")
-                        .or(existing.get("WORKSPACE_DIR"))
-                        .cloned()
-                        .unwrap_or_else(|| "./workspace".into()),
+                    key: "MAX_TOKENS",
+                    label: "Max tokens per response",
+                    value: existing.get("MAX_TOKENS").cloned().unwrap_or_else(|| "8192".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "MAX_TOOL_ITERATIONS",
+                    label: "Max tool loop iterations",
+                    value: existing.get("MAX_TOOL_ITERATIONS").cloned().unwrap_or_else(|| "100".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "MAX_HISTORY_MESSAGES",
+                    label: "Chat history context size",
+                    value: existing.get("MAX_HISTORY_MESSAGES").cloned().unwrap_or_else(|| "50".into()),
+                    required: false,
+                    secret: false,
+                },
+                // ── Orchestrator ──
+                Field {
+                    key: "ORCHESTRATOR_ENABLED",
+                    label: "Enable orchestrator (plan-first)",
+                    value: existing.get("ORCHESTRATOR_ENABLED").cloned().unwrap_or_else(|| "true".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "ORCHESTRATOR_MODEL",
+                    label: "Orchestrator model override",
+                    value: existing.get("ORCHESTRATOR_MODEL").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── Delegate ──
+                Field {
+                    key: "DELEGATE_TOOL_ENABLED",
+                    label: "Enable delegate tool",
+                    value: existing.get("DELEGATE_TOOL_ENABLED").cloned().unwrap_or_else(|| "true".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "DELEGATE_MAX_ITERATIONS",
+                    label: "Delegate max iterations",
+                    value: existing.get("DELEGATE_MAX_ITERATIONS").cloned().unwrap_or_else(|| "10".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "DELEGATE_MODEL",
+                    label: "Delegate model override",
+                    value: existing.get("DELEGATE_MODEL").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── Discord ──
+                Field {
+                    key: "DISCORD_BOT_TOKEN",
+                    label: "Discord bot token",
+                    value: existing.get("DISCORD_BOT_TOKEN").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: true,
+                },
+                Field {
+                    key: "DISCORD_ALLOWED_CHANNELS",
+                    label: "Discord allowed channel IDs (comma-separated)",
+                    value: existing.get("DISCORD_ALLOWED_CHANNELS").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── WhatsApp ──
+                Field {
+                    key: "WHATSAPP_ACCESS_TOKEN",
+                    label: "WhatsApp access token",
+                    value: existing.get("WHATSAPP_ACCESS_TOKEN").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: true,
+                },
+                Field {
+                    key: "WHATSAPP_PHONE_NUMBER_ID",
+                    label: "WhatsApp phone number ID",
+                    value: existing.get("WHATSAPP_PHONE_NUMBER_ID").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "WHATSAPP_VERIFY_TOKEN",
+                    label: "WhatsApp webhook verify token",
+                    value: existing.get("WHATSAPP_VERIFY_TOKEN").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: true,
+                },
+                Field {
+                    key: "WHATSAPP_WEBHOOK_PORT",
+                    label: "WhatsApp webhook port",
+                    value: existing.get("WHATSAPP_WEBHOOK_PORT").cloned().unwrap_or_else(|| "8080".into()),
+                    required: false,
+                    secret: false,
+                },
+                // ── Web UI ──
+                Field {
+                    key: "WEB_ENABLED",
+                    label: "Enable web UI",
+                    value: existing.get("WEB_ENABLED").cloned().unwrap_or_else(|| "true".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "WEB_HOST",
+                    label: "Web UI host",
+                    value: existing.get("WEB_HOST").cloned().unwrap_or_else(|| "0.0.0.0".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "WEB_PORT",
+                    label: "Web UI port",
+                    value: existing.get("WEB_PORT").cloned().unwrap_or_else(|| "10961".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "WEB_AUTH_TOKEN",
+                    label: "Web UI auth token (required if non-local)",
+                    value: existing.get("WEB_AUTH_TOKEN").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: true,
+                },
+                // ── Browser ──
+                Field {
+                    key: "BROWSER_MANAGED",
+                    label: "Managed browser (auto-launch)",
+                    value: existing.get("BROWSER_MANAGED").cloned().unwrap_or_else(|| "false".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "AGENT_BROWSER_PATH",
+                    label: "agent-browser CLI path",
+                    value: existing.get("AGENT_BROWSER_PATH").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── Cursor Agent ──
+                Field {
+                    key: "CURSOR_AGENT_CLI_PATH",
+                    label: "cursor-agent CLI path",
+                    value: existing.get("CURSOR_AGENT_CLI_PATH").cloned().unwrap_or_else(|| "cursor-agent".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "CURSOR_AGENT_MODEL",
+                    label: "cursor-agent model",
+                    value: existing.get("CURSOR_AGENT_MODEL").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "CURSOR_AGENT_RUNNER_URL",
+                    label: "cursor-agent runner URL",
+                    value: existing.get("CURSOR_AGENT_RUNNER_URL").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── Vault ──
+                Field {
+                    key: "VAULT_ORIGIN_VAULT_PATH",
+                    label: "Vault path (relative to workspace)",
+                    value: existing.get("VAULT_ORIGIN_VAULT_PATH").cloned().unwrap_or_else(|| "shared/ORIGIN".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "VAULT_VECTOR_DB_PATH",
+                    label: "Vector DB path (relative to workspace)",
+                    value: existing.get("VAULT_VECTOR_DB_PATH").cloned().unwrap_or_else(|| "shared/vault_db".into()),
                     required: false,
                     secret: false,
                 },
                 Field {
                     key: "VAULT_GIT_URL",
-                    label: "ORIGIN vault git URL (optional; leave empty to create empty folder)",
+                    label: "Vault git URL (optional)",
                     value: existing.get("VAULT_GIT_URL").cloned().unwrap_or_default(),
                     required: false,
                     secret: false,
+                },
+                Field {
+                    key: "VAULT_SEARCH_COMMAND",
+                    label: "Vault search command",
+                    value: existing.get("VAULT_SEARCH_COMMAND").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "VAULT_INDEX_COMMAND",
+                    label: "Vault index command",
+                    value: existing.get("VAULT_INDEX_COMMAND").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "VAULT_VECTOR_DB_URL",
+                    label: "ChromaDB server URL",
+                    value: existing.get("VAULT_VECTOR_DB_URL").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── Universal ──
+                Field {
+                    key: "UNIVERSAL_CHAT_ID",
+                    label: "Universal chat ID (cross-channel)",
+                    value: existing.get("UNIVERSAL_CHAT_ID").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                // ── Git ──
+                Field {
+                    key: "GIT_USERNAME",
+                    label: "Git username (for push inside container)",
+                    value: existing.get("GIT_USERNAME").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "GIT_TOKEN",
+                    label: "Git token / PAT",
+                    value: existing.get("GIT_TOKEN").cloned().unwrap_or_default(),
+                    required: false,
+                    secret: true,
                 },
             ],
             selected: 0,
@@ -446,6 +687,15 @@ impl SetupApp {
         let provider = self.field_value("LLM_PROVIDER");
         if provider.is_empty() {
             return Err(FinallyAValueBotError::Config("LLM_PROVIDER is required".into()));
+        }
+
+        // At least one channel must be configured
+        let tg_token = self.field_value("TELEGRAM_BOT_TOKEN");
+        let discord_token = self.field_value("DISCORD_BOT_TOKEN");
+        if tg_token.is_empty() && discord_token.is_empty() {
+            return Err(FinallyAValueBotError::Config(
+                "At least one of TELEGRAM_BOT_TOKEN or DISCORD_BOT_TOKEN must be set".into(),
+            ));
         }
 
         let username = self.field_value("BOT_USERNAME");
@@ -684,16 +934,27 @@ impl SetupApp {
     fn default_value_for_field(&self, key: &str) -> String {
         let provider = self.field_value("LLM_PROVIDER");
         match key {
-            "TELEGRAM_BOT_TOKEN" | "BOT_USERNAME" | "LLM_API_KEY" => String::new(),
             "LLM_PROVIDER" => "anthropic".into(),
             "LLM_MODEL" => default_model_for_provider(&provider).into(),
             "LLM_BASE_URL" => find_provider_preset(&provider)
                 .map(|p| p.default_base_url.to_string())
                 .unwrap_or_default(),
-            "DATA_DIR" => "./finally_a_value_bot.data".into(),
+            "WORKSPACE_DIR" => "./workspace".into(),
             "TIMEZONE" => "UTC".into(),
-            "WORKING_DIR" => "./workspace".into(),
-            "VAULT_GIT_URL" => String::new(),
+            "MAX_TOKENS" => "8192".into(),
+            "MAX_TOOL_ITERATIONS" => "100".into(),
+            "MAX_HISTORY_MESSAGES" => "50".into(),
+            "ORCHESTRATOR_ENABLED" => "true".into(),
+            "DELEGATE_TOOL_ENABLED" => "true".into(),
+            "DELEGATE_MAX_ITERATIONS" => "10".into(),
+            "WHATSAPP_WEBHOOK_PORT" => "8080".into(),
+            "WEB_ENABLED" => "true".into(),
+            "WEB_HOST" => "0.0.0.0".into(),
+            "WEB_PORT" => "10961".into(),
+            "BROWSER_MANAGED" => "false".into(),
+            "CURSOR_AGENT_CLI_PATH" => "cursor-agent".into(),
+            "VAULT_ORIGIN_VAULT_PATH" => "shared/ORIGIN".into(),
+            "VAULT_VECTOR_DB_PATH" => "shared/vault_db".into(),
             _ => String::new(),
         }
     }
@@ -716,11 +977,26 @@ impl SetupApp {
     }
 
     fn current_section(&self) -> &'static str {
-        match self.selected {
-            0..=1 => "Telegram",
-            2..=5 => "LLM",
-            6..=8 => "Runtime",
-            _ => "Setup",
+        // Find the section by looking at the field key at the current index
+        if self.selected < self.fields.len() {
+            match self.fields[self.selected].key {
+                "TELEGRAM_BOT_TOKEN" | "BOT_USERNAME" | "ALLOWED_GROUPS" | "CONTROL_CHAT_IDS" => "Telegram",
+                "LLM_PROVIDER" | "LLM_API_KEY" | "LLM_MODEL" | "LLM_BASE_URL" | "OPENAI_API_KEY" => "LLM",
+                "WORKSPACE_DIR" | "TIMEZONE" | "MAX_TOKENS" | "MAX_TOOL_ITERATIONS" | "MAX_HISTORY_MESSAGES" => "Runtime",
+                "ORCHESTRATOR_ENABLED" | "ORCHESTRATOR_MODEL" => "Orchestrator",
+                "DELEGATE_TOOL_ENABLED" | "DELEGATE_MAX_ITERATIONS" | "DELEGATE_MODEL" => "Delegate",
+                "DISCORD_BOT_TOKEN" | "DISCORD_ALLOWED_CHANNELS" => "Discord",
+                "WHATSAPP_ACCESS_TOKEN" | "WHATSAPP_PHONE_NUMBER_ID" | "WHATSAPP_VERIFY_TOKEN" | "WHATSAPP_WEBHOOK_PORT" => "WhatsApp",
+                "WEB_ENABLED" | "WEB_HOST" | "WEB_PORT" | "WEB_AUTH_TOKEN" => "Web UI",
+                "BROWSER_MANAGED" | "AGENT_BROWSER_PATH" => "Browser",
+                "CURSOR_AGENT_CLI_PATH" | "CURSOR_AGENT_MODEL" | "CURSOR_AGENT_RUNNER_URL" => "Cursor Agent",
+                "VAULT_ORIGIN_VAULT_PATH" | "VAULT_VECTOR_DB_PATH" | "VAULT_GIT_URL" | "VAULT_SEARCH_COMMAND" | "VAULT_INDEX_COMMAND" | "VAULT_VECTOR_DB_URL" => "Vault",
+                "UNIVERSAL_CHAT_ID" => "Universal",
+                "GIT_USERNAME" | "GIT_TOKEN" => "Git",
+                _ => "Setup",
+            }
+        } else {
+            "Setup"
         }
     }
 
@@ -753,29 +1029,33 @@ fn perform_online_validation(
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    // --- Telegram validation ---
-    let tg_resp: serde_json::Value = client
-        .get(format!("https://api.telegram.org/bot{tg_token}/getMe"))
-        .send()?
-        .json()?;
-    let ok = tg_resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-    if !ok {
-        return Err(FinallyAValueBotError::Config(
-            "Telegram getMe failed (check TELEGRAM_BOT_TOKEN)".into(),
-        ));
-    }
-    let actual_username = tg_resp
-        .get("result")
-        .and_then(|r| r.get("username"))
-        .and_then(|u| u.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if !env_username.is_empty() && !actual_username.is_empty() && env_username != actual_username {
-        checks.push(format!(
-            "Telegram OK (token user={actual_username}, configured={env_username})"
-        ));
+    // --- Telegram validation (skip if no token) ---
+    if !tg_token.is_empty() {
+        let tg_resp: serde_json::Value = client
+            .get(format!("https://api.telegram.org/bot{tg_token}/getMe"))
+            .send()?
+            .json()?;
+        let ok = tg_resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            return Err(FinallyAValueBotError::Config(
+                "Telegram getMe failed (check TELEGRAM_BOT_TOKEN)".into(),
+            ));
+        }
+        let actual_username = tg_resp
+            .get("result")
+            .and_then(|r| r.get("username"))
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !env_username.is_empty() && !actual_username.is_empty() && env_username != actual_username {
+            checks.push(format!(
+                "Telegram OK (token user={actual_username}, configured={env_username})"
+            ));
+        } else {
+            checks.push(format!("Telegram OK ({actual_username})"));
+        }
     } else {
-        checks.push(format!("Telegram OK ({actual_username})"));
+        checks.push("Telegram skipped (no token)".into());
     }
 
     // --- LLM validation: send a minimal "hi" message ---
@@ -869,7 +1149,6 @@ fn perform_online_validation(
         }
         checks.push(format!("LLM OK (openai-compatible, model={model})"));
     }
-
     Ok(checks)
 }
 
@@ -884,26 +1163,35 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
     let mut backup = None;
     if path.exists() {
         let ts = Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let backup_path = format!("{}.bak.{ts}", path.display());
+        let backup_path = format!("{}.bak.{}", path.display(), ts);
         fs::copy(path, &backup_path)?;
         backup = Some(backup_path);
     }
 
     let get = |key: &str| values.get(key).cloned().unwrap_or_default().trim().to_string();
 
-    let workspace_dir = values
-        .get("WORKING_DIR")
-        .or(values.get("WORKSPACE_DIR"))
-        .cloned()
-        .unwrap_or_else(|| "./workspace".into())
-        .trim()
-        .to_string();
-    let workspace_dir = if workspace_dir.is_empty() {
-        "./workspace".into()
-    } else {
-        workspace_dir
+    let mut lines = Vec::new();
+
+    // Helper: emit a key=value line
+    macro_rules! emit {
+        ($section:expr, $key:expr, $val:expr, $always:expr) => {
+            if !$section.is_empty() {
+                lines.push("".into());
+                lines.push(format!("# {}", $section));
+            }
+            let v = $val;
+            if $always || !v.is_empty() {
+                lines.push(format!("{}={}", $key, escape_env(&v)));
+            }
+        };
+    }
+
+    let workspace_dir = {
+        let w = get("WORKSPACE_DIR");
+        if w.is_empty() { "./workspace".to_string() } else { w }
     };
 
+    // Clone vault if needed
     let vault_url = get("VAULT_GIT_URL");
     let shared_dir = Path::new(&workspace_dir).join("shared");
     let origin_path = shared_dir.join("ORIGIN");
@@ -919,33 +1207,80 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
         let _ = fs::create_dir_all(&origin_path);
     }
 
-    let mut lines = Vec::new();
     lines.push("# FinallyAValueBot configuration".into());
-    lines.push("".into());
-    lines.push("# Telegram".into());
-    lines.push(format!("TELEGRAM_BOT_TOKEN={}", escape_env(&get("TELEGRAM_BOT_TOKEN"))));
-    lines.push(format!("BOT_USERNAME={}", escape_env(&get("BOT_USERNAME"))));
-    lines.push("".into());
-    lines.push("# LLM (anthropic, ollama, openai, openrouter, deepseek, google, etc.)".into());
-    lines.push(format!("LLM_PROVIDER={}", escape_env(&get("LLM_PROVIDER"))));
-    lines.push(format!("LLM_API_KEY={}", escape_env(&get("LLM_API_KEY"))));
-    if !get("LLM_MODEL").is_empty() {
-        lines.push(format!("LLM_MODEL={}", escape_env(&get("LLM_MODEL"))));
-    }
-    if !get("LLM_BASE_URL").is_empty() {
-        lines.push(format!("LLM_BASE_URL={}", escape_env(&get("LLM_BASE_URL"))));
-    }
-    lines.push("".into());
-    lines.push("# Workspace".into());
-    lines.push(format!("WORKSPACE_DIR={}", escape_env(&workspace_dir)));
-    lines.push(format!("TIMEZONE={}", escape_env(&get("TIMEZONE"))));
-    lines.push("".into());
-    lines.push("# ORIGIN vault (optional). Paths relative to workspace_dir.".into());
-    lines.push("VAULT_ORIGIN_VAULT_PATH=shared/ORIGIN".into());
-    lines.push("VAULT_VECTOR_DB_PATH=shared/vault_db".into());
+
+    // Telegram
+    emit!("Telegram", "TELEGRAM_BOT_TOKEN", get("TELEGRAM_BOT_TOKEN"), true);
+    emit!("", "BOT_USERNAME", get("BOT_USERNAME"), false);
+    emit!("", "ALLOWED_GROUPS", get("ALLOWED_GROUPS"), false);
+    emit!("", "CONTROL_CHAT_IDS", get("CONTROL_CHAT_IDS"), false);
+
+    // LLM
+    emit!("LLM", "LLM_PROVIDER", get("LLM_PROVIDER"), true);
+    emit!("", "LLM_API_KEY", get("LLM_API_KEY"), true);
+    emit!("", "LLM_MODEL", get("LLM_MODEL"), false);
+    emit!("", "LLM_BASE_URL", get("LLM_BASE_URL"), false);
+    emit!("", "OPENAI_API_KEY", get("OPENAI_API_KEY"), false);
+
+    // Runtime
+    emit!("Runtime", "WORKSPACE_DIR", workspace_dir, true);
+    emit!("", "TIMEZONE", get("TIMEZONE"), true);
+    emit!("", "MAX_TOKENS", get("MAX_TOKENS"), false);
+    emit!("", "MAX_TOOL_ITERATIONS", get("MAX_TOOL_ITERATIONS"), false);
+    emit!("", "MAX_HISTORY_MESSAGES", get("MAX_HISTORY_MESSAGES"), false);
+
+    // Orchestrator
+    emit!("Orchestrator", "ORCHESTRATOR_ENABLED", get("ORCHESTRATOR_ENABLED"), false);
+    emit!("", "ORCHESTRATOR_MODEL", get("ORCHESTRATOR_MODEL"), false);
+
+    // Delegate
+    emit!("Delegate", "DELEGATE_TOOL_ENABLED", get("DELEGATE_TOOL_ENABLED"), false);
+    emit!("", "DELEGATE_MAX_ITERATIONS", get("DELEGATE_MAX_ITERATIONS"), false);
+    emit!("", "DELEGATE_MODEL", get("DELEGATE_MODEL"), false);
+
+    // Discord
+    emit!("Discord", "DISCORD_BOT_TOKEN", get("DISCORD_BOT_TOKEN"), false);
+    emit!("", "DISCORD_ALLOWED_CHANNELS", get("DISCORD_ALLOWED_CHANNELS"), false);
+
+    // WhatsApp
+    emit!("WhatsApp", "WHATSAPP_ACCESS_TOKEN", get("WHATSAPP_ACCESS_TOKEN"), false);
+    emit!("", "WHATSAPP_PHONE_NUMBER_ID", get("WHATSAPP_PHONE_NUMBER_ID"), false);
+    emit!("", "WHATSAPP_VERIFY_TOKEN", get("WHATSAPP_VERIFY_TOKEN"), false);
+    emit!("", "WHATSAPP_WEBHOOK_PORT", get("WHATSAPP_WEBHOOK_PORT"), false);
+
+    // Web UI
+    emit!("Web UI", "WEB_ENABLED", get("WEB_ENABLED"), false);
+    emit!("", "WEB_HOST", get("WEB_HOST"), false);
+    emit!("", "WEB_PORT", get("WEB_PORT"), false);
+    emit!("", "WEB_AUTH_TOKEN", get("WEB_AUTH_TOKEN"), false);
+
+    // Browser
+    emit!("Browser", "BROWSER_MANAGED", get("BROWSER_MANAGED"), false);
+    emit!("", "AGENT_BROWSER_PATH", get("AGENT_BROWSER_PATH"), false);
+
+    // Cursor Agent
+    emit!("Cursor Agent", "CURSOR_AGENT_CLI_PATH", get("CURSOR_AGENT_CLI_PATH"), false);
+    emit!("", "CURSOR_AGENT_MODEL", get("CURSOR_AGENT_MODEL"), false);
+    emit!("", "CURSOR_AGENT_RUNNER_URL", get("CURSOR_AGENT_RUNNER_URL"), false);
+
+    // Vault
+    emit!("Vault", "VAULT_ORIGIN_VAULT_PATH", get("VAULT_ORIGIN_VAULT_PATH"), false);
+    emit!("", "VAULT_VECTOR_DB_PATH", get("VAULT_VECTOR_DB_PATH"), false);
     if !vault_url.is_empty() {
-        lines.push(format!("VAULT_ORIGIN_VAULT_REPO={}", escape_env(&vault_url)));
+        emit!("", "VAULT_ORIGIN_VAULT_REPO", vault_url.clone(), false);
     }
+    emit!("", "VAULT_GIT_URL", vault_url, false);
+    emit!("", "VAULT_SEARCH_COMMAND", get("VAULT_SEARCH_COMMAND"), false);
+    emit!("", "VAULT_INDEX_COMMAND", get("VAULT_INDEX_COMMAND"), false);
+    emit!("", "VAULT_VECTOR_DB_URL", get("VAULT_VECTOR_DB_URL"), false);
+
+    // Universal
+    emit!("Universal", "UNIVERSAL_CHAT_ID", get("UNIVERSAL_CHAT_ID"), false);
+
+    // Git
+    emit!("Git", "GIT_USERNAME", get("GIT_USERNAME"), false);
+    emit!("", "GIT_TOKEN", get("GIT_TOKEN"), false);
+
     let content = lines.join("\n");
     fs::write(path, content)?;
     Ok(backup)
@@ -983,8 +1318,12 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
                 app.backup_path.as_deref().unwrap_or("none")
             )),
             Line::from(""),
-            Line::from("Next:"),
-            Line::from("  1) finally_a_value_bot start"),
+            Line::from("Next steps:"),
+            Line::from("  1) Run in foreground:"),
+            Line::from("     finally-a-value-bot start"),
+            Line::from(""),
+            Line::from("  2) Run in background (systemd service):"),
+            Line::from("     finally-a-value-bot gateway install"),
             Line::from(""),
             Line::from("Press Enter to finish."),
         ])

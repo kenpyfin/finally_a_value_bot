@@ -65,13 +65,15 @@ pub enum AgentEvent {
         iteration: usize,
     },
     ToolStart {
+        tool_use_id: String,
         name: String,
         input: serde_json::Value,
     },
     ToolResult {
+        tool_use_id: String,
         name: String,
         is_error: bool,
-        preview: String,
+        output: String,
         duration_ms: u128,
         status_code: Option<i32>,
         bytes: usize,
@@ -203,15 +205,37 @@ pub async fn run_bot(
         });
     }
 
-    let handler = Update::filter_message().endpoint(handle_message);
-
-    Dispatcher::builder(bot, handler)
-        .default_handler(|_| async {})
-        .dependencies(dptree::deps![state])
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
+    const TELEGRAM_RETRY_DELAY_SECS: u64 = 10;
+    loop {
+        let bot_clone = bot.clone();
+        let state_clone = state.clone();
+        let join_result = tokio::spawn(async move {
+            let handler = Update::filter_message().endpoint(handle_message);
+            Dispatcher::builder(bot_clone, handler)
+                .default_handler(|_| async {})
+                .dependencies(dptree::deps![state_clone])
+                .enable_ctrlc_handler()
+                .build()
+                .dispatch()
+                .await;
+        })
         .await;
+
+        match join_result {
+            Ok(()) => {
+                // Dispatcher exited gracefully (e.g. Ctrl-C).
+                break;
+            }
+            Err(e) => {
+                error!(
+                    "Telegram dispatcher crashed: {}. Retrying in {}s (other channels stay active).",
+                    e,
+                    TELEGRAM_RETRY_DELAY_SECS
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(TELEGRAM_RETRY_DELAY_SECS)).await;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -223,9 +247,18 @@ async fn handle_message(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let chat_id = msg.chat.id.0;
 
-    // Resolve to unified contact (canonical_chat_id); for Telegram, handle == canonical.
+    // Resolve to unified contact (canonical_chat_id).
+    // When UNIVERSAL_CHAT_ID is configured, bind this Telegram handle to that canonical contact.
+    let telegram_handle = chat_id.to_string();
+    let universal_chat_id = state.config.universal_chat_id;
     let canonical_chat_id = call_blocking(state.db.clone(), move |db| {
-        db.resolve_canonical_chat_id("telegram", &chat_id.to_string(), None)
+        if let Some(cid) = universal_chat_id {
+            db.upsert_chat(cid, None, "telegram")?;
+            db.link_channel(cid, "telegram", &telegram_handle)?;
+            Ok(cid)
+        } else {
+            db.resolve_canonical_chat_id("telegram", &telegram_handle, None)
+        }
     })
     .await
     .map_err(|e| format!("resolve_canonical_chat_id: {e}"))?;
@@ -635,7 +668,7 @@ async fn handle_message(
         const STATUS_API_TIMEOUT_SECS: u64 = 5;
         let mut event_handle = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
-                if let AgentEvent::ToolStart { name, input } = event {
+                if let AgentEvent::ToolStart { name, input, .. } = event {
                     let text = format_tool_status(&name, &input);
                     let current_id = *status_msg_id_ev.lock().await;
                     // Wrap each Telegram API call with a timeout so a slow/hung
@@ -835,18 +868,36 @@ pub async fn process_with_agent_with_events(
                 collection
             ));
         } else if use_command {
-            parts.push(format!(
-                "- Vector search: use `search_vault` tool (command-based: runs vault_search_command)"
-            ));
-        } else if let Some(ref u) = v.embedding_server_url {
-            if !u.trim().is_empty() {
-                parts.push(format!("- Embedding server: {}", u.trim()));
+            parts.push(
+                "- Vector search: use `search_vault` tool (command-based: runs vault_search_command)".to_string()
+            );
+        } else {
+            // Check if search_vault was auto-detected from built-in skill
+            let skills_dir = state.config.workspace_root_absolute().join("skills");
+            let auto_script = skills_dir.join("search-vault").join("query_vault.py");
+            if auto_script.exists() {
+                parts.push(
+                    "- Vector search: use `search_vault` tool (auto-detected from built-in search-vault skill)".to_string()
+                );
+            } else if let Some(ref u) = v.embedding_server_url {
+                if !u.trim().is_empty() {
+                    parts.push(format!("- Embedding server: {}", u.trim()));
+                }
             }
         }
         if let Some(ref c) = v.vault_index_command {
             if !c.trim().is_empty() {
                 parts.push(format!("- Index: {}", c.trim()));
             }
+        }
+        // Auto-detect index-vault skill
+        let index_script = state.config.workspace_root_absolute()
+            .join("skills").join("index-vault").join("index_vault.py");
+        if index_script.exists() {
+            parts.push(format!(
+                "- Index vault: activate the `index-vault` skill or run `{}`",
+                index_script.display()
+            ));
         }
         if parts.is_empty() {
             None
@@ -995,7 +1046,8 @@ pub async fn process_with_agent_with_events(
     // - Tool execution timeout: prevents hanging on slow/unresponsive tools (e.g., browser, bash)
     // Both timeouts are critical to ensure the bot always sends a response.
     const LLM_ROUND_TIMEOUT_SECS: u64 = 180;
-    const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 120;
+    const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 600;
+    const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
     info!(
@@ -1031,6 +1083,7 @@ pub async fn process_with_agent_with_events(
         })
         .unwrap_or_default();
     let mut history_iterations: Vec<IterationRecord> = Vec::new();
+    let mut schedule_skill_activated_this_turn = false;
 
     macro_rules! save_run_history {
         ($stop_reason:expr) => {{
@@ -1233,6 +1286,7 @@ pub async fn process_with_agent_with_events(
                 } = block {
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolStart {
+                            tool_use_id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
                         });
@@ -1253,6 +1307,16 @@ pub async fn process_with_agent_with_events(
                     );
 
                     let started = std::time::Instant::now();
+                    let requested_skill_name = input
+                        .get("skill_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim);
+                    let activates_required_schedule_skill = name == "activate_skill"
+                        && requested_skill_name
+                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_SCHEDULING_SKILL))
+                            .unwrap_or(false);
+                    let missing_schedule_skill = name == "schedule_task"
+                        && !schedule_skill_activated_this_turn;
 
                     // TSA: allow or deny before execution
                     let tsa_deny = if state.config.tool_skill_agent_enabled {
@@ -1316,6 +1380,11 @@ pub async fn process_with_agent_with_events(
 
                     let result = if let Some(deny_result) = tsa_deny {
                         deny_result
+                    } else if missing_schedule_skill {
+                        crate::tools::ToolResult::error(
+                            "schedule_task requires activating the `schedule-job` skill first in this turn. Call `activate_skill` with skill_name `schedule-job`, follow its preflight (including timezone handling), then call schedule_task.".into(),
+                        )
+                        .with_error_type("skill_required")
                     } else {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
@@ -1348,6 +1417,15 @@ pub async fn process_with_agent_with_events(
                             }
                         }
                     } };
+                    if activates_required_schedule_skill && !result.is_error {
+                        schedule_skill_activated_this_turn = true;
+                        info!(
+                            "Main agent iteration {}/{}: required scheduling skill activated ({})",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            REQUIRED_SCHEDULING_SKILL
+                        );
+                    }
 
                     let result_preview = if result.content.len() > 10000 {
                         format!(
@@ -1370,16 +1448,11 @@ pub async fn process_with_agent_with_events(
                     );
 
                     if let Some(tx) = event_tx {
-                        let preview = if result.content.chars().count() > 160 {
-                            let clipped = result.content.chars().take(160).collect::<String>();
-                            format!("{clipped}...")
-                        } else {
-                            result.content.clone()
-                        };
                         let _ = tx.send(AgentEvent::ToolResult {
+                            tool_use_id: id.clone(),
                             name: name.clone(),
                             is_error: result.is_error,
-                            preview,
+                            output: result.content.clone(),
                             duration_ms: result
                                 .duration_ms
                                 .unwrap_or_else(|| started.elapsed().as_millis()),
@@ -1757,8 +1830,10 @@ The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when 
 When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list. Use write_memory with scope 'chat_daily' to append to the daily log (today and yesterday are injected at session start). Principles are in AGENTS.md at workspace root; do not overwrite them.
 
 For scheduling:
+- Always activate `schedule-job` skill before calling `schedule_task`
 - Use 6-field cron format: sec min hour dom month dow (e.g., "0 */5 * * * *" for every 5 minutes)
 - For standard 5-field cron from the user, prepend "0 " to add the seconds field
+- If timezone is unknown, default to UTC and state that assumption clearly
 - Use schedule_type "once" with an ISO 8601 timestamp for one-time tasks
 
 ## Browser
