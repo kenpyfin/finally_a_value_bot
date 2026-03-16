@@ -57,6 +57,7 @@ pub struct AgentRequestContext<'a> {
     pub chat_id: i64,
     pub chat_type: &'a str,
     pub persona_id: i64,
+    pub is_scheduled_task: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -497,6 +498,25 @@ async fn handle_message(
         }
     }
 
+    // Handle location/venue (shared location pin)
+    if text.trim().is_empty() {
+        if let Some(venue) = msg.venue() {
+            text = format!(
+                "[location] Title: {}, Address: {}, lat: {}, lon: {}",
+                venue.title,
+                venue.address,
+                venue.location.latitude,
+                venue.location.longitude
+            );
+        } else if let Some(loc) = msg.location() {
+            text = format!(
+                "[location] lat: {}, lon: {}",
+                loc.latitude,
+                loc.longitude
+            );
+        }
+    }
+
     // If no text/image/document content, nothing to process
     if text.trim().is_empty() && image_data.is_none() && document_saved_path.is_none() {
         return Ok(());
@@ -704,6 +724,7 @@ async fn handle_message(
                 chat_id: canonical_chat_id_spawn,
                 chat_type: &runtime_chat_type_owned,
                 persona_id,
+                is_scheduled_task: false,
             },
             None,
             image_data,
@@ -927,44 +948,48 @@ pub async fn process_with_agent_with_events(
     );
 
     // Try to resume from session
-    let mut messages = if let Some((json, updated_at)) =
-        call_blocking(state.db.clone(), move |db| db.load_session(chat_id, persona_id)).await?
-    {
-        // Session exists — deserialize and append new user messages
-        let mut session_messages: Vec<Message> = serde_json::from_str(&json).unwrap_or_default();
+    let mut messages = if !context.is_scheduled_task {
+        if let Some((json, updated_at)) =
+            call_blocking(state.db.clone(), move |db| db.load_session(chat_id, persona_id)).await?
+        {
+            // Session exists — deserialize and append new user messages
+            let mut session_messages: Vec<Message> = serde_json::from_str(&json).unwrap_or_default();
 
-        if session_messages.is_empty() {
-            // Corrupted session, fall back to DB history
-            load_messages_from_db(state, chat_id, persona_id, context.chat_type).await?
-        } else {
-            // Get new user messages since session was last saved
-            let updated_at_cloned = updated_at.clone();
-            let new_msgs = call_blocking(state.db.clone(), move |db| {
-                db.get_new_user_messages_since(chat_id, persona_id, &updated_at_cloned)
-            })
-            .await?;
-            for stored_msg in &new_msgs {
-                let content = format_user_message(&stored_msg.sender_name, &stored_msg.content);
-                // Merge if last message is also from user
-                if let Some(last) = session_messages.last_mut() {
-                    if last.role == "user" {
-                        if let MessageContent::Text(t) = &mut last.content {
-                            t.push('\n');
-                            t.push_str(&content);
-                            continue;
+            if session_messages.is_empty() {
+                // Corrupted session, fall back to DB history
+                load_messages_from_db(state, chat_id, persona_id, context.chat_type).await?
+            } else {
+                // Get new user messages since session was last saved
+                let updated_at_cloned = updated_at.clone();
+                let new_msgs = call_blocking(state.db.clone(), move |db| {
+                    db.get_new_user_messages_since(chat_id, persona_id, &updated_at_cloned)
+                })
+                .await?;
+                for stored_msg in &new_msgs {
+                    let content = format_user_message(&stored_msg.sender_name, &stored_msg.content);
+                    // Merge if last message is also from user
+                    if let Some(last) = session_messages.last_mut() {
+                        if last.role == "user" {
+                            if let MessageContent::Text(t) = &mut last.content {
+                                t.push('\n');
+                                t.push_str(&content);
+                                continue;
+                            }
                         }
                     }
+                    session_messages.push(Message {
+                        role: "user".into(),
+                        content: MessageContent::Text(content),
+                    });
                 }
-                session_messages.push(Message {
-                    role: "user".into(),
-                    content: MessageContent::Text(content),
-                });
+                session_messages
             }
-            session_messages
+        } else {
+            // No session — build from DB history
+            load_messages_from_db(state, chat_id, persona_id, context.chat_type).await?
         }
     } else {
-        // No session — build from DB history
-        load_messages_from_db(state, chat_id, persona_id, context.chat_type).await?
+        Vec::new()
     };
 
     // Strip tool_use / tool_result block messages from prior agentic loops.
@@ -1196,9 +1221,11 @@ pub async fn process_with_agent_with_events(
                 content: MessageContent::Text(assistant_text.clone()),
             });
             strip_images_for_session(&mut messages);
-            if let Ok(json) = serde_json::to_string(&messages) {
-                let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json))
-                    .await;
+            if !context.is_scheduled_task {
+                if let Ok(json) = serde_json::to_string(&messages) {
+                    let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json))
+                        .await;
+                }
             }
 
             let display_text = if state.config.show_thinking {
@@ -1573,11 +1600,13 @@ pub async fn process_with_agent_with_events(
                             content: MessageContent::Text(text.clone()),
                         });
                         strip_images_for_session(&mut messages);
-                        if let Ok(json) = serde_json::to_string(&messages) {
-                            let _ = call_blocking(state.db.clone(), move |db| {
-                                db.save_session(chat_id, persona_id, &json)
-                            })
-                            .await;
+                        if !context.is_scheduled_task {
+                            if let Ok(json) = serde_json::to_string(&messages) {
+                                let _ = call_blocking(state.db.clone(), move |db| {
+                                    db.save_session(chat_id, persona_id, &json)
+                                })
+                                .await;
+                            }
                         }
 
                         let display_text = if state.config.show_thinking {
@@ -1671,9 +1700,11 @@ pub async fn process_with_agent_with_events(
                         content: MessageContent::Text(timeout_msg.clone()),
                     });
                     strip_images_for_session(&mut messages);
-                    if let Ok(json) = serde_json::to_string(&messages) {
-                        let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json))
-                            .await;
+                    if !context.is_scheduled_task {
+                        if let Ok(json) = serde_json::to_string(&messages) {
+                            let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json))
+                                .await;
+                        }
                     }
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::FinalResponse {
@@ -1714,9 +1745,11 @@ pub async fn process_with_agent_with_events(
             content: MessageContent::Text(assistant_text.clone()),
         });
         strip_images_for_session(&mut messages);
-        if let Ok(json) = serde_json::to_string(&messages) {
-            let _ =
-                call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+        if !context.is_scheduled_task {
+            if let Ok(json) = serde_json::to_string(&messages) {
+                let _ =
+                    call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+            }
         }
 
         save_run_history!(stop_reason);
@@ -1741,8 +1774,10 @@ pub async fn process_with_agent_with_events(
         content: MessageContent::Text(max_iter_msg.clone()),
     });
     strip_images_for_session(&mut messages);
-    if let Ok(json) = serde_json::to_string(&messages) {
-        let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+    if !context.is_scheduled_task {
+        if let Ok(json) = serde_json::to_string(&messages) {
+            let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+        }
     }
 
     if let Some(tx) = event_tx {
@@ -3045,6 +3080,7 @@ mod tests {
                     id: "t1".into(),
                     name: "bash".into(),
                     input: serde_json::json!({"command": "ls"}),
+                    thought_signature: None,
                 },
             ]),
         };

@@ -858,21 +858,43 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn ensure_indexing_task(
+    fn ensure_unique_cron_task_by_prompt_prefix(
         &self,
         chat_id: i64,
+        prompt_prefix: &str,
         prompt: &str,
         cron_expr: &str,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM scheduled_tasks WHERE prompt = ?1 AND status = 'active')",
-            params![prompt],
-            |row| row.get(0),
+        let like_pattern = format!("{prompt_prefix}%");
+        let mut stmt = conn.prepare(
+            "SELECT id FROM scheduled_tasks
+             WHERE chat_id = ?1
+               AND status = 'active'
+               AND schedule_type = 'cron'
+               AND prompt LIKE ?2
+             ORDER BY id ASC",
         )?;
+        let existing_ids: Vec<i64> = stmt
+            .query_map(params![chat_id, like_pattern], |row| row.get(0))?
+            .filter_map(Result::ok)
+            .collect();
 
-        if !exists {
-            let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(primary_id) = existing_ids.first().copied() {
+            conn.execute(
+                "UPDATE scheduled_tasks
+                 SET prompt = ?1, schedule_value = ?2, status = 'active'
+                 WHERE id = ?3",
+                params![prompt, cron_expr, primary_id],
+            )?;
+            for dup_id in existing_ids.into_iter().skip(1) {
+                conn.execute(
+                    "UPDATE scheduled_tasks SET status = 'inactive' WHERE id = ?1",
+                    params![dup_id],
+                )?;
+            }
+        } else {
             conn.execute(
                 "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
                  VALUES (?1, ?2, 'cron', ?3, ?4, 'active', ?4)",
@@ -880,6 +902,34 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    pub fn ensure_indexing_task(
+        &self,
+        chat_id: i64,
+        prompt: &str,
+        cron_expr: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        self.ensure_unique_cron_task_by_prompt_prefix(
+            chat_id,
+            "Run the vault indexing script:",
+            prompt,
+            cron_expr,
+        )
+    }
+
+    pub fn ensure_vault_push_task(
+        &self,
+        chat_id: i64,
+        prompt: &str,
+        cron_expr: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        self.ensure_unique_cron_task_by_prompt_prefix(
+            chat_id,
+            "Sync ORIGIN vault to git remote:",
+            prompt,
+            cron_expr,
+        )
     }
 
     pub fn ensure_onboarding_task(

@@ -470,28 +470,11 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
-    // Ensure 4x daily indexing schedule exists.
-    // Build the indexing prompt dynamically: use the venv python if available, otherwise python3.
-    let index_script = workspace_root.join("skills").join("index-vault").join("index_vault.py");
-    let venv_python = workspace_root.join("shared").join(".venv-vault").join("bin").join("python");
-    let python_bin = if venv_python.exists() {
-        venv_python.to_string_lossy().to_string()
-    } else {
-        "python3".to_string()
-    };
-    let index_prompt = format!(
-        "Run the vault indexing script: {} {}. When finished, send a message to the user confirming the indexing status.",
-        python_bin,
-        index_script.display()
-    );
-    if let Err(e) = db.ensure_indexing_task(997894126, &index_prompt, "0 0 */6 * * *") {
-        tracing::warn!("Failed to seed indexing schedule: {}", e);
-    }
-
     // Seed onboarding task for fresh installations
+    let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
     if let Err(e) = db.ensure_onboarding_task(
-        997894126,
-        "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. I've already set up a 4x daily indexing schedule for your vault. How can I help you get started? Please tell me about your projects or what you'd like me to track."
+        seed_chat_id,
+        "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track."
     ) {
         tracing::warn!("Failed to seed onboarding task: {}", e);
     }

@@ -1227,6 +1227,7 @@ async fn send_and_store_response_with_events(
                 chat_id,
                 chat_type: "private",
                 persona_id,
+                is_scheduled_task: false,
             },
             None,
             None,
@@ -1242,6 +1243,7 @@ async fn send_and_store_response_with_events(
                 chat_id,
                 chat_type: "private",
                 persona_id,
+                is_scheduled_task: false,
             },
             None,
             None,
@@ -1539,10 +1541,15 @@ async fn api_schedules_create(
 
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
+    let effective_tz = body.timezone.as_deref()
+        .or_else(|| {
+            let default = state.app_state.config.timezone.trim();
+            if default.is_empty() { None } else { Some(default) }
+        });
     let preflight = crate::tools::schedule::preflight_schedule_request(
         &body.schedule_type,
         &body.schedule_value,
-        body.timezone.as_deref(),
+        effective_tz,
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
@@ -2240,7 +2247,7 @@ mod tests {
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Box::new(SlowLlm { sleep_ms: 300 }), None, limits);
+        let web_state = test_web_state(Arc::new(SlowLlm { sleep_ms: 300 }), None, limits);
         let app = build_router(web_state);
 
         let req1 = Request::builder()
@@ -2273,7 +2280,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_includes_tool_events_and_replay() {
         let web_state = test_web_state(
-            Box::new(ToolFlowLlm {
+            Arc::new(ToolFlowLlm {
                 calls: AtomicUsize::new(0),
             }),
             None,

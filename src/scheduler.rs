@@ -102,6 +102,7 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                 chat_id,
                 chat_type: "private",
                 persona_id,
+                is_scheduled_task: true,
             },
             Some(&prompt),
             None,

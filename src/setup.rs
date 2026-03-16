@@ -1670,17 +1670,17 @@ mod tests {
         values.insert("LLM_PROVIDER".into(), "anthropic".into());
         values.insert("LLM_API_KEY".into(), "key".into());
 
-        let backup = save_config_yaml(&yaml_path, &values).unwrap();
+        let backup = save_config_env(&yaml_path, &values).unwrap();
         assert!(backup.is_none()); // No previous file to back up
 
         let s = fs::read_to_string(&yaml_path).unwrap();
-        assert!(s.contains("telegram_bot_token: \"new_tok\""));
-        assert!(s.contains("bot_username: \"new_bot\""));
-        assert!(s.contains("llm_provider: \"anthropic\""));
-        assert!(s.contains("api_key: \"key\""));
+        assert!(s.contains("TELEGRAM_BOT_TOKEN=\"new_tok\""));
+        assert!(s.contains("BOT_USERNAME=\"new_bot\""));
+        assert!(s.contains("LLM_PROVIDER=\"anthropic\""));
+        assert!(s.contains("LLM_API_KEY=\"key\""));
 
         // Save again to test backup
-        let backup2 = save_config_yaml(&yaml_path, &values).unwrap();
+        let backup2 = save_config_env(&yaml_path, &values).unwrap();
         assert!(backup2.is_some());
 
         let _ = fs::remove_file(&yaml_path);

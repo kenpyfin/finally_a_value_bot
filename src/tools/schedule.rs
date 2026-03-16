@@ -54,7 +54,7 @@ pub(crate) fn compute_next_run(cron_expr: &str, tz_name: &str) -> Result<String,
         .upcoming(tz)
         .next()
         .ok_or_else(|| "No upcoming run found for this cron expression".to_string())?;
-    Ok(next.to_rfc3339())
+    Ok(next.with_timezone(&chrono::Utc).to_rfc3339())
 }
 
 #[derive(Debug, Clone)]
@@ -98,12 +98,14 @@ pub fn preflight_schedule_request(
             })
         }
         "once" => {
-            if chrono::DateTime::parse_from_rfc3339(schedule_value).is_err() {
-                return Err("Invalid ISO 8601 timestamp for one-time schedule".into());
-            }
+            let dt = match chrono::DateTime::parse_from_rfc3339(schedule_value) {
+                Ok(dt) => dt,
+                Err(_) => return Err("Invalid ISO 8601 timestamp for one-time schedule".into()),
+            };
+            let next_run = dt.with_timezone(&chrono::Utc).to_rfc3339();
             Ok(SchedulePreflight {
                 schedule_value: schedule_value.to_string(),
-                next_run: schedule_value.to_string(),
+                next_run,
                 timezone_used: timezone.to_string(),
                 timezone_defaulted_to_utc,
             })
@@ -137,7 +139,7 @@ impl Tool for ScheduleTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "schedule_task".into(),
-            description: "Schedule a recurring or one-time task. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, UTC is used.".into(),
+            description: "Schedule a recurring or one-time task. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -159,7 +161,7 @@ impl Tool for ScheduleTaskTool {
                     },
                     "timezone": {
                         "type": "string",
-                        "description": "Optional IANA timezone name (e.g. 'US/Eastern', 'Europe/London'). If omitted, defaults to UTC."
+                        "description": "Optional IANA timezone name (e.g. 'US/Eastern', 'Europe/London'). If omitted, the bot's configured default timezone is used."
                     }
                 }),
                 &["chat_id", "prompt", "schedule_type", "schedule_value"],
@@ -191,8 +193,10 @@ impl Tool for ScheduleTaskTool {
             None => return ToolResult::error("Missing required parameter: schedule_value".into()),
         };
         let timezone_input = input.get("timezone").and_then(|v| v.as_str());
-        let _configured_default_timezone = self.default_timezone.trim();
-        let preflight = match preflight_schedule_request(schedule_type, schedule_value, timezone_input)
+        let configured_default_tz = self.default_timezone.trim();
+        let effective_tz = timezone_input
+            .or_else(|| if configured_default_tz.is_empty() { None } else { Some(configured_default_tz) });
+        let preflight = match preflight_schedule_request(schedule_type, schedule_value, effective_tz)
         {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),

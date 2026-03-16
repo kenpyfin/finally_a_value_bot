@@ -192,6 +192,7 @@ impl EventHandler for Handler {
                     "private"
                 },
                 persona_id,
+                is_scheduled_task: false,
             },
             None,
             None,

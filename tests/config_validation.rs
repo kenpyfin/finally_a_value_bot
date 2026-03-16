@@ -49,6 +49,19 @@ fn minimal_config() -> Config {
         cursor_agent_timeout_secs: 600,
         social: None,
         vault: None,
+        universal_chat_id: None,
+        orchestrator_enabled: true,
+        orchestrator_model: String::new(),
+        tool_skill_agent_enabled: true,
+        tool_skill_agent_model: String::new(),
+        post_tool_evaluator_enabled: false,
+        post_tool_evaluator_model: String::new(),
+        delegate_tool_enabled: true,
+        delegate_max_iterations: 10,
+        delegate_model: String::new(),
+        cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
+        cursor_agent_tmux_enabled: true,
+        cursor_agent_runner_url: None,
     }
 }
 

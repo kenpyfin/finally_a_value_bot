@@ -215,57 +215,25 @@ install_from_archive() {
   install_binary_atomic "$bin_path" "$install_dir"
 }
 
-setup_systemd() {
+setup_gateway_service() {
   local install_dir="$1"
-  local finally_a_value_bot_cmd="${install_dir}/${BIN_NAME}"
-  local service_name="finally-a-value-bot"
-  local service_file="/etc/systemd/system/${service_name}.service"
-  local user_name
-  user_name=$(id -un)
-  local project_dir
-  project_dir=$(pwd)
+  local bot_cmd="${install_dir}/${BIN_NAME}"
 
-  if [ "$(uname -s)" != "Linux" ]; then
-    return 0
-  fi
-
-  if ! need_cmd systemctl; then
+  if [ ! -x "$bot_cmd" ]; then
     return 0
   fi
 
   printf "\n"
-  log_info "Optionally, you can install FinallyAValueBot as a systemd service."
-  printf "Install systemd service? [y/N] "
+  log_info "Optionally, install background service via gateway (cross-platform)."
+  printf "Install gateway service now? [y/N] "
   read -r install_svc
   install_svc="$(echo "${install_svc:-n}" | tr '[:upper:]' '[:lower:]')"
 
   if [ "$install_svc" = "y" ] || [ "$install_svc" = "yes" ]; then
-    local tmp_svc
-    tmp_svc=$(mktemp)
-    cat <<EOF > "$tmp_svc"
-[Unit]
-Description=FinallyAValueBot Bot
-After=network.target
-
-[Service]
-Type=simple
-User=$user_name
-WorkingDirectory=$project_dir
-ExecStart=$finally_a_value_bot_cmd start
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    log_info "Installing service to $service_file (requires sudo)..."
-    if sudo mv "$tmp_svc" "$service_file" && sudo systemctl daemon-reload; then
-      log_success "Service installed and reloaded."
-      log_info "To start: sudo systemctl start $service_name"
-      log_info "To enable on boot: sudo systemctl enable $service_name"
+    if "$bot_cmd" gateway install; then
+      log_success "Gateway service installed."
     else
-      log_error "Failed to install systemd service."
+      log_error "Gateway install failed."
     fi
   fi
 }
@@ -335,15 +303,13 @@ main() {
     log_info "Example: export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
 
-  local finally_a_value_bot_cmd="${install_dir}/${BIN_NAME}"
-
   if [ ! -f .env ] && [ -f .env.example ]; then
     cp .env.example .env
     log_success "Copied .env.example to .env"
   fi
 
   if [ -t 0 ]; then
-    setup_systemd "$install_dir"
+    setup_gateway_service "$install_dir"
   fi
 
   printf "\n"

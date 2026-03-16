@@ -68,24 +68,31 @@ remove_file() {
   return 0
 }
 
-remove_systemd_service() {
-  local service_name="finally-a-value-bot"
-  local service_file="/etc/systemd/system/${service_name}.service"
+remove_gateway_service() {
+  local candidates=(
+    "${FINALLY_A_VALUE_BOT_INSTALL_DIR:-}/$BIN_NAME"
+    "$(command -v "$BIN_NAME" 2>/dev/null || true)"
+    "/usr/local/bin/$BIN_NAME"
+    "$HOME/.local/bin/$BIN_NAME"
+  )
+  local cmd=""
+  local c
+  for c in "${candidates[@]}"; do
+    if [ -n "$c" ] && [ -x "$c" ]; then
+      cmd="$c"
+      break
+    fi
+  done
 
-  if [ "$(uname -s)" != "Linux" ]; then
+  if [ -z "$cmd" ]; then
     return 0
   fi
 
-  if [ -f "$service_file" ]; then
-    log_info "Removing systemd service $service_file (requires sudo)..."
-    if sudo systemctl stop "$service_name" 2>/dev/null && \
-       sudo systemctl disable "$service_name" 2>/dev/null && \
-       sudo rm -f "$service_file" && \
-       sudo systemctl daemon-reload; then
-      log_success "Systemd service removed."
-    else
-      log_error "Failed to remove systemd service."
-    fi
+  log_info "Uninstalling gateway service via CLI..."
+  if "$cmd" gateway uninstall >/dev/null 2>&1; then
+    log_success "Gateway service uninstalled."
+  else
+    log_warn "Gateway uninstall skipped or failed (service may not be installed)."
   fi
 }
 
@@ -110,7 +117,7 @@ main() {
     fi
   done < <(resolve_targets)
 
-  remove_systemd_service
+  remove_gateway_service
 
   if [ "$failed" -ne 0 ]; then
     exit 1

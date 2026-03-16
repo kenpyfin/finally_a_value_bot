@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::db::Database;
 use crate::logging;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -75,14 +76,18 @@ run: finally_a_value_bot gateway uninstall && finally_a_value_bot gateway instal
 fn install() -> Result<()> {
     let ctx = build_context()?;
     if cfg!(target_os = "macos") {
-        install_macos(&ctx)
+        install_macos(&ctx)?;
     } else if cfg!(target_os = "linux") {
-        install_linux(&ctx)
+        install_linux(&ctx)?;
     } else {
-        Err(anyhow!(
+        return Err(anyhow!(
             "Gateway service is only supported on macOS and Linux"
-        ))
+        ));
     }
+    if let Err(e) = seed_default_vault_maintenance_tasks(&ctx) {
+        eprintln!("Warning: failed to seed recurring vault tasks: {e}");
+    }
+    Ok(())
 }
 
 fn uninstall() -> Result<()> {
@@ -200,6 +205,51 @@ fn resolve_runtime_logs_dir(cwd: &Path) -> PathBuf {
         Ok(cfg) => PathBuf::from(cfg.runtime_data_dir()).join("logs"),
         Err(_) => cwd.join("runtime").join("logs"),
     }
+}
+
+fn load_config_for_gateway(ctx: &ServiceContext) -> Result<Config> {
+    if let Some(path) = &ctx.config_path {
+        Config::load_from_path(path).map_err(Into::into)
+    } else {
+        Config::load().map_err(Into::into)
+    }
+}
+
+fn seed_default_vault_maintenance_tasks(ctx: &ServiceContext) -> Result<()> {
+    let cfg = load_config_for_gateway(ctx)?;
+    let runtime_data_dir = cfg.runtime_data_dir();
+    let db = Database::new(&runtime_data_dir)?;
+    let chat_id = cfg.universal_chat_id.unwrap_or(997894126);
+
+    let workspace_root = cfg.workspace_root_absolute();
+    let index_script = workspace_root
+        .join("skills")
+        .join("index-vault")
+        .join("index_vault.py");
+    let venv_python = workspace_root
+        .join("shared")
+        .join(".venv-vault")
+        .join("bin")
+        .join("python");
+    let python_bin = if venv_python.exists() {
+        venv_python.to_string_lossy().to_string()
+    } else {
+        "python3".to_string()
+    };
+
+    let index_prompt = format!(
+        "Run the vault indexing script: {} {}. When finished, send a message to the user confirming the indexing status.",
+        python_bin,
+        index_script.display()
+    );
+    db.ensure_indexing_task(chat_id, &index_prompt, "0 0 */6 * * *")?;
+
+    let push_prompt = format!(
+        "Sync ORIGIN vault to git remote: run `cd {} && git add -A && git commit -m \"auto: vault sync\" || true && git push origin HEAD`. If there is nothing to commit, report that no changes were pushed.",
+        workspace_root.join("shared").join("ORIGIN").display()
+    );
+    db.ensure_vault_push_task(chat_id, &push_prompt, "0 0 */6 * * *")?;
+    Ok(())
 }
 
 fn run_command(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
