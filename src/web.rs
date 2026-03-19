@@ -25,6 +25,7 @@ use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::telegram::{
     archive_conversation, process_with_agent,
     process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
+    BACKGROUND_JOB_HANDOFF_PREFIX,
 };
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
@@ -952,15 +953,95 @@ async fn api_send_stream(
                     .unwrap_or_default()
                     .to_string();
 
-                state_for_task
-                    .run_hub
-                    .publish(
-                        &run_id_for_task,
-                        "done",
-                        json!({"response": response_text}).to_string(),
-                        limits.run_history_limit,
-                    )
-                    .await;
+                if response_text.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
+                    let job_id = uuid::Uuid::new_v4().to_string();
+                    let prompt_text = resp
+                        .0
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let persona_id = resp
+                        .0
+                        .get("persona_id")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
+                    // Allow only one active background subagent per chat to avoid
+                    // result interleaving and ambiguous follow-up replies.
+                    let active_jobs = call_blocking(state_for_task.app_state.db.clone(), move |db| {
+                        db.count_active_background_jobs_for_chat(chat_id)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if active_jobs > 0 {
+                        state_for_task
+                            .run_hub
+                            .publish(
+                                &run_id_for_task,
+                                "done",
+                                json!({
+                                    "response": "A background task is already running for this chat. Please wait for it to finish before starting another long-running background task."
+                                })
+                                .to_string(),
+                                limits.run_history_limit,
+                            )
+                            .await;
+                    } else {
+                        let jid = job_id.clone();
+                        let prompt_for_db = prompt_text.clone();
+                        let _ = call_blocking(state_for_task.app_state.db.clone(), move |db| {
+                            db.create_background_job(&jid, chat_id, persona_id, &prompt_for_db, "timeout")
+                        })
+                        .await;
+
+                        crate::background_jobs::spawn_background_job(
+                            state_for_task.app_state.clone(),
+                            job_id.clone(),
+                            chat_id,
+                            persona_id,
+                            prompt_text,
+                        );
+
+                        state_for_task
+                            .run_hub
+                            .publish(
+                                &run_id_for_task,
+                                "background_job",
+                                json!({
+                                    "job_id": job_id,
+                                    "message": "Task moved to background due to timeout. You can keep chatting while it runs."
+                                })
+                                .to_string(),
+                                limits.run_history_limit,
+                            )
+                            .await;
+
+                        state_for_task
+                            .run_hub
+                            .publish(
+                                &run_id_for_task,
+                                "done",
+                                json!({
+                                    "response": "This task is now running as a background subagent. You can continue chatting; a separate reply will arrive when it finishes.",
+                                    "background_job_id": job_id
+                                })
+                                .to_string(),
+                                limits.run_history_limit,
+                            )
+                            .await;
+                    }
+                } else {
+                    state_for_task
+                        .run_hub
+                        .publish(
+                            &run_id_for_task,
+                            "done",
+                            json!({"response": response_text}).to_string(),
+                            limits.run_history_limit,
+                        )
+                        .await;
+                }
             }
             Err((_, err_msg)) => {
                 state_for_task
@@ -1278,6 +1359,7 @@ async fn send_and_store_response_with_events(
                 chat_type: "private",
                 persona_id,
                 is_scheduled_task: false,
+                is_background_job: false,
             },
             None,
             image_data,
@@ -1294,6 +1376,7 @@ async fn send_and_store_response_with_events(
                 chat_type: "private",
                 persona_id,
                 is_scheduled_task: false,
+                is_background_job: false,
             },
             None,
             image_data,
@@ -1302,21 +1385,25 @@ async fn send_and_store_response_with_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
-    deliver_to_contact(
-        state.app_state.db.clone(),
-        Some(&state.app_state.bot),
-        state.app_state.discord_http.as_deref(),
-        &state.app_state.config.bot_username,
-        chat_id,
-        persona_id,
-        &response,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !response.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
+        deliver_to_contact(
+            state.app_state.db.clone(),
+            Some(&state.app_state.bot),
+            state.app_state.discord_http.as_deref(),
+            &state.app_state.config.bot_username,
+            chat_id,
+            persona_id,
+            &response,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
 
     Ok(Json(json!({
         "ok": true,
         "chat_id": chat_id,
+        "persona_id": persona_id,
+        "prompt": raw_text,
         "response": response,
     })))
 }
@@ -1830,6 +1917,55 @@ async fn api_schedules_update(
     })))
 }
 
+// --- Background jobs API ---
+
+#[derive(Debug, Deserialize)]
+struct BackgroundJobsQuery {
+    chat_id: Option<i64>,
+    limit: Option<usize>,
+}
+
+async fn api_background_jobs_list(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<BackgroundJobsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    let limit = query.limit.unwrap_or(20).min(100);
+    let jobs = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_background_jobs_for_chat(chat_id, limit)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let items: Vec<serde_json::Value> = jobs
+        .into_iter()
+        .map(|j| {
+            json!({
+                "id": j.id,
+                "chat_id": j.chat_id,
+                "persona_id": j.persona_id,
+                "prompt": j.prompt,
+                "status": j.status,
+                "trigger_reason": j.trigger_reason,
+                "created_at": j.created_at,
+                "started_at": j.started_at,
+                "finished_at": j.finished_at,
+                "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
+                "error_text": j.error_text,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "jobs": items,
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 struct ContactsBindingsQuery {
     chat_id: Option<i64>,
@@ -2159,6 +2295,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/contacts/bindings", get(api_contacts_bindings))
         .route("/api/schedules", get(api_schedules_list).post(api_schedules_create))
         .route("/api/schedules/:id", patch(api_schedules_update))
+        .route("/api/background_jobs", get(api_background_jobs_list))
         .route("/api/history", get(api_history))
         .route("/api/history/days", get(api_history_days))
         .route("/api/send", post(api_send))

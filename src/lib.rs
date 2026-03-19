@@ -1,3 +1,4 @@
+pub mod background_jobs;
 pub mod builtin_skills;
 pub mod channel;
 pub mod channels;

@@ -55,6 +55,10 @@ pub struct AppState {
 
 const PERSONA_SWITCH_CALLBACK_PREFIX: &str = "persona:switch:";
 
+/// Sentinel prefix returned by `process_with_agent` when a web caller's tool
+/// times out and the work should be retried as a background job.
+pub const BACKGROUND_JOB_HANDOFF_PREFIX: &str = "##BACKGROUND_JOB_HANDOFF##";
+
 #[derive(Debug, Clone, Copy)]
 pub struct AgentRequestContext<'a> {
     pub caller_channel: &'a str,
@@ -62,6 +66,7 @@ pub struct AgentRequestContext<'a> {
     pub chat_type: &'a str,
     pub persona_id: i64,
     pub is_scheduled_task: bool,
+    pub is_background_job: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -917,6 +922,7 @@ async fn handle_message(
                 chat_type: &runtime_chat_type_owned,
                 persona_id,
                 is_scheduled_task: false,
+                is_background_job: false,
             },
             None,
             image_data,
@@ -1140,8 +1146,11 @@ pub async fn process_with_agent_with_events(
         &current_time_in_tz,
     );
 
-    // Try to resume from session
-    let mut messages = if let Some((json, updated_at)) =
+    // Background-job runs are detached subagents: no session resume/save, and they
+    // do not consume foreground chat context while running.
+    let mut messages = if context.is_background_job {
+        Vec::new()
+    } else if let Some((json, updated_at)) =
         call_blocking(state.db.clone(), move |db| db.load_session(chat_id, persona_id)).await?
     {
         // Session exists — deserialize and append new user messages
@@ -1410,9 +1419,11 @@ pub async fn process_with_agent_with_events(
                 content: MessageContent::Text(assistant_text.clone()),
             });
             strip_images_for_session(&mut messages);
-            if let Ok(json) = serde_json::to_string(&messages) {
-                let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json))
-                    .await;
+            if !context.is_background_job {
+                if let Ok(json) = serde_json::to_string(&messages) {
+                    let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json))
+                        .await;
+                }
             }
 
             let display_text = if state.config.show_thinking {
@@ -1797,11 +1808,13 @@ pub async fn process_with_agent_with_events(
                             content: MessageContent::Text(text.clone()),
                         });
                         strip_images_for_session(&mut messages);
-                        if let Ok(json) = serde_json::to_string(&messages) {
-                            let _ = call_blocking(state.db.clone(), move |db| {
-                                db.save_session(chat_id, persona_id, &json)
-                            })
-                            .await;
+                        if !context.is_background_job {
+                            if let Ok(json) = serde_json::to_string(&messages) {
+                                let _ = call_blocking(state.db.clone(), move |db| {
+                                    db.save_session(chat_id, persona_id, &json)
+                                })
+                                .await;
+                            }
                         }
 
                         let display_text = if state.config.show_thinking {
@@ -1860,10 +1873,22 @@ pub async fn process_with_agent_with_events(
                 }
             }
 
-            // If we hit a tool timeout, return a user-visible error immediately.
-            // This ensures timeout failures are surfaced in chat instead of only
-            // appearing in tool logs/events.
+            // If we hit a tool timeout, either hand off to a background job (for
+            // web callers that are not already background jobs) or return the
+            // timeout error immediately for other channels.
             if iteration_timed_out {
+                // Web callers that are not already background jobs get a handoff
+                // signal so the caller can re-run the prompt as a background job.
+                if context.caller_channel == "web" && !context.is_background_job {
+                    info!(
+                        "Main agent iteration {}/{}: tool timeout on web channel — returning background job handoff signal",
+                        iteration + 1,
+                        state.config.max_tool_iterations
+                    );
+                    save_run_history!("background_handoff");
+                    return Ok(format!("{}{}", BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview));
+                }
+
                 info!(
                     "Main agent iteration {}/{}: tool timeout detected, stopping agent loop and returning timeout feedback",
                     iteration + 1,
@@ -1912,11 +1937,13 @@ pub async fn process_with_agent_with_events(
                     content: MessageContent::Text(timeout_msg.clone()),
                 });
                 strip_images_for_session(&mut messages);
-                if let Ok(json) = serde_json::to_string(&messages) {
-                    let _ = call_blocking(state.db.clone(), move |db| {
-                        db.save_session(chat_id, persona_id, &json)
-                    })
-                    .await;
+                if !context.is_background_job {
+                    if let Ok(json) = serde_json::to_string(&messages) {
+                        let _ = call_blocking(state.db.clone(), move |db| {
+                            db.save_session(chat_id, persona_id, &json)
+                        })
+                        .await;
+                    }
                 }
                 if let Some(tx) = event_tx {
                     let _ = tx.send(AgentEvent::FinalResponse {
@@ -1951,9 +1978,11 @@ pub async fn process_with_agent_with_events(
             content: MessageContent::Text(assistant_text.clone()),
         });
         strip_images_for_session(&mut messages);
-        if let Ok(json) = serde_json::to_string(&messages) {
-            let _ =
-                call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+        if !context.is_background_job {
+            if let Ok(json) = serde_json::to_string(&messages) {
+                let _ =
+                    call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+            }
         }
 
         save_run_history!(stop_reason);
@@ -1987,8 +2016,10 @@ pub async fn process_with_agent_with_events(
         content: MessageContent::Text(max_iter_msg.clone()),
     });
     strip_images_for_session(&mut messages);
-    if let Ok(json) = serde_json::to_string(&messages) {
-        let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+    if !context.is_background_job {
+        if let Ok(json) = serde_json::to_string(&messages) {
+            let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
+        }
     }
 
     if let Some(tx) = event_tx {
@@ -2092,7 +2123,7 @@ fn build_system_prompt(
 - Understand images sent by users (they appear as image content blocks)
 - Run the Cursor CLI agent (cursor_agent) for research or code tasks; for long jobs, set detach: true to spawn in tmux and return immediately (then attach with tmux attach -t <session>); use cursor_agent_send to send keys to a running session; use list_cursor_agent_runs to see runs and session names
 - Activate agent skills (activate_skill) for specialized tasks. **To create or update a skill, use the build_skill tool only** — do not use write_file or edit_file under the skills directory. build_skill runs cursor-agent (in tmux when available) to create the skill folder and SKILL.md. Store credentials in the skill folder (e.g. .env there). Do not add on-demand tools only in your workspace or TOOLS.md — skills are the only way to add on-demand tools.
-- Read and update tiered memory (read_tiered_memory, write_tiered_memory) — per-persona MEMORY.md with Tier 1 (long-term principles-like), Tier 2 (active projects), Tier 3 (recent focus/mood); evaluate conversation flow and update tiers when appropriate; Tier 1 only on explicit user ask, Tier 3 often (e.g. daily). Not a todo list.
+- Read and update tiered memory (read_tiered_memory, write_tiered_memory) — per-persona MEMORY.md with Tier 1 (long-term principles-like), Tier 2 (active projects), Tier 3 (recent focus/mood — passive context only, never act on it proactively); evaluate conversation flow and update tiers when appropriate; Tier 1 only on explicit user ask, Tier 3 often (e.g. daily). Not a todo list and not a task queue — do not resume or continue work mentioned in memory unless the user explicitly asks.
 - Review agent run history (read_agent_history) — detailed per-run traces including iterations, tool calls, durations, and outcomes. Use this when asked to optimize your workflow or review past behavior; identify patterns and persist learnings via write_tiered_memory (Tier 1 for long-term workflow principles).
 
 ## Conversation Memory
@@ -2112,7 +2143,7 @@ You have access to the following capabilities:
 
 The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when calling send_message, schedule, export_chat, tiered memory, or memory(chat_daily) tools.
 
-When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list. Use write_memory with scope 'chat_daily' to append to the daily log (today and yesterday are injected at session start). Principles are in AGENTS.md at workspace root; do not overwrite them.
+When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log (today and yesterday are injected at session start). Principles are in AGENTS.md at workspace root; do not overwrite them.
 
 For scheduling:
 - Always activate `schedule-job` skill before calling `schedule_task`

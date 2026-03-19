@@ -926,10 +926,45 @@ impl Config {
                 lines.push(format!("LLM_BASE_URL={}", esc(u)));
             }
         }
+        lines.push(format!("MAX_TOKENS={}", self.max_tokens));
+        lines.push(format!("MAX_TOOL_ITERATIONS={}", self.max_tool_iterations));
+        lines.push(format!("MAX_HISTORY_MESSAGES={}", self.max_history_messages));
+        lines.push(format!("MAX_DOCUMENT_SIZE_MB={}", self.max_document_size_mb));
+        lines.push(format!("SHOW_THINKING={}", if self.show_thinking { "true" } else { "false" }));
         lines.push("".into());
         lines.push("# Workspace".into());
         lines.push(format!("WORKSPACE_DIR={}", esc(&self.workspace_dir)));
         lines.push(format!("TIMEZONE={}", esc(&self.timezone)));
+        if let Some(id) = self.universal_chat_id {
+            lines.push(format!("UNIVERSAL_CHAT_ID={id}"));
+        }
+        lines.push("".into());
+        lines.push("# Web".into());
+        lines.push(format!("WEB_ENABLED={}", if self.web_enabled { "true" } else { "false" }));
+        lines.push(format!("WEB_HOST={}", esc(&self.web_host)));
+        lines.push(format!("WEB_PORT={}", self.web_port));
+        if let Some(ref token) = self.web_auth_token {
+            if !token.is_empty() {
+                lines.push(format!("WEB_AUTH_TOKEN={}", esc(token)));
+            }
+        }
+        lines.push(format!(
+            "WEB_MAX_INFLIGHT_PER_SESSION={}",
+            self.web_max_inflight_per_session
+        ));
+        lines.push(format!(
+            "WEB_MAX_REQUESTS_PER_WINDOW={}",
+            self.web_max_requests_per_window
+        ));
+        lines.push(format!(
+            "WEB_RATE_WINDOW_SECONDS={}",
+            self.web_rate_window_seconds
+        ));
+        lines.push(format!("WEB_RUN_HISTORY_LIMIT={}", self.web_run_history_limit));
+        lines.push(format!(
+            "WEB_SESSION_IDLE_TTL_SECONDS={}",
+            self.web_session_idle_ttl_seconds
+        ));
         lines.push("".into());
         lines.push("# Runtime safety".into());
         lines.push(format!(
@@ -1294,6 +1329,44 @@ discord_allowed_channels: [111, 222]
         config.save_yaml(path.to_str().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("telegram_bot_token"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_config_save_env_includes_runtime_and_web_keys() {
+        let mut config = test_config();
+        config.max_tokens = 4096;
+        config.max_tool_iterations = 55;
+        config.max_document_size_mb = 77;
+        config.show_thinking = true;
+        config.web_enabled = true;
+        config.web_host = "0.0.0.0".into();
+        config.web_port = 11999;
+        config.web_auth_token = Some("secret123".into());
+        config.web_max_inflight_per_session = 4;
+        config.web_max_requests_per_window = 12;
+        config.web_rate_window_seconds = 30;
+        config.web_run_history_limit = 900;
+        config.web_session_idle_ttl_seconds = 600;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("finally_a_value_bot_test_config.env");
+        config.save_env(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(content.contains("MAX_TOKENS=4096"));
+        assert!(content.contains("MAX_TOOL_ITERATIONS=55"));
+        assert!(content.contains("MAX_DOCUMENT_SIZE_MB=77"));
+        assert!(content.contains("SHOW_THINKING=true"));
+        assert!(content.contains("WEB_ENABLED=true"));
+        assert!(content.contains("WEB_HOST=0.0.0.0"));
+        assert!(content.contains("WEB_PORT=11999"));
+        assert!(content.contains("WEB_AUTH_TOKEN=secret123"));
+        assert!(content.contains("WEB_MAX_INFLIGHT_PER_SESSION=4"));
+        assert!(content.contains("WEB_MAX_REQUESTS_PER_WINDOW=12"));
+        assert!(content.contains("WEB_RATE_WINDOW_SECONDS=30"));
+        assert!(content.contains("WEB_RUN_HISTORY_LIMIT=900"));
+        assert!(content.contains("WEB_SESSION_IDLE_TTL_SECONDS=600"));
         std::fs::remove_file(path).ok();
     }
 }

@@ -37,7 +37,7 @@ import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
-import type { Persona, ScheduleTask, ChannelBinding } from './types'
+import type { Persona, ScheduleTask, ChannelBinding, BackgroundJob } from './types'
 
 type ConfigPayload = Record<string, unknown>
 
@@ -134,6 +134,23 @@ const DEFAULT_CONFIG_VALUES = {
 const OUTPUT_GUARD_MODE_OPTIONS = ['off', 'moderate', 'strict'] as const
 const EXECUTION_MODE_OPTIONS = ['off', 'warn_confirm', 'strict'] as const
 const RISKY_CATEGORY_OPTIONS = ['destructive', 'system', 'network', 'package'] as const
+
+function riskyCategoryTooltip(category: string, enabled: boolean): string {
+  const meaning =
+    category === 'destructive'
+      ? 'Delete/overwrite commands (for example rm -rf, mkfs).'
+      : category === 'system'
+        ? 'System/service/process control commands (for example systemctl, reboot, sudo).'
+        : category === 'network'
+          ? 'Network commands that can mutate external state (for example POST/PUT/PATCH/DELETE requests).'
+          : 'Package manager install/remove commands (for example apt, npm install/uninstall).'
+
+  const action = enabled
+    ? 'Selected: this category is protected by execution safety mode.'
+    : 'Deselected: this category is not protected by execution safety mode.'
+
+  return `${meaning} ${action}`
+}
 
 const UI_THEME_OPTIONS: { key: UiTheme; label: string; color: string }[] = [
   { key: 'green', label: 'Green', color: '#34d399' },
@@ -718,6 +735,8 @@ function App() {
   const [newScheduleValue, setNewScheduleValue] = useState('0 9 * * *')
   const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
+  const [bgJobs, setBgJobs] = useState<BackgroundJob[]>([])
+  const [bgJobsOpen, setBgJobsOpen] = useState<boolean>(false)
   const sendingRef = React.useRef<boolean>(false)
 
   React.useEffect(() => {
@@ -1001,6 +1020,16 @@ function App() {
               throw new Error(message)
             }
 
+            if (event.event === 'background_job') {
+              const bgMsg = typeof data.message === 'string' ? data.message : 'Task moved to background processing.'
+              assistantText += `\n\n${bgMsg}`
+              const content = makeContent()
+              if (content.length > 0) yield { content }
+              setStatusText('Background job started')
+              loadBackgroundJobs(chatId).catch(() => {})
+              continue
+            }
+
             if (event.event === 'done') {
               receivedDone = true
               // Command shortcuts (e.g. /persona, /reset) return full response in done only, no deltas
@@ -1102,6 +1131,7 @@ function App() {
       web_enabled: Boolean(data.config?.web_enabled),
       web_host: String(data.config?.web_host || '127.0.0.1'),
       web_port: Number(data.config?.web_port ?? 10961),
+      web_auth_token: '',
       safety_output_guard_mode: String(
         data.config?.safety_output_guard_mode || DEFAULT_CONFIG_VALUES.safety_output_guard_mode,
       ),
@@ -1219,6 +1249,8 @@ function App() {
       }
       const apiKey = String(configDraft.api_key || '').trim()
       if (apiKey) payload.api_key = apiKey
+      const webAuthToken = String(configDraft.web_auth_token || '').trim()
+      if (webAuthToken) payload.web_auth_token = webAuthToken
 
       await api('/api/config', { method: 'PUT', body: JSON.stringify(payload) })
       setSaveStatus('Saved. Restart finally-a-value-bot to apply changes.')
@@ -1250,6 +1282,7 @@ function App() {
           const chosen = await loadPersonas(cid)
           loadBindings(cid).catch(() => {})
           loadSchedules(cid).catch(() => {})
+          loadBackgroundJobs(cid).catch(() => {})
           await loadHistory(cid, chosen?.id ?? pid)
         }
       } catch (e) {
@@ -1267,6 +1300,19 @@ function App() {
       setSchedules(Array.isArray(data.tasks) ? data.tasks : [])
     } catch {
       setSchedules([])
+    }
+  }
+
+  async function loadBackgroundJobs(cid: number | null = chatId): Promise<void> {
+    if (cid == null) return
+    try {
+      const query = new URLSearchParams({ chat_id: String(cid) })
+      const data = await api<{ jobs?: BackgroundJob[] }>(`/api/background_jobs?${query.toString()}`)
+      const jobs = Array.isArray(data.jobs) ? data.jobs : []
+      setBgJobs(jobs)
+      return
+    } catch {
+      setBgJobs([])
     }
   }
 
@@ -1337,6 +1383,7 @@ function App() {
       if (cancelled) return
       loadBindings(chatId).catch(() => {})
       loadSchedules(chatId).catch(() => {})
+      loadBackgroundJobs(chatId).catch(() => {})
       if (chosen) {
         try {
           await api('/api/personas/switch', {
@@ -1360,6 +1407,45 @@ function App() {
     }
   }, [activePersonaId])
 
+  // Poll background jobs while any are still in active subagent lifecycle states.
+  useEffect(() => {
+    const hasActive = bgJobs.some((j) =>
+      j.status === 'pending' ||
+      j.status === 'running' ||
+      j.status === 'completed_raw' ||
+      j.status === 'main_agent_processing',
+    )
+    if (!hasActive || chatId == null) return
+    const interval = setInterval(() => {
+      loadBackgroundJobs(chatId).catch(() => {})
+    }, 5000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bgJobs, chatId])
+
+  // When a background job reaches its terminal state, refresh history once.
+  const prevBgJobsRef = React.useRef<BackgroundJob[]>([])
+  useEffect(() => {
+    const prev = prevBgJobsRef.current
+    for (const job of bgJobs) {
+      if (job.status === 'done' || job.status === 'failed') {
+        const was = prev.find((p) => p.id === job.id)
+        if (
+          was && (
+            was.status === 'pending' ||
+            was.status === 'running' ||
+            was.status === 'completed_raw' ||
+            was.status === 'main_agent_processing'
+          )
+        ) {
+          loadHistory(chatId, activePersonaId ?? undefined).catch(() => {})
+          break
+        }
+      }
+    }
+    prevBgJobsRef.current = bgJobs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bgJobs])
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
@@ -1481,7 +1567,14 @@ function App() {
                           </Select.Content>
                         </Select.Root>
                         <Text size="1" color="gray">{t.schedule_type} · {t.next_run ?? '—'}</Text>
-                        <Text size="1" color="gray">{t.status}</Text>
+                        <Text size="1" color={
+                          t.status === 'active' || t.status === 'running' ? 'green' :
+                          t.status === 'paused' ? 'orange' :
+                          t.status === 'completed' ? 'gray' :
+                          t.status === 'cancelled' ? 'red' : 'gray'
+                        }>
+                          {t.status === 'running' ? 'active' : t.status}
+                        </Text>
                         {t.status === 'active' ? (
                           <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'paused' })}>Pause</Button>
                         ) : t.status === 'paused' ? (
@@ -1546,6 +1639,69 @@ function App() {
                 </div>
               ) : null}
             </div>
+
+            {bgJobs.length > 0 ? (
+              <div className="mx-3 mt-2">
+                <Button size="1" variant="soft" onClick={() => setBgJobsOpen((o) => !o)}>
+                  {bgJobsOpen ? 'Hide' : 'Show'} Background Jobs
+                  {bgJobs.some((j) =>
+                    j.status === 'pending' ||
+                    j.status === 'running' ||
+                    j.status === 'completed_raw' ||
+                    j.status === 'main_agent_processing',
+                  )
+                    ? ` (${bgJobs.filter((j) =>
+                      j.status === 'pending' ||
+                      j.status === 'running' ||
+                      j.status === 'completed_raw' ||
+                      j.status === 'main_agent_processing',
+                    ).length} active)`
+                    : ''}
+                </Button>
+                {bgJobsOpen ? (
+                  <div className="mt-2 rounded-md border p-3" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' } : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}>
+                    <Text size="2" weight="bold" className="mb-2 block">Background Jobs</Text>
+                    <ul className="list-none space-y-2">
+                      {bgJobs.map((j) => (
+                        <li key={j.id} className="flex flex-wrap items-center gap-2 rounded border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
+                          <span className="min-w-0 flex-1 truncate" title={j.prompt}>{j.prompt}</span>
+                          <Text size="1" color={
+                            j.status === 'running' ? 'blue' :
+                            j.status === 'completed_raw' ? 'orange' :
+                            j.status === 'main_agent_processing' ? 'blue' :
+                            j.status === 'done' ? 'green' :
+                            j.status === 'failed' ? 'red' : 'gray'
+                          }>
+                            {j.status === 'running' ? 'Running...' :
+                             j.status === 'completed_raw' ? 'Raw result ready' :
+                             j.status === 'main_agent_processing' ? 'Main agent summarizing...' :
+                             j.status === 'done' ? 'Completed' :
+                             j.status === 'failed' ? 'Failed' :
+                             j.status === 'pending' ? 'Pending' : j.status}
+                          </Text>
+                          {j.created_at ? (
+                            <Text size="1" color="gray" title={j.created_at}>
+                              {new Date(j.created_at).toLocaleTimeString()}
+                            </Text>
+                          ) : null}
+                          {j.finished_at ? (
+                            <Text size="1" color="gray" title={j.finished_at}>
+                              done {new Date(j.finished_at).toLocaleTimeString()}
+                            </Text>
+                          ) : null}
+                          {j.error_text ? (
+                            <Text size="1" color="red" className="w-full truncate" title={j.error_text}>{j.error_text}</Text>
+                          ) : null}
+                          {j.result_preview ? (
+                            <Text size="1" color="gray" className="w-full truncate" title={j.result_preview}>{j.result_preview}</Text>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
 
             <div
               className={
@@ -1791,6 +1947,7 @@ function App() {
                             key={category}
                             size="1"
                             variant={enabled ? 'solid' : 'soft'}
+                            title={riskyCategoryTooltip(category, enabled)}
                             onClick={() => {
                               const next = enabled
                                 ? current.filter((c) => c !== category)
@@ -1803,6 +1960,9 @@ function App() {
                         )
                       })}
                     </Flex>
+                    <Text size="1" color="gray" className="mt-2 block">
+                      Selected categories are protected by execution safety mode. Deselected categories are allowed without that category-specific safeguard.
+                    </Text>
                   </div>
                 </div>
 
@@ -1833,6 +1993,16 @@ function App() {
                         placeholder="web_port"
                       />
                     </div>
+                  </div>
+                  <div className="mt-3">
+                    <Text size="1" color="gray">Web auth token (leave blank to keep existing)</Text>
+                    <TextField.Root
+                      type="password"
+                      className="mt-2"
+                      value={String(configDraft.web_auth_token || '')}
+                      onChange={(e) => setConfigField('web_auth_token', e.target.value)}
+                      placeholder="WEB_AUTH_TOKEN"
+                    />
                   </div>
                   <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
                     <div className={toggleCardClass} style={toggleCardStyle}>

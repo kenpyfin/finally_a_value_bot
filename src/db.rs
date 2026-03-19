@@ -91,6 +91,21 @@ pub struct ChannelBinding {
 }
 
 #[derive(Debug, Clone)]
+pub struct BackgroundJob {
+    pub id: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub prompt: String,
+    pub status: String, // "pending", "running", "completed_raw", "main_agent_processing", "done", "failed"
+    pub trigger_reason: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub result_text: Option<String>,
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
     pub chat_id: i64,
@@ -222,6 +237,24 @@ impl Database {
                 ON cursor_agent_runs(chat_id);
             CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_finished_at
                 ON cursor_agent_runs(finished_at DESC);
+
+            CREATE TABLE IF NOT EXISTS background_jobs (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                trigger_reason TEXT NOT NULL DEFAULT 'timeout',
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                result_text TEXT,
+                error_text TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_chat_id
+                ON background_jobs(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_status
+                ON background_jobs(status);
 
             CREATE TABLE IF NOT EXISTS channel_bindings (
                 canonical_chat_id INTEGER NOT NULL,
@@ -1488,6 +1521,164 @@ impl Database {
             }
         };
         Ok(runs)
+    }
+
+    // --- Background jobs ---
+
+    pub fn create_background_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        prompt: &str,
+        trigger_reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+            params![id, chat_id, persona_id, prompt, trigger_reason, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_running(&self, id: &str) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'running', started_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_completed_raw(
+        &self,
+        id: &str,
+        result_text: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs
+             SET status = 'completed_raw', finished_at = ?1, result_text = ?2
+             WHERE id = ?3",
+            params![now, result_text, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_main_agent_processing(
+        &self,
+        id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'main_agent_processing' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_done(&self, id: &str) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'done' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_background_job(
+        &self,
+        id: &str,
+        error_text: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'failed', finished_at = ?1, error_text = ?2 WHERE id = ?3",
+            params![now, error_text, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_active_background_jobs_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             WHERE chat_id = ?1
+               AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
+            params![chat_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn list_background_jobs_for_chat(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
+             FROM background_jobs
+             WHERE chat_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let jobs = stmt
+            .query_map(params![chat_id, limit as i64], |row| {
+                Ok(BackgroundJob {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    status: row.get(4)?,
+                    trigger_reason: row.get(5)?,
+                    created_at: row.get(6)?,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                    result_text: row.get(9)?,
+                    error_text: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn get_background_job(&self, id: &str) -> Result<Option<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
+             FROM background_jobs WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(BackgroundJob {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    status: row.get(4)?,
+                    trigger_reason: row.get(5)?,
+                    created_at: row.get(6)?,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                    result_text: row.get(9)?,
+                    error_text: row.get(10)?,
+                })
+            },
+        );
+        match result {
+            Ok(job) => Ok(Some(job)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     #[allow(dead_code)]

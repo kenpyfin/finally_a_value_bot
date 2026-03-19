@@ -257,7 +257,7 @@ impl Tool for WriteTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_tiered_memory".into(),
-            description: "Write one tier of this persona's MEMORY.md. Tier 1 = long-term (only on explicit user ask); Tier 2 = active projects; Tier 3 = recent focus/mood (update often). Replaces that tier's section; other tiers are preserved.".into(),
+            description: "Write one tier of this persona's MEMORY.md. Tier 1 = long-term (only on explicit user ask); Tier 2 = active projects; Tier 3 = recent focus/mood (update often; use past-tense status language, never 'awaiting/finalizing/TODO' — memory is context, not a task queue). Replaces that tier's section; other tiers are preserved.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
