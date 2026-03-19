@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::path::Path;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use serde::Deserialize;
 use tracing::{error, info};
 
@@ -59,6 +61,8 @@ struct WhatsAppMessage {
     #[serde(rename = "type")]
     msg_type: String,
     text: Option<WhatsAppText>,
+    image: Option<WhatsAppMediaRef>,
+    document: Option<WhatsAppDocumentRef>,
     #[allow(dead_code)]
     timestamp: Option<String>,
 }
@@ -66,6 +70,21 @@ struct WhatsAppMessage {
 #[derive(Debug, Deserialize)]
 struct WhatsAppText {
     body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhatsAppMediaRef {
+    id: String,
+    mime_type: Option<String>,
+    caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhatsAppDocumentRef {
+    id: String,
+    mime_type: Option<String>,
+    filename: Option<String>,
+    caption: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,14 +149,22 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
             };
 
             for message in &value.messages {
-                if message.msg_type != "text" {
-                    // Only handle text messages for now
-                    continue;
-                }
-
-                let text = match &message.text {
-                    Some(t) => t.body.clone(),
-                    None => continue,
+                let mut text = match message.msg_type.as_str() {
+                    "text" => match &message.text {
+                        Some(t) => t.body.clone(),
+                        None => continue,
+                    },
+                    "image" => message
+                        .image
+                        .as_ref()
+                        .and_then(|m| m.caption.clone())
+                        .unwrap_or_default(),
+                    "document" => message
+                        .document
+                        .as_ref()
+                        .and_then(|d| d.caption.clone())
+                        .unwrap_or_default(),
+                    _ => continue,
                 };
 
                 // Parse sender phone handle.
@@ -296,6 +323,124 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     continue;
                 }
 
+                let mut image_data: Option<(String, String)> = None;
+                if message.msg_type == "image" || message.msg_type == "document" {
+                    let preferred_mime = message
+                        .image
+                        .as_ref()
+                        .and_then(|m| m.mime_type.clone())
+                        .or_else(|| {
+                            message
+                                .document
+                                .as_ref()
+                                .and_then(|d| d.mime_type.clone())
+                        });
+                    let preferred_filename = message
+                        .document
+                        .as_ref()
+                        .and_then(|d| d.filename.clone());
+                    let media_id = if let Some(img) = &message.image {
+                        Some(img.id.as_str())
+                    } else {
+                        message.document.as_ref().map(|d| d.id.as_str())
+                    };
+
+                    if let Some(media_id) = media_id {
+                        match download_whatsapp_media(
+                            &state.http_client,
+                            &state.access_token,
+                            media_id,
+                        )
+                        .await
+                        {
+                            Ok((bytes, fetched_mime, fetched_name)) => {
+                                let effective_mime =
+                                    preferred_mime.clone().unwrap_or(fetched_mime.clone());
+                                let effective_name =
+                                    preferred_filename.as_deref().or(fetched_name.as_deref());
+                                let max_bytes = state
+                                    .app_state
+                                    .config
+                                    .max_document_size_mb
+                                    .saturating_mul(1024)
+                                    .saturating_mul(1024);
+                                if (bytes.len() as u64) > max_bytes {
+                                    let note = format!(
+                                        "[document] filename={} bytes={} mime={} skipped=too_large",
+                                        effective_name.unwrap_or("whatsapp-media.bin"),
+                                        bytes.len(),
+                                        effective_mime
+                                    );
+                                    if text.trim().is_empty() {
+                                        text = note;
+                                    } else {
+                                        text = format!("{}\n\n{}", text.trim(), note);
+                                    }
+                                } else {
+                                    match save_whatsapp_upload(
+                                        state.app_state.config.working_dir(),
+                                        chat_id,
+                                        fetched_name
+                                            .as_deref().or(preferred_filename.as_deref())
+                                            .unwrap_or("whatsapp-media.bin"),
+                                        &bytes,
+                                    )
+                                    .await
+                                    {
+                                        Ok(path) => {
+                                            if image_data.is_none()
+                                                && effective_mime.starts_with("image/")
+                                            {
+                                                let b64 = base64::engine::general_purpose::STANDARD
+                                                    .encode(bytes.as_slice());
+                                                image_data = Some((b64, effective_mime.clone()));
+                                            }
+                                            let note = format!(
+                                                "[document] filename={} bytes={} mime={} saved_path={}",
+                                                effective_name.unwrap_or("whatsapp-media.bin"),
+                                                bytes.len(),
+                                                effective_mime,
+                                                path
+                                            );
+                                            if text.trim().is_empty() {
+                                                text = note;
+                                            } else {
+                                                text = format!("{}\n\n{}", text.trim(), note);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let note = format!(
+                                                "[document] filename={} bytes={} mime={} save_error={}",
+                                                effective_name.unwrap_or("whatsapp-media.bin"),
+                                                bytes.len(),
+                                                effective_mime,
+                                                e
+                                            );
+                                            if text.trim().is_empty() {
+                                                text = note;
+                                            } else {
+                                                text = format!("{}\n\n{}", text.trim(), note);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let note = format!("[document] download failed: {e}");
+                                if text.trim().is_empty() {
+                                    text = note;
+                                } else {
+                                    text = format!("{}\n\n{}", text.trim(), note);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if text.trim().is_empty() && image_data.is_none() {
+                    continue;
+                }
+
                 // Store message in DB
                 let sender_name_for_chat = sender_name.clone();
                 let _ = call_blocking(state.app_state.db.clone(), move |db| {
@@ -334,7 +479,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                         is_scheduled_task: false,
                     },
                     None,
-                    None,
+                    image_data,
                 )
                 .await
                 {
@@ -382,6 +527,89 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct WhatsAppMediaInfo {
+    url: Option<String>,
+    mime_type: Option<String>,
+}
+
+async fn download_whatsapp_media(
+    client: &reqwest::Client,
+    access_token: &str,
+    media_id: &str,
+) -> anyhow::Result<(Vec<u8>, String, Option<String>)> {
+    let info_url = format!("https://graph.facebook.com/v21.0/{media_id}");
+    let info_resp = client
+        .get(&info_url)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .send()
+        .await?;
+    if !info_resp.status().is_success() {
+        let status = info_resp.status();
+        let body = info_resp.text().await.unwrap_or_default();
+        anyhow::bail!("media metadata request failed ({status}): {body}");
+    }
+    let info: WhatsAppMediaInfo = info_resp.json().await?;
+    let download_url = info.url.ok_or_else(|| anyhow::anyhow!("missing media url"))?;
+
+    let media_resp = client
+        .get(&download_url)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .send()
+        .await?;
+    if !media_resp.status().is_success() {
+        let status = media_resp.status();
+        let body = media_resp.text().await.unwrap_or_default();
+        anyhow::bail!("media download failed ({status}): {body}");
+    }
+    let bytes = media_resp.bytes().await?.to_vec();
+    let mime = info
+        .mime_type
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let ext = mime
+        .split('/')
+        .nth(1)
+        .unwrap_or("bin")
+        .split(';')
+        .next()
+        .unwrap_or("bin");
+    let fallback_name = format!("whatsapp-media-{}.{}", chrono::Utc::now().timestamp(), ext);
+    Ok((bytes, mime, Some(fallback_name)))
+}
+
+async fn save_whatsapp_upload(
+    working_dir: &str,
+    chat_id: i64,
+    filename: &str,
+    bytes: &[u8],
+) -> anyhow::Result<String> {
+    let safe_name = sanitize_upload_filename(filename);
+    let dir = Path::new(working_dir)
+        .join("uploads")
+        .join("whatsapp")
+        .join(chat_id.to_string());
+    tokio::fs::create_dir_all(&dir).await?;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let path = dir.join(format!("{}-{}", ts, safe_name));
+    tokio::fs::write(&path, bytes).await?;
+    Ok(path.display().to_string())
+}
+
+fn sanitize_upload_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "whatsapp-upload.bin".to_string()
+    } else {
+        sanitized
+    }
 }
 
 // --- Send message via WhatsApp Cloud API ---

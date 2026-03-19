@@ -24,6 +24,7 @@ export type ChannelBinding = {
 export type ScheduleTask = {
   id: number
   chat_id: number
+  persona_id: number
   prompt: string
   schedule_type: string
   schedule_value: string

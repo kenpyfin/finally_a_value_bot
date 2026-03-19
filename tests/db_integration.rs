@@ -204,6 +204,31 @@ fn test_scheduled_task_lifecycle() {
     cleanup(&dir);
 }
 
+#[test]
+fn test_scheduled_task_binds_to_active_persona_at_creation() {
+    let (db, dir) = test_db();
+    db.upsert_chat(100, None, "private").unwrap();
+    let default_pid = db.get_or_create_default_persona(100).unwrap();
+    let alt_pid = db.create_persona(100, "work", None).unwrap();
+    assert!(db.set_active_persona(100, alt_pid).unwrap());
+
+    let task_id = db
+        .create_scheduled_task(
+            100,
+            "persona-bound task",
+            "once",
+            "2099-12-31T00:00:00Z",
+            "2099-12-31T00:00:00Z",
+        )
+        .unwrap();
+
+    // Switch active persona after scheduling. Task binding should remain unchanged.
+    assert!(db.set_active_persona(100, default_pid).unwrap());
+    let task = db.get_task_by_id(task_id).unwrap().unwrap();
+    assert_eq!(task.persona_id, alt_pid);
+    cleanup(&dir);
+}
+
 /// Task run logs: create → retrieve → ordering → limit.
 #[test]
 fn test_task_run_log_lifecycle() {

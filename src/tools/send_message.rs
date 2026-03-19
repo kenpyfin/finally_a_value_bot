@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -70,14 +70,33 @@ impl SendMessageTool {
         file_path: PathBuf,
         caption: Option<String>,
     ) -> Result<String, String> {
-        let mut req = self
-            .bot
-            .send_document(ChatId(chat_id), InputFile::file(file_path.clone()));
-        if let Some(c) = &caption {
-            req = req.caption(c.clone());
+        let is_image = matches!(
+            file_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+                .as_deref(),
+            Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+        );
+        if is_image {
+            let mut req = self
+                .bot
+                .send_photo(ChatId(chat_id), InputFile::file(file_path.clone()));
+            if let Some(c) = &caption {
+                req = req.caption(c.clone());
+            }
+            req.await
+                .map_err(|e| format!("Failed to send Telegram image: {e}"))?;
+        } else {
+            let mut req = self
+                .bot
+                .send_document(ChatId(chat_id), InputFile::file(file_path.clone()));
+            if let Some(c) = &caption {
+                req = req.caption(c.clone());
+            }
+            req.await
+                .map_err(|e| format!("Failed to send Telegram attachment: {e}"))?;
         }
-        req.await
-            .map_err(|e| format!("Failed to send Telegram attachment: {e}"))?;
 
         Ok(match caption {
             Some(c) => format!("[attachment:{}] {}", file_path.display(), c),
@@ -240,6 +259,97 @@ impl SendMessageTool {
             None => format!("[attachment:{}]", file_path.display()),
         })
     }
+
+    async fn send_web_attachment(
+        &self,
+        chat_id: i64,
+        file_path: PathBuf,
+        caption: Option<String>,
+    ) -> Result<String, String> {
+        let cfg = self
+            .config
+            .as_ref()
+            .ok_or_else(|| "send_message config unavailable".to_string())?;
+        let filename = file_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let bytes = tokio::fs::read(&file_path)
+            .await
+            .map_err(|e| format!("Failed to read attachment file: {e}"))?;
+
+        let uploads_dir = Path::new(cfg.working_dir())
+            .join("uploads")
+            .join("web")
+            .join(chat_id.to_string());
+        tokio::fs::create_dir_all(&uploads_dir)
+            .await
+            .map_err(|e| format!("Failed to create web uploads directory: {e}"))?;
+        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let safe_name = sanitize_upload_filename(&filename);
+        let stored_name = format!("{}-bot-{}", ts, safe_name);
+        let saved_path = uploads_dir.join(&stored_name);
+        tokio::fs::write(&saved_path, &bytes)
+            .await
+            .map_err(|e| format!("Failed to write web attachment: {e}"))?;
+
+        let rel_url = format!("/api/uploads/web/{chat_id}/{stored_name}");
+        let content = if is_image_file(&file_path, &bytes) {
+            let alt = filename.replace(']', "_");
+            match caption {
+                Some(c) => format!("{c}\n\n![{alt}]({rel_url})"),
+                None => format!("![{alt}]({rel_url})"),
+            }
+        } else {
+            match caption {
+                Some(c) => format!("{c}\n\n[{filename}]({rel_url})"),
+                None => format!("[{filename}]({rel_url})"),
+            }
+        };
+        Ok(content)
+    }
+}
+
+fn sanitize_upload_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "web-upload.bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn is_image_file(path: &Path, bytes: &[u8]) -> bool {
+    if bytes.len() >= 8 && bytes[0..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
+        return true;
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return true;
+    }
+    if bytes.len() >= 6 && (bytes[0..6] == *b"GIF87a" || bytes[0..6] == *b"GIF89a") {
+        return true;
+    }
+    if bytes.len() >= 12 && bytes[0..4] == *b"RIFF" && bytes[8..12] == *b"WEBP" {
+        return true;
+    }
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+    {
+        Some(ext) => matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+        ),
+        None => false,
+    }
 }
 
 #[async_trait]
@@ -251,7 +361,7 @@ impl Tool for SendMessageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "Send a message mid-conversation. Supports text for all channels, and attachments for Telegram/Discord/WhatsApp via attachment_path.".into(),
+            description: "Send a message mid-conversation. Supports text for all channels, and attachments for Telegram/Discord/WhatsApp/web via attachment_path. For attachments, use an absolute local file path so the tool can find the file reliably.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -264,7 +374,7 @@ impl Tool for SendMessageTool {
                     },
                     "attachment_path": {
                         "type": "string",
-                        "description": "Optional local file path to send as an attachment"
+                        "description": "Optional local file path to send as an attachment. Prefer an absolute path (for example: /home/user/project/workspace/shared/image.png)."
                     },
                     "caption": {
                         "type": "string",
@@ -337,6 +447,7 @@ impl Tool for SendMessageTool {
                 | Some("telegram_group")
                 | Some("telegram_supergroup")
                 | Some("telegram_channel")
+                | Some("telegram")
                 | Some("private")
                 | Some("group")
                 | Some("supergroup")
@@ -352,7 +463,10 @@ impl Tool for SendMessageTool {
                     self.send_whatsapp_attachment(chat_id, file_path.clone(), used_caption.clone())
                         .await
                 }
-                Some("web") => Err("attachment sending is not supported for web chat".to_string()),
+                Some("web") => {
+                    self.send_web_attachment(chat_id, file_path.clone(), used_caption.clone())
+                        .await
+                }
                 Some(other) => Err(format!(
                     "attachment sending is not supported for chat type: {other}"
                 )),
@@ -509,7 +623,7 @@ mod tests {
             }))
             .await;
         assert!(result.is_error);
-        assert!(result.content.contains("not supported for web chat"));
+        assert!(result.content.contains("config unavailable"));
         cleanup(&dir);
     }
 

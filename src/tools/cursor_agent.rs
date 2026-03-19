@@ -26,6 +26,15 @@ fn in_docker() -> bool {
         || std::path::Path::new("/.dockerenv").exists()
 }
 
+async fn tmux_session_exists(session: &str) -> Result<bool, String> {
+    let output = tokio::process::Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run tmux has-session: {e}"))?;
+    Ok(output.status.success())
+}
+
 impl CursorAgentTool {
     pub fn new(config: &Config, db: Arc<Database>) -> Self {
         Self {
@@ -272,7 +281,7 @@ impl Tool for CursorAgentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "cursor_agent".into(),
-            description: "Run the Cursor CLI agent (cursor-agent) with a prompt. Use for research, code generation, or analysis that benefits from Cursor's native agent. Optional: timeout_secs, model override. Working directory is the shared tool workspace.".into(),
+            description: "Run the Cursor CLI agent (cursor-agent) with a prompt. Use for research, code generation, or analysis that benefits from Cursor's native agent. For long tasks, prefer detach: true to run in background via tmux and avoid request timeouts. Optional: timeout_secs, model override. Working directory is the shared tool workspace.".into(),
             input_schema: schema_object(
                 json!({
                     "prompt": {
@@ -289,7 +298,7 @@ impl Tool for CursorAgentTool {
                     },
                     "detach": {
                         "type": "boolean",
-                        "description": "If true, spawn cursor-agent in a tmux session and return immediately. Attach with tmux attach -t <session>. Not available in Docker."
+                        "description": "If true, spawn cursor-agent in a tmux session and return immediately. Prefer true for long-running tasks. Attach with tmux attach -t <session>. Not available in Docker."
                     }
                 }),
                 &["prompt"],
@@ -524,9 +533,25 @@ impl Tool for ListCursorAgentRunsTool {
                     return ToolResult::success("No cursor-agent runs found.".into());
                 }
                 let mut out = String::new();
+                let mut tmux_probe_error: Option<String> = None;
                 for r in &runs {
-                    let status = if r.tmux_session.is_some() {
+                    let session_running = if let Some(ref sess) = r.tmux_session {
+                        match tmux_session_exists(sess).await {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                if tmux_probe_error.is_none() {
+                                    tmux_probe_error = Some(e);
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let status = if session_running == Some(true) {
                         "running"
+                    } else if r.tmux_session.is_some() && r.exit_code.is_none() {
+                        "stopped"
                     } else if r.success {
                         "ok"
                     } else {
@@ -543,12 +568,27 @@ impl Tool for ListCursorAgentRunsTool {
                         r.id, r.finished_at, status, code, preview, suffix
                     ));
                     if let Some(ref sess) = r.tmux_session {
-                        out.push_str(&format!("  session: {} | Attach: tmux attach -t {}\n", sess, sess));
+                        if session_running == Some(true) {
+                            out.push_str(&format!(
+                                "  session: {} | Attach: tmux attach -t {}\n",
+                                sess, sess
+                            ));
+                        } else if session_running == Some(false) {
+                            out.push_str(&format!("  session: {} | not currently running\n", sess));
+                        } else {
+                            out.push_str(&format!("  session: {} | status unknown\n", sess));
+                        }
                     }
                     if let Some(ref prev) = r.output_preview {
                         let first_line = prev.lines().next().unwrap_or("");
                         out.push_str(&format!("  -> {}\n", &first_line[..first_line.len().min(80)]));
                     }
+                }
+                if let Some(err) = tmux_probe_error {
+                    out.push_str(&format!(
+                        "\n(note: could not verify tmux session state for some runs: {})\n",
+                        err
+                    ));
                 }
                 ToolResult::success(out)
             }

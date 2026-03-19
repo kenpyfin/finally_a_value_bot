@@ -46,6 +46,7 @@ impl Tool for WebFetchTool {
 
 async fn fetch_url(url: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(std::time::Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()

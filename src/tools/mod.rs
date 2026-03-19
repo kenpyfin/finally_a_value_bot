@@ -283,7 +283,11 @@ impl ToolRegistry {
         let primary_skills = workspace_root.join("skills");
         let shared_skills = workspace_root.join("shared").join("skills");
         let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(bash::BashTool::new(config.working_dir())),
+            Box::new(bash::BashTool::new_with_safety(
+                config.working_dir(),
+                config.safety_execution_mode.clone(),
+                config.safety_risky_categories.clone(),
+            )),
             Box::new(browser::BrowserTool::new(
                 &config.runtime_data_dir(),
                 config.agent_browser_path.clone(),
@@ -296,7 +300,7 @@ impl ToolRegistry {
             Box::new(memory::ReadMemoryTool::new(&config.runtime_data_dir(), config.working_dir())),
             Box::new(memory::WriteMemoryTool::new(&config.runtime_data_dir(), config.working_dir())),
             Box::new(web_fetch::WebFetchTool),
-            Box::new(web_search::WebSearchTool),
+            Box::new(web_search::WebSearchTool::new(config.web_search_searxng_url.clone())),
             Box::new(send_message::SendMessageTool::new_with_config(
                 bot,
                 db.clone(),

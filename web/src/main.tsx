@@ -124,7 +124,16 @@ const DEFAULT_CONFIG_VALUES = {
   web_enabled: true,
   web_host: '127.0.0.1',
   web_port: 10961,
+  safety_output_guard_mode: 'moderate',
+  safety_max_emojis_per_response: 12,
+  safety_tail_repeat_limit: 8,
+  safety_execution_mode: 'warn_confirm',
+  safety_risky_categories: ['destructive', 'system', 'network', 'package'],
 }
+
+const OUTPUT_GUARD_MODE_OPTIONS = ['off', 'moderate', 'strict'] as const
+const EXECUTION_MODE_OPTIONS = ['off', 'warn_confirm', 'strict'] as const
+const RISKY_CATEGORY_OPTIONS = ['destructive', 'system', 'network', 'package'] as const
 
 const UI_THEME_OPTIONS: { key: UiTheme; label: string; color: string }[] = [
   { key: 'green', label: 'Green', color: '#34d399' },
@@ -207,11 +216,29 @@ if (typeof document !== 'undefined') {
 
 const WEB_AUTH_STORAGE_KEY = 'web_auth_token'
 
+function sanitizeHttpHeaderValue(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (trimmed.includes('\r') || trimmed.includes('\n')) return null
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const code = trimmed.charCodeAt(i)
+    // Browser header values must be ISO-8859-1 representable.
+    if (code > 0xff) return null
+  }
+  return trimmed
+}
+
 function getStoredAuthToken(): string | null {
   if (typeof sessionStorage === 'undefined') return null
   try {
     const t = sessionStorage.getItem(WEB_AUTH_STORAGE_KEY)
-    return t && t.trim() ? t.trim() : null
+    if (!t) return null
+    const sanitized = sanitizeHttpHeaderValue(t)
+    if (!sanitized) {
+      sessionStorage.removeItem(WEB_AUTH_STORAGE_KEY)
+      return null
+    }
+    return sanitized
   } catch {
     return null
   }
@@ -220,6 +247,18 @@ function getStoredAuthToken(): string | null {
 function makeHeaders(options: RequestInit = {}): HeadersInit {
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string> | undefined),
+  }
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value !== 'string') {
+      delete headers[key]
+      continue
+    }
+    const sanitized = sanitizeHttpHeaderValue(value)
+    if (!sanitized) {
+      delete headers[key]
+      continue
+    }
+    headers[key] = sanitized
   }
   const token = getStoredAuthToken()
   if (token) {
@@ -344,46 +383,128 @@ async function* parseSseFrames(
   }
 }
 
-function extractLatestUserText(messages: readonly ChatModelRunOptions['messages'][number][]): string {
+type SendAttachmentPayload = {
+  filename?: string
+  media_type?: string
+  data_base64: string
+}
+
+function splitDataUrl(value: string): { mimeType?: string; base64: string } | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (!trimmed.startsWith('data:')) return { base64: trimmed }
+  const comma = trimmed.indexOf(',')
+  if (comma < 0) return null
+  const header = trimmed.slice(5, comma)
+  const base64 = trimmed.slice(comma + 1)
+  const mimeType = header.split(';')[0] || undefined
+  return { mimeType, base64 }
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  const buf = await file.arrayBuffer()
+  let binary = ''
+  const bytes = new Uint8Array(buf)
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  return btoa(binary)
+}
+
+async function extractAttachmentFromUnknown(part: unknown): Promise<SendAttachmentPayload | null> {
+  if (!part || typeof part !== 'object') return null
+  const obj = part as Record<string, unknown>
+
+  const fileVal = obj.file
+  if (fileVal instanceof File) {
+    return {
+      filename: fileVal.name || undefined,
+      media_type: fileVal.type || undefined,
+      data_base64: await fileToBase64(fileVal),
+    }
+  }
+
+  const candidateData =
+    (typeof obj.data === 'string' ? obj.data : null) ||
+    (typeof obj.url === 'string' && String(obj.url).startsWith('data:') ? String(obj.url) : null) ||
+    (typeof obj.image === 'string' && String(obj.image).startsWith('data:') ? String(obj.image) : null) ||
+    (typeof obj.source === 'string' && String(obj.source).startsWith('data:') ? String(obj.source) : null)
+
+  if (!candidateData) return null
+  const parsed = splitDataUrl(candidateData)
+  if (!parsed || !parsed.base64) return null
+
+  const filename = typeof obj.filename === 'string' ? obj.filename : undefined
+  const mediaType =
+    (typeof obj.mediaType === 'string' ? obj.mediaType : undefined) ||
+    (typeof obj.mimeType === 'string' ? obj.mimeType : undefined) ||
+    (typeof obj.contentType === 'string' ? obj.contentType : undefined) ||
+    parsed.mimeType
+
+  return {
+    filename,
+    media_type: mediaType,
+    data_base64: parsed.base64,
+  }
+}
+
+async function extractLatestUserInput(
+  messages: readonly ChatModelRunOptions['messages'][number][],
+): Promise<{ text: string; attachments: SendAttachmentPayload[] }> {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i]
     if (message.role !== 'user') continue
 
     const content = message.content
-    let text: string
+    let text = ''
+    const attachments: SendAttachmentPayload[] = []
 
     if (typeof content === 'string') {
       text = content.trim()
     } else if (Array.isArray(content)) {
-      text = content
+      const textParts = content
         .map((part) => {
           if (part && typeof part === 'object' && part.type === 'text' && 'text' in part) {
             return typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : ''
           }
           return ''
         })
-        .join('\n')
-        .trim()
+      text = textParts.join('\n').trim()
+      for (const part of content) {
+        const att = await extractAttachmentFromUnknown(part)
+        if (att) attachments.push(att)
+      }
     } else if (content && typeof content === 'object' && !Array.isArray(content)) {
       // Single part object: { type: 'text', text: '...' }
       const part = content as { type?: string; text?: unknown }
       if (part.type === 'text' && typeof part.text === 'string') {
         text = part.text.trim()
       } else {
-        continue
+        const att = await extractAttachmentFromUnknown(content)
+        if (att) attachments.push(att)
       }
-    } else {
-      continue
     }
 
-    if (text.length > 0) {
-      if (import.meta.env?.DEV && typeof console !== 'undefined' && console.debug) {
-        console.debug('[extractLatestUserText]', text.slice(0, 80) + (text.length > 80 ? '…' : ''))
+    const extraAttachments = (message as { attachments?: unknown }).attachments
+    if (Array.isArray(extraAttachments)) {
+      for (const part of extraAttachments) {
+        const att = await extractAttachmentFromUnknown(part)
+        if (att) attachments.push(att)
       }
-      return text
+    }
+
+    if (text.length > 0 || attachments.length > 0) {
+      if (import.meta.env?.DEV && typeof console !== 'undefined' && console.debug) {
+        console.debug(
+          '[extractLatestUserInput]',
+          text.slice(0, 80) + (text.length > 80 ? '…' : ''),
+          `attachments=${attachments.length}`,
+        )
+      }
+      return { text, attachments }
     }
   }
-  return ''
+  return { text: '', attachments: [] }
 }
 
 function mapBackendHistory(messages: BackendMessage[]): ThreadMessageLike[] {
@@ -425,6 +546,14 @@ function formatUnknown(value: unknown): string {
   } catch {
     return String(value)
   }
+}
+
+function readStringArray(value: unknown, fallback: readonly string[]): string[] {
+  if (!Array.isArray(value)) return [...fallback]
+  const out = value
+    .map((v) => (typeof v === 'string' ? v.trim().toLowerCase() : ''))
+    .filter((v) => v.length > 0)
+  return out.length > 0 ? out : [...fallback]
 }
 
 function ToolCallCard(props: ToolCallMessagePartProps) {
@@ -545,7 +674,7 @@ function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
             },
           }}
           userMessage={{ allowEdit: false }}
-          composer={{ allowAttachments: false }}
+          composer={{ allowAttachments: true }}
           components={{
             AssistantMessage: CustomAssistantMessage,
             UserMessage: CustomUserMessage,
@@ -587,7 +716,9 @@ function App() {
   const [newSchedulePrompt, setNewSchedulePrompt] = useState('')
   const [newScheduleType, setNewScheduleType] = useState<'cron' | 'once'>('cron')
   const [newScheduleValue, setNewScheduleValue] = useState('0 9 * * *')
+  const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
+  const sendingRef = React.useRef<boolean>(false)
 
   React.useEffect(() => {
     const onAuthRequired = () => setAuthRequired(true)
@@ -618,9 +749,15 @@ function App() {
             : null
       if (chosen) {
         setActivePersonaId(chosen.id)
+        if (newSchedulePersonaId == null) {
+          setNewSchedulePersonaId(chosen.id)
+        }
         if (!storedInList) writeStoredPersonaId(chosen.id)
       } else {
         setActivePersonaId(null)
+        if (newSchedulePersonaId == null) {
+          setNewSchedulePersonaId(null)
+        }
       }
       return chosen
     } catch {
@@ -695,8 +832,12 @@ function App() {
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
       run: async function* (options): AsyncGenerator<ChatModelRunResult, void> {
-        const userText = extractLatestUserText(options.messages)
-        if (!userText) return
+        const { text: userText, attachments } = await extractLatestUserInput(options.messages)
+        if (!userText && attachments.length === 0) return
+        if (sendingRef.current) {
+          throw new Error('A response is already in progress. Please wait for it to finish.')
+        }
+        sendingRef.current = true
 
         setSending(true)
         setStatusText('Sending...')
@@ -709,12 +850,19 @@ function App() {
             throw new Error('This chat is read-only. Switch to a web session or create a new chat to send messages.')
           }
 
-          const sendBody: { chat_id?: number; persona_id?: number; sender_name: string; message: string } = {
+          const sendBody: {
+            chat_id?: number
+            persona_id?: number
+            sender_name: string
+            message: string
+            attachments?: SendAttachmentPayload[]
+          } = {
             sender_name: 'web-user',
             message: userText,
           }
           if (chatId != null) sendBody.chat_id = chatId
           if (activePersonaId != null && activePersonaId > 0) sendBody.persona_id = activePersonaId
+          if (attachments.length > 0) sendBody.attachments = attachments
           const sendResponse = await api<{ run_id?: string }>('/api/send_stream', {
             method: 'POST',
             body: JSON.stringify(sendBody),
@@ -893,12 +1041,13 @@ function App() {
             }
           }
         } finally {
+          sendingRef.current = false
           setSending(false)
           void loadHistory(chatId, activePersonaId ?? undefined)
         }
       },
     }),
-    [chatId, selectedSessionReadOnly, activePersonaId],
+    [chatId, selectedSessionReadOnly, activePersonaId, sendingRef],
   )
 
   function toggleAppearance(): void {
@@ -953,6 +1102,22 @@ function App() {
       web_enabled: Boolean(data.config?.web_enabled),
       web_host: String(data.config?.web_host || '127.0.0.1'),
       web_port: Number(data.config?.web_port ?? 10961),
+      safety_output_guard_mode: String(
+        data.config?.safety_output_guard_mode || DEFAULT_CONFIG_VALUES.safety_output_guard_mode,
+      ),
+      safety_max_emojis_per_response: Number(
+        data.config?.safety_max_emojis_per_response ?? DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response,
+      ),
+      safety_tail_repeat_limit: Number(
+        data.config?.safety_tail_repeat_limit ?? DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit,
+      ),
+      safety_execution_mode: String(
+        data.config?.safety_execution_mode || DEFAULT_CONFIG_VALUES.safety_execution_mode,
+      ),
+      safety_risky_categories: readStringArray(
+        data.config?.safety_risky_categories,
+        DEFAULT_CONFIG_VALUES.safety_risky_categories,
+      ),
     })
     setConfigOpen(true)
   }
@@ -996,6 +1161,21 @@ function App() {
         case 'web_port':
           next.web_port = DEFAULT_CONFIG_VALUES.web_port
           break
+        case 'safety_output_guard_mode':
+          next.safety_output_guard_mode = DEFAULT_CONFIG_VALUES.safety_output_guard_mode
+          break
+        case 'safety_max_emojis_per_response':
+          next.safety_max_emojis_per_response = DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response
+          break
+        case 'safety_tail_repeat_limit':
+          next.safety_tail_repeat_limit = DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit
+          break
+        case 'safety_execution_mode':
+          next.safety_execution_mode = DEFAULT_CONFIG_VALUES.safety_execution_mode
+          break
+        case 'safety_risky_categories':
+          next.safety_risky_categories = [...DEFAULT_CONFIG_VALUES.safety_risky_categories]
+          break
         default:
           break
       }
@@ -1017,6 +1197,22 @@ function App() {
         web_enabled: Boolean(configDraft.web_enabled),
         web_host: String(configDraft.web_host || '127.0.0.1'),
         web_port: Number(configDraft.web_port || 10961),
+        safety_output_guard_mode: String(
+          configDraft.safety_output_guard_mode || DEFAULT_CONFIG_VALUES.safety_output_guard_mode,
+        ),
+        safety_max_emojis_per_response: Number(
+          configDraft.safety_max_emojis_per_response || DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response,
+        ),
+        safety_tail_repeat_limit: Number(
+          configDraft.safety_tail_repeat_limit || DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit,
+        ),
+        safety_execution_mode: String(
+          configDraft.safety_execution_mode || DEFAULT_CONFIG_VALUES.safety_execution_mode,
+        ),
+        safety_risky_categories: readStringArray(
+          configDraft.safety_risky_categories,
+          DEFAULT_CONFIG_VALUES.safety_risky_categories,
+        ),
       }
       if (String(configDraft.llm_provider || '').trim().toLowerCase() === 'custom') {
         payload.llm_base_url = String(configDraft.llm_base_url || '').trim() || null
@@ -1103,7 +1299,12 @@ function App() {
     await loadBindings(chatId)
   }
 
-  async function createSchedule(prompt: string, scheduleType: string, scheduleValue: string): Promise<void> {
+  async function createSchedule(
+    prompt: string,
+    scheduleType: string,
+    scheduleValue: string,
+    personaId?: number | null,
+  ): Promise<void> {
     await api('/api/schedules', {
       method: 'POST',
       body: JSON.stringify({
@@ -1111,15 +1312,19 @@ function App() {
         prompt,
         schedule_type: scheduleType,
         schedule_value: scheduleValue,
+        persona_id: personaId && personaId > 0 ? personaId : undefined,
       }),
     })
     await loadSchedules(chatId)
   }
 
-  async function updateScheduleStatus(taskId: number, status: string): Promise<void> {
+  async function updateSchedule(
+    taskId: number,
+    patch: { status?: string; persona_id?: number },
+  ): Promise<void> {
     await api(`/api/schedules/${taskId}`, {
       method: 'PATCH',
-      body: JSON.stringify({ status }),
+      body: JSON.stringify(patch),
     })
     await loadSchedules(chatId)
   }
@@ -1149,6 +1354,12 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId])
 
+  useEffect(() => {
+    if (activePersonaId != null && activePersonaId > 0) {
+      setNewSchedulePersonaId((prev) => (prev == null ? activePersonaId : prev))
+    }
+  }, [activePersonaId])
+
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
@@ -1171,8 +1382,12 @@ function App() {
     : undefined
 
   function submitAuthToken() {
-    const token = authTokenInput.trim()
+    const token = sanitizeHttpHeaderValue(authTokenInput)
     if (!token) return
+    if (token.length !== authTokenInput.trim().length) {
+      setError('Invalid API token: unsupported header characters.')
+      return
+    }
     sessionStorage.setItem(WEB_AUTH_STORAGE_KEY, token)
     setAuthRequired(false)
     setAuthTokenInput('')
@@ -1252,15 +1467,28 @@ function App() {
                     {schedules.map((t) => (
                       <li key={t.id} className="flex flex-wrap items-center gap-2 rounded border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
                         <span className="min-w-0 flex-1 truncate" title={t.prompt}>{t.prompt}</span>
+                        <Select.Root
+                          value={String(t.persona_id)}
+                          onValueChange={(v) => void updateSchedule(t.id, { persona_id: Number(v) })}
+                        >
+                          <Select.Trigger className="w-[120px]" />
+                          <Select.Content>
+                            {personas.map((p) => (
+                              <Select.Item key={p.id} value={String(p.id)}>
+                                {p.name}
+                              </Select.Item>
+                            ))}
+                          </Select.Content>
+                        </Select.Root>
                         <Text size="1" color="gray">{t.schedule_type} · {t.next_run ?? '—'}</Text>
                         <Text size="1" color="gray">{t.status}</Text>
                         {t.status === 'active' ? (
-                          <Button size="1" variant="soft" onClick={() => void updateScheduleStatus(t.id, 'paused')}>Pause</Button>
+                          <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'paused' })}>Pause</Button>
                         ) : t.status === 'paused' ? (
-                          <Button size="1" variant="soft" onClick={() => void updateScheduleStatus(t.id, 'active')}>Resume</Button>
+                          <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'active' })}>Resume</Button>
                         ) : null}
                         {t.status !== 'cancelled' ? (
-                          <Button size="1" variant="soft" color="red" onClick={() => void updateScheduleStatus(t.id, 'cancelled')}>Cancel</Button>
+                          <Button size="1" variant="soft" color="red" onClick={() => void updateSchedule(t.id, { status: 'cancelled' })}>Cancel</Button>
                         ) : null}
                       </li>
                     ))}
@@ -1285,11 +1513,29 @@ function App() {
                       onChange={(e) => setNewScheduleValue(e.target.value)}
                       className="min-w-[160px]"
                     />
+                    <Select.Root
+                      value={newSchedulePersonaId != null ? String(newSchedulePersonaId) : ''}
+                      onValueChange={(v) => setNewSchedulePersonaId(Number(v))}
+                    >
+                      <Select.Trigger className="w-[140px]" placeholder="Persona" />
+                      <Select.Content>
+                        {personas.map((p) => (
+                          <Select.Item key={p.id} value={String(p.id)}>
+                            {p.name}
+                          </Select.Item>
+                        ))}
+                      </Select.Content>
+                    </Select.Root>
                     <Button
                       size="1"
                       onClick={() => {
                         if (newSchedulePrompt.trim()) {
-                          void createSchedule(newSchedulePrompt.trim(), newScheduleType, newScheduleValue)
+                          void createSchedule(
+                            newSchedulePrompt.trim(),
+                            newScheduleType,
+                            newScheduleValue,
+                            newSchedulePersonaId ?? activePersonaId,
+                          )
                           setNewSchedulePrompt('')
                         }
                       }}
@@ -1449,6 +1695,114 @@ function App() {
                         placeholder="max_document_size_mb"
                       />
                     </div>
+                  </div>
+                </div>
+
+                <div className={sectionCardClass} style={sectionCardStyle}>
+                  <Text size="3" weight="bold">
+                    Safety
+                  </Text>
+                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                    <div>
+                      <Flex justify="between" align="center" mb="1">
+                        <Text size="1" color="gray">Output guard mode</Text>
+                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_output_guard_mode')}>
+                          Reset
+                        </Button>
+                      </Flex>
+                      <Select.Root
+                        value={String(configDraft.safety_output_guard_mode || DEFAULT_CONFIG_VALUES.safety_output_guard_mode)}
+                        onValueChange={(value) => setConfigField('safety_output_guard_mode', value)}
+                      >
+                        <Select.Trigger />
+                        <Select.Content>
+                          {OUTPUT_GUARD_MODE_OPTIONS.map((mode) => (
+                            <Select.Item key={mode} value={mode}>
+                              {mode}
+                            </Select.Item>
+                          ))}
+                        </Select.Content>
+                      </Select.Root>
+                    </div>
+                    <div>
+                      <Flex justify="between" align="center" mb="1">
+                        <Text size="1" color="gray">Execution safety mode</Text>
+                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_execution_mode')}>
+                          Reset
+                        </Button>
+                      </Flex>
+                      <Select.Root
+                        value={String(configDraft.safety_execution_mode || DEFAULT_CONFIG_VALUES.safety_execution_mode)}
+                        onValueChange={(value) => setConfigField('safety_execution_mode', value)}
+                      >
+                        <Select.Trigger />
+                        <Select.Content>
+                          {EXECUTION_MODE_OPTIONS.map((mode) => (
+                            <Select.Item key={mode} value={mode}>
+                              {mode}
+                            </Select.Item>
+                          ))}
+                        </Select.Content>
+                      </Select.Root>
+                    </div>
+                    <div>
+                      <Flex justify="between" align="center" mb="1">
+                        <Text size="1" color="gray">Max emojis per response</Text>
+                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_max_emojis_per_response')}>
+                          Reset
+                        </Button>
+                      </Flex>
+                      <TextField.Root
+                        value={String(configDraft.safety_max_emojis_per_response || DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response)}
+                        onChange={(e) => setConfigField('safety_max_emojis_per_response', e.target.value)}
+                        placeholder="12"
+                      />
+                    </div>
+                    <div>
+                      <Flex justify="between" align="center" mb="1">
+                        <Text size="1" color="gray">Tail repeat limit</Text>
+                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_tail_repeat_limit')}>
+                          Reset
+                        </Button>
+                      </Flex>
+                      <TextField.Root
+                        value={String(configDraft.safety_tail_repeat_limit || DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit)}
+                        onChange={(e) => setConfigField('safety_tail_repeat_limit', e.target.value)}
+                        placeholder="8"
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-3">
+                    <Flex justify="between" align="center" mb="2">
+                      <Text size="1" color="gray">Risky command categories</Text>
+                      <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_risky_categories')}>
+                        Reset
+                      </Button>
+                    </Flex>
+                    <Flex gap="2" wrap="wrap">
+                      {RISKY_CATEGORY_OPTIONS.map((category) => {
+                        const current = readStringArray(
+                          configDraft.safety_risky_categories,
+                          DEFAULT_CONFIG_VALUES.safety_risky_categories,
+                        )
+                        const enabled = current.includes(category)
+                        return (
+                          <Button
+                            key={category}
+                            size="1"
+                            variant={enabled ? 'solid' : 'soft'}
+                            onClick={() => {
+                              const next = enabled
+                                ? current.filter((c) => c !== category)
+                                : [...current, category]
+                              setConfigField('safety_risky_categories', next)
+                            }}
+                          >
+                            {category}
+                          </Button>
+                        )
+                      })}
+                    </Flex>
                   </div>
                 </div>
 

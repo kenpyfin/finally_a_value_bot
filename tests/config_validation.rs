@@ -44,6 +44,7 @@ fn minimal_config() -> Config {
         browser_idle_timeout_secs: None,
         browser_headless: false,
         agent_browser_path: None,
+        web_search_searxng_url: None,
         cursor_agent_cli_path: "cursor-agent".into(),
         cursor_agent_model: String::new(),
         cursor_agent_timeout_secs: 600,

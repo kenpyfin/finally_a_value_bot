@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use serenity::async_trait;
@@ -5,6 +6,7 @@ use serenity::model::channel::Message as DiscordMessage;
 use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
 use serenity::prelude::*;
+use base64::Engine;
 use tracing::{error, info};
 
 use crate::claude::Message as ClaudeMessage;
@@ -25,10 +27,106 @@ impl EventHandler for Handler {
             return;
         }
 
-        let text = msg.content.clone();
+        let mut text = msg.content.clone();
         let channel_id = msg.channel_id.get() as i64;
         let channel_handle = channel_id.to_string();
         let sender_name = msg.author.name.clone();
+        let mut image_data: Option<(String, String)> = None;
+        let mut attachment_notes: Vec<String> = Vec::new();
+
+        if !msg.attachments.is_empty() {
+            let max_bytes = self
+                .app_state
+                .config
+                .max_document_size_mb
+                .saturating_mul(1024)
+                .saturating_mul(1024);
+            let upload_dir = Path::new(self.app_state.config.working_dir())
+                .join("uploads")
+                .join("discord")
+                .join(channel_id.to_string());
+            if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+                error!(
+                    "Failed to create Discord upload dir {}: {e}",
+                    upload_dir.display()
+                );
+            } else {
+                for (idx, attachment) in msg.attachments.iter().enumerate() {
+                    let size = attachment.size as u64;
+                    let mime = attachment
+                        .content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    if size > max_bytes {
+                        attachment_notes.push(format!(
+                            "[document] filename={} bytes={} mime={} skipped=too_large",
+                            attachment.filename, size, mime
+                        ));
+                        continue;
+                    }
+
+                    match reqwest::get(attachment.url.as_str()).await {
+                        Ok(resp) => match resp.bytes().await {
+                            Ok(bytes) => {
+                                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                                let safe_name = sanitize_upload_filename(&attachment.filename);
+                                let path =
+                                    upload_dir.join(format!("{}-{}-{}", ts, idx + 1, safe_name));
+                                if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                                    error!(
+                                        "Failed to save Discord attachment {}: {e}",
+                                        path.display()
+                                    );
+                                    attachment_notes.push(format!(
+                                        "[document] filename={} bytes={} mime={} save_error={}",
+                                        attachment.filename,
+                                        bytes.len(),
+                                        mime,
+                                        e
+                                    ));
+                                    continue;
+                                }
+
+                                if image_data.is_none() && mime.starts_with("image/") {
+                                    let b64 = base64::engine::general_purpose::STANDARD
+                                        .encode(bytes.as_ref());
+                                    image_data = Some((b64, mime.clone()));
+                                }
+
+                                attachment_notes.push(format!(
+                                    "[document] filename={} bytes={} mime={} saved_path={}",
+                                    attachment.filename,
+                                    bytes.len(),
+                                    mime,
+                                    path.display()
+                                ));
+                            }
+                            Err(e) => {
+                                attachment_notes.push(format!(
+                                    "[document] filename={} bytes={} mime={} download_error={}",
+                                    attachment.filename, size, mime, e
+                                ));
+                            }
+                        },
+                        Err(e) => {
+                            attachment_notes.push(format!(
+                                "[document] filename={} bytes={} mime={} download_error={}",
+                                attachment.filename, size, mime, e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !attachment_notes.is_empty() {
+            let notes = attachment_notes.join("\n");
+            if text.trim().is_empty() {
+                text = notes;
+            } else {
+                text = format!("{}\n\n{}", text.trim(), notes);
+            }
+        }
 
         // Resolve to unified contact (canonical_chat_id).
         // When UNIVERSAL_CHAT_ID is configured, bind this Discord handle to that canonical contact.
@@ -124,7 +222,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        if text.is_empty() {
+        if text.trim().is_empty() && image_data.is_none() {
             return;
         }
 
@@ -195,7 +293,7 @@ impl EventHandler for Handler {
                 is_scheduled_task: false,
             },
             None,
-            None,
+            image_data,
         )
         .await
         {
@@ -228,6 +326,21 @@ impl EventHandler for Handler {
 
     async fn ready(&self, _ctx: Context, ready: Ready) {
         info!("Discord bot connected as {}", ready.user.name);
+    }
+}
+
+fn sanitize_upload_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "discord-upload.bin".to_string()
+    } else {
+        sanitized
     }
 }
 

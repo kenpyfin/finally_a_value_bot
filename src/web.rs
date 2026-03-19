@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use include_dir::{include_dir, Dir};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
@@ -341,6 +342,15 @@ struct SendRequest {
     persona_id: Option<i64>,
     sender_name: Option<String>,
     message: String,
+    #[serde(default)]
+    attachments: Vec<SendAttachmentRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendAttachmentRequest {
+    filename: Option<String>,
+    media_type: Option<String>,
+    data_base64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,6 +413,7 @@ struct ScheduleCreateRequest {
     schedule_type: String,  // "cron" | "once"
     schedule_value: String,
     timezone: Option<String>,
+    persona_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,7 +425,8 @@ struct DeleteSessionRequest {
 
 #[derive(Debug, Deserialize)]
 struct ScheduleUpdateRequest {
-    status: String, // "paused" | "active" | "cancelled"
+    status: Option<String>, // "paused" | "active" | "cancelled"
+    persona_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,6 +453,11 @@ struct UpdateConfigRequest {
     web_rate_window_seconds: Option<u64>,
     web_run_history_limit: Option<usize>,
     web_session_idle_ttl_seconds: Option<u64>,
+    safety_output_guard_mode: Option<String>,
+    safety_max_emojis_per_response: Option<usize>,
+    safety_tail_repeat_limit: Option<usize>,
+    safety_execution_mode: Option<String>,
+    safety_risky_categories: Option<Vec<String>>,
 }
 
 fn config_path_for_save() -> Result<PathBuf, (StatusCode, String)> {
@@ -571,6 +588,21 @@ async fn api_update_config(
     }
     if let Some(v) = body.web_session_idle_ttl_seconds {
         cfg.web_session_idle_ttl_seconds = v;
+    }
+    if let Some(v) = body.safety_output_guard_mode {
+        cfg.safety_output_guard_mode = v;
+    }
+    if let Some(v) = body.safety_max_emojis_per_response {
+        cfg.safety_max_emojis_per_response = v;
+    }
+    if let Some(v) = body.safety_tail_repeat_limit {
+        cfg.safety_tail_repeat_limit = v;
+    }
+    if let Some(v) = body.safety_execution_mode {
+        cfg.safety_execution_mode = v;
+    }
+    if let Some(v) = body.safety_risky_categories {
+        cfg.safety_risky_categories = v;
     }
 
     if let Err(e) = cfg.post_deserialize() {
@@ -784,7 +816,7 @@ async fn api_send_stream(
     let start = Instant::now();
 
     let text = body.message.trim().to_string();
-    if text.is_empty() {
+    if text.is_empty() && body.attachments.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "message is required".into()));
     }
 
@@ -1088,14 +1120,33 @@ async fn send_and_store_response_with_events(
     body: SendRequest,
     event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let text = body.message.trim().to_string();
-    if text.is_empty() {
+    let raw_text = body.message.trim().to_string();
+    let mut text = raw_text.clone();
+    let mut image_data: Option<(String, String)> = None;
+
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let attachment_notes = process_web_attachments(
+        &state,
+        chat_id,
+        &body.attachments,
+        &mut image_data,
+    )
+    .await?;
+    if !attachment_notes.is_empty() {
+        let note_text = attachment_notes.join("\n");
+        if text.trim().is_empty() {
+            text = note_text;
+        } else {
+            text = format!("{}\n\n{}", text.trim(), note_text);
+        }
+    }
+
+    if text.trim().is_empty() && image_data.is_none() {
         return Err((StatusCode::BAD_REQUEST, "message is required".into()));
     }
 
     // Single entry point: parse slash command first. If command, run backend handler and return — never send to LLM.
-    if let Some(cmd) = parse_slash_command(&text) {
-        let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    if let Some(cmd) = parse_slash_command(&raw_text) {
         ensure_web_binding_for_universal(&state, chat_id).await?;
         call_blocking(state.app_state.db.clone(), move |db| {
             db.upsert_chat(chat_id, Some("default"), "web")
@@ -1177,7 +1228,6 @@ async fn send_and_store_response_with_events(
     }
 
     // Not a slash command: normal flow — resolve, store message, run agent
-    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
     let sender_name = body
         .sender_name
@@ -1230,7 +1280,7 @@ async fn send_and_store_response_with_events(
                 is_scheduled_task: false,
             },
             None,
-            None,
+            image_data,
             Some(tx),
         )
         .await
@@ -1246,7 +1296,7 @@ async fn send_and_store_response_with_events(
                 is_scheduled_task: false,
             },
             None,
-            None,
+            image_data,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -1269,6 +1319,103 @@ async fn send_and_store_response_with_events(
         "chat_id": chat_id,
         "response": response,
     })))
+}
+
+async fn process_web_attachments(
+    state: &WebState,
+    chat_id: i64,
+    attachments: &[SendAttachmentRequest],
+    image_data: &mut Option<(String, String)>,
+) -> Result<Vec<String>, (StatusCode, String)> {
+    if attachments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_bytes = state
+        .app_state
+        .config
+        .max_document_size_mb
+        .saturating_mul(1024)
+        .saturating_mul(1024);
+    let dir = FsPath::new(state.app_state.config.working_dir())
+        .join("uploads")
+        .join("web")
+        .join(chat_id.to_string());
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut notes = Vec::new();
+    for (idx, att) in attachments.iter().enumerate() {
+        let bytes = decode_base64_payload(&att.data_base64)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid attachment base64: {e}")))?;
+        let mime = att
+            .media_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let filename = att
+            .filename
+            .clone()
+            .unwrap_or_else(|| format!("web-attachment-{}.bin", idx + 1));
+
+        if (bytes.len() as u64) > max_bytes {
+            notes.push(format!(
+                "[document] filename={} bytes={} mime={} skipped=too_large",
+                filename,
+                bytes.len(),
+                mime
+            ));
+            continue;
+        }
+
+        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let safe_name = sanitize_upload_filename(&filename);
+        let path = dir.join(format!("{}-{}-{}", ts, idx + 1, safe_name));
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if image_data.is_none() && mime.starts_with("image/") {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
+            *image_data = Some((b64, mime.clone()));
+        }
+
+        notes.push(format!(
+            "[document] filename={} bytes={} mime={} saved_path={}",
+            filename,
+            bytes.len(),
+            mime,
+            path.display()
+        ));
+    }
+
+    Ok(notes)
+}
+
+fn decode_base64_payload(payload: &str) -> anyhow::Result<Vec<u8>> {
+    let raw = payload
+        .split_once(',')
+        .map(|(_, b64)| b64)
+        .unwrap_or(payload)
+        .trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+fn sanitize_upload_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "web-upload.bin".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Clear context: delete only the current persona's session for this contact (per-persona reset).
@@ -1514,6 +1661,7 @@ async fn api_schedules_list(
             json!({
                 "id": t.id,
                 "chat_id": t.chat_id,
+                "persona_id": t.persona_id,
                 "prompt": t.prompt,
                 "schedule_type": t.schedule_type,
                 "schedule_value": t.schedule_value,
@@ -1557,8 +1705,27 @@ async fn api_schedules_create(
     let schedule_type = body.schedule_type;
     let schedule_value = preflight.schedule_value.clone();
     let next_run_for_db = preflight.next_run.clone();
+    let requested_persona_id = body.persona_id.filter(|id| *id > 0);
     let id = call_blocking(state.app_state.db.clone(), move |db| {
-        db.create_scheduled_task(chat_id, &prompt, &schedule_type, &schedule_value, &next_run_for_db)
+        let persona_id = if let Some(pid) = requested_persona_id {
+            if !db.persona_exists(chat_id, pid)? {
+                return Err(crate::error::FinallyAValueBotError::ToolExecution(format!(
+                    "Persona {} does not exist for this chat",
+                    pid
+                )));
+            }
+            pid
+        } else {
+            db.get_current_persona_id(chat_id)?
+        };
+        db.create_scheduled_task_for_persona(
+            chat_id,
+            persona_id,
+            &prompt,
+            &schedule_type,
+            &schedule_value,
+            &next_run_for_db,
+        )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1584,25 +1751,82 @@ async fn api_schedules_update(
     Json(body): Json<ScheduleUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
 
-    let status = match body.status.as_str() {
-        "paused" => "paused",
-        "active" | "resumed" => "active",
-        "cancelled" => "cancelled",
-        _ => return Err((StatusCode::BAD_REQUEST, "status must be paused, active, or cancelled".into())),
+    let status = match body.status.as_deref() {
+        Some("paused") => Some("paused"),
+        Some("active") | Some("resumed") => Some("active"),
+        Some("cancelled") => Some("cancelled"),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "status must be paused, active, or cancelled".into(),
+            ))
+        }
+        None => None,
     };
+    let persona_id = body.persona_id;
+    if status.is_none() && persona_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide at least one field to update: status or persona_id".into(),
+        ));
+    }
+    if let Some(pid) = persona_id {
+        if pid <= 0 {
+            return Err((StatusCode::BAD_REQUEST, "persona_id must be a positive integer".into()));
+        }
+    }
 
-    let ok = call_blocking(state.app_state.db.clone(), move |db| db.update_task_status(task_id, status))
+    let task = call_blocking(state.app_state.db.clone(), move |db| db.get_task_by_id(task_id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if !ok {
+    let Some(task) = task else {
         return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+    };
+    if task.chat_id != chat_id {
+        return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+    }
+
+    if let Some(pid) = persona_id {
+        let exists = call_blocking(state.app_state.db.clone(), move |db| {
+            db.persona_exists(chat_id, pid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !exists {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Persona {} does not exist for this chat", pid),
+            ));
+        }
+    }
+
+    if let Some(next_status) = status {
+        let ok = call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_task_status(task_id, next_status)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !ok {
+            return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+        }
+    }
+    if let Some(pid) = persona_id {
+        let ok = call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_task_persona(task_id, pid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !ok {
+            return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+        }
     }
 
     Ok(Json(json!({
         "ok": true,
-        "message": format!("Task updated to {}", status),
+        "message": "Task updated",
     })))
 }
 
@@ -1680,6 +1904,50 @@ async fn asset_file(Path(file): Path<String>) -> impl IntoResponse {
             ([("content-type", content_type)], file.contents().to_vec()).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+    }
+}
+
+async fn upload_file(
+    State(state): State<WebState>,
+    Path(path): Path<String>,
+) -> impl IntoResponse {
+    let clean = path.replace("..", "");
+    if clean.is_empty() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+    let full_path = FsPath::new(state.app_state.config.working_dir())
+        .join("uploads")
+        .join(clean);
+    if !full_path.is_file() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    match tokio::fs::read(&full_path).await {
+        Ok(bytes) => {
+            let content_type = guess_upload_content_type(&full_path);
+            ([("content-type", content_type)], bytes).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+    }
+}
+
+fn guess_upload_content_type(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("json") => "application/json",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
     }
 }
 
@@ -1880,6 +2148,7 @@ fn build_router(web_state: WebState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/*file", get(asset_file))
+        .route("/api/uploads/*path", get(upload_file))
         .route("/icon.png", get(icon_file))
         .route("/favicon.ico", get(favicon_file))
         .route("/api/health", get(api_health))
@@ -2076,7 +2345,18 @@ mod tests {
             browser_cdp_port_base: 9222,
             browser_idle_timeout_secs: None,
             browser_headless: false,
+            safety_output_guard_mode: "moderate".into(),
+            safety_max_emojis_per_response: 12,
+            safety_tail_repeat_limit: 8,
+            safety_execution_mode: "warn_confirm".into(),
+            safety_risky_categories: vec![
+                "destructive".into(),
+                "system".into(),
+                "network".into(),
+                "package".into(),
+            ],
             agent_browser_path: None,
+            web_search_searxng_url: None,
             cursor_agent_cli_path: "cursor-agent".into(),
             cursor_agent_model: String::new(),
             cursor_agent_timeout_secs: 600,

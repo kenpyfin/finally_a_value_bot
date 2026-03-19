@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::{authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
 use crate::channel::enforce_channel_policy;
 use crate::claude::ToolDefinition;
 use crate::db::{call_blocking, Database, ScheduledTask};
@@ -19,6 +19,23 @@ pub fn format_tasks_list(tasks: &[ScheduledTask]) -> String {
 /// Format all scheduled tasks (slash /schedule), including chat_id for each.
 pub fn format_tasks_list_all(tasks: &[ScheduledTask]) -> String {
     format_tasks_list_impl(tasks, true)
+}
+
+/// Format scheduled tasks for Telegram /schedule in a single chat context:
+/// include persona id, omit chat id.
+pub fn format_tasks_list_persona(tasks: &[ScheduledTask]) -> String {
+    if tasks.is_empty() {
+        return "No scheduled tasks. Ask me to schedule one (recurring or one-time).".to_string();
+    }
+    let mut output = String::from("Scheduled tasks:\n");
+    for t in tasks {
+        output.push_str(&format!(
+            "#{} [{}] persona:{} | {} | {} '{}' | next: {}\n",
+            t.id, t.status, t.persona_id, t.prompt, t.schedule_type, t.schedule_value, t.next_run
+        ));
+    }
+    output.push_str("\nUse `schedule_task` to add; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
+    output
 }
 
 fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> String {
@@ -206,9 +223,25 @@ impl Tool for ScheduleTaskTool {
         let schedule_type_owned = schedule_type.to_string();
         let schedule_value_owned = preflight.schedule_value.clone();
         let next_run_owned = preflight.next_run.clone();
+        let persona_id = auth_context_from_input(&input)
+            .map(|auth| {
+                if auth.caller_chat_id == chat_id {
+                    auth.caller_persona_id
+                } else {
+                    0
+                }
+            })
+            .filter(|id| *id > 0)
+            .unwrap_or_else(|| 0);
         match call_blocking(self.db.clone(), move |db| {
-            db.create_scheduled_task(
+            let resolved_persona_id = if persona_id > 0 {
+                persona_id
+            } else {
+                db.get_current_persona_id(chat_id)?
+            };
+            db.create_scheduled_task_for_persona(
                 chat_id,
+                resolved_persona_id,
                 &prompt_owned,
                 &schedule_type_owned,
                 &schedule_value_owned,
@@ -253,7 +286,7 @@ impl Tool for ListTasksTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_scheduled_tasks".into(),
-            description: "List all scheduled tasks (active, paused, completed) across all chats and personas.".into(),
+            description: "List all scheduled tasks (active, running, paused, completed) across all chats and personas.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {

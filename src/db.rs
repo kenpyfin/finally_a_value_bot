@@ -73,12 +73,13 @@ pub struct SocialOAuthToken {
 pub struct ScheduledTask {
     pub id: i64,
     pub chat_id: i64,
+    pub persona_id: i64,
     pub prompt: String,
     pub schedule_type: String,  // "cron" or "once"
     pub schedule_value: String, // cron expression or ISO timestamp
     pub next_run: String,       // ISO timestamp
     pub last_run: Option<String>,
-    pub status: String, // "active", "paused", "completed", "cancelled"
+    pub status: String, // "active", "running", "paused", "completed", "cancelled"
     pub created_at: String,
 }
 
@@ -152,6 +153,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
                 prompt TEXT NOT NULL,
                 schedule_type TEXT NOT NULL DEFAULT 'cron',
                 schedule_value TEXT NOT NULL,
@@ -233,6 +235,7 @@ impl Database {
         )?;
 
         Self::migrate_persona_schema(&conn)?;
+        Self::migrate_scheduled_tasks_persona_schema(&conn)?;
         Self::migrate_channel_bindings(&conn)?;
         Self::migrate_fts(&conn)?;
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
@@ -358,6 +361,96 @@ impl Database {
             DROP TABLE messages;
             ALTER TABLE messages_new RENAME TO messages;
             CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp ON messages(chat_id, persona_id, timestamp);",
+        )?;
+
+        Ok(())
+    }
+
+    fn migrate_scheduled_tasks_persona_schema(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        let has_persona_id = conn
+            .prepare("PRAGMA table_info(scheduled_tasks)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "persona_id"))
+            })
+            .unwrap_or(false);
+        if has_persona_id {
+            return Ok(());
+        }
+
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN persona_id INTEGER", [])?;
+        conn.execute_batch(
+            "UPDATE scheduled_tasks
+             SET persona_id = (
+                 SELECT active_persona_id
+                 FROM chats
+                 WHERE chats.chat_id = scheduled_tasks.chat_id
+             )
+             WHERE persona_id IS NULL;
+             UPDATE scheduled_tasks
+             SET persona_id = (
+                 SELECT p.id
+                 FROM personas p
+                 WHERE p.chat_id = scheduled_tasks.chat_id
+                 ORDER BY CASE WHEN p.name = 'default' THEN 0 ELSE 1 END, p.id
+                 LIMIT 1
+             )
+             WHERE persona_id IS NULL;",
+        )?;
+
+        let mut stmt = conn.prepare("SELECT DISTINCT chat_id FROM scheduled_tasks WHERE persona_id IS NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        for row in rows {
+            let chat_id = row?;
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO chats (chat_id, chat_title, chat_type, last_message_time, active_persona_id)
+                 VALUES (?1, NULL, 'private', ?2, NULL)
+                 ON CONFLICT(chat_id) DO NOTHING",
+                params![chat_id, now],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO personas (chat_id, name, model_override) VALUES (?1, 'default', NULL)",
+                params![chat_id],
+            )?;
+            let persona_id: i64 = conn.query_row(
+                "SELECT id FROM personas WHERE chat_id = ?1 AND name = 'default'",
+                params![chat_id],
+                |r| r.get(0),
+            )?;
+            conn.execute(
+                "UPDATE chats SET active_persona_id = COALESCE(active_persona_id, ?1) WHERE chat_id = ?2",
+                params![persona_id, chat_id],
+            )?;
+            conn.execute(
+                "UPDATE scheduled_tasks SET persona_id = ?1 WHERE chat_id = ?2 AND persona_id IS NULL",
+                params![persona_id, chat_id],
+            )?;
+        }
+
+        // Enforce NOT NULL via table rebuild (SQLite cannot alter nullability in place).
+        conn.execute_batch(
+            "CREATE TABLE scheduled_tasks_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                schedule_type TEXT NOT NULL DEFAULT 'cron',
+                schedule_value TEXT NOT NULL,
+                next_run TEXT NOT NULL,
+                last_run TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO scheduled_tasks_new (id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at)
+            SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+            FROM scheduled_tasks;
+            DROP TABLE scheduled_tasks;
+            ALTER TABLE scheduled_tasks_new RENAME TO scheduled_tasks;
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status_next
+                ON scheduled_tasks(status, next_run);",
         )?;
 
         Ok(())
@@ -848,12 +941,40 @@ impl Database {
         schedule_value: &str,
         next_run: &str,
     ) -> Result<i64, FinallyAValueBotError> {
+        let persona_id = self.get_current_persona_id(chat_id)?;
+        self.create_scheduled_task_for_persona(
+            chat_id,
+            persona_id,
+            prompt,
+            schedule_type,
+            schedule_value,
+            next_run,
+        )
+    }
+
+    pub fn create_scheduled_task_for_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        prompt: &str,
+        schedule_type: &str,
+        schedule_value: &str,
+        next_run: &str,
+    ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
-            params![chat_id, prompt, schedule_type, schedule_value, next_run, now],
+            "INSERT INTO scheduled_tasks (chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+            params![
+                chat_id,
+                persona_id,
+                prompt,
+                schedule_type,
+                schedule_value,
+                next_run,
+                now
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -861,6 +982,7 @@ impl Database {
     fn ensure_unique_cron_task_by_prompt_prefix(
         &self,
         chat_id: i64,
+        persona_id: i64,
         prompt_prefix: &str,
         prompt: &str,
         cron_expr: &str,
@@ -870,13 +992,14 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id FROM scheduled_tasks
              WHERE chat_id = ?1
+               AND persona_id = ?2
                AND status = 'active'
                AND schedule_type = 'cron'
-               AND prompt LIKE ?2
+               AND prompt LIKE ?3
              ORDER BY id ASC",
         )?;
         let existing_ids: Vec<i64> = stmt
-            .query_map(params![chat_id, like_pattern], |row| row.get(0))?
+            .query_map(params![chat_id, persona_id, like_pattern], |row| row.get(0))?
             .filter_map(Result::ok)
             .collect();
 
@@ -897,8 +1020,8 @@ impl Database {
         } else {
             conn.execute(
                 "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
-                 VALUES (?1, ?2, 'cron', ?3, ?4, 'active', ?4)",
-                params![chat_id, prompt, cron_expr, now],
+                 VALUES (?1, ?2, ?3, 'cron', ?4, ?5, 'active', ?5)",
+                params![chat_id, persona_id, prompt, cron_expr, now],
             )?;
         }
         Ok(())
@@ -907,11 +1030,13 @@ impl Database {
     pub fn ensure_indexing_task(
         &self,
         chat_id: i64,
+        persona_id: i64,
         prompt: &str,
         cron_expr: &str,
     ) -> Result<(), FinallyAValueBotError> {
         self.ensure_unique_cron_task_by_prompt_prefix(
             chat_id,
+            persona_id,
             "Run the vault indexing script:",
             prompt,
             cron_expr,
@@ -921,11 +1046,13 @@ impl Database {
     pub fn ensure_vault_push_task(
         &self,
         chat_id: i64,
+        persona_id: i64,
         prompt: &str,
         cron_expr: &str,
     ) -> Result<(), FinallyAValueBotError> {
         self.ensure_unique_cron_task_by_prompt_prefix(
             chat_id,
+            persona_id,
             "Sync ORIGIN vault to git remote:",
             prompt,
             cron_expr,
@@ -935,6 +1062,7 @@ impl Database {
     pub fn ensure_onboarding_task(
         &self,
         chat_id: i64,
+        persona_id: i64,
         prompt: &str,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
@@ -955,9 +1083,9 @@ impl Database {
             if !exists {
                 let now = chrono::Utc::now().to_rfc3339();
                 conn.execute(
-                    "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
-                     VALUES (?1, ?2, 'once', ?3, ?3, 'active', ?3)",
-                    params![chat_id, prompt, now],
+                    "INSERT INTO scheduled_tasks (chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, status, created_at)
+                     VALUES (?1, ?2, ?3, 'once', ?4, ?4, 'active', ?4)",
+                    params![chat_id, persona_id, prompt, now],
                 )?;
             }
         }
@@ -967,7 +1095,7 @@ impl Database {
     pub fn get_due_tasks(&self, now: &str) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
              FROM scheduled_tasks
              WHERE status = 'active' AND next_run <= ?1",
         )?;
@@ -976,13 +1104,14 @@ impl Database {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    prompt: row.get(2)?,
-                    schedule_type: row.get(3)?,
-                    schedule_value: row.get(4)?,
-                    next_run: row.get(5)?,
-                    last_run: row.get(6)?,
-                    status: row.get(7)?,
-                    created_at: row.get(8)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -992,9 +1121,9 @@ impl Database {
     pub fn get_all_active_tasks(&self) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
              FROM scheduled_tasks
-             WHERE status IN ('active', 'paused')
+             WHERE status IN ('active', 'running', 'paused')
              ORDER BY id",
         )?;
         let tasks = stmt
@@ -1002,26 +1131,28 @@ impl Database {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    prompt: row.get(2)?,
-                    schedule_type: row.get(3)?,
-                    schedule_value: row.get(4)?,
-                    next_run: row.get(5)?,
-                    last_run: row.get(6)?,
-                    status: row.get(7)?,
-                    created_at: row.get(8)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
 
-    /// All scheduled tasks for /schedule and list_scheduled_tasks: active, paused, and completed (all chats/personas).
+    /// All scheduled tasks for /schedule and list_scheduled_tasks:
+    /// active, running, paused, and completed (all chats/personas).
     pub fn get_all_scheduled_tasks_for_display(&self) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
              FROM scheduled_tasks
-             WHERE status IN ('active', 'paused', 'completed')
+             WHERE status IN ('active', 'running', 'paused', 'completed')
              ORDER BY id",
         )?;
         let tasks = stmt
@@ -1029,13 +1160,14 @@ impl Database {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    prompt: row.get(2)?,
-                    schedule_type: row.get(3)?,
-                    schedule_value: row.get(4)?,
-                    next_run: row.get(5)?,
-                    last_run: row.get(6)?,
-                    status: row.get(7)?,
-                    created_at: row.get(8)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1045,9 +1177,9 @@ impl Database {
     pub fn get_tasks_for_chat(&self, chat_id: i64) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
              FROM scheduled_tasks
-             WHERE chat_id = ?1 AND status IN ('active', 'paused')
+             WHERE chat_id = ?1 AND status IN ('active', 'running', 'paused')
              ORDER BY id",
         )?;
         let tasks = stmt
@@ -1055,13 +1187,14 @@ impl Database {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    prompt: row.get(2)?,
-                    schedule_type: row.get(3)?,
-                    schedule_value: row.get(4)?,
-                    next_run: row.get(5)?,
-                    last_run: row.get(6)?,
-                    status: row.get(7)?,
-                    created_at: row.get(8)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1071,7 +1204,7 @@ impl Database {
     pub fn get_task_by_id(&self, task_id: i64) -> Result<Option<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
              FROM scheduled_tasks
              WHERE id = ?1",
             params![task_id],
@@ -1079,13 +1212,14 @@ impl Database {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    prompt: row.get(2)?,
-                    schedule_type: row.get(3)?,
-                    schedule_value: row.get(4)?,
-                    next_run: row.get(5)?,
-                    last_run: row.get(6)?,
-                    status: row.get(7)?,
-                    created_at: row.get(8)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             },
         );
@@ -1101,6 +1235,19 @@ impl Database {
         let rows = conn.execute(
             "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2",
             params![status, task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn update_task_persona(
+        &self,
+        task_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE scheduled_tasks SET persona_id = ?1 WHERE id = ?2",
+            params![persona_id, task_id],
         )?;
         Ok(rows > 0)
     }
@@ -1124,6 +1271,64 @@ impl Database {
                 conn.execute(
                     "UPDATE scheduled_tasks SET last_run = ?1, status = 'completed' WHERE id = ?2",
                     params![last_run, task_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a due task as running so it does not get picked again while executing.
+    /// For cron tasks, next_run should be precomputed and stored here.
+    pub fn mark_task_running(
+        &self,
+        task_id: i64,
+        started_at: &str,
+        next_run: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        match next_run {
+            Some(next) => {
+                conn.execute(
+                    "UPDATE scheduled_tasks
+                     SET last_run = ?1, next_run = ?2, status = 'running'
+                     WHERE id = ?3",
+                    params![started_at, next, task_id],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE scheduled_tasks
+                     SET last_run = ?1, status = 'running'
+                     WHERE id = ?2",
+                    params![started_at, task_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize a running task after execution.
+    /// - Cron tasks (Some next_run) return to active with the provided next run.
+    /// - One-shot tasks (None) are marked completed.
+    pub fn finalize_task_run(
+        &self,
+        task_id: i64,
+        next_run: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        match next_run {
+            Some(next) => {
+                conn.execute(
+                    "UPDATE scheduled_tasks
+                     SET next_run = ?1, status = 'active'
+                     WHERE id = ?2",
+                    params![next, task_id],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE scheduled_tasks SET status = 'completed' WHERE id = ?1",
+                    params![task_id],
                 )?;
             }
         }
@@ -1553,6 +1758,23 @@ impl Database {
         self.get_or_create_default_persona(chat_id)
     }
 
+    pub fn persona_exists(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM personas
+                WHERE chat_id = ?1 AND id = ?2
+            )",
+            params![chat_id, persona_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
     pub fn set_active_persona(
         &self,
         chat_id: i64,
@@ -1960,6 +2182,7 @@ mod tests {
     #[test]
     fn test_create_and_get_scheduled_task() {
         let (db, dir) = test_db();
+        let persona_id = test_persona(&db, 100);
         let id = db
             .create_scheduled_task(
                 100,
@@ -1973,9 +2196,33 @@ mod tests {
 
         let tasks = db.get_tasks_for_chat(100).unwrap();
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].persona_id, persona_id);
         assert_eq!(tasks[0].prompt, "say hello");
         assert_eq!(tasks[0].schedule_type, "cron");
         assert_eq!(tasks[0].status, "active");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_create_scheduled_task_for_persona_binds_explicit_persona() {
+        let (db, dir) = test_db();
+        let default_pid = test_persona(&db, 100);
+        let alt_pid = db.create_persona(100, "alt", None).unwrap();
+        db.set_active_persona(100, default_pid).unwrap();
+
+        let id = db
+            .create_scheduled_task_for_persona(
+                100,
+                alt_pid,
+                "run as alt persona",
+                "once",
+                "2099-12-31T00:00:00Z",
+                "2099-12-31T00:00:00Z",
+            )
+            .unwrap();
+
+        let task = db.get_task_by_id(id).unwrap().unwrap();
+        assert_eq!(task.persona_id, alt_pid);
         cleanup(&dir);
     }
 

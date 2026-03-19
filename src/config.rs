@@ -80,6 +80,26 @@ fn default_browser_cdp_port_base() -> u16 {
 fn default_browser_headless() -> bool {
     false
 }
+fn default_safety_output_guard_mode() -> String {
+    "moderate".into()
+}
+fn default_safety_max_emojis_per_response() -> usize {
+    12
+}
+fn default_safety_tail_repeat_limit() -> usize {
+    8
+}
+fn default_safety_execution_mode() -> String {
+    "warn_confirm".into()
+}
+fn default_safety_risky_categories() -> Vec<String> {
+    vec![
+        "destructive".into(),
+        "system".into(),
+        "network".into(),
+        "package".into(),
+    ]
+}
 
 #[cfg(target_os = "windows")]
 pub(crate) fn default_cursor_agent_cli_path() -> String {
@@ -302,9 +322,27 @@ pub struct Config {
     pub browser_idle_timeout_secs: Option<u64>,
     #[serde(default = "default_browser_headless")]
     pub browser_headless: bool,
+    /// Output repetition guard mode: off | moderate | strict.
+    #[serde(default = "default_safety_output_guard_mode")]
+    pub safety_output_guard_mode: String,
+    /// Max emoji-like characters allowed in one assistant response before trimming.
+    #[serde(default = "default_safety_max_emojis_per_response")]
+    pub safety_max_emojis_per_response: usize,
+    /// Max repeated tail-pattern count allowed before trimming repetitive suffixes.
+    #[serde(default = "default_safety_tail_repeat_limit")]
+    pub safety_tail_repeat_limit: usize,
+    /// Execution safety mode: off | warn_confirm | strict.
+    #[serde(default = "default_safety_execution_mode")]
+    pub safety_execution_mode: String,
+    /// Risky command categories monitored by execution safety.
+    #[serde(default = "default_safety_risky_categories")]
+    pub safety_risky_categories: Vec<String>,
     /// Full path to the agent-browser CLI (npm). If set, the browser tool uses this instead of looking up "agent-browser" on PATH. Use when the process PATH doesn't include agent-browser (e.g. when run as a service).
     #[serde(default)]
     pub agent_browser_path: Option<String>,
+    /// Optional SearXNG instance URL for web_search (e.g. https://search.example.org). When set, web_search uses this instead of DuckDuckGo HTML. Env: SEARXNG_URL.
+    #[serde(default)]
+    pub web_search_searxng_url: Option<String>,
     /// Path to the cursor-agent CLI. Default: "cursor-agent" (or "cursor-agent.cmd" on Windows). Use when the process PATH doesn't include cursor-agent.
     #[serde(default = "default_cursor_agent_cli_path")]
     pub cursor_agent_cli_path: String,
@@ -483,6 +521,16 @@ impl Config {
             })
             .unwrap_or_default()
     }
+    fn env_vec_string(key: &str) -> Vec<String> {
+        Self::env(key)
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_ascii_lowercase())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     /// Load config from environment (.env file + process env). Load .env from FINALLY_A_VALUE_BOT_CONFIG path or ./
     pub fn load() -> Result<Self, FinallyAValueBotError> {
@@ -625,7 +673,28 @@ impl Config {
             ),
             browser_idle_timeout_secs: Self::env("BROWSER_IDLE_TIMEOUT_SECS").and_then(|s| s.parse().ok()),
             browser_headless: Self::env_bool("BROWSER_HEADLESS", default_browser_headless()),
+            safety_output_guard_mode: Self::env("SAFETY_OUTPUT_GUARD_MODE")
+                .unwrap_or_else(default_safety_output_guard_mode),
+            safety_max_emojis_per_response: Self::env_usize(
+                "SAFETY_MAX_EMOJIS_PER_RESPONSE",
+                default_safety_max_emojis_per_response(),
+            ),
+            safety_tail_repeat_limit: Self::env_usize(
+                "SAFETY_TAIL_REPEAT_LIMIT",
+                default_safety_tail_repeat_limit(),
+            ),
+            safety_execution_mode: Self::env("SAFETY_EXECUTION_MODE")
+                .unwrap_or_else(default_safety_execution_mode),
+            safety_risky_categories: {
+                let parsed = Self::env_vec_string("SAFETY_RISKY_CATEGORIES");
+                if parsed.is_empty() {
+                    default_safety_risky_categories()
+                } else {
+                    parsed
+                }
+            },
             agent_browser_path: Self::env("AGENT_BROWSER_PATH"),
+            web_search_searxng_url: Self::env("SEARXNG_URL"),
             cursor_agent_cli_path: Self::env("CURSOR_AGENT_CLI_PATH")
                 .unwrap_or_else(default_cursor_agent_cli_path),
             cursor_agent_model: Self::env("CURSOR_AGENT_MODEL").unwrap_or_default(),
@@ -673,6 +742,14 @@ impl Config {
     /// Apply post-deserialization normalization and validation.
     pub(crate) fn post_deserialize(&mut self) -> Result<(), FinallyAValueBotError> {
         self.llm_provider = self.llm_provider.trim().to_lowercase();
+        self.safety_output_guard_mode = self.safety_output_guard_mode.trim().to_ascii_lowercase();
+        self.safety_execution_mode = self.safety_execution_mode.trim().to_ascii_lowercase();
+        self.safety_risky_categories = self
+            .safety_risky_categories
+            .iter()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .collect();
 
         // Apply provider-specific default model if empty
         if self.model.is_empty() {
@@ -734,6 +811,38 @@ impl Config {
         }
         if self.max_document_size_mb == 0 {
             self.max_document_size_mb = default_max_document_size_mb();
+        }
+        if self.safety_max_emojis_per_response == 0 {
+            self.safety_max_emojis_per_response = default_safety_max_emojis_per_response();
+        }
+        if self.safety_tail_repeat_limit == 0 {
+            self.safety_tail_repeat_limit = default_safety_tail_repeat_limit();
+        }
+        if self.safety_risky_categories.is_empty() {
+            self.safety_risky_categories = default_safety_risky_categories();
+        }
+        let valid_guard_modes = ["off", "moderate", "strict"];
+        if !valid_guard_modes.contains(&self.safety_output_guard_mode.as_str()) {
+            return Err(FinallyAValueBotError::Config(format!(
+                "Invalid safety_output_guard_mode: {} (expected off|moderate|strict)",
+                self.safety_output_guard_mode
+            )));
+        }
+        let valid_exec_modes = ["off", "warn_confirm", "strict"];
+        if !valid_exec_modes.contains(&self.safety_execution_mode.as_str()) {
+            return Err(FinallyAValueBotError::Config(format!(
+                "Invalid safety_execution_mode: {} (expected off|warn_confirm|strict)",
+                self.safety_execution_mode
+            )));
+        }
+        let valid_risky_categories = ["destructive", "system", "network", "package"];
+        for cat in &self.safety_risky_categories {
+            if !valid_risky_categories.contains(&cat.as_str()) {
+                return Err(FinallyAValueBotError::Config(format!(
+                    "Invalid safety risky category: {} (expected one of destructive,system,network,package)",
+                    cat
+                )));
+            }
         }
         // Expand ~ in agent_browser_path if present
         if let Some(ref p) = self.agent_browser_path {
@@ -821,6 +930,28 @@ impl Config {
         lines.push("# Workspace".into());
         lines.push(format!("WORKSPACE_DIR={}", esc(&self.workspace_dir)));
         lines.push(format!("TIMEZONE={}", esc(&self.timezone)));
+        lines.push("".into());
+        lines.push("# Runtime safety".into());
+        lines.push(format!(
+            "SAFETY_OUTPUT_GUARD_MODE={}",
+            esc(&self.safety_output_guard_mode)
+        ));
+        lines.push(format!(
+            "SAFETY_MAX_EMOJIS_PER_RESPONSE={}",
+            self.safety_max_emojis_per_response
+        ));
+        lines.push(format!(
+            "SAFETY_TAIL_REPEAT_LIMIT={}",
+            self.safety_tail_repeat_limit
+        ));
+        lines.push(format!(
+            "SAFETY_EXECUTION_MODE={}",
+            esc(&self.safety_execution_mode)
+        ));
+        lines.push(format!(
+            "SAFETY_RISKY_CATEGORIES={}",
+            esc(&self.safety_risky_categories.join(","))
+        ));
         if let Some(ref v) = self.vault {
             lines.push("".into());
             lines.push("# ORIGIN vault".into());
@@ -888,7 +1019,18 @@ mod tests {
             browser_cdp_port_base: 9222,
             browser_idle_timeout_secs: None,
             browser_headless: false,
+            safety_output_guard_mode: "moderate".into(),
+            safety_max_emojis_per_response: 12,
+            safety_tail_repeat_limit: 8,
+            safety_execution_mode: "warn_confirm".into(),
+            safety_risky_categories: vec![
+                "destructive".into(),
+                "system".into(),
+                "network".into(),
+                "package".into(),
+            ],
             agent_browser_path: None,
+            web_search_searxng_url: None,
             cursor_agent_cli_path: default_cursor_agent_cli_path(),
             cursor_agent_model: String::new(),
             cursor_agent_timeout_secs: 600,
@@ -942,6 +1084,14 @@ mod tests {
         assert_eq!(config.timezone, "US/Eastern");
         assert_eq!(config.allowed_groups, vec![123, 456]);
         assert_eq!(config.control_chat_ids, vec![999]);
+        assert_eq!(config.safety_output_guard_mode, "moderate");
+        assert_eq!(config.safety_max_emojis_per_response, 12);
+        assert_eq!(config.safety_tail_repeat_limit, 8);
+        assert_eq!(config.safety_execution_mode, "warn_confirm");
+        assert_eq!(
+            config.safety_risky_categories,
+            vec!["destructive", "system", "network", "package"]
+        );
     }
 
     #[test]
@@ -1067,6 +1217,24 @@ mod tests {
         config.post_deserialize().unwrap();
         assert_eq!(config.llm_provider, "anthropic");
         assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn test_post_deserialize_invalid_safety_output_guard_mode() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nsafety_output_guard_mode: noisy\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = config.post_deserialize().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Invalid safety_output_guard_mode"));
+    }
+
+    #[test]
+    fn test_post_deserialize_invalid_safety_execution_mode() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nsafety_execution_mode: ask-first\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = config.post_deserialize().unwrap_err();
+        assert!(err.to_string().contains("Invalid safety_execution_mode"));
     }
 
     #[test]

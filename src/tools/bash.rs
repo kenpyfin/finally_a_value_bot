@@ -10,14 +10,121 @@ use super::{schema_object, Tool, ToolResult};
 
 pub struct BashTool {
     working_dir: PathBuf,
+    safety_execution_mode: String,
+    safety_risky_categories: Vec<String>,
 }
 
 impl BashTool {
     pub fn new(working_dir: &str) -> Self {
+        Self::new_with_safety(
+            working_dir,
+            "warn_confirm".to_string(),
+            vec![
+                "destructive".into(),
+                "system".into(),
+                "network".into(),
+                "package".into(),
+            ],
+        )
+    }
+
+    pub fn new_with_safety(
+        working_dir: &str,
+        safety_execution_mode: String,
+        safety_risky_categories: Vec<String>,
+    ) -> Self {
         Self {
             working_dir: PathBuf::from(working_dir),
+            safety_execution_mode,
+            safety_risky_categories,
         }
     }
+}
+
+fn parse_confirmation_prefix(command: &str) -> (bool, String) {
+    const PREFIX: &str = "CONFIRM_EXECUTE ";
+    if let Some(rest) = command.strip_prefix(PREFIX) {
+        (true, rest.trim().to_string())
+    } else {
+        (false, command.to_string())
+    }
+}
+
+fn command_is_risky_for_category(command_lower: &str, category: &str) -> bool {
+    match category {
+        "destructive" => {
+            command_lower.contains("rm -rf")
+                || command_lower.contains("rm -fr")
+                || command_lower.contains("mkfs")
+                || command_lower.contains("shred ")
+                || command_lower.contains(" dd if=")
+                || command_lower.starts_with("dd if=")
+        }
+        "system" => {
+            command_lower.contains("systemctl ")
+                || command_lower.contains(" service ")
+                || command_lower.starts_with("service ")
+                || command_lower.contains("shutdown")
+                || command_lower.contains("reboot")
+                || command_lower.contains("killall ")
+                || command_lower.contains("pkill ")
+                || command_lower.contains("launchctl ")
+                || command_lower.contains("sudo ")
+        }
+        "network" => {
+            (command_lower.contains("curl ")
+                && (command_lower.contains(" -x post")
+                    || command_lower.contains(" --request post")
+                    || command_lower.contains(" -x put")
+                    || command_lower.contains(" --request put")
+                    || command_lower.contains(" -x patch")
+                    || command_lower.contains(" --request patch")
+                    || command_lower.contains(" -x delete")
+                    || command_lower.contains(" --request delete")))
+                || (command_lower.contains("wget ")
+                    && (command_lower.contains(" --post")
+                        || command_lower.contains(" --method=post")
+                        || command_lower.contains(" --method=put")
+                        || command_lower.contains(" --method=patch")
+                        || command_lower.contains(" --method=delete")))
+        }
+        "package" => {
+            command_lower.contains("apt-get ")
+                || command_lower.starts_with("apt ")
+                || command_lower.contains(" yum ")
+                || command_lower.starts_with("yum ")
+                || command_lower.contains(" dnf ")
+                || command_lower.starts_with("dnf ")
+                || command_lower.contains(" pacman ")
+                || command_lower.starts_with("pacman ")
+                || command_lower.contains("brew install")
+                || command_lower.contains("brew uninstall")
+                || command_lower.contains("pip install")
+                || command_lower.contains("pip uninstall")
+                || command_lower.contains("npm install")
+                || command_lower.contains("npm uninstall")
+                || command_lower.contains("cargo install")
+                || command_lower.contains("cargo uninstall")
+        }
+        _ => false,
+    }
+}
+
+fn detect_risky_categories(command: &str, configured_categories: &[String]) -> Vec<String> {
+    let command_lower = command.to_ascii_lowercase();
+    let mut matched = Vec::new();
+    for category in configured_categories {
+        let c = category.trim().to_ascii_lowercase();
+        if c.is_empty() {
+            continue;
+        }
+        if command_is_risky_for_category(&command_lower, &c) {
+            matched.push(c);
+        }
+    }
+    matched.sort();
+    matched.dedup();
+    matched
 }
 
 #[async_trait]
@@ -47,10 +154,11 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
-        let command = match input.get("command").and_then(|v| v.as_str()) {
+        let raw_command = match input.get("command").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => return ToolResult::error("Missing 'command' parameter".into()),
         };
+        let (confirmed, command) = parse_confirmation_prefix(raw_command.trim());
 
         let timeout_secs = input
             .get("timeout_secs")
@@ -64,9 +172,29 @@ impl Tool for BashTool {
             ));
         }
 
+        let safety_mode = self.safety_execution_mode.trim().to_ascii_lowercase();
+        let risky_categories = detect_risky_categories(&command, &self.safety_risky_categories);
+        if !risky_categories.is_empty() && safety_mode != "off" {
+            if safety_mode == "strict" {
+                return ToolResult::error(format!(
+                    "Blocked by safety_execution_mode=strict. Risky categories detected: [{}]. Command was not executed.",
+                    risky_categories.join(", ")
+                ))
+                .with_error_type("blocked_by_policy");
+            }
+            if safety_mode == "warn_confirm" && !confirmed {
+                return ToolResult::error(format!(
+                    "Execution paused by safety policy. Risky categories detected: [{}]. \
+Add explicit confirmation by re-running with prefix: CONFIRM_EXECUTE <your command>",
+                    risky_categories.join(", ")
+                ))
+                .with_error_type("confirmation_required");
+            }
+        }
+
         info!("Executing bash: {}", command);
 
-        let spec = shell_command(command);
+        let spec = shell_command(&command);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             build_command(&spec, Some(&working_dir)).output(),
@@ -186,6 +314,45 @@ mod tests {
         assert!(result.content.contains(work.to_str().unwrap()));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_bash_warn_confirm_requires_prefix_for_risky_command() {
+        let tool = BashTool::new_with_safety(
+            ".",
+            "warn_confirm".into(),
+            vec!["destructive".into()],
+        );
+        let result = tool.execute(json!({"command": "rm -rf /tmp/foo"})).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Execution paused by safety policy"));
+        assert_eq!(result.error_type.as_deref(), Some("confirmation_required"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_warn_confirm_allows_risky_command_with_prefix() {
+        let tool = BashTool::new_with_safety(
+            ".",
+            "warn_confirm".into(),
+            vec!["destructive".into()],
+        );
+        let result = tool
+            .execute(json!({"command": "CONFIRM_EXECUTE rm -rf /tmp/finally_a_value_bot_test_confirm"}))
+            .await;
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_bash_strict_blocks_risky_command() {
+        let tool = BashTool::new_with_safety(
+            ".",
+            "strict".into(),
+            vec!["package".into()],
+        );
+        let result = tool.execute(json!({"command": "npm install lodash"})).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Blocked by safety_execution_mode=strict"));
+        assert_eq!(result.error_type.as_deref(), Some("blocked_by_policy"));
     }
 
 }

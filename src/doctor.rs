@@ -325,11 +325,18 @@ fn check_node_and_browser(report: &mut DoctorReport) {
         },
     );
 
-    let browser_cmd = if cfg!(target_os = "windows") {
-        command_exists("agent-browser.cmd") || command_exists("agent-browser")
-    } else {
-        command_exists("agent-browser")
-    };
+    let browser_cmd = Config::load()
+        .ok()
+        .and_then(|c| c.agent_browser_path.clone())
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| std::path::Path::new(&p).is_file())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                command_exists("agent-browser.cmd") || command_exists("agent-browser")
+            } else {
+                command_exists("agent-browser")
+            }
+        });
 
     report.push(
         "deps.agent_browser",
@@ -347,7 +354,7 @@ fn check_node_and_browser(report: &mut DoctorReport) {
         if browser_cmd {
             None
         } else {
-            Some("Run `npm install -g agent-browser && agent-browser install`.".to_string())
+            Some("Run `npm install -g agent-browser && agent-browser install`. In Docker the image sets AGENT_BROWSER_PATH.".to_string())
         },
     );
 

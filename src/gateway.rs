@@ -220,6 +220,7 @@ fn seed_default_vault_maintenance_tasks(ctx: &ServiceContext) -> Result<()> {
     let runtime_data_dir = cfg.runtime_data_dir();
     let db = Database::new(&runtime_data_dir)?;
     let chat_id = cfg.universal_chat_id.unwrap_or(997894126);
+    let persona_id = db.get_current_persona_id(chat_id)?;
 
     let workspace_root = cfg.workspace_root_absolute();
     let index_script = workspace_root
@@ -242,13 +243,13 @@ fn seed_default_vault_maintenance_tasks(ctx: &ServiceContext) -> Result<()> {
         python_bin,
         index_script.display()
     );
-    db.ensure_indexing_task(chat_id, &index_prompt, "0 0 */6 * * *")?;
+    db.ensure_indexing_task(chat_id, persona_id, &index_prompt, "0 0 */6 * * *")?;
 
     let push_prompt = format!(
         "Sync ORIGIN vault to git remote: run `cd {} && git add -A && git commit -m \"auto: vault sync\" || true && git push origin HEAD`. If there is nothing to commit, report that no changes were pushed.",
         workspace_root.join("shared").join("ORIGIN").display()
     );
-    db.ensure_vault_push_task(chat_id, &push_prompt, "0 0 */6 * * *")?;
+    db.ensure_vault_push_task(chat_id, persona_id, &push_prompt, "0 0 */6 * * *")?;
     Ok(())
 }
 

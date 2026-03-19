@@ -472,8 +472,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Seed onboarding task for fresh installations
     let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
+    let seed_persona_id = db.get_current_persona_id(seed_chat_id)?;
     if let Err(e) = db.ensure_onboarding_task(
         seed_chat_id,
+        seed_persona_id,
         "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track."
     ) {
         tracing::warn!("Failed to seed onboarding task: {}", e);

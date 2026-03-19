@@ -252,7 +252,7 @@ impl Tool for BrowserTool {
                 let msg = if e.to_string().contains("No such file") || e.to_string().contains("not found") {
                     format!(
                         "Browser automation is not available: the command '{}' was not found. \
-                        Fix: (1) Install agent-browser: npm install -g agent-browser, then agent-browser install; (2) if the bot runs as a service or PATH doesn't include agent-browser, set AGENT_BROWSER_PATH in .env to the full path (e.g. agent_browser_path: \"$HOME/.local/bin/agent-browser\" or agent_browser_path: \"~/.local/bin/agent-browser\"). Raw error: {e}",
+                        Fix: install with `npm install -g agent-browser` and `agent-browser install`. In Docker the image sets AGENT_BROWSER_PATH. Raw error: {e}",
                         program
                     )
                 } else {

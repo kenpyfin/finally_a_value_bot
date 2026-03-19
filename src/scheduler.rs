@@ -40,6 +40,7 @@ async fn run_due_tasks(state: &Arc<AppState>) {
     for task in tasks {
         let task_id = task.id;
         let chat_id = task.chat_id;
+        let scheduled_persona_id = task.persona_id;
         let prompt = task.prompt.clone();
 
         info!(
@@ -67,13 +68,13 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                 }
             }
         } else {
-            None // one-shot: will be marked completed by update_task_after_run
+            None
         };
 
         let started_for_claim = started_at_str.clone();
         let next_run_claim = next_run.clone();
         if let Err(e) = call_blocking(state.db.clone(), move |db| {
-            db.update_task_after_run(task_id, &started_for_claim, next_run_claim.as_deref())?;
+            db.mark_task_running(task_id, &started_for_claim, next_run_claim.as_deref())?;
             Ok(())
         })
         .await
@@ -88,13 +89,28 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                 _ => "telegram",
             };
 
-        let persona_id = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+        let persona_id = call_blocking(state.db.clone(), move |db| {
+            if scheduled_persona_id > 0 && db.persona_exists(chat_id, scheduled_persona_id)? {
+                return Ok(scheduled_persona_id);
+            }
+            let fallback = db.get_current_persona_id(chat_id)?;
+            if scheduled_persona_id > 0 && fallback != scheduled_persona_id {
+                info!(
+                    "Scheduler: task #{} persona {} missing for chat {}, falling back to persona {}",
+                    task_id, scheduled_persona_id, chat_id, fallback
+                );
+            }
+            Ok(fallback)
+        })
+        .await
+        .unwrap_or(0);
         if persona_id == 0 {
             error!("Scheduler: could not resolve persona for chat {}", chat_id);
             continue;
         }
 
-        // Run agent loop with the task prompt (may take a long time)
+        // Run agent loop with the task prompt (may take a long time), then deliver
+        // the result back to the user channel(s).
         let (success, result_summary) = match crate::telegram::process_with_agent(
             state,
             AgentRequestContext {
@@ -110,45 +126,86 @@ async fn run_due_tasks(state: &Arc<AppState>) {
         .await
         {
             Ok(response) => {
-                if !response.is_empty() {
-                    let _ = deliver_to_contact(
-                        state.db.clone(),
-                        Some(&state.bot),
-                        state.discord_http.as_deref(),
-                        &state.config.bot_username,
-                        chat_id,
-                        persona_id,
-                        &response,
-                    )
-                    .await;
-                }
-                let summary = if response.len() > 200 {
-                    format!("{}...", &response[..response.floor_char_boundary(200)])
+                // Always provide a user-visible scheduled run result, even if the agent
+                // returns an empty string.
+                let response_text = if response.trim().is_empty() {
+                    format!("Scheduled task #{} completed.", task_id)
                 } else {
                     response
                 };
-                (true, Some(summary))
-            }
-            Err(e) => {
-                error!("Scheduler: task #{} failed: {e}", task_id);
-                let err_text = format!("Scheduled task #{} failed: {e}", task_id);
-                let _ = deliver_to_contact(
+
+                match deliver_to_contact(
                     state.db.clone(),
                     Some(&state.bot),
                     state.discord_http.as_deref(),
                     &state.config.bot_username,
                     chat_id,
                     persona_id,
-                    &err_text,
+                    &response_text,
                 )
-                .await;
-                (false, Some(format!("Error: {e}")))
+                .await
+                {
+                    Ok(()) => {
+                        let summary = if response_text.len() > 200 {
+                            format!("{}...", &response_text[..response_text.floor_char_boundary(200)])
+                        } else {
+                            response_text
+                        };
+                        (true, Some(summary))
+                    }
+                    Err(e) => {
+                        error!(
+                            "Scheduler: task #{} produced a response but delivery failed: {}",
+                            task_id, e
+                        );
+                        (
+                            false,
+                            Some(format!(
+                                "Delivery error after successful execution: {e}"
+                            )),
+                        )
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Scheduler: task #{} failed: {e}", task_id);
+                let err_text = format!("Scheduled task #{} failed: {e}", task_id);
+                let delivery_ok = deliver_to_contact(
+                        state.db.clone(),
+                        Some(&state.bot),
+                        state.discord_http.as_deref(),
+                        &state.config.bot_username,
+                        chat_id,
+                        persona_id,
+                        &err_text,
+                    )
+                .await
+                .is_ok();
+                if delivery_ok {
+                    (false, Some(format!("Error: {e}")))
+                } else {
+                    (false, Some(format!("Error: {e} (and failed to deliver error message)")))
+                }
             }
         };
 
         let finished_at = Utc::now();
         let finished_at_str = finished_at.to_rfc3339();
         let duration_ms = (finished_at - started_at).num_milliseconds();
+
+        // Move running task back to active (cron) or completed (one-shot).
+        let next_run_finalize = next_run.clone();
+        if let Err(e) = call_blocking(state.db.clone(), move |db| {
+            db.finalize_task_run(task_id, next_run_finalize.as_deref())?;
+            Ok(())
+        })
+        .await
+        {
+            error!(
+                "Scheduler: failed to finalize task state for #{} after run: {}",
+                task_id, e
+            );
+        }
 
         // Log the task run
         let log_summary = result_summary.clone();
