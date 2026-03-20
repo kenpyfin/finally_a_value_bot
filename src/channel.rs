@@ -1,8 +1,9 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use teloxide::prelude::*;
 
-use crate::channels::telegram::{send_response_plain, send_response_result};
+use crate::channels::telegram::send_response_result;
 use crate::db::{call_blocking, Database, StoredMessage};
 use crate::tools::auth_context_from_input;
 
@@ -36,6 +37,7 @@ pub async fn deliver_and_store_bot_message(
     chat_id: i64,
     persona_id: i64,
     text: &str,
+    workspace_root: Option<PathBuf>,
 ) -> Result<(), String> {
     if is_web_chat(db.clone(), chat_id).await {
         let msg = StoredMessage {
@@ -51,7 +53,8 @@ pub async fn deliver_and_store_bot_message(
             .await
             .map_err(|e| format!("Failed to store web message: {e}"))
     } else {
-        let send_result = send_response_result(bot, ChatId(chat_id), text, None).await;
+        let send_result =
+            send_response_result(bot, ChatId(chat_id), text, None, workspace_root.as_deref()).await;
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
@@ -82,20 +85,7 @@ pub async fn deliver_and_store_bot_message(
                     return Ok(());
                 }
 
-                // Fallback for parse errors
-                if err_str.contains("can't parse entities") {
-                    tracing::warn!(
-                        target: "channel",
-                        chat_id = chat_id,
-                        error = %err_str,
-                        "Telegram HTML parse failed, retrying as plain text"
-                    );
-                    if let Err(e2) = send_response_plain(bot, ChatId(chat_id), text, None).await {
-                        return Err(format!("Failed to send plain text message after HTML failure: {e2}"));
-                    }
-                } else {
-                    return Err(format!("Failed to send message: {e}"));
-                }
+                return Err(format!("Failed to send message: {e}"));
             }
         }
         call_blocking(db.clone(), move |d| d.store_message(&msg))
@@ -114,6 +104,7 @@ pub async fn deliver_to_contact(
     canonical_chat_id: i64,
     persona_id: i64,
     text: &str,
+    workspace_root: Option<PathBuf>,
 ) -> Result<(), String> {
     let msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -137,18 +128,16 @@ pub async fn deliver_to_contact(
             "telegram" => {
                 if let Some(bot) = bot {
                     if let Ok(chat_id) = b.channel_handle.parse::<i64>() {
-                        if let Err(e) = send_response_result(bot, ChatId(chat_id), text, None).await {
+                        if let Err(e) =
+                            send_response_result(bot, ChatId(chat_id), text, None, workspace_root.as_deref())
+                                .await
+                        {
                             let err_str = e.to_string();
                             if !err_str.contains("chat not found")
                                 && !err_str.contains("Chat not found")
                                 && !err_str.contains("user is deactivated")
                             {
-                                if err_str.contains("can't parse entities") {
-                                    tracing::warn!(target: "channel", chat_id = chat_id, error = %err_str, "Telegram HTML parse failed for bound channel, retrying as plain text");
-                                    let _ = send_response_plain(bot, ChatId(chat_id), text, None).await;
-                                } else {
-                                    tracing::warn!(target: "channel", chat_id = chat_id, error = %err_str, "Telegram delivery to bound channel failed");
-                                }
+                                tracing::warn!(target: "channel", chat_id = chat_id, error = %err_str, "Telegram delivery to bound channel failed");
                             }
                         }
                     }

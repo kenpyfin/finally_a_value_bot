@@ -20,7 +20,7 @@ use crate::channel::deliver_to_contact;
 use crate::config::Config;
 use crate::db::{call_blocking, Persona, StoredMessage};
 use crate::social_oauth;
-use crate::claude::Message;
+use crate::claude::{Message, MessageContent};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::telegram::{
     archive_conversation, process_with_agent,
@@ -1266,26 +1266,27 @@ async fn send_and_store_response_with_events(
             SlashCommand::Archive => {
                 let cid2 = chat_id;
                 let pid = persona_id;
-                match call_blocking(state.app_state.db.clone(), move |db| {
-                    db.load_session(cid2, pid)
+                let history = call_blocking(state.app_state.db.clone(), move |db| {
+                    db.get_recent_messages(cid2, pid, 500)
                 })
                 .await
-                {
-                    Ok(Some((json_str, _))) => {
-                        let messages: Vec<Message> =
-                            serde_json::from_str(&json_str).unwrap_or_default();
-                        if messages.is_empty() {
-                            "No session to archive.".into()
-                        } else {
-                            archive_conversation(
-                                &state.app_state.config.runtime_data_dir(),
-                                chat_id,
-                                &messages,
-                            );
-                            format!("Archived {} messages.", messages.len())
-                        }
-                    }
-                    _ => "No session to archive.".into(),
+                .unwrap_or_default();
+                let messages: Vec<Message> = history
+                    .into_iter()
+                    .map(|m| Message {
+                        role: if m.is_from_bot { "assistant" } else { "user" }.into(),
+                        content: MessageContent::Text(m.content),
+                    })
+                    .collect();
+                if messages.is_empty() {
+                    "No conversation to archive.".into()
+                } else {
+                    archive_conversation(
+                        &state.app_state.config.runtime_data_dir(),
+                        chat_id,
+                        &messages,
+                    );
+                    format!("Archived {} messages.", messages.len())
                 }
             }
         };
@@ -1298,6 +1299,7 @@ async fn send_and_store_response_with_events(
             chat_id,
             persona_id,
             &resp,
+            Some(state.app_state.config.workspace_root_absolute()),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1394,6 +1396,7 @@ async fn send_and_store_response_with_events(
             chat_id,
             persona_id,
             &response,
+            Some(state.app_state.config.workspace_root_absolute()),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;

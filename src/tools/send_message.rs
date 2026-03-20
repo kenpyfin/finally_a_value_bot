@@ -488,6 +488,7 @@ impl Tool for SendMessageTool {
                 Ok(pid) => pid,
                 Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
             };
+            let workspace_root = self.config.as_ref().map(|c| c.workspace_root_absolute());
             match deliver_and_store_bot_message(
                 &self.bot,
                 self.db.clone(),
@@ -495,6 +496,7 @@ impl Tool for SendMessageTool {
                 chat_id,
                 persona_id,
                 &text,
+                workspace_root,
             )
             .await
             {

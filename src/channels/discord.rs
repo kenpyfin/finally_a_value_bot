@@ -195,26 +195,29 @@ impl EventHandler for Handler {
                 SlashCommand::Archive => {
                     let pid = call_blocking(self.app_state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
                     if pid == 0 {
-                        let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
+                        let _ = msg.channel_id.say(&ctx.http, "No conversation to archive.").await;
                     } else {
                         let pid_f = pid;
-                        if let Ok(Some((json, _))) = call_blocking(self.app_state.db.clone(), move |db| {
-                            db.load_session(canonical_chat_id, pid_f)
+                        let history = call_blocking(self.app_state.db.clone(), move |db| {
+                            db.get_recent_messages(canonical_chat_id, pid_f, 500)
                         })
                         .await
-                        {
-                            let messages: Vec<ClaudeMessage> = serde_json::from_str(&json).unwrap_or_default();
-                            if messages.is_empty() {
-                                let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
-                            } else {
-                                archive_conversation(&self.app_state.config.runtime_data_dir(), canonical_chat_id, &messages);
-                                let _ = msg
-                                    .channel_id
-                                    .say(&ctx.http, format!("Archived {} messages.", messages.len()))
-                                    .await;
-                            }
+                        .unwrap_or_default();
+                        let messages: Vec<ClaudeMessage> = history
+                            .into_iter()
+                            .map(|m| ClaudeMessage {
+                                role: if m.is_from_bot { "assistant" } else { "user" }.into(),
+                                content: crate::claude::MessageContent::Text(m.content),
+                            })
+                            .collect();
+                        if messages.is_empty() {
+                            let _ = msg.channel_id.say(&ctx.http, "No conversation to archive.").await;
                         } else {
-                            let _ = msg.channel_id.say(&ctx.http, "No session to archive.").await;
+                            archive_conversation(&self.app_state.config.runtime_data_dir(), canonical_chat_id, &messages);
+                            let _ = msg
+                                .channel_id
+                                .say(&ctx.http, format!("Archived {} messages.", messages.len()))
+                                .await;
                         }
                     }
                 }
@@ -309,6 +312,7 @@ impl EventHandler for Handler {
                         canonical_chat_id,
                         persona_id,
                         &response,
+                        Some(self.app_state.config.workspace_root_absolute()),
                     )
                     .await
                     {

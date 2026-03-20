@@ -2,14 +2,12 @@ use std::sync::Arc;
 
 use tracing::{error, info};
 
+use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::channel::deliver_to_contact;
 use crate::db::call_blocking;
 use crate::telegram::{process_with_agent, AgentRequestContext, AppState};
 
-/// Spawn a background job that re-runs the user prompt with extended timeouts.
-/// When the background run completes (success or failure), the raw result is fed
-/// back through the main agent as tool-context so the main agent produces the
-/// final user-facing reply.
+/// Spawn a background job and deliver the final result asynchronously.
 pub fn spawn_background_job(
     state: Arc<AppState>,
     job_id: String,
@@ -64,41 +62,46 @@ pub fn spawn_background_job(
         })
         .await;
 
-        // Feed the background result back to the main agent as tool-context so
-        // the main agent can reason about it and produce the final user reply.
-        // Mark continuation lane and ask main agent to produce user-facing output.
+        // Mark continuation lane while we generate user-facing output.
         let jid = job_id.clone();
         let _ = call_blocking(state.db.clone(), move |db| {
             db.mark_background_job_main_agent_processing(&jid)
         })
         .await;
 
-        let continuation_prompt = if raw_success {
+        let format_prompt = if raw_success {
             format!(
-                "[System: A background job completed for this chat. The user's original request was: \"{}\". The background job produced the following result. Please review it and respond to the user with the final answer.]\n\n{}",
+                "The user's original request was: \"{}\".\n\nBackground job result:\n{}\n\nRespond to the user with a concise final answer.",
                 prompt, raw_output
             )
         } else {
             format!(
-                "[System: A background job failed for this chat. The user's original request was: \"{}\". The error was: {}. Please inform the user about this failure and suggest next steps.]",
+                "The user's original request was: \"{}\".\n\nBackground job error:\n{}\n\nInform the user about this failure and suggest next steps.",
                 prompt, raw_output
             )
         };
 
-        let final_result = process_with_agent(
-            &state,
-            AgentRequestContext {
-                caller_channel: "web",
-                chat_id,
-                chat_type: "private",
-                persona_id,
-                is_scheduled_task: false,
-                is_background_job: true,
-            },
-            Some(&continuation_prompt),
-            None,
-        )
-        .await;
+        let final_result = state
+            .llm
+            .send_message(
+                "You are a concise assistant writing final user-facing replies.",
+                vec![Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(format_prompt),
+                }],
+                None,
+            )
+            .await
+            .map(|resp| {
+                resp.content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ResponseContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            });
 
         match final_result {
             Ok(final_text) => {
@@ -116,6 +119,7 @@ pub fn spawn_background_job(
                     chat_id,
                     persona_id,
                     &final_text,
+                    Some(state.config.workspace_root_absolute()),
                 )
                 .await
                 {
@@ -142,7 +146,7 @@ pub fn spawn_background_job(
             Err(e) => {
                 error!(
                     job_id = %job_id,
-                    "Background job: main agent continuation failed: {e}"
+                    "Background job: format pass failed: {e}"
                 );
                 let fallback = if raw_success {
                     format!("Your background task completed, but I had trouble generating a summary. Here is the raw result:\n\n{}", raw_output)
@@ -157,11 +161,12 @@ pub fn spawn_background_job(
                     chat_id,
                     persona_id,
                     &fallback,
+                    Some(state.config.workspace_root_absolute()),
                 )
                 .await;
 
                 let jid = job_id.clone();
-                let err_text = format!("Main-agent continuation failed: {e}");
+                let err_text = format!("Background formatting failed: {e}");
                 let _ = call_blocking(state.db.clone(), move |db| {
                     db.fail_background_job(&jid, &err_text)
                 })

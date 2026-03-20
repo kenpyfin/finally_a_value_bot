@@ -20,7 +20,6 @@ pub mod setup;
 pub mod skills;
 pub mod social_oauth;
 pub mod agent_history;
-pub mod agent_loop;
 pub mod tool_skill_agent;
 pub mod post_tool_evaluator;
 pub mod tools;

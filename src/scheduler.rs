@@ -143,6 +143,7 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                     chat_id,
                     persona_id,
                     &response_text,
+                    Some(state.config.workspace_root_absolute()),
                 )
                 .await
                 {
@@ -179,6 +180,7 @@ async fn run_due_tasks(state: &Arc<AppState>) {
                         chat_id,
                         persona_id,
                         &err_text,
+                        Some(state.config.workspace_root_absolute()),
                     )
                 .await
                 .is_ok();

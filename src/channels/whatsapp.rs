@@ -257,48 +257,44 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                     &state.access_token,
                                     &state.phone_number_id,
                                     &message.from,
-                                    "No session to archive.",
+                                    "No conversation to archive.",
                                 )
                                 .await;
                             } else {
                                 let pid_f = pid;
-                                if let Ok(Some((json, _))) = call_blocking(state.app_state.db.clone(), move |db| {
-                                    db.load_session(chat_id, pid_f)
+                                let history = call_blocking(state.app_state.db.clone(), move |db| {
+                                    db.get_recent_messages(chat_id, pid_f, 500)
                                 })
                                 .await
-                                {
-                                    let messages: Vec<crate::claude::Message> = serde_json::from_str(&json).unwrap_or_default();
-                                    if messages.is_empty() {
-                                        send_whatsapp_message(
-                                            &state.http_client,
-                                            &state.access_token,
-                                            &state.phone_number_id,
-                                            &message.from,
-                                            "No session to archive.",
-                                        )
-                                        .await;
-                                    } else {
-                                        crate::telegram::archive_conversation(
-                                            &state.app_state.config.runtime_data_dir(),
-                                            chat_id,
-                                            &messages,
-                                        );
-                                        send_whatsapp_message(
-                                            &state.http_client,
-                                            &state.access_token,
-                                            &state.phone_number_id,
-                                            &message.from,
-                                            &format!("Archived {} messages.", messages.len()),
-                                        )
-                                        .await;
-                                    }
-                                } else {
+                                .unwrap_or_default();
+                                let messages: Vec<crate::claude::Message> = history
+                                    .into_iter()
+                                    .map(|m| crate::claude::Message {
+                                        role: if m.is_from_bot { "assistant" } else { "user" }.into(),
+                                        content: crate::claude::MessageContent::Text(m.content),
+                                    })
+                                    .collect();
+                                if messages.is_empty() {
                                     send_whatsapp_message(
                                         &state.http_client,
                                         &state.access_token,
                                         &state.phone_number_id,
                                         &message.from,
-                                        "No session to archive.",
+                                        "No conversation to archive.",
+                                    )
+                                    .await;
+                                } else {
+                                    crate::telegram::archive_conversation(
+                                        &state.app_state.config.runtime_data_dir(),
+                                        chat_id,
+                                        &messages,
+                                    );
+                                    send_whatsapp_message(
+                                        &state.http_client,
+                                        &state.access_token,
+                                        &state.phone_number_id,
+                                        &message.from,
+                                        &format!("Archived {} messages.", messages.len()),
                                     )
                                     .await;
                                 }

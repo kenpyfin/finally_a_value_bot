@@ -4,7 +4,6 @@ pub mod bash;
 pub mod browser;
 pub mod command_runner;
 pub mod cursor_agent;
-pub mod delegate;
 pub mod edit_file;
 pub mod export_chat;
 pub mod glob;
@@ -103,7 +102,6 @@ pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
         "bash" => ToolRisk::High,
         "cursor_agent"
-        | "delegate"
         | "write_file"
         | "edit_file"
         | "write_memory"
@@ -411,6 +409,38 @@ impl ToolRegistry {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.iter().map(|t| t.definition()).collect()
+    }
+
+    pub fn definitions_filtered(&self, read_only: bool) -> Vec<ToolDefinition> {
+        if !read_only {
+            return self.definitions();
+        }
+        self.tools
+            .iter()
+            .filter_map(|t| {
+                let name = t.name();
+                let allowed = matches!(
+                    name,
+                    "read_file"
+                        | "glob"
+                        | "grep"
+                        | "read_memory"
+                        | "read_tiered_memory"
+                        | "search_chat_history"
+                        | "search_vault"
+                        | "web_search"
+                        | "web_fetch"
+                        | "read_agent_history"
+                        | "list_scheduled_tasks"
+                        | "get_task_history"
+                );
+                if allowed {
+                    Some(t.definition())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub async fn execute(&self, name: &str, input: serde_json::Value) -> ToolResult {

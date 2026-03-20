@@ -1,11 +1,15 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use serenity::http::Http as SerenityHttp;
 use teloxide::prelude::*;
 use teloxide::types::{
-    BotCommand, CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, ThreadId,
+    BotCommand, CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+    ParseMode, ThreadId,
 };
+use regex::Regex;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 
@@ -39,6 +43,13 @@ fn format_user_message(sender_name: &str, content: &str) -> String {
         sanitize_xml(sender_name),
         sanitize_xml(content)
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserIntent {
+    Conversational,
+    Question,
+    Task,
 }
 
 pub struct AppState {
@@ -136,15 +147,6 @@ pub async fn run_bot(
 
     let llm: Arc<dyn LlmProvider> = Arc::from(crate::llm::create_provider(&config));
     let mut tools = ToolRegistry::new(&config, bot.clone(), db.clone());
-
-    if config.delegate_tool_enabled {
-        tools.add_tool(Box::new(crate::tools::delegate::DelegateTool::new(
-            config.clone(),
-            bot.clone(),
-            db.clone(),
-            llm.clone(),
-        )));
-    }
 
     let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
     info!(
@@ -342,12 +344,12 @@ async fn send_persona_menu(
             }
             if let Err(e) = req.await {
                 error!("Failed to send persona menu: {}", e);
-                let _ = send_response_plain(bot, chat_id, "Failed to show persona menu.", thread_id).await;
+                let _ = send_response_plain(bot, chat_id, "Failed to show persona menu.", thread_id, None).await;
             }
         }
         Err(e) => {
             error!("Failed to build persona menu: {}", e);
-            let _ = send_response_plain(bot, chat_id, &format!("Error: {e}"), thread_id).await;
+            let _ = send_response_plain(bot, chat_id, &format!("Error: {e}"), thread_id, None).await;
         }
     }
 }
@@ -433,12 +435,12 @@ async fn handle_callback_query(
                 .await
             {
                 warn!("Failed to update persona menu message: {}", e);
-                let _ = send_response_plain(&bot, chat_id, "Persona switched.", thread_id).await;
+                let _ = send_response_plain(&bot, chat_id, "Persona switched.", thread_id, None).await;
             }
         }
         Err(e) => {
             error!("Failed to refresh persona menu after switch: {}", e);
-            let _ = send_response_plain(&bot, chat_id, "Persona switched.", thread_id).await;
+            let _ = send_response_plain(&bot, chat_id, "Persona switched.", thread_id, None).await;
         }
     }
 
@@ -490,7 +492,7 @@ async fn handle_message(
             }
             SlashCommand::Skills => {
                 let formatted = state.skills.list_skills_formatted();
-                send_response(&bot, msg.chat.id, &formatted, msg.thread_id).await;
+                send_response(&bot, msg.chat.id, &formatted, msg.thread_id, None).await;
             }
             SlashCommand::Persona => {
                 let parts: Vec<&str> = text.split_whitespace().collect();
@@ -499,7 +501,7 @@ async fn handle_message(
                     send_persona_menu(&bot, state.clone(), msg.chat.id, canonical_chat_id, msg.thread_id).await;
                 } else {
                     let resp = crate::persona::handle_persona_command(state.db.clone(), canonical_chat_id, text.trim(), Some(&state.config)).await;
-                    send_response(&bot, msg.chat.id, &resp, msg.thread_id).await;
+                    send_response(&bot, msg.chat.id, &resp, msg.thread_id, None).await;
                 }
             }
             SlashCommand::Schedule => {
@@ -509,7 +511,7 @@ async fn handle_message(
                     Err(e) => format!("Error listing tasks: {e}"),
                 };
                 info!("schedule_cmd: {} tasks, sending response (len={})", tasks.as_ref().map(|v| v.len()).unwrap_or(0), text.len());
-                if let Err(e) = send_response_plain(&bot, msg.chat.id, &text, msg.thread_id).await {
+                if let Err(e) = send_response_plain(&bot, msg.chat.id, &text, msg.thread_id, None).await {
                     error!("schedule_cmd: failed to send response: {e}");
                 }
             }
@@ -523,21 +525,20 @@ async fn handle_message(
                     req
                 };
                 if pid == 0 {
-                    let _ = send_archive_msg("No session to archive.").await;
+                    let _ = send_archive_msg("No conversation to archive.").await;
                 } else {
                     let pid_f = pid;
-                    if let Ok(Some((json, _))) =
-                        call_blocking(state.db.clone(), move |db| db.load_session(canonical_chat_id, pid_f)).await
-                    {
-                        let messages: Vec<Message> = serde_json::from_str(&json).unwrap_or_default();
-                        if messages.is_empty() {
-                            let _ = send_archive_msg("No session to archive.").await;
-                        } else {
-                            archive_conversation(&state.config.runtime_data_dir(), canonical_chat_id, &messages);
-                            let _ = send_archive_msg(&format!("Archived {} messages.", messages.len())).await;
-                        }
+                    let history = call_blocking(state.db.clone(), move |db| {
+                        db.get_recent_messages(canonical_chat_id, pid_f, 500)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let messages = history_to_claude_messages(&history, &state.config.bot_username);
+                    if messages.is_empty() {
+                        let _ = send_archive_msg("No conversation to archive.").await;
                     } else {
-                        let _ = send_archive_msg("No session to archive.").await;
+                        archive_conversation(&state.config.runtime_data_dir(), canonical_chat_id, &messages);
+                        let _ = send_archive_msg(&format!("Archived {} messages.", messages.len())).await;
                     }
                 }
             }
@@ -966,6 +967,7 @@ async fn handle_message(
                     canonical_chat_id_spawn,
                     to_send.len()
                 );
+                let ws_root = state_spawn.config.workspace_root_absolute();
                 if let Err(e) = crate::channel::deliver_to_contact(
                     state_spawn.db.clone(),
                     Some(&state_spawn.bot),
@@ -974,11 +976,19 @@ async fn handle_message(
                     canonical_chat_id_spawn,
                     persona_id,
                     &to_send,
+                    Some(ws_root.clone()),
                 )
                 .await
                 {
                     tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Telegram only");
-                    send_response(&bot_spawn, chat_id_spawn, &to_send, thread_id_spawn).await;
+                    send_response(
+                        &bot_spawn,
+                        chat_id_spawn,
+                        &to_send,
+                        thread_id_spawn,
+                        Some(ws_root.as_path()),
+                    )
+                    .await;
                 }
             }
             Err(e) => {
@@ -1143,50 +1153,12 @@ pub async fn process_with_agent_with_events(
         &skills_dir_for_prompt,
         vault_paths_section.as_deref(),
         &state.config.timezone,
-        &current_time_in_tz,
     );
 
-    // Background-job runs are detached subagents: no session resume/save, and they
-    // do not consume foreground chat context while running.
+    // Background-job runs are detached and do not consume foreground chat context while running.
     let mut messages = if context.is_background_job {
         Vec::new()
-    } else if let Some((json, updated_at)) =
-        call_blocking(state.db.clone(), move |db| db.load_session(chat_id, persona_id)).await?
-    {
-        // Session exists — deserialize and append new user messages
-        let mut session_messages: Vec<Message> = serde_json::from_str(&json).unwrap_or_default();
-
-        if session_messages.is_empty() {
-            // Corrupted session, fall back to DB history
-            load_messages_from_db(state, chat_id, persona_id, context.chat_type).await?
-        } else {
-            // Get new user messages since session was last saved
-            let updated_at_cloned = updated_at.clone();
-            let new_msgs = call_blocking(state.db.clone(), move |db| {
-                db.get_new_user_messages_since(chat_id, persona_id, &updated_at_cloned)
-            })
-            .await?;
-            for stored_msg in &new_msgs {
-                let content = format_user_message(&stored_msg.sender_name, &stored_msg.content);
-                // Merge if last message is also from user
-                if let Some(last) = session_messages.last_mut() {
-                    if last.role == "user" {
-                        if let MessageContent::Text(t) = &mut last.content {
-                            t.push('\n');
-                            t.push_str(&content);
-                            continue;
-                        }
-                    }
-                }
-                session_messages.push(Message {
-                    role: "user".into(),
-                    content: MessageContent::Text(content),
-                });
-            }
-            session_messages
-        }
     } else {
-        // No session — build from DB history
         load_messages_from_db(state, chat_id, persona_id, context.chat_type).await?
     };
 
@@ -1203,6 +1175,7 @@ pub async fn process_with_agent_with_events(
     }
 
     // If image_data is present, convert the last user message to a blocks-based message with the image
+    let has_image_input = image_data.is_some();
     if let Some((base64_data, media_type)) = image_data {
         if let Some(last_msg) = messages.last_mut() {
             if last_msg.role == "user" {
@@ -1225,7 +1198,7 @@ pub async fn process_with_agent_with_events(
         }
     }
 
-    // Keep smallest suffix with at least 2 user and 2 assistant messages (chronological)
+    // Keep smallest suffix with at least 3 user and 3 assistant messages (chronological)
     messages = trim_to_recent_balanced(messages);
 
     // Ensure we have at least one message
@@ -1233,35 +1206,40 @@ pub async fn process_with_agent_with_events(
         return Ok("I didn't receive any message to process.".into());
     }
 
-    // Compact if messages exceed threshold
-    if messages.len() > state.config.max_session_messages {
-        // Pre-compaction memory flush: run one silent agent turn so the model can write
-        // important facts to memory before we summarize the transcript away.
-        messages = run_memory_flush_before_compaction(
-            state,
-            chat_id,
-            persona_id,
-            context.caller_channel,
-            &system_prompt,
-            messages,
-        )
-        .await;
-        archive_conversation(&state.config.runtime_data_dir(), chat_id, &messages);
-        messages = compact_messages(
-            state.llm.as_ref(),
-            &messages,
-            state.config.compact_keep_recent,
-        )
-        .await;
-    }
+    // Keep volatile runtime context out of the system prompt to improve provider-side prompt caching.
+    let runtime_context = format!(
+        "[system_runtime_context timezone=\"{}\"]Current date and time: {}[/system_runtime_context]",
+        state.config.timezone, current_time_in_tz
+    );
+    let mut prepended = vec![
+        Message {
+            role: "user".into(),
+            content: MessageContent::Text(runtime_context),
+        },
+        Message {
+            role: "assistant".into(),
+            content: MessageContent::Text("Acknowledged runtime context.".into()),
+        },
+    ];
+    prepended.extend(messages);
+    messages = prepended;
 
-    let tool_defs = state.tools.definitions();
+    let latest_user_text = latest_user_text(&messages);
+    let intent = classify_user_intent(&latest_user_text, has_image_input);
+    let tool_defs = match intent {
+        UserIntent::Conversational => Vec::new(),
+        UserIntent::Question => state.tools.definitions_filtered(true),
+        UserIntent::Task => state.tools.definitions(),
+    };
     let tool_auth = ToolAuthContext {
         caller_channel: context.caller_channel.to_string(),
         caller_chat_id: chat_id,
         caller_persona_id: persona_id,
         control_chat_ids: state.config.control_chat_ids.clone(),
     };
+
+    // Token-aware trimming safety net (keeps at least 6 latest messages).
+    trim_to_token_budget(&mut messages, &system_prompt, &tool_defs, 12_000, 6);
 
     // Main agent loop: chat agent has tools and executes directly.
     // Agentic tool-use loop. Timeouts prevent hangs:
@@ -1345,10 +1323,14 @@ pub async fn process_with_agent_with_events(
         let llm_start = std::time::Instant::now();
         let response = {
             let messages = messages.clone();
-            let tool_defs = tool_defs.clone();
+            let tool_defs = if tool_defs.is_empty() {
+                None
+            } else {
+                Some(tool_defs.clone())
+            };
             match tokio::time::timeout(
                 std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                state.llm.send_message(&system_prompt, messages, Some(tool_defs)),
+                state.llm.send_message(&system_prompt, messages, tool_defs),
             )
             .await
             {
@@ -1418,14 +1400,6 @@ pub async fn process_with_agent_with_events(
                 role: "assistant".into(),
                 content: MessageContent::Text(assistant_text.clone()),
             });
-            strip_images_for_session(&mut messages);
-            if !context.is_background_job {
-                if let Ok(json) = serde_json::to_string(&messages) {
-                    let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json))
-                        .await;
-                }
-            }
-
             let display_text = if state.config.show_thinking {
                 assistant_text
             } else {
@@ -1448,15 +1422,22 @@ pub async fn process_with_agent_with_events(
                 final_text.len(),
                 iteration + 1
             );
-            run_memory_maintenance_after_response(
-                state,
-                chat_id,
-                persona_id,
-                context.caller_channel,
-                &system_prompt,
+            if should_run_memory_maintenance(
+                context.is_background_job,
                 &messages,
-            )
-            .await;
+                final_text.len(),
+                iteration > 0,
+            ) {
+                run_memory_maintenance_after_response(
+                    state,
+                    chat_id,
+                    persona_id,
+                    context.caller_channel,
+                    &system_prompt,
+                    &messages,
+                )
+                .await;
+            }
             save_run_history!(stop_reason);
             return Ok(final_text);
         }
@@ -1807,16 +1788,6 @@ pub async fn process_with_agent_with_events(
                             role: "assistant".into(),
                             content: MessageContent::Text(text.clone()),
                         });
-                        strip_images_for_session(&mut messages);
-                        if !context.is_background_job {
-                            if let Ok(json) = serde_json::to_string(&messages) {
-                                let _ = call_blocking(state.db.clone(), move |db| {
-                                    db.save_session(chat_id, persona_id, &json)
-                                })
-                                .await;
-                            }
-                        }
-
                         let display_text = if state.config.show_thinking {
                             text
                         } else {
@@ -1838,15 +1809,22 @@ pub async fn process_with_agent_with_events(
                             final_text.len(),
                             iteration + 1
                         );
-                        run_memory_maintenance_after_response(
-                            state,
-                            chat_id,
-                            persona_id,
-                            context.caller_channel,
-                            &system_prompt,
+                        if should_run_memory_maintenance(
+                            context.is_background_job,
                             &messages,
-                        )
-                        .await;
+                            final_text.len(),
+                            iteration > 0,
+                        ) {
+                            run_memory_maintenance_after_response(
+                                state,
+                                chat_id,
+                                persona_id,
+                                context.caller_channel,
+                                &system_prompt,
+                                &messages,
+                            )
+                            .await;
+                        }
                         save_run_history!("pte_complete");
                         return Ok(final_text);
                     }
@@ -1936,15 +1914,6 @@ pub async fn process_with_agent_with_events(
                     role: "assistant".into(),
                     content: MessageContent::Text(timeout_msg.clone()),
                 });
-                strip_images_for_session(&mut messages);
-                if !context.is_background_job {
-                    if let Ok(json) = serde_json::to_string(&messages) {
-                        let _ = call_blocking(state.db.clone(), move |db| {
-                            db.save_session(chat_id, persona_id, &json)
-                        })
-                        .await;
-                    }
-                }
                 if let Some(tx) = event_tx {
                     let _ = tx.send(AgentEvent::FinalResponse {
                         text: timeout_msg.clone(),
@@ -1977,24 +1946,23 @@ pub async fn process_with_agent_with_events(
             role: "assistant".into(),
             content: MessageContent::Text(assistant_text.clone()),
         });
-        strip_images_for_session(&mut messages);
-        if !context.is_background_job {
-            if let Ok(json) = serde_json::to_string(&messages) {
-                let _ =
-                    call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
-            }
-        }
-
         save_run_history!(stop_reason);
-        run_memory_maintenance_after_response(
-            state,
-            chat_id,
-            persona_id,
-            context.caller_channel,
-            &system_prompt,
+        if should_run_memory_maintenance(
+            context.is_background_job,
             &messages,
-        )
-        .await;
+            assistant_text.len(),
+            iteration > 0,
+        ) {
+            run_memory_maintenance_after_response(
+                state,
+                chat_id,
+                persona_id,
+                context.caller_channel,
+                &system_prompt,
+                &messages,
+            )
+            .await;
+        }
         return Ok(if assistant_text.is_empty() {
             "(no response)".into()
         } else {
@@ -2015,27 +1983,27 @@ pub async fn process_with_agent_with_events(
         role: "assistant".into(),
         content: MessageContent::Text(max_iter_msg.clone()),
     });
-    strip_images_for_session(&mut messages);
-    if !context.is_background_job {
-        if let Ok(json) = serde_json::to_string(&messages) {
-            let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, persona_id, &json)).await;
-        }
-    }
-
     if let Some(tx) = event_tx {
         let _ = tx.send(AgentEvent::FinalResponse {
             text: max_iter_msg.clone(),
         });
     }
-    run_memory_maintenance_after_response(
-        state,
-        chat_id,
-        persona_id,
-        context.caller_channel,
-        &system_prompt,
+    if should_run_memory_maintenance(
+        context.is_background_job,
         &messages,
-    )
-    .await;
+        max_iter_msg.len(),
+        true,
+    ) {
+        run_memory_maintenance_after_response(
+            state,
+            chat_id,
+            persona_id,
+            context.caller_channel,
+            &system_prompt,
+            &messages,
+        )
+        .await;
+    }
     save_run_history!("max_iterations");
     Ok(max_iter_msg)
 }
@@ -2095,6 +2063,120 @@ async fn load_messages_from_db(
     ))
 }
 
+fn latest_user_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| {
+            if m.role != "user" {
+                return None;
+            }
+            match &m.content {
+                MessageContent::Text(t) => Some(t.clone()),
+                MessageContent::Blocks(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    Some(text)
+                }
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn classify_user_intent(text: &str, has_image_input: bool) -> UserIntent {
+    if has_image_input {
+        return UserIntent::Task;
+    }
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+    if lower.is_empty() {
+        return UserIntent::Conversational;
+    }
+    let is_short_chat = lower.len() <= 30
+        && matches!(
+            lower.as_str(),
+            "hi" | "hello" | "thanks" | "thank you" | "ok" | "okay" | "got it" | "cool"
+        );
+    if is_short_chat {
+        return UserIntent::Conversational;
+    }
+    let task_keywords = [
+        "search", "find", "create", "write", "edit", "schedule", "browse", "fetch", "run",
+        "execute", "build", "deploy", "fix", "update", "implement",
+    ];
+    if task_keywords.iter().any(|k| lower.contains(k)) || lower.contains("http://") || lower.contains("https://") {
+        return UserIntent::Task;
+    }
+    if lower.ends_with('?') || lower.starts_with("what ") || lower.starts_with("how ") || lower.starts_with("why ") || lower.starts_with("when ") {
+        return UserIntent::Question;
+    }
+    UserIntent::Task
+}
+
+fn should_run_memory_maintenance(
+    is_background_job: bool,
+    messages: &[Message],
+    response_len: usize,
+    had_tool_calls: bool,
+) -> bool {
+    if is_background_job {
+        return false;
+    }
+    let last_user_len = latest_user_text(messages).len();
+    response_len > 100 || had_tool_calls || last_user_len > 50
+}
+
+fn estimate_message_tokens(message: &Message) -> usize {
+    match &message.content {
+        MessageContent::Text(t) => t.chars().count() / 4 + 6,
+        MessageContent::Blocks(blocks) => {
+            let mut chars = 0usize;
+            for b in blocks {
+                chars += match b {
+                    ContentBlock::Text { text } => text.chars().count(),
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        name.chars().count() + serde_json::to_string(input).unwrap_or_default().chars().count()
+                    }
+                    ContentBlock::ToolResult { content, .. } => content.chars().count(),
+                    ContentBlock::Image { .. } => 40,
+                };
+            }
+            chars / 4 + 8
+        }
+    }
+}
+
+fn trim_to_token_budget(
+    messages: &mut Vec<Message>,
+    system_prompt: &str,
+    tool_defs: &[crate::claude::ToolDefinition],
+    budget_tokens: usize,
+    min_messages_to_keep: usize,
+) {
+    let mut total = system_prompt.chars().count() / 4 + 16;
+    for d in tool_defs {
+        total += (d.name.chars().count()
+            + d.description.chars().count()
+            + serde_json::to_string(&d.input_schema).unwrap_or_default().chars().count())
+            / 4
+            + 6;
+    }
+    for m in messages.iter() {
+        total += estimate_message_tokens(m);
+    }
+
+    while total > budget_tokens && messages.len() > min_messages_to_keep {
+        let removed = messages.remove(0);
+        total = total.saturating_sub(estimate_message_tokens(&removed));
+    }
+}
+
 fn build_system_prompt(
     bot_username: &str,
     principles_content: &str,
@@ -2107,7 +2189,6 @@ fn build_system_prompt(
     skills_dir_display: &str,
     vault_paths_section: Option<&str>,
     timezone: &str,
-    current_time_in_tz: &str,
 ) -> String {
     let caps = format!(
         r#"- Execute bash commands
@@ -2127,7 +2208,7 @@ fn build_system_prompt(
 - Review agent run history (read_agent_history) — detailed per-run traces including iterations, tool calls, durations, and outcomes. Use this when asked to optimize your workflow or review past behavior; identify patterns and persist learnings via write_tiered_memory (Tier 1 for long-term workflow principles).
 
 ## Conversation Memory
-- **Working memory (exact)**: The last few turns of this conversation (at least 2 from you and 2 from the user) are provided verbatim above. When the most recent message is from the user, treat it as often being a direct reply to your last message; use it to continue the conversation coherently.
+- **Working memory (exact)**: The last few turns of this conversation (at least 3 from you and 3 from the user when available) are provided verbatim above. When the most recent message is from the user, treat it as often being a direct reply to your last message; use it to continue the conversation coherently.
 - **Long-term conversation recall**: Use `search_chat_history` to search ALL past messages in this chat by keyword/phrase. Always search before saying "I don't remember" or asking the user to repeat something.
 - **Vault knowledge base**: Use the `search_vault` tool (when available) to semantically search the ORIGIN vault. Do NOT use grep, read_file, or other file tools for vault retrieval — search_vault is the correct tool. The vault is a knowledge base, NOT conversation history.
 - **Skills directory**: {skills_dir_display}"#,
@@ -2136,14 +2217,14 @@ fn build_system_prompt(
     let mut prompt = format!(
         r#"You are {bot_username}, a helpful smart assistant. You can execute tools to help users with tasks.
 
-**Time and timezone (prioritize this):** Your configured timezone is **{timezone}**. Current date and time in that timezone: **{current_time_in_tz}**. Always interpret "now", "today", "tomorrow", and any relative or scheduled times in this timezone unless the user explicitly specifies another. Use this timezone for schedule_task (it defaults to this) and when answering questions about current time or date.
+**Time and timezone (prioritize this):** Your configured timezone is **{timezone}**. The current runtime date/time is provided in a dedicated system runtime context message. Always interpret "now", "today", "tomorrow", and any relative or scheduled times in this timezone unless the user explicitly specifies another. Use this timezone for schedule_task (it defaults to this) and when answering questions about current time or date.
 
 You have access to the following capabilities:
 {caps}
 
 The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when calling send_message, schedule, export_chat, tiered memory, or memory(chat_daily) tools.
 
-When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log (today and yesterday are injected at session start). Principles are in AGENTS.md at workspace root; do not overwrite them.
+When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
 
 For scheduling:
 - Always activate `schedule-job` skill before calling `schedule_task`
@@ -2174,7 +2255,6 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         persona_id = persona_id,
         skills_dir_display = skills_dir_display,
         timezone = timezone,
-        current_time_in_tz = current_time_in_tz,
     );
 
     // Agent Skills (section 2: immediately after capabilities)
@@ -2338,7 +2418,7 @@ pub(crate) fn trim_to_recent_balanced(messages: Vec<Message>) -> Vec<Message> {
         let suffix = &messages[start..];
         let n_user = suffix.iter().filter(|m| m.role == "user").count();
         let n_asst = suffix.iter().filter(|m| m.role == "assistant").count();
-        if n_user >= 2 && n_asst >= 2 {
+        if n_user >= 3 && n_asst >= 3 {
             return suffix.to_vec();
         }
     }
@@ -2676,15 +2756,199 @@ fn split_response_text(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Send text to a chat, optionally in a forum topic. Returns Result for error handling.
-/// When plain_text is true, skips markdown-to-HTML conversion (use for cron, prompts, etc.).
-pub async fn send_response_result(
+fn markdown_image_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"!\[[^\]]*\]\(([^)]+)\)").unwrap())
+}
+
+fn backtick_abs_image_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"`(/[^`]+?\.(?:png|jpg|jpeg|gif|webp|bmp))`").unwrap())
+}
+
+fn is_telegram_sendable_image_file(path: &Path) -> bool {
+    path.is_file()
+        && matches!(
+            path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+        )
+}
+
+fn path_under_workspace(candidate: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    let cand = candidate.canonicalize().ok()?;
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    if !cand.starts_with(&root) || !is_telegram_sendable_image_file(&cand) {
+        return None;
+    }
+    Some(cand)
+}
+
+fn resolve_workspace_image_ref(raw: &str, workspace_root: &Path) -> Option<PathBuf> {
+    let t = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
+    if t.is_empty()
+        || t.starts_with("http://")
+        || t.starts_with("https://")
+        || t.starts_with("data:")
+    {
+        return None;
+    }
+    let p = if t.starts_with('/') {
+        PathBuf::from(t)
+    } else {
+        let shared = workspace_root.join("shared").join(t);
+        if shared.exists() {
+            shared
+        } else {
+            workspace_root.join(t)
+        }
+    };
+    path_under_workspace(&p, workspace_root)
+}
+
+/// Find workspace image files referenced in assistant text (markdown images and absolute paths
+/// in backticks), return them in document order (deduped) plus text with those markers removed.
+pub(crate) fn prepare_telegram_workspace_auto_images(
+    text: &str,
+    workspace_root: &Path,
+) -> (Vec<PathBuf>, String) {
+    let md_re = markdown_image_regex();
+    let bt_re = backtick_abs_image_regex();
+
+    let mut ordered: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    let mut consider = |raw: &str| {
+        if let Some(p) = resolve_workspace_image_ref(raw, workspace_root) {
+            if seen.insert(p.clone()) {
+                ordered.push(p);
+            }
+        }
+    };
+
+    for caps in md_re.captures_iter(text) {
+        if let Some(m) = caps.get(1) {
+            consider(m.as_str());
+        }
+    }
+    for caps in bt_re.captures_iter(text) {
+        if let Some(m) = caps.get(1) {
+            consider(m.as_str());
+        }
+    }
+
+    if ordered.is_empty() {
+        return (ordered, text.to_string());
+    }
+
+    let sent: HashSet<PathBuf> = ordered.iter().cloned().collect();
+    let mut body = text.to_string();
+
+    for caps in md_re.captures_iter(text) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let Some(inner) = caps.get(1) else {
+            continue;
+        };
+        if let Some(p) = resolve_workspace_image_ref(inner.as_str(), workspace_root) {
+            if sent.contains(&p) {
+                body = body.replace(full.as_str(), "");
+            }
+        }
+    }
+    for caps in bt_re.captures_iter(text) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let Some(inner) = caps.get(1) else {
+            continue;
+        };
+        if let Some(p) = resolve_workspace_image_ref(inner.as_str(), workspace_root) {
+            if sent.contains(&p) {
+                body = body.replace(full.as_str(), "");
+            }
+        }
+    }
+
+    while body.contains("\n\n\n") {
+        body = body.replace("\n\n\n", "\n\n");
+    }
+    let body = body.trim().to_string();
+    (ordered, body)
+}
+
+async fn send_workspace_images_telegram(
+    bot: &Bot,
+    chat_id: ChatId,
+    thread_id: Option<ThreadId>,
+    paths: &[PathBuf],
+) {
+    for p in paths {
+        let mut req = bot.send_photo(chat_id, InputFile::file(p.clone()));
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(tid);
+        }
+        if let Err(e) = req.await {
+            warn!(
+                target: "channel",
+                path = %p.display(),
+                error = %e,
+                "Telegram auto workspace image send failed"
+            );
+        }
+    }
+}
+
+async fn send_plain_chunks(
     bot: &Bot,
     chat_id: ChatId,
     text: &str,
     thread_id: Option<ThreadId>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    send_response_result_impl(bot, chat_id, text, thread_id, false).await
+    const MAX_LEN: usize = 4096;
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let chunk_len = if remaining.len() <= MAX_LEN {
+            remaining.len()
+        } else {
+            remaining[..MAX_LEN].rfind('\n').unwrap_or(MAX_LEN)
+        };
+        let chunk = &remaining[..chunk_len];
+        let mut req = bot.send_message(chat_id, chunk);
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(tid);
+        }
+        req.await?;
+        remaining = &remaining[chunk_len..];
+        if remaining.starts_with('\n') {
+            remaining = &remaining[1..];
+        }
+    }
+    Ok(())
+}
+
+/// Send text to a chat, optionally in a forum topic. Returns Result for error handling.
+/// When plain_text is true, skips markdown-to-HTML conversion (use for cron, prompts, etc.).
+///
+/// When `workspace_auto_images` is set, local image paths referenced in the text (markdown images
+/// or `` `/abs/path/to/file.png` `` under the workspace root) are sent as Telegram photos before
+/// the text message.
+pub async fn send_response_result(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    thread_id: Option<ThreadId>,
+    workspace_auto_images: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    send_response_result_impl(bot, chat_id, text, thread_id, false, workspace_auto_images).await
 }
 
 /// Send plain text (no HTML parsing). Use for content with cron expressions, asterisks, etc.
@@ -2693,8 +2957,9 @@ pub async fn send_response_plain(
     chat_id: ChatId,
     text: &str,
     thread_id: Option<ThreadId>,
+    workspace_auto_images: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    send_response_result_impl(bot, chat_id, text, thread_id, true).await
+    send_response_result_impl(bot, chat_id, text, thread_id, true, workspace_auto_images).await
 }
 
 async fn send_response_result_impl(
@@ -2703,155 +2968,102 @@ async fn send_response_result_impl(
     text: &str,
     thread_id: Option<ThreadId>,
     plain_text: bool,
+    workspace_auto_images: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const MAX_LEN: usize = 4096;
 
-    let formatted = if plain_text {
-        text.to_string()
-    } else {
-        markdown_to_telegram_html(text)
+    let (paths, body_text) = match workspace_auto_images {
+        Some(root) => prepare_telegram_workspace_auto_images(text, root),
+        None => (Vec::new(), text.to_string()),
     };
 
-    let send_one = |b: &Bot, cid: ChatId, txt: &str, as_plain: bool| {
-        let mut req = b.send_message(cid, txt);
-        if !plain_text && !as_plain {
-            req = req.parse_mode(ParseMode::Html);
+    if !paths.is_empty() {
+        send_workspace_images_telegram(bot, chat_id, thread_id, &paths).await;
+    }
+
+    let trimmed = body_text.trim();
+    let body_text = if trimmed.is_empty() {
+        if !paths.is_empty() {
+            return Ok(());
         }
+        "Done.".to_string()
+    } else {
+        body_text
+    };
+
+    let formatted_len = if plain_text {
+        body_text.len()
+    } else {
+        markdown_to_telegram_html(&body_text).len()
+    };
+
+    if formatted_len > MAX_LEN {
+        return send_plain_chunks(bot, chat_id, &body_text, thread_id).await;
+    }
+
+    if plain_text {
+        let mut req = bot.send_message(chat_id, &body_text);
         if let Some(tid) = thread_id {
             req = req.message_thread_id(tid);
         }
-        req
-    };
-
-    if formatted.len() <= MAX_LEN {
-        send_one(bot, chat_id, &formatted, false).await?;
+        if let Err(e) = req.await {
+            return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+        }
         return Ok(());
     }
 
-    // Chunked: send original text as plain so we never split inside an HTML tag (Telegram "Unmatched end tag").
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let chunk_len = if remaining.len() <= MAX_LEN {
-            remaining.len()
-        } else {
-            remaining[..MAX_LEN].rfind('\n').unwrap_or(MAX_LEN)
-        };
-
-        let chunk = &remaining[..chunk_len];
-        send_one(bot, chat_id, chunk, true).await?;
-        remaining = &remaining[chunk_len..];
-
-        if remaining.starts_with('\n') {
-            remaining = &remaining[1..];
+    let formatted = markdown_to_telegram_html(&body_text);
+    let mut req = bot
+        .send_message(chat_id, &formatted)
+        .parse_mode(ParseMode::Html);
+    if let Some(tid) = thread_id {
+        req = req.message_thread_id(tid);
+    }
+    match req.await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("can't parse entities") {
+                warn!(
+                    target: "channel",
+                    error = %err_str,
+                    "Telegram HTML parse failed, sending as plain text"
+                );
+                let mut req = bot.send_message(chat_id, &body_text);
+                if let Some(tid) = thread_id {
+                    req = req.message_thread_id(tid);
+                }
+                if let Err(e) = req.await {
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                }
+                Ok(())
+            } else {
+                Err(e.into())
+            }
         }
     }
-    Ok(())
 }
 
 /// Send text to a chat, optionally in a forum topic. In forum groups, pass thread_id
 /// so the reply appears in the same topic as the user's message.
 /// Falls back to plain text if the HTML-formatted version is rejected by Telegram.
-pub async fn send_response(bot: &Bot, chat_id: ChatId, text: &str, thread_id: Option<ThreadId>) {
-    if let Err(e) = send_response_result(bot, chat_id, text, thread_id).await {
-        warn!("HTML send failed ({}), retrying as plain text", e);
-        if let Err(e2) = send_response_plain(bot, chat_id, text, thread_id).await {
-            error!("Plain text send also failed: {}", e2);
-        }
-    }
-}
-
-/// Extract text content from a Message for summarization/display.
-fn message_to_text(msg: &Message) -> String {
-    match &msg.content {
-        MessageContent::Text(t) => t.clone(),
-        MessageContent::Blocks(blocks) => {
-            let mut parts = Vec::new();
-            for block in blocks {
-                match block {
-                    ContentBlock::Text { text } => parts.push(text.clone()),
-                    ContentBlock::ToolUse { name, input, .. } => {
-                        parts.push(format!("[tool_use: {name}({})]", input));
-                    }
-                    ContentBlock::ToolResult {
-                        content, is_error, ..
-                    } => {
-                        let prefix = if is_error == &Some(true) {
-                            "[tool_error]: "
-                        } else {
-                            "[tool_result]: "
-                        };
-                        // Truncate long tool results for summary (char-boundary safe)
-                        let truncated = if content.len() > 200 {
-                            let mut end = 200;
-                            while !content.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            format!("{}...", &content[..end])
-                        } else {
-                            content.clone()
-                        };
-                        parts.push(format!("{prefix}{truncated}"));
-                    }
-                    ContentBlock::Image { .. } => {
-                        parts.push("[image]".into());
-                    }
-                }
-            }
-            parts.join("\n")
-        }
-    }
-}
-
-/// Replace Image content blocks with text placeholders to avoid storing base64 data in sessions.
-fn strip_images_for_session(messages: &mut [Message]) {
-    for msg in messages.iter_mut() {
-        if let MessageContent::Blocks(blocks) = &mut msg.content {
-            for block in blocks.iter_mut() {
-                if matches!(block, ContentBlock::Image { .. }) {
-                    *block = ContentBlock::Text {
-                        text: "[image was sent]".into(),
-                    };
-                }
-            }
-        }
-    }
-}
-
-/// Archive the full conversation to a markdown file before compaction.
-/// Saved to `<runtime_dir>/groups/<chat_id>/conversations/<timestamp>.md` (caller passes runtime data dir).
-pub fn archive_conversation(data_dir: &str, chat_id: i64, messages: &[Message]) {
-    let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let dir = std::path::PathBuf::from(data_dir)
-        .join("groups")
-        .join(chat_id.to_string())
-        .join("conversations");
-
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("Failed to create conversations dir: {e}");
-        return;
-    }
-
-    let path = dir.join(format!("{now}.md"));
-    let mut content = String::new();
-    for msg in messages {
-        let role = &msg.role;
-        let text = message_to_text(msg);
-        content.push_str(&format!("## {role}\n\n{text}\n\n---\n\n"));
-    }
-
-    if let Err(e) = std::fs::write(&path, &content) {
-        tracing::warn!("Failed to archive conversation to {}: {e}", path.display());
-    } else {
-        info!(
-            "Archived conversation ({} messages) to {}",
-            messages.len(),
-            path.display()
+pub async fn send_response(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    thread_id: Option<ThreadId>,
+    workspace_auto_images: Option<&Path>,
+) {
+    if let Err(e) =
+        send_response_result(bot, chat_id, text, thread_id, workspace_auto_images).await
+    {
+        error!(
+            "Telegram send failed after HTML/plain handling inside send_response_result: {}",
+            e
         );
     }
 }
 
-/// Maximum tool iterations for the pre-compaction memory flush turn (avoid runaway).
-const MEMORY_FLUSH_MAX_ITERATIONS: usize = 10;
 const MEMORY_MAINTENANCE_MAX_ITERATIONS: usize = 3;
 
 async fn run_memory_maintenance_after_response(
@@ -2966,245 +3178,64 @@ If there is nothing meaningful to store, reply exactly: No memory update needed.
     }
 }
 
-/// Pre-compaction memory flush: run one silent agent turn so the model can write
-/// important facts to tiered memory or daily log before we summarize the transcript away.
-async fn run_memory_flush_before_compaction(
-    state: &AppState,
-    chat_id: i64,
-    persona_id: i64,
-    caller_channel: &str,
-    system_prompt: &str,
-    mut messages: Vec<Message>,
-) -> Vec<Message> {
-    let flush_prompt = "Session context is about to be compacted. Write any important facts, \
-        decisions, or preferences to memory (write_tiered_memory or write_memory with scope chat_daily) now; then reply with a single \
-        line like 'Done' or 'Nothing to store'.";
-    messages.push(Message {
-        role: "user".into(),
-        content: MessageContent::Text(flush_prompt.into()),
-    });
-
-    let tool_defs = state.tools.definitions();
-    let tool_auth = ToolAuthContext {
-        caller_channel: caller_channel.to_string(),
-        caller_chat_id: chat_id,
-        caller_persona_id: persona_id,
-        control_chat_ids: state.config.control_chat_ids.clone(),
-    };
-
-    for iteration in 0..MEMORY_FLUSH_MAX_ITERATIONS {
-        let response = match state
-            .llm
-            .send_message(
-                system_prompt,
-                messages.clone(),
-                Some(tool_defs.clone()),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Memory flush LLM call failed: {e}, proceeding to compaction");
-                messages.pop(); // remove the flush user message so we compact original
-                return messages;
-            }
-        };
-
-        let stop_reason = response.stop_reason.as_deref().unwrap_or("end_turn");
-
-        if stop_reason == "end_turn" || stop_reason == "max_tokens" {
-            let text = response
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ResponseContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            messages.push(Message {
-                role: "assistant".into(),
-                content: MessageContent::Text(text),
-            });
-            return messages;
-        }
-
-        if stop_reason == "tool_use" {
-            let assistant_content: Vec<ContentBlock> = response
-                .content
-                .iter()
-                .map(|block| match block {
-                    ResponseContentBlock::Text { text } => {
-                        ContentBlock::Text { text: text.clone() }
-                    }
-                    ResponseContentBlock::ToolUse {
-                        id,
-                        name,
-                        input,
-                        thought_signature,
-                    } => ContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                        thought_signature: thought_signature.clone(),
-                    },
-                })
-                .collect();
-            messages.push(Message {
-                role: "assistant".into(),
-                content: MessageContent::Blocks(assistant_content),
-            });
-
-            let mut tool_results = Vec::new();
-            for block in &response.content {
-                if let ResponseContentBlock::ToolUse {
-                    id, name, input, ..
-                } = block {
-                    info!(
-                        "Memory flush: executing tool {} (iteration {})",
-                        name,
-                        iteration + 1
-                    );
-                    let result = state
-                        .tools
-                        .execute_with_auth(name, input.clone(), &tool_auth)
-                        .await;
-                    tool_results.push(ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: result.content,
-                        is_error: if result.is_error { Some(true) } else { None },
-                    });
-                }
-            }
-            messages.push(Message {
-                role: "user".into(),
-                content: MessageContent::Blocks(tool_results),
-            });
-            continue;
-        }
-
-        // Unknown stop reason: append text if any and return
-        let text = response
-            .content
+fn message_to_text(msg: &Message) -> String {
+    match &msg.content {
+        MessageContent::Text(t) => t.clone(),
+        MessageContent::Blocks(blocks) => blocks
             .iter()
-            .filter_map(|block| match block {
-                ResponseContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::ToolUse { name, input, .. } => format!("[tool_use: {name}({})]", input),
+                ContentBlock::ToolResult { content, .. } => {
+                    if content.len() > 200 {
+                        format!(
+                            "{}...",
+                            &content[..content.floor_char_boundary(200)]
+                        )
+                    } else {
+                        content.clone()
+                    }
+                }
+                ContentBlock::Image { .. } => "[image]".to_string(),
             })
             .collect::<Vec<_>>()
-            .join("");
-        messages.push(Message {
-            role: "assistant".into(),
-            content: MessageContent::Text(if text.is_empty() {
-                "Done.".into()
-            } else {
-                text
-            }),
-        });
-        return messages;
+            .join("\n"),
     }
-
-    tracing::warn!(
-        "Memory flush hit max iterations ({}), proceeding to compaction",
-        MEMORY_FLUSH_MAX_ITERATIONS
-    );
-    messages
 }
 
-/// Compact old messages by summarizing them via Claude, keeping recent messages verbatim.
-async fn compact_messages(
-    llm: &dyn LlmProvider,
-    messages: &[Message],
-    keep_recent: usize,
-) -> Vec<Message> {
-    let total = messages.len();
-    if total <= keep_recent {
-        return messages.to_vec();
-    }
-
-    let split_at = total - keep_recent;
-    let old_messages = &messages[..split_at];
-    let recent_messages = &messages[split_at..];
-
-    // Build text representation of old messages
-    let mut summary_input = String::new();
-    for msg in old_messages {
-        let role = &msg.role;
-        let text = message_to_text(msg);
-        summary_input.push_str(&format!("[{role}]: {text}\n\n"));
-    }
-
-    // Truncate if very long
-    if summary_input.len() > 20000 {
-        summary_input.truncate(20000);
-        summary_input.push_str("\n... (truncated)");
-    }
-
-    let summarize_prompt = "Summarize the following conversation concisely, preserving key facts, decisions, tool results, and context needed to continue the conversation. Be brief but thorough.";
-
-    let summarize_messages = vec![Message {
-        role: "user".into(),
-        content: MessageContent::Text(format!("{summarize_prompt}\n\n---\n\n{summary_input}")),
-    }];
-
-    let summary = match llm
-        .send_message("You are a helpful summarizer.", summarize_messages, None)
-        .await
-    {
-        Ok(response) => response
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ResponseContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        Err(e) => {
-            tracing::warn!("Compaction summarization failed: {e}, falling back to truncation");
-            // Fallback: just keep recent messages
-            return recent_messages.to_vec();
-        }
-    };
-
-    // Build compacted message list: summary context + recent messages
-    let mut compacted = vec![
-        Message {
-            role: "user".into(),
-            content: MessageContent::Text(format!("[Conversation Summary]\n{summary}")),
-        },
-        Message {
-            role: "assistant".into(),
-            content: MessageContent::Text(
-                "Understood, I have the conversation context. How can I help?".into(),
-            ),
-        },
-    ];
-
-    // Append recent messages, fixing role alternation
-    for msg in recent_messages {
-        if let Some(last) = compacted.last() {
-            if last.role == msg.role {
-                // Merge with previous to maintain alternation
-                if let Some(last_mut) = compacted.last_mut() {
-                    let existing = message_to_text(last_mut);
-                    let new_text = message_to_text(msg);
-                    last_mut.content = MessageContent::Text(format!("{existing}\n{new_text}"));
+#[allow(dead_code)]
+fn strip_images_for_session(messages: &mut [Message]) {
+    for msg in messages.iter_mut() {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            for block in blocks.iter_mut() {
+                if matches!(block, ContentBlock::Image { .. }) {
+                    *block = ContentBlock::Text {
+                        text: "[image was sent]".into(),
+                    };
                 }
-                continue;
             }
         }
-        compacted.push(msg.clone());
     }
+}
 
-    // Ensure last message is from user
-    if let Some(last) = compacted.last() {
-        if last.role == "assistant" {
-            compacted.pop();
-        }
+pub fn archive_conversation(data_dir: &str, chat_id: i64, messages: &[Message]) {
+    let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let dir = std::path::PathBuf::from(data_dir)
+        .join("groups")
+        .join(chat_id.to_string())
+        .join("conversations");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("Failed to create conversations dir: {e}");
+        return;
     }
-
-    compacted
+    let path = dir.join(format!("{now}.md"));
+    let mut content = String::new();
+    for msg in messages {
+        content.push_str(&format!("## {}\n\n{}\n\n---\n\n", msg.role, message_to_text(msg)));
+    }
+    if let Err(e) = std::fs::write(&path, &content) {
+        tracing::warn!("Failed to archive conversation to {}: {e}", path.display());
+    }
 }
 
 #[cfg(test)]
@@ -4054,5 +4085,36 @@ mod tests {
         if let MessageContent::Text(t) = &out[3].content {
             assert_eq!(t.as_str(), "8");
         }
+    }
+
+    #[test]
+    fn test_prepare_telegram_workspace_auto_images_markdown_absolute() {
+        let root = std::env::temp_dir().join(format!("tg_auto_img_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        let img = root.join("shared").join("mark.png");
+        std::fs::write(&img, [137u8, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+        let root = root.canonicalize().unwrap();
+        let img = img.canonicalize().unwrap();
+
+        let text = format!("Hello\n\n![]({})\n\nBye", img.display());
+        let (paths, body) = prepare_telegram_workspace_auto_images(&text, &root);
+        assert_eq!(paths, vec![img.clone()]);
+        assert!(body.contains("Hello"));
+        assert!(body.contains("Bye"));
+        assert!(!body.contains("!("));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_prepare_telegram_workspace_auto_images_skips_http() {
+        let root = std::env::temp_dir().join(format!("tg_auto_img_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let text = "x ![](https://example.com/a.png) y";
+        let (paths, body) = prepare_telegram_workspace_auto_images(text, &root);
+        assert!(paths.is_empty());
+        assert_eq!(body, text);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

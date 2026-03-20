@@ -35,12 +35,6 @@ fn default_workspace_dir() -> String {
 fn default_timezone() -> String {
     "UTC".into()
 }
-fn default_max_session_messages() -> usize {
-    40
-}
-fn default_compact_keep_recent() -> usize {
-    20
-}
 fn default_whatsapp_webhook_port() -> u16 {
     8080
 }
@@ -139,18 +133,6 @@ fn default_post_tool_evaluator_enabled() -> bool {
 }
 
 fn default_post_tool_evaluator_model() -> String {
-    String::new()
-}
-
-fn default_delegate_tool_enabled() -> bool {
-    true
-}
-
-fn default_delegate_max_iterations() -> usize {
-    10
-}
-
-fn default_delegate_model() -> String {
     String::new()
 }
 
@@ -272,10 +254,6 @@ pub struct Config {
     pub allowed_groups: Vec<i64>,
     #[serde(default = "default_control_chat_ids")]
     pub control_chat_ids: Vec<i64>,
-    #[serde(default = "default_max_session_messages")]
-    pub max_session_messages: usize,
-    #[serde(default = "default_compact_keep_recent")]
-    pub compact_keep_recent: usize,
     #[serde(default)]
     pub whatsapp_access_token: Option<String>,
     #[serde(default)]
@@ -375,15 +353,6 @@ pub struct Config {
     /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_post_tool_evaluator_model")]
     pub post_tool_evaluator_model: String,
-    /// Enable the delegate tool for sub-agent task delegation. Default true.
-    #[serde(default = "default_delegate_tool_enabled")]
-    pub delegate_tool_enabled: bool,
-    /// Maximum tool iterations for delegated sub-agent tasks. Default 10.
-    #[serde(default = "default_delegate_max_iterations")]
-    pub delegate_max_iterations: usize,
-    /// Optional model override for delegate sub-agent. If empty, use main model.
-    #[serde(default = "default_delegate_model")]
-    pub delegate_model: String,
     /// Tmux session name prefix for cursor_agent when detach=true (e.g. finally_a_value_bot-cursor).
     #[serde(default = "default_cursor_agent_tmux_session_prefix")]
     pub cursor_agent_tmux_session_prefix: String,
@@ -631,8 +600,6 @@ impl Config {
             timezone: Self::env("TIMEZONE").unwrap_or_else(default_timezone),
             allowed_groups: Self::env_vec_i64("ALLOWED_GROUPS"),
             control_chat_ids: Self::env_vec_i64("CONTROL_CHAT_IDS"),
-            max_session_messages: Self::env_usize("MAX_SESSION_MESSAGES", default_max_session_messages()),
-            compact_keep_recent: Self::env_usize("COMPACT_KEEP_RECENT", default_compact_keep_recent()),
             whatsapp_access_token: Self::env("WHATSAPP_ACCESS_TOKEN"),
             whatsapp_phone_number_id: Self::env("WHATSAPP_PHONE_NUMBER_ID"),
             whatsapp_verify_token: Self::env("WHATSAPP_VERIFY_TOKEN"),
@@ -719,15 +686,6 @@ impl Config {
                 default_post_tool_evaluator_enabled(),
             ),
             post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
-            delegate_tool_enabled: Self::env_bool(
-                "DELEGATE_TOOL_ENABLED",
-                default_delegate_tool_enabled(),
-            ),
-            delegate_max_iterations: Self::env_usize(
-                "DELEGATE_MAX_ITERATIONS",
-                default_delegate_max_iterations(),
-            ),
-            delegate_model: Self::env("DELEGATE_MODEL").unwrap_or_default(),
             cursor_agent_tmux_session_prefix: Self::env("CURSOR_AGENT_TMUX_SESSION_PREFIX")
                 .unwrap_or_else(default_cursor_agent_tmux_session_prefix),
             cursor_agent_tmux_enabled: Self::env_bool(
