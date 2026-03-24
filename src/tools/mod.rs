@@ -123,6 +123,8 @@ pub struct ToolAuthContext {
     pub caller_chat_id: i64,
     pub caller_persona_id: i64,
     pub control_chat_ids: Vec<i64>,
+    /// True when the agent run was started by the scheduler (cron / one-shot task).
+    pub is_scheduled_task: bool,
 }
 
 impl ToolAuthContext {
@@ -160,11 +162,16 @@ pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthCont
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
         .unwrap_or_default();
+    let is_scheduled_task = ctx
+        .get("is_scheduled_task")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Some(ToolAuthContext {
         caller_channel,
         caller_chat_id,
         caller_persona_id,
         control_chat_ids,
+        is_scheduled_task,
     })
 }
 
@@ -209,6 +216,7 @@ fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serd
             "caller_chat_id": auth.caller_chat_id,
             "caller_persona_id": auth.caller_persona_id,
             "control_chat_ids": auth.control_chat_ids,
+            "is_scheduled_task": auth.is_scheduled_task,
         }),
     );
     serde_json::Value::Object(obj)

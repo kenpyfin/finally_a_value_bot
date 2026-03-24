@@ -1,0 +1,18 @@
+---
+description: Document implementations in docs/development-journal.md; read it when planning or changing code
+alwaysApply: true
+---
+
+# Development journal
+
+The canonical development journal is **`docs/development-journal.md`**.
+
+## When to read it
+
+Before **planning**, **adding features**, **refactoring**, or **non-trivial fixes**, read recent entries (and any section relevant to the area you are touching). Use it to align with prior decisions, avoid repeating mistakes, and know where related code lives.
+
+## When to update it
+
+After completing work that is **user-visible**, **architectural**, or **hard to infer from code alone**, append an entry at the **top** of the journal (newest first), using the template in that file. Include enough **file paths** and **symbols** that the next change does not require archaeology.
+
+Skip journal entries for purely mechanical edits (typos, formatting, one-line renames with no behavior change) unless they clarify a recurring convention.

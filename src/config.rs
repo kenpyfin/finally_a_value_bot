@@ -112,6 +112,22 @@ fn default_cursor_agent_timeout_secs() -> u64 {
     600
 }
 
+fn default_scheduler_task_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_scheduler_stale_running_reclaim_secs() -> u64 {
+    7200
+}
+
+fn default_scheduler_max_concurrent_tasks() -> usize {
+    2
+}
+
+fn default_scheduler_poll_interval_secs() -> u64 {
+    60
+}
+
 fn default_orchestrator_enabled() -> bool {
     true
 }
@@ -362,6 +378,18 @@ pub struct Config {
     /// URL of a host runner that executes cursor-agent (e.g. http://host.docker.internal:3847). When set, the bot POSTs spawn requests instead of running cursor-agent locally.
     #[serde(default)]
     pub cursor_agent_runner_url: Option<String>,
+    /// Max wall-clock time (seconds) for a single scheduled-agent run. Default 3600.
+    #[serde(default = "default_scheduler_task_timeout_secs")]
+    pub scheduler_task_timeout_secs: u64,
+    /// Reclaim `scheduled_tasks` stuck in `running` if the claim timestamp is older than this (seconds). Default 7200.
+    #[serde(default = "default_scheduler_stale_running_reclaim_secs")]
+    pub scheduler_stale_running_reclaim_secs: u64,
+    /// Max concurrent scheduled task runs (semaphore). Default 2.
+    #[serde(default = "default_scheduler_max_concurrent_tasks")]
+    pub scheduler_max_concurrent_tasks: usize,
+    /// Seconds between scheduler ticks (reclaim + due-task scan). Default 60.
+    #[serde(default = "default_scheduler_poll_interval_secs")]
+    pub scheduler_poll_interval_secs: u64,
 }
 
 impl Config {
@@ -694,6 +722,22 @@ impl Config {
             ),
             cursor_agent_runner_url: Self::env("CURSOR_AGENT_RUNNER_URL")
                 .filter(|s| !s.trim().is_empty()),
+            scheduler_task_timeout_secs: Self::env_u64(
+                "SCHEDULER_TASK_TIMEOUT_SECS",
+                default_scheduler_task_timeout_secs(),
+            ),
+            scheduler_stale_running_reclaim_secs: Self::env_u64(
+                "SCHEDULER_STALE_RUNNING_RECLAIM_SECS",
+                default_scheduler_stale_running_reclaim_secs(),
+            ),
+            scheduler_max_concurrent_tasks: Self::env_usize(
+                "SCHEDULER_MAX_CONCURRENT_TASKS",
+                default_scheduler_max_concurrent_tasks(),
+            ),
+            scheduler_poll_interval_secs: Self::env_u64(
+                "SCHEDULER_POLL_INTERVAL_SECS",
+                default_scheduler_poll_interval_secs(),
+            ),
         }
     }
 
@@ -1041,6 +1085,10 @@ mod tests {
             cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
+            scheduler_task_timeout_secs: default_scheduler_task_timeout_secs(),
+            scheduler_stale_running_reclaim_secs: default_scheduler_stale_running_reclaim_secs(),
+            scheduler_max_concurrent_tasks: default_scheduler_max_concurrent_tasks(),
+            scheduler_poll_interval_secs: default_scheduler_poll_interval_secs(),
         }
     }
 

@@ -2346,6 +2346,10 @@ mod tests {
             cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
+            scheduler_task_timeout_secs: 3600,
+            scheduler_stale_running_reclaim_secs: 7200,
+            scheduler_max_concurrent_tasks: 2,
+            scheduler_poll_interval_secs: 60,
         };
         // Should not panic
         let _provider = create_provider(&config);
@@ -2412,6 +2416,10 @@ mod tests {
             cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
+            scheduler_task_timeout_secs: 3600,
+            scheduler_stale_running_reclaim_secs: 7200,
+            scheduler_max_concurrent_tasks: 2,
+            scheduler_poll_interval_secs: 60,
         };
         let _provider = create_provider(&config);
     }
@@ -2791,6 +2799,10 @@ mod tests {
             cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
+            scheduler_task_timeout_secs: 3600,
+            scheduler_stale_running_reclaim_secs: 7200,
+            scheduler_max_concurrent_tasks: 2,
+            scheduler_poll_interval_secs: 60,
         };
         // Should not panic
         let _provider = create_provider(&config);

@@ -6,7 +6,7 @@ use serde_json::json;
 use teloxide::prelude::*;
 use teloxide::types::InputFile;
 
-use super::{authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
 use crate::channel::{deliver_and_store_bot_message, enforce_channel_policy};
 use crate::claude::ToolDefinition;
 use crate::config::Config;
@@ -414,6 +414,15 @@ impl Tool for SendMessageTool {
 
         if let Err(e) = authorize_chat_access(&input, chat_id) {
             return ToolResult::error(e);
+        }
+
+        if let Some(auth) = auth_context_from_input(&input) {
+            if auth.is_scheduled_task && chat_id == auth.caller_chat_id {
+                return ToolResult::error(
+                    "Scheduled runs deliver the final reply automatically; do not use send_message for this chat. Put all user-facing output in your final assistant message."
+                        .into(),
+                );
+            }
         }
 
         if let Err(e) = enforce_channel_policy(self.db.clone(), &input, chat_id).await {

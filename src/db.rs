@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Mutex;
@@ -611,6 +612,49 @@ impl Database {
         Ok(())
     }
 
+    /// True when the **latest** row for this chat is a bot message with the same body as `content`
+    /// and a recent timestamp. That usually means `send_message` already posted this text and the
+    /// main agent is about to deliver the same final reply again.
+    pub fn should_skip_duplicate_final_delivery(
+        &self,
+        chat_id: i64,
+        content: &str,
+        max_age_secs: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        use rusqlite::OptionalExtension;
+
+        let conn = self.conn.lock().unwrap();
+        let last: Option<(bool, String, String)> = conn
+            .query_row(
+                "SELECT is_from_bot, content, timestamp FROM messages
+                 WHERE chat_id = ?1
+                 ORDER BY timestamp DESC
+                 LIMIT 1",
+                params![chat_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i32>(0)? != 0,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((is_bot, last_content, ts)) = last else {
+            return Ok(false);
+        };
+        if !is_bot || last_content != content {
+            return Ok(false);
+        }
+        let Ok(parsed) = DateTime::parse_from_rfc3339(&ts) else {
+            return Ok(false);
+        };
+        let parsed = parsed.with_timezone(&Utc);
+        let age = Utc::now().signed_duration_since(parsed);
+        Ok(age.num_seconds() >= 0 && age.num_seconds() <= max_age_secs)
+    }
+
     pub fn get_recent_messages(
         &self,
         chat_id: i64,
@@ -1130,7 +1174,8 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
              FROM scheduled_tasks
-             WHERE status = 'active' AND next_run <= ?1",
+             WHERE status = 'active' AND next_run <= ?1
+             ORDER BY next_run ASC, id ASC",
         )?;
         let tasks = stmt
             .query_map(params![now], |row| {
@@ -1338,6 +1383,75 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Atomic conditional claim: only marks running if the task is still active and due.
+    /// Returns true iff exactly one row was updated. Callers should skip spawn when false.
+    pub fn try_mark_task_running(
+        &self,
+        task_id: i64,
+        started_at: &str,
+        next_run: Option<&str>,
+        now_upper_bound: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = match next_run {
+            Some(next) => conn.execute(
+                "UPDATE scheduled_tasks
+                 SET last_run = ?1, next_run = ?2, status = 'running'
+                 WHERE id = ?3 AND status = 'active' AND next_run <= ?4",
+                params![started_at, next, task_id, now_upper_bound],
+            )?,
+            None => conn.execute(
+                "UPDATE scheduled_tasks
+                 SET last_run = ?1, status = 'running'
+                 WHERE id = ?2 AND status = 'active' AND next_run <= ?3",
+                params![started_at, task_id, now_upper_bound],
+            )?,
+        };
+        Ok(rows == 1)
+    }
+
+    /// Reset tasks stuck in `running` (e.g. process crash or hung agent) back to `active`.
+    /// `last_run` holds the claim/start time from `mark_task_running`. Does not change `next_run`.
+    /// Returns IDs of reclaimed tasks.
+    pub fn reclaim_stale_running_tasks(
+        &self,
+        now_rfc3339: &str,
+        max_age_secs: i64,
+    ) -> Result<Vec<i64>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "reclaim_stale_running_tasks: invalid now timestamp: {e}"
+                ))
+            })?;
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, last_run FROM scheduled_tasks WHERE status = 'running' AND last_run IS NOT NULL",
+        )?;
+        let pending: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut reclaimed = Vec::new();
+        for (id, last_run) in pending {
+            let Ok(started) = DateTime::parse_from_rfc3339(&last_run) else {
+                continue;
+            };
+            let started = started.with_timezone(&Utc);
+            if now.signed_duration_since(started).num_seconds() > max_age_secs {
+                conn.execute(
+                    "UPDATE scheduled_tasks SET status = 'active' WHERE id = ?1",
+                    params![id],
+                )?;
+                reclaimed.push(id);
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// Finalize a running task after execution.

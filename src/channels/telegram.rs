@@ -968,7 +968,27 @@ async fn handle_message(
                     to_send.len()
                 );
                 let ws_root = state_spawn.config.workspace_root_absolute();
-                if let Err(e) = crate::channel::deliver_to_contact(
+                const DEDUPE_WINDOW_SECS: i64 = 120;
+                let skip_dup = match crate::db::call_blocking(state_spawn.db.clone(), {
+                    let text = to_send.clone();
+                    let cid = canonical_chat_id_spawn;
+                    move |db| db.should_skip_duplicate_final_delivery(cid, &text, DEDUPE_WINDOW_SECS)
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(target: "channel", error = %e, "duplicate-final check failed; delivering anyway");
+                        false
+                    }
+                };
+                if skip_dup {
+                    info!(
+                        target: "channel",
+                        chat_id = canonical_chat_id_spawn,
+                        "Skipping duplicate final delivery: latest stored message already matches this reply (likely send_message + final)"
+                    );
+                } else if let Err(e) = crate::channel::deliver_to_contact(
                     state_spawn.db.clone(),
                     Some(&state_spawn.bot),
                     state_spawn.discord_http.as_deref(),
@@ -1221,6 +1241,22 @@ pub async fn process_with_agent_with_events(
             content: MessageContent::Text("Acknowledged runtime context.".into()),
         },
     ];
+    if context.is_scheduled_task {
+        prepended.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text(
+                "[scheduler_policy] This is a scheduled run. Do not use the send_message tool for this chat; the scheduler delivers your final reply once. Put all user-facing output in your final assistant message."
+                    .into(),
+            ),
+        });
+        prepended.push(Message {
+            role: "assistant".into(),
+            content: MessageContent::Text(
+                "Understood. I will not use send_message for this chat and will put everything in my final reply."
+                    .into(),
+            ),
+        });
+    }
     prepended.extend(messages);
     messages = prepended;
 
@@ -1236,6 +1272,7 @@ pub async fn process_with_agent_with_events(
         caller_chat_id: chat_id,
         caller_persona_id: persona_id,
         control_chat_ids: state.config.control_chat_ids.clone(),
+        is_scheduled_task: context.is_scheduled_task,
     };
 
     // Token-aware trimming safety net (keeps at least 6 latest messages).
@@ -3102,6 +3139,7 @@ If there is nothing meaningful to store, reply exactly: No memory update needed.
         caller_chat_id: chat_id,
         caller_persona_id: persona_id,
         control_chat_ids: state.config.control_chat_ids.clone(),
+        is_scheduled_task: false,
     };
 
     for _ in 0..MEMORY_MAINTENANCE_MAX_ITERATIONS {

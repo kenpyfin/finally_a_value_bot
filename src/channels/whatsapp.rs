@@ -10,6 +10,7 @@ use base64::Engine;
 use serde::Deserialize;
 use tracing::{error, info};
 
+use crate::channel::with_persona_indicator;
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
@@ -482,6 +483,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 {
                     Ok(response) => {
                         if !response.is_empty() {
+                            let response = with_persona_indicator(state.app_state.db.clone(), persona_id, &response).await;
                             send_whatsapp_message(
                                 &state.http_client,
                                 &state.access_token,

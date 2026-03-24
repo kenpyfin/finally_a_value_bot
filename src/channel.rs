@@ -30,6 +30,15 @@ pub async fn enforce_channel_policy(
     Ok(())
 }
 
+/// Prepend `[PersonaName] ` to outbound bot text so users know which persona sent it.
+pub async fn with_persona_indicator(db: Arc<Database>, persona_id: i64, text: &str) -> String {
+    let name = match call_blocking(db, move |d| d.get_persona(persona_id)).await {
+        Ok(Some(p)) => p.name,
+        _ => "Unknown".to_string(),
+    };
+    format!("[{name}] {text}")
+}
+
 pub async fn deliver_and_store_bot_message(
     bot: &Bot,
     db: Arc<Database>,
@@ -39,6 +48,7 @@ pub async fn deliver_and_store_bot_message(
     text: &str,
     workspace_root: Option<PathBuf>,
 ) -> Result<(), String> {
+    let text = &with_persona_indicator(db.clone(), persona_id, text).await;
     if is_web_chat(db.clone(), chat_id).await {
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -106,6 +116,7 @@ pub async fn deliver_to_contact(
     text: &str,
     workspace_root: Option<PathBuf>,
 ) -> Result<(), String> {
+    let text = &with_persona_indicator(db.clone(), persona_id, text).await;
     let msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
         chat_id: canonical_chat_id,

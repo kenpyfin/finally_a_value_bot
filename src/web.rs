@@ -2514,6 +2514,10 @@ mod tests {
             cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
+            scheduler_task_timeout_secs: 3600,
+            scheduler_stale_running_reclaim_secs: 7200,
+            scheduler_max_concurrent_tasks: 2,
+            scheduler_poll_interval_secs: 60,
         };
         let dir = std::env::temp_dir().join(format!("finally_a_value_bot_webtest_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
