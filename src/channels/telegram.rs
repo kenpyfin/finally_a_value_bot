@@ -533,7 +533,8 @@ async fn handle_message(
                     })
                     .await
                     .unwrap_or_default();
-                    let messages = history_to_claude_messages(&history, &state.config.bot_username);
+                    let messages =
+                        history_to_claude_messages(&history, &state.config.bot_username, false);
                     if messages.is_empty() {
                         let _ = send_archive_msg("No conversation to archive.").await;
                     } else {
@@ -969,8 +970,14 @@ async fn handle_message(
                 );
                 let ws_root = state_spawn.config.workspace_root_absolute();
                 const DEDUPE_WINDOW_SECS: i64 = 120;
+                let dedupe_text = crate::channel::with_persona_indicator(
+                    state_spawn.db.clone(),
+                    persona_id,
+                    &to_send,
+                )
+                .await;
                 let skip_dup = match crate::db::call_blocking(state_spawn.db.clone(), {
-                    let text = to_send.clone();
+                    let text = dedupe_text;
                     let cid = canonical_chat_id_spawn;
                     move |db| db.should_skip_duplicate_final_delivery(cid, &text, DEDUPE_WINDOW_SECS)
                 })
@@ -1179,7 +1186,14 @@ pub async fn process_with_agent_with_events(
     let mut messages = if context.is_background_job {
         Vec::new()
     } else {
-        load_messages_from_db(state, chat_id, persona_id, context.chat_type).await?
+        load_messages_from_db(
+            state,
+            chat_id,
+            persona_id,
+            context.chat_type,
+            context.is_scheduled_task,
+        )
+        .await?
     };
 
     // Strip tool_use / tool_result block messages from prior agentic loops.
@@ -2081,6 +2095,7 @@ async fn load_messages_from_db(
     chat_id: i64,
     persona_id: i64,
     chat_type: &str,
+    is_scheduled_task: bool,
 ) -> Result<Vec<Message>, anyhow::Error> {
     let max_history = state.config.max_history_messages;
     let history = if chat_type == "group" {
@@ -2097,6 +2112,7 @@ async fn load_messages_from_db(
     Ok(history_to_claude_messages(
         &history,
         &state.config.bot_username,
+        is_scheduled_task,
     ))
 }
 
@@ -2324,14 +2340,36 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
     prompt
 }
 
-fn history_to_claude_messages(history: &[StoredMessage], _bot_username: &str) -> Vec<Message> {
+fn strip_transport_persona_prefix(text: &str) -> String {
+    let mut rest = text.trim_start();
+    loop {
+        if !rest.starts_with('[') {
+            break;
+        }
+        let Some(close_idx) = rest.find(']') else {
+            break;
+        };
+        let token = &rest[1..close_idx];
+        if token.is_empty() || token.len() > 64 || token.contains('\n') {
+            break;
+        }
+        rest = rest[close_idx + 1..].trim_start();
+    }
+    rest.to_string()
+}
+
+fn history_to_claude_messages(
+    history: &[StoredMessage],
+    _bot_username: &str,
+    keep_trailing_assistant: bool,
+) -> Vec<Message> {
     let mut messages = Vec::new();
 
     for msg in history {
         let role = if msg.is_from_bot { "assistant" } else { "user" };
 
         let content = if msg.is_from_bot {
-            msg.content.clone()
+            strip_transport_persona_prefix(&msg.content)
         } else {
             format_user_message(&msg.sender_name, &msg.content)
         };
@@ -2354,10 +2392,13 @@ fn history_to_claude_messages(history: &[StoredMessage], _bot_username: &str) ->
         });
     }
 
-    // Ensure the last message is from user (Claude API requirement)
-    if let Some(last) = messages.last() {
-        if last.role == "assistant" {
-            messages.pop();
+    // Ensure the final message is user unless caller intentionally keeps trailing assistant
+    // (scheduled runs append a user scheduler prompt after loading history).
+    if !keep_trailing_assistant {
+        if let Some(last) = messages.last() {
+            if last.role == "assistant" {
+                messages.pop();
+            }
         }
     }
 

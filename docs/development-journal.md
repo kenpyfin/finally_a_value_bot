@@ -20,6 +20,36 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 <!-- Add entries below this line, newest first. -->
 
+### 2026-03-27 — Enable markdown tables in web chat
+
+- **Area:** web / frontend rendering
+- **Summary:** Enabled GFM markdown parsing for assistant messages in the active web chat thread and added table-specific rendering/styling so pipe-table markdown is displayed as a proper, scrollable table.
+- **Rationale:** The live web chat path used `makeMarkdownText()` without `remark-gfm`, so pipe-table markdown was not parsed into table nodes and could not render with readable table layout.
+- **Key files / symbols:**
+  - `web/src/main.tsx` — `ThreadPane`, `makeMarkdownText({ remarkPlugins, components })`, table override with `mc-md-table-scroll`.
+  - `web/src/styles.css` — `.mc-md-table-scroll`, dark/light `.aui-assistant-message-content .aui-md-table/.aui-md-th/.aui-md-td` table presentation rules.
+- **Follow-ups:** If users also want markdown tables for user-authored messages, wire the user message text renderer to markdown as a separate change.
+
+### 2026-03-25 — Fix persona prefix duplication and scheduled repeat delivery
+
+- **Area:** channels / scheduler / history shaping
+- **Summary:** Made persona prefixing idempotent, stripped transport persona tags from assistant history before LLM context, preserved trailing assistant history for scheduled runs, and added duplicate-final suppression to scheduler delivery.
+- **Rationale:** Repeated `[Persona]` prefixes and repeated scheduled outputs were caused by feeding prefixed transport text back into model context and missing dedupe checks on scheduler delivery paths.
+- **Key files / symbols:**
+  - `src/channel.rs` — `with_persona_indicator`, `normalize_persona_prefixed_text`, `strip_leading_persona_tokens`.
+  - `src/channels/telegram.rs` — `load_messages_from_db(..., is_scheduled_task)`, `history_to_claude_messages(..., keep_trailing_assistant)`, `strip_transport_persona_prefix`, and interactive `should_skip_duplicate_final_delivery` check now using persona-prefixed comparison text.
+  - `src/scheduler.rs` — `run_scheduled_agent_and_finalize`: duplicate-final check before `deliver_to_contact`.
+- **Follow-ups:** Consider moving output safeguards (`apply_output_safeguards`) to a shared delivery boundary to fully cover tool-driven and background-job sends.
+
+### 2026-03-23 — Memory Hygiene & Structural Integrity clause
+
+- **Area:** agent / AGENTS.md
+- **Summary:** Added rules 7-11 under a new `## Memory Hygiene & Structural Integrity` subsection in Ways of Working. Introduces vault-first archiving, rejection handling with audit trail, Tier 3 volatility cap (15 lines), stale status eviction, loop prevention, explicit cleanup triggers, a fallback policy, a pre-response checklist, and a one-time migration step.
+- **Rationale:** The bot's tiered memory (MEMORY.md) was accumulating stale statuses, rejected proposals, and repeated pending-task references across sessions, leading to context pollution and repetitive outputs. The original proposal ("purge everything on rejection") conflicted with Absolute Capture and Chronological Logging, so rejection handling was rewritten to keep a one-line audit record in the ORIGIN vault.
+- **Key files / symbols:**
+  - `workspace/AGENTS.md` — `## Memory Hygiene & Structural Integrity` (lines 24-52): tier definitions, rules 7-11, cleanup triggers, fallback, pre-response checklist, one-time migration.
+- **Follow-ups:** Formal acceptance criteria deferred to a future iteration. Once the bot has a MEMORY.md file, verify tier size limits are enforced in practice.
+
 ### 2026-03-22 — Persona indicator on all bot messages
 
 - **Area:** channels / delivery

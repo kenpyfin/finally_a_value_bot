@@ -33,6 +33,7 @@ import {
   TextField,
   Theme,
 } from '@radix-ui/themes'
+import remarkGfm from 'remark-gfm'
 import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
@@ -669,7 +670,16 @@ type ThreadPaneProps = {
 }
 
 function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
-  const MarkdownText = makeMarkdownText()
+  const MarkdownText = makeMarkdownText({
+    remarkPlugins: [remarkGfm],
+    components: {
+      table: ({ className, ...props }) => (
+        <div className="mc-md-table-scroll">
+          <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
+        </div>
+      ),
+    },
+  })
   const runtime = useLocalRuntime(adapter, {
     initialMessages,
     maxSteps: 100,

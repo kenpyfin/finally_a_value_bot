@@ -327,41 +327,71 @@ async fn run_scheduled_agent_and_finalize(
             } else {
                 response
             };
-
-            match deliver_to_contact(
-                state.db.clone(),
-                Some(&state.bot),
-                state.discord_http.as_deref(),
-                &state.config.bot_username,
-                chat_id,
-                persona_id,
-                &response_text,
-                Some(state.config.workspace_root_absolute()),
-            )
+            const DEDUPE_WINDOW_SECS: i64 = 120;
+            let dedupe_text =
+                crate::channel::with_persona_indicator(state.db.clone(), persona_id, &response_text)
+                    .await;
+            let skip_dup = match call_blocking(state.db.clone(), {
+                let text = dedupe_text;
+                move |db| db.should_skip_duplicate_final_delivery(chat_id, &text, DEDUPE_WINDOW_SECS)
+            })
             .await
             {
-                Ok(()) => {
-                    let summary = if response_text.len() > 200 {
-                        format!(
-                            "{}...",
-                            &response_text[..response_text.floor_char_boundary(200)]
-                        )
-                    } else {
-                        response_text
-                    };
-                    (true, Some(summary))
-                }
+                Ok(v) => v,
                 Err(e) => {
-                    error!(
-                        "Scheduler: task #{} produced a response but delivery failed: {}",
-                        task_id, e
+                    tracing::warn!(
+                        target: "scheduler",
+                        task_id = task_id,
+                        error = %e,
+                        "duplicate-final check failed; delivering anyway"
                     );
-                    (
-                        false,
-                        Some(format!(
-                            "Delivery error after successful execution: {e}"
-                        )),
-                    )
+                    false
+                }
+            };
+            if skip_dup {
+                info!(
+                    target: "scheduler",
+                    task_id = task_id,
+                    chat_id = chat_id,
+                    "Skipping duplicate scheduled delivery: latest stored message already matches"
+                );
+                (true, Some("Skipped duplicate final delivery".to_string()))
+            } else {
+                match deliver_to_contact(
+                    state.db.clone(),
+                    Some(&state.bot),
+                    state.discord_http.as_deref(),
+                    &state.config.bot_username,
+                    chat_id,
+                    persona_id,
+                    &response_text,
+                    Some(state.config.workspace_root_absolute()),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let summary = if response_text.len() > 200 {
+                            format!(
+                                "{}...",
+                                &response_text[..response_text.floor_char_boundary(200)]
+                            )
+                        } else {
+                            response_text
+                        };
+                        (true, Some(summary))
+                    }
+                    Err(e) => {
+                        error!(
+                            "Scheduler: task #{} produced a response but delivery failed: {}",
+                            task_id, e
+                        );
+                        (
+                            false,
+                            Some(format!(
+                                "Delivery error after successful execution: {e}"
+                            )),
+                        )
+                    }
                 }
             }
         }

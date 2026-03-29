@@ -30,13 +30,41 @@ pub async fn enforce_channel_policy(
     Ok(())
 }
 
+fn strip_leading_persona_tokens(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        if !rest.starts_with('[') {
+            break;
+        }
+        let Some(close_idx) = rest.find(']') else {
+            break;
+        };
+        // Only treat short single-line bracket heads as transport persona tags.
+        let token = &rest[1..close_idx];
+        if token.is_empty() || token.len() > 64 || token.contains('\n') {
+            break;
+        }
+        rest = rest[close_idx + 1..].trim_start();
+    }
+    rest
+}
+
+fn normalize_persona_prefixed_text(persona_name: &str, text: &str) -> String {
+    let body = strip_leading_persona_tokens(text).trim();
+    if body.is_empty() {
+        format!("[{persona_name}]")
+    } else {
+        format!("[{persona_name}] {body}")
+    }
+}
+
 /// Prepend `[PersonaName] ` to outbound bot text so users know which persona sent it.
 pub async fn with_persona_indicator(db: Arc<Database>, persona_id: i64, text: &str) -> String {
     let name = match call_blocking(db, move |d| d.get_persona(persona_id)).await {
         Ok(Some(p)) => p.name,
         _ => "Unknown".to_string(),
     };
-    format!("[{name}] {text}")
+    normalize_persona_prefixed_text(&name, text)
 }
 
 pub async fn deliver_and_store_bot_message(
@@ -101,6 +129,32 @@ pub async fn deliver_and_store_bot_message(
         call_blocking(db.clone(), move |d| d.store_message(&msg))
             .await
             .map_err(|e| format!("Failed to store sent message: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_persona_prefixed_text;
+
+    #[test]
+    fn persona_prefix_is_added_once() {
+        let out = normalize_persona_prefixed_text("InfluencerPZ", "Hello");
+        assert_eq!(out, "[InfluencerPZ] Hello");
+    }
+
+    #[test]
+    fn repeated_leading_persona_tags_are_collapsed() {
+        let out = normalize_persona_prefixed_text(
+            "InfluencerPZ",
+            "[InfluencerPZ] [InfluencerPZ] [InfluencerPZ] Hi there",
+        );
+        assert_eq!(out, "[InfluencerPZ] Hi there");
+    }
+
+    #[test]
+    fn other_persona_tag_is_replaced_with_current() {
+        let out = normalize_persona_prefixed_text("Trader", "[InfluencerPZ] Market open");
+        assert_eq!(out, "[Trader] Market open");
     }
 }
 

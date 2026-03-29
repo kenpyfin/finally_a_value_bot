@@ -21,3 +21,4 @@ workspace/shared/.venv-vault/
 workspace/**/.env
 workspace/**/node_modules/
 
+docs/development-journal.md
