@@ -20,6 +20,17 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 <!-- Add entries below this line, newest first. -->
 
+### 2026-04-01 — Restrict write_memory and harden tiered writes
+
+- **Area:** agent / memory tools
+- **Summary:** Limited `write_memory` to `chat_daily` appends only, removed full `MEMORY.md` replacement via that tool, and tightened post-response memory maintenance to use only tiered memory tools. Also hardened tiered memory writes to canonicalize sections and merge duplicate tier blocks instead of propagating duplicate headers.
+- **Rationale:** Full-file `MEMORY.md` writes from non-tiered context risk accidental overwrites. Canonical tier writes reduce corruption/duplication risk and keep per-tier updates deterministic.
+- **Key files / symbols:**
+  - `src/tools/memory.rs` — `WriteMemoryTool::definition`, `WriteMemoryTool::execute`, and tests now enforce `scope: "chat_daily"` only.
+  - `src/tools/tiered_memory.rs` — added `extract_tier_sections`, `render_memory_document`, and updated `replace_tier_content` to canonicalize one section per tier while preserving content from duplicate tier headers.
+  - `src/channels/telegram.rs` — `run_memory_maintenance_after_response` now allows only `read_tiered_memory` and `write_tiered_memory`.
+- **Follow-ups:** Consider deprecating `read_memory(scope="chat")` from prompts in favor of tiered reads only once downstream agents/tools no longer rely on it.
+
 ### 2026-04-01 — Remove web runtime config editor
 
 - **Area:** web / frontend / api

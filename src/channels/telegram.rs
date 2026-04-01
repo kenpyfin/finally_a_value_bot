@@ -3176,7 +3176,7 @@ If there is nothing meaningful to store, reply exactly: No memory update needed.
         ),
     });
 
-    let allowed_tools = ["read_tiered_memory", "write_tiered_memory", "write_memory"];
+    let allowed_tools = ["read_tiered_memory", "write_tiered_memory"];
     let tool_defs: Vec<_> = state
         .tools
         .definitions()
