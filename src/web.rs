@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,6 @@ struct WebState {
     app_state: Arc<AppState>,
     auth_token: Option<String>,
     run_hub: RunHub,
-    session_hub: SessionHub,
     request_hub: RequestHub,
     limits: WebLimits,
 }
@@ -50,11 +49,6 @@ struct RunEvent {
 #[derive(Clone, Default)]
 struct RunHub {
     channels: Arc<Mutex<HashMap<String, RunChannel>>>,
-}
-
-#[derive(Clone, Default)]
-struct SessionHub {
-    locks: Arc<Mutex<HashMap<String, SessionLockEntry>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,11 +103,6 @@ impl Default for SessionQuota {
             last_touch: Instant::now(),
         }
     }
-}
-
-struct SessionLockEntry {
-    lock: Arc<tokio::sync::Mutex<()>>,
-    last_touch: Instant,
 }
 
 #[derive(Clone)]
@@ -207,30 +196,6 @@ impl RunHub {
             let mut guard = channels.lock().await;
             guard.remove(&run_id);
         });
-    }
-}
-
-impl SessionHub {
-    async fn lock_for(&self, session_key: &str, limits: &WebLimits) -> Arc<tokio::sync::Mutex<()>> {
-        let now = Instant::now();
-        let mut guard = self.locks.lock().await;
-        guard.retain(|key, entry| {
-            if key == session_key {
-                return true;
-            }
-            let stale = now.duration_since(entry.last_touch) > limits.session_idle_ttl;
-            // Remove only stale + uncontended locks.
-            !(stale && Arc::strong_count(&entry.lock) == 1 && entry.lock.try_lock().is_ok())
-        });
-        guard
-            .entry(session_key.to_string())
-            .and_modify(|entry| entry.last_touch = now)
-            .or_insert_with(|| SessionLockEntry {
-                lock: Arc::new(tokio::sync::Mutex::new(())),
-                last_touch: now,
-            })
-            .lock
-            .clone()
     }
 }
 
@@ -435,67 +400,6 @@ struct RunStatusQuery {
     run_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct UpdateConfigRequest {
-    llm_provider: Option<String>,
-    api_key: Option<String>,
-    model: Option<String>,
-    llm_base_url: Option<Option<String>>,
-    max_tokens: Option<u32>,
-    max_tool_iterations: Option<usize>,
-    max_document_size_mb: Option<u64>,
-    show_thinking: Option<bool>,
-    web_enabled: Option<bool>,
-    web_host: Option<String>,
-    web_port: Option<u16>,
-    web_auth_token: Option<Option<String>>,
-    web_max_inflight_per_session: Option<usize>,
-    web_max_requests_per_window: Option<usize>,
-    web_rate_window_seconds: Option<u64>,
-    web_run_history_limit: Option<usize>,
-    web_session_idle_ttl_seconds: Option<u64>,
-    safety_output_guard_mode: Option<String>,
-    safety_max_emojis_per_response: Option<usize>,
-    safety_tail_repeat_limit: Option<usize>,
-    safety_execution_mode: Option<String>,
-    safety_risky_categories: Option<Vec<String>>,
-}
-
-fn config_path_for_save() -> Result<PathBuf, (StatusCode, String)> {
-    match Config::resolve_config_path() {
-        Ok(Some(path)) => Ok(path),
-        Ok(None) => Ok(PathBuf::from("./.env")),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-fn redact_config(config: &Config) -> serde_json::Value {
-    let mut cfg = config.clone();
-    if !cfg.telegram_bot_token.is_empty() {
-        cfg.telegram_bot_token = "***".into();
-    }
-    if !cfg.api_key.is_empty() {
-        cfg.api_key = "***".into();
-    }
-    if cfg.openai_api_key.is_some() {
-        cfg.openai_api_key = Some("***".into());
-    }
-    if cfg.whatsapp_access_token.is_some() {
-        cfg.whatsapp_access_token = Some("***".into());
-    }
-    if cfg.whatsapp_verify_token.is_some() {
-        cfg.whatsapp_verify_token = Some("***".into());
-    }
-    if cfg.discord_bot_token.is_some() {
-        cfg.discord_bot_token = Some("***".into());
-    }
-    if cfg.web_auth_token.is_some() {
-        cfg.web_auth_token = Some("***".into());
-    }
-
-    json!(cfg)
-}
-
 async fn index() -> impl IntoResponse {
     match WEB_ASSETS.get_file("index.html") {
         Some(file) => Html(String::from_utf8_lossy(file.contents()).to_string()).into_response(),
@@ -512,112 +416,6 @@ async fn api_health(
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "web_enabled": state.app_state.config.web_enabled,
-    })))
-}
-
-async fn api_get_config(
-    headers: HeaderMap,
-    State(state): State<WebState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_auth(&headers, state.auth_token.as_deref())?;
-
-    let path = config_path_for_save()?;
-    Ok(Json(json!({
-        "ok": true,
-        "path": path,
-        "config": redact_config(&state.app_state.config),
-        "requires_restart": true
-    })))
-}
-
-async fn api_update_config(
-    headers: HeaderMap,
-    State(state): State<WebState>,
-    Json(body): Json<UpdateConfigRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_auth(&headers, state.auth_token.as_deref())?;
-
-    let mut cfg = state.app_state.config.clone();
-
-    if let Some(v) = body.llm_provider {
-        cfg.llm_provider = v;
-    }
-    if let Some(v) = body.api_key {
-        cfg.api_key = v;
-    }
-    if let Some(v) = body.model {
-        cfg.model = v;
-    }
-    if let Some(v) = body.llm_base_url {
-        cfg.llm_base_url = v;
-    }
-    if let Some(v) = body.max_tokens {
-        cfg.max_tokens = v;
-    }
-    if let Some(v) = body.max_tool_iterations {
-        cfg.max_tool_iterations = v;
-    }
-    if let Some(v) = body.max_document_size_mb {
-        cfg.max_document_size_mb = v;
-    }
-    if let Some(v) = body.show_thinking {
-        cfg.show_thinking = v;
-    }
-    if let Some(v) = body.web_enabled {
-        cfg.web_enabled = v;
-    }
-    if let Some(v) = body.web_host {
-        cfg.web_host = v;
-    }
-    if let Some(v) = body.web_port {
-        cfg.web_port = v;
-    }
-    if let Some(v) = body.web_auth_token {
-        cfg.web_auth_token = v;
-    }
-    if let Some(v) = body.web_max_inflight_per_session {
-        cfg.web_max_inflight_per_session = v;
-    }
-    if let Some(v) = body.web_max_requests_per_window {
-        cfg.web_max_requests_per_window = v;
-    }
-    if let Some(v) = body.web_rate_window_seconds {
-        cfg.web_rate_window_seconds = v;
-    }
-    if let Some(v) = body.web_run_history_limit {
-        cfg.web_run_history_limit = v;
-    }
-    if let Some(v) = body.web_session_idle_ttl_seconds {
-        cfg.web_session_idle_ttl_seconds = v;
-    }
-    if let Some(v) = body.safety_output_guard_mode {
-        cfg.safety_output_guard_mode = v;
-    }
-    if let Some(v) = body.safety_max_emojis_per_response {
-        cfg.safety_max_emojis_per_response = v;
-    }
-    if let Some(v) = body.safety_tail_repeat_limit {
-        cfg.safety_tail_repeat_limit = v;
-    }
-    if let Some(v) = body.safety_execution_mode {
-        cfg.safety_execution_mode = v;
-    }
-    if let Some(v) = body.safety_risky_categories {
-        cfg.safety_risky_categories = v;
-    }
-
-    if let Err(e) = cfg.post_deserialize() {
-        return Err((StatusCode::BAD_REQUEST, e.to_string()));
-    }
-
-    let path = config_path_for_save()?;
-    cfg.save_env(&path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(json!({
-        "ok": true,
-        "path": path,
-        "requires_restart": true
     })))
 }
 
@@ -795,17 +593,93 @@ async fn api_send(
         );
         return Err((status, msg));
     }
-    let result = send_and_store_response(state.clone(), body).await;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    state.run_hub.create(&run_id).await;
+    let state_for_task = state.clone();
+    let run_id_for_task = run_id.clone();
+    let limits = state.limits.clone();
+    let queue_position = state
+        .app_state
+        .chat_queue
+        .enqueue(chat_id, async move {
+            state_for_task
+                .run_hub
+                .publish(
+                    &run_id_for_task,
+                    "status",
+                    json!({"message": "running"}).to_string(),
+                    limits.run_history_limit,
+                )
+                .await;
+            match send_and_store_response_with_events(state_for_task.clone(), body, None).await {
+                Ok(resp) => {
+                    let response_text = resp
+                        .0
+                        .get("response")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    state_for_task
+                        .run_hub
+                        .publish(
+                            &run_id_for_task,
+                            "done",
+                            json!({"response": response_text}).to_string(),
+                            limits.run_history_limit,
+                        )
+                        .await;
+                }
+                Err((_, err_msg)) => {
+                    state_for_task
+                        .run_hub
+                        .publish(
+                            &run_id_for_task,
+                            "error",
+                            json!({"error": err_msg}).to_string(),
+                            limits.run_history_limit,
+                        )
+                        .await;
+                }
+            }
+            state_for_task
+                .run_hub
+                .remove_later(run_id_for_task, 300)
+                .await;
+        })
+        .await;
+    state
+        .run_hub
+        .publish(
+            &run_id,
+            "status",
+            json!({
+                "message": if queue_position > 1 {
+                    format!("queued ({} ahead)", queue_position.saturating_sub(1))
+                } else {
+                    "queued".to_string()
+                }
+            })
+            .to_string(),
+            state.limits.run_history_limit,
+        )
+        .await;
     state.request_hub.end_with_limits(&key, &state.limits).await;
     info!(
         target: "web",
         endpoint = "/api/send",
         chat_id = chat_id,
-        ok = result.is_ok(),
+        run_id = %run_id,
+        queue_position = queue_position,
         latency_ms = start.elapsed().as_millis(),
-        "Completed request"
+        "Accepted queued request"
     );
-    result
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "run_id": run_id,
+        "state": "queued",
+        "queue_position": queue_position,
+    })))
 }
 
 async fn api_send_stream(
@@ -839,20 +713,12 @@ async fn api_send_stream(
     state.run_hub.create(&run_id).await;
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();
-    let lock = state.session_hub.lock_for(&key, &state.limits).await;
     let limits = state.limits.clone();
-    let key_for_release = key.clone();
-        info!(
-            target: "web",
-            endpoint = "/api/send_stream",
-        run_id = %run_id,
-        latency_ms = start.elapsed().as_millis(),
-        "Accepted stream run"
-    );
-
-    tokio::spawn(async move {
+    let queue_position = state
+        .app_state
+        .chat_queue
+        .enqueue(chat_id, async move {
         let run_start = Instant::now();
-        let _guard = lock.lock().await;
         state_for_task
             .run_hub
             .publish(
@@ -1057,10 +923,6 @@ async fn api_send_stream(
         }
         drop(evt_tx);
         let _ = forward.await;
-        state_for_task
-            .request_hub
-            .end_with_limits(&key_for_release, &limits)
-            .await;
         info!(
             target: "web",
             endpoint = "/api/send_stream",
@@ -1074,11 +936,44 @@ async fn api_send_stream(
             .run_hub
             .remove_later(run_id_for_task, 300)
             .await;
-    });
+    })
+        .await;
+
+    state
+        .run_hub
+        .publish(
+            &run_id,
+            "status",
+            json!({
+                "message": if queue_position > 1 {
+                    format!("queued ({} ahead)", queue_position.saturating_sub(1))
+                } else {
+                    "queued".to_string()
+                }
+            })
+            .to_string(),
+            limits.run_history_limit,
+        )
+        .await;
+    state
+        .request_hub
+        .end_with_limits(&key, &state.limits)
+        .await;
+    info!(
+        target: "web",
+        endpoint = "/api/send_stream",
+        chat_id = chat_id,
+        run_id = %run_id,
+        queue_position = queue_position,
+        latency_ms = start.elapsed().as_millis(),
+        "Accepted stream run"
+    );
 
     Ok(Json(json!({
         "ok": true,
         "run_id": run_id,
+        "state": "queued",
+        "queue_position": queue_position,
     })))
 }
 
@@ -1183,17 +1078,6 @@ async fn api_run_status(
         "done": done,
         "last_event_id": last_event_id,
     })))
-}
-
-async fn send_and_store_response(
-    state: WebState,
-    body: SendRequest,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
-    let key = format!("chat:{}", chat_id);
-    let lock = state.session_hub.lock_for(&key, &state.limits).await;
-    let _guard = lock.lock().await;
-    send_and_store_response_with_events(state, body, None).await
 }
 
 async fn send_and_store_response_with_events(
@@ -2007,7 +1891,6 @@ pub async fn start_web_server(state: Arc<AppState>) {
         auth_token: state.config.web_auth_token.clone(),
         app_state: state.clone(),
         run_hub: RunHub::default(),
-        session_hub: SessionHub::default(),
         request_hub: RequestHub::default(),
         limits,
     };
@@ -2291,7 +2174,6 @@ fn build_router(web_state: WebState) -> Router {
         .route("/icon.png", get(icon_file))
         .route("/favicon.ico", get(favicon_file))
         .route("/api/health", get(api_health))
-        .route("/api/config", get(api_get_config).put(api_update_config))
         .route("/api/chat", get(api_chat))
         .route("/api/contacts/bind", post(api_contacts_bind))
         .route("/api/contacts/unlink", post(api_contacts_unlink))
@@ -2499,7 +2381,7 @@ mod tests {
             web_search_searxng_url: None,
             cursor_agent_cli_path: "cursor-agent".into(),
             cursor_agent_model: String::new(),
-            cursor_agent_timeout_secs: 600,
+            cursor_agent_timeout_secs: 1500,
             social: None,
             vault: None,
             orchestrator_enabled: true,
@@ -2541,6 +2423,7 @@ mod tests {
             llm,
             tools: ToolRegistry::new(&cfg, bot, db),
             discord_http: None,
+            chat_queue: crate::chat_queue::ChatRunQueue::default(),
         };
         Arc::new(state)
     }
@@ -2555,7 +2438,6 @@ mod tests {
             app_state: state,
             auth_token,
             run_hub: RunHub::default(),
-            session_hub: SessionHub::default(),
             request_hub: RequestHub::default(),
             limits,
         }

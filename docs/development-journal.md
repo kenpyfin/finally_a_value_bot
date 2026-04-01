@@ -20,6 +20,46 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 <!-- Add entries below this line, newest first. -->
 
+### 2026-04-01 — Remove web runtime config editor
+
+- **Area:** web / frontend / api
+- **Summary:** Removed the web chat runtime config feature so the UI no longer fetches or updates config at runtime. The web API config endpoints were also removed to keep behavior aligned with the frontend.
+- **Rationale:** Runtime config editing in the chat UI adds an admin control path directly in the frontend and encourages mutable-in-place server config from browser sessions. This change keeps web chat focused on conversation and uses normal config files/deploy flow instead.
+- **Key files / symbols:**
+  - `web/src/main.tsx` — removed `Runtime Config` dialog/state and `/api/config` calls.
+  - `web/src/components/session-sidebar.tsx` — removed runtime config action/button and `onOpenConfig` prop.
+  - `src/web.rs` — removed `UpdateConfigRequest`, `api_get_config`, `api_update_config`, and `/api/config` router entry.
+  - `web/dist/index.html`, `web/dist/assets/index-BXcaORuE.js` — rebuilt frontend bundle after source removal.
+- **Follow-ups:** If admin config changes are still needed, move them behind an explicit admin interface outside the chat app (or keep them CLI/env-only).
+
+### 2026-03-29 — Raise long-run timeout defaults to 1500s
+
+- **Area:** agent / tools / config
+- **Summary:** Increased the 600-second execution guardrails to 1500 seconds for long-running tool workflows, including the main agent tool execution timeout and tool defaults used by `bash` and `cursor_agent`.
+- **Rationale:** Legitimate long processes were being cut off at 600s. The queue architecture now protects foreground responsiveness, so a larger bounded timeout improves completion rate without removing safety limits.
+- **Key files / symbols:**
+  - `src/channels/telegram.rs` — `TOOL_EXECUTION_TIMEOUT_SECS` changed from `600` to `1500`.
+  - `src/tools/bash.rs` — default `timeout_secs` changed from `600` to `1500` (schema + runtime default).
+  - `src/config.rs` — `default_cursor_agent_timeout_secs()` now `1500`; updated config field docs/default test fixture value.
+  - `src/tools/cursor_agent.rs` — tool schema text updated to reflect `1500`.
+  - `src/config_wizard.rs`, `src/web.rs`, `src/llm.rs` — aligned embedded default/test config values for `cursor_agent_timeout_secs`.
+- **Follow-ups:** If needed, make the main tool execution timeout (`TOOL_EXECUTION_TIMEOUT_SECS`) configurable via `.env` to tune per deployment without code changes.
+
+### 2026-03-28 — Chat-scoped background queue for agent runs
+
+- **Area:** channels / web / scheduler / queueing
+- **Summary:** Added a centralized per-`chat_id` FIFO queue and routed Telegram, Discord, WhatsApp, web send endpoints, and scheduler executions through it so agent runs are accepted immediately and processed asynchronously in deterministic order per chat.
+- **Rationale:** Foreground/awaited processing blocked users from continuing conversation while a run was in progress. A shared queue removes that UX bottleneck and prevents overlapping agent loops in the same chat.
+- **Key files / symbols:**
+  - `src/chat_queue.rs` — `ChatRunQueue::enqueue`, per-chat lane worker lifecycle and pending-position tracking.
+  - `src/channels/telegram.rs` — `AppState.chat_queue`; `handle_message` now enqueues the existing evented agent run/delivery pipeline.
+  - `src/channels/discord.rs` — message handler now enqueues run execution and delivery by canonical chat.
+  - `src/channels/whatsapp.rs` — webhook processing now enqueues persona runs and WhatsApp response delivery.
+  - `src/scheduler.rs` — due-task execution now enqueues `run_scheduled_agent_and_finalize` into the shared chat lane.
+  - `src/web.rs` — `/api/send` and `/api/send_stream` now enqueue runs and return queued acknowledgements with `run_id` + `queue_position`; request inflight accounting is released on accept.
+  - `web/src/main.tsx` — adapter switched to enqueue-ack behavior (no per-token wait), tracks pending run IDs, polls `/api/run_status`, and refreshes history on completion.
+- **Follow-ups:** Web SSE endpoints still emit run events, but the UI now uses queue ack + completion polling; if richer live queue dashboards are needed, add explicit queue-state API fields beyond run completion.
+
 ### 2026-03-27 — Enable markdown tables in web chat
 
 - **Area:** web / frontend rendering

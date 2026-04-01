@@ -46,24 +46,6 @@ impl SendMessageTool {
         }
     }
 
-    async fn store_bot_message(&self, chat_id: i64, content: String) -> Result<(), String> {
-        let persona_id = call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(chat_id))
-            .await
-            .map_err(|e| format!("Failed to resolve persona: {e}"))?;
-        let msg = StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            persona_id,
-            sender_name: self.bot_username.clone(),
-            content,
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
-        call_blocking(self.db.clone(), move |db| db.store_message(&msg))
-            .await
-            .map_err(|e| format!("Failed to store sent message: {e}"))
-    }
-
     async fn send_telegram_attachment(
         &self,
         chat_id: i64,

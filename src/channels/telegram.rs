@@ -14,6 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 
 use crate::claude::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
+use crate::chat_queue::ChatRunQueue;
 use crate::config::Config;
 use crate::db::{call_blocking, Database, StoredMessage};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
@@ -62,6 +63,7 @@ pub struct AppState {
     pub tools: ToolRegistry,
     /// When Discord is enabled, used by deliver_to_contact to send to bound Discord channels.
     pub discord_http: Option<Arc<SerenityHttp>>,
+    pub chat_queue: ChatRunQueue,
 }
 
 const PERSONA_SWITCH_CALLBACK_PREFIX: &str = "persona:switch:";
@@ -173,6 +175,7 @@ pub async fn run_bot(
         llm,
         tools,
         discord_http,
+        chat_queue: ChatRunQueue::default(),
     });
 
     // Start scheduler
@@ -850,14 +853,16 @@ async fn handle_message(
         text.chars().take(100).collect::<String>()
     );
 
-    // Run agent in a background task so webhook/request timeout cannot kill it before the reply is sent.
+    // Queue agent work by canonical chat so responses are serialized per contact.
     let state_spawn = state.clone();
     let bot_spawn = bot.clone();
     let chat_id_spawn = msg.chat.id;
     let thread_id_spawn = msg.thread_id;
     let runtime_chat_type_owned = runtime_chat_type.to_string();
     let canonical_chat_id_spawn = canonical_chat_id;
-    tokio::spawn(async move {
+    let queue_position = state
+        .chat_queue
+        .enqueue(canonical_chat_id_spawn, async move {
         // Typing indicator for the duration of the run
         let typing_bot = bot_spawn.clone();
         let typing_chat_id = chat_id_spawn;
@@ -1027,7 +1032,14 @@ async fn handle_message(
                 let _ = req.await;
             }
         }
-    });
+    })
+        .await;
+    info!(
+        target: "queue",
+        chat_id = canonical_chat_id,
+        queue_position = queue_position,
+        "Enqueued Telegram agent run"
+    );
 
     Ok(())
 }
@@ -1298,7 +1310,7 @@ pub async fn process_with_agent_with_events(
     // - Tool execution timeout: prevents hanging on slow/unresponsive tools (e.g., browser, bash)
     // Both timeouts are critical to ensure the bot always sends a response.
     const LLM_ROUND_TIMEOUT_SECS: u64 = 180;
-    const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 600;
+    const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 1500;
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();

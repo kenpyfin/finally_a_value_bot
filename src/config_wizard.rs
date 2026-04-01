@@ -451,7 +451,7 @@ fn default_config() -> Config {
         web_search_searxng_url: None,
         cursor_agent_cli_path: crate::config::default_cursor_agent_cli_path(),
         cursor_agent_model: String::new(),
-        cursor_agent_timeout_secs: 600,
+        cursor_agent_timeout_secs: 1500,
         social: None,
         vault: None,
         orchestrator_enabled: true,

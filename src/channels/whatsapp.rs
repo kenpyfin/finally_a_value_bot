@@ -465,62 +465,78 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     text.chars().take(100).collect::<String>()
                 );
 
-                // Process with Claude (reuses the same agentic loop as Telegram)
-                match crate::telegram::process_with_agent(
-                    &state.app_state,
-                    AgentRequestContext {
-                        caller_channel: "whatsapp",
-                        chat_id,
-                        chat_type: "private",
-                        persona_id,
-                        is_scheduled_task: false,
-                        is_background_job: false,
-                    },
-                    None,
-                    image_data,
-                )
-                .await
-                {
-                    Ok(response) => {
-                        if !response.is_empty() {
-                            let response = with_persona_indicator(state.app_state.db.clone(), persona_id, &response).await;
-                            send_whatsapp_message(
-                                &state.http_client,
-                                &state.access_token,
-                                &state.phone_number_id,
-                                &message.from,
-                                &response,
-                            )
-                            .await;
-
-                            // Store bot response
-                            let bot_msg = StoredMessage {
-                                id: uuid::Uuid::new_v4().to_string(),
+                // Queue by canonical chat so WhatsApp runs are backgrounded and ordered.
+                let app_state = state.app_state.clone();
+                let chat_queue = app_state.chat_queue.clone();
+                let http_client = state.http_client.clone();
+                let access_token = state.access_token.clone();
+                let phone_number_id = state.phone_number_id.clone();
+                let to_phone = message.from.clone();
+                let queue_position = chat_queue
+                    .enqueue(chat_id, async move {
+                        match crate::telegram::process_with_agent(
+                            &app_state,
+                            AgentRequestContext {
+                                caller_channel: "whatsapp",
                                 chat_id,
+                                chat_type: "private",
                                 persona_id,
-                                sender_name: state.app_state.config.bot_username.clone(),
-                                content: response,
-                                is_from_bot: true,
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                            };
-                            let _ = call_blocking(state.app_state.db.clone(), move |db| {
-                                db.store_message(&bot_msg)
-                            })
-                            .await;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error processing WhatsApp message: {e}");
-                        send_whatsapp_message(
-                            &state.http_client,
-                            &state.access_token,
-                            &state.phone_number_id,
-                            &message.from,
-                            &format!("Error: {e}"),
+                                is_scheduled_task: false,
+                                is_background_job: false,
+                            },
+                            None,
+                            image_data,
                         )
-                        .await;
-                    }
-                }
+                        .await
+                        {
+                            Ok(response) => {
+                                if !response.is_empty() {
+                                    let response = with_persona_indicator(app_state.db.clone(), persona_id, &response).await;
+                                    send_whatsapp_message(
+                                        &http_client,
+                                        &access_token,
+                                        &phone_number_id,
+                                        &to_phone,
+                                        &response,
+                                    )
+                                    .await;
+
+                                    // Store bot response
+                                    let bot_msg = StoredMessage {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        chat_id,
+                                        persona_id,
+                                        sender_name: app_state.config.bot_username.clone(),
+                                        content: response,
+                                        is_from_bot: true,
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    };
+                                    let _ = call_blocking(app_state.db.clone(), move |db| {
+                                        db.store_message(&bot_msg)
+                                    })
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error processing WhatsApp message: {e}");
+                                send_whatsapp_message(
+                                    &http_client,
+                                    &access_token,
+                                    &phone_number_id,
+                                    &to_phone,
+                                    &format!("Error: {e}"),
+                                )
+                                .await;
+                            }
+                        }
+                    })
+                    .await;
+                info!(
+                    target: "queue",
+                    chat_id = chat_id,
+                    queue_position = queue_position,
+                    "Enqueued WhatsApp agent run"
+                );
             }
         }
     }

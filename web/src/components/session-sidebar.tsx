@@ -13,7 +13,6 @@ type SessionSidebarProps = {
   onPersonaSelect: (personaName: string) => void
   onCreatePersona: () => void
   onDeletePersona: (personaId: number) => void
-  onOpenConfig: () => Promise<void>
 }
 
 export function SessionSidebar({
@@ -27,7 +26,6 @@ export function SessionSidebar({
   onPersonaSelect,
   onCreatePersona,
   onDeletePersona,
-  onOpenConfig,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
@@ -232,9 +230,6 @@ export function SessionSidebar({
       </div>
 
       <div className={isDark ? 'mt-4 border-t border-[color:var(--mc-border-soft)] pt-3' : 'mt-4 border-t border-slate-200 pt-3'}>
-        <Button size="2" variant="soft" onClick={() => void onOpenConfig()} style={{ width: '100%' }}>
-          Runtime Config
-        </Button>
         <div className="mt-3 flex flex-col items-center gap-1">
           <a
             href="https://finally-a-value-bot.ai"

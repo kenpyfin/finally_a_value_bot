@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { ReadonlyJSONObject, ReadonlyJSONValue } from 'assistant-stream/utils'
 import {
   AssistantRuntimeProvider,
   MessagePrimitive,
@@ -28,7 +27,6 @@ import {
   Flex,
   Heading,
   Select,
-  Switch,
   Text,
   TextField,
   Theme,
@@ -40,36 +38,12 @@ import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
 import type { Persona, ScheduleTask, ChannelBinding, BackgroundJob } from './types'
 
-type ConfigPayload = Record<string, unknown>
-
-type StreamEvent = {
-  event: string
-  payload: Record<string, unknown>
-}
-
 type BackendMessage = {
   id?: string
   sender_name?: string
   content?: string
   is_from_bot?: boolean
   timestamp?: string
-}
-
-type ToolStartPayload = {
-  tool_use_id: string
-  name: string
-  input?: unknown
-}
-
-type ToolResultPayload = {
-  tool_use_id: string
-  name: string
-  is_error?: boolean
-  output?: unknown
-  duration_ms?: number
-  bytes?: number
-  status_code?: number
-  error_type?: string
 }
 
 type Appearance = 'dark' | 'light'
@@ -85,73 +59,6 @@ type UiTheme =
   | 'orange'
   | 'indigo'
 
-const PROVIDER_SUGGESTIONS = [
-  'openai',
-  'ollama',
-  'openrouter',
-  'anthropic',
-  'google',
-  'alibaba',
-  'deepseek',
-  'moonshot',
-  'mistral',
-  'azure',
-  'bedrock',
-  'zhipu',
-  'minimax',
-  'cohere',
-  'tencent',
-  'xai',
-  'huggingface',
-  'together',
-  'custom',
-]
-
-const MODEL_OPTIONS: Record<string, string[]> = {
-  anthropic: ['claude-sonnet-4-5-20250929', 'claude-opus-4-1-20250805', 'claude-3-7-sonnet-latest'],
-  openai: ['gpt-5.2', 'gpt-5', 'gpt-4.1'],
-  ollama: ['llama3.2', 'qwen2.5', 'deepseek-r1'],
-  openrouter: ['openai/gpt-5', 'anthropic/claude-sonnet-4-5', 'google/gemini-2.5-pro'],
-  deepseek: ['deepseek-chat', 'deepseek-reasoner'],
-  google: ['gemini-2.5-pro', 'gemini-2.5-flash'],
-}
-
-const DEFAULT_CONFIG_VALUES = {
-  llm_provider: 'anthropic',
-  max_tokens: 8192,
-  max_tool_iterations: 100,
-  max_document_size_mb: 100,
-  show_thinking: false,
-  web_enabled: true,
-  web_host: '127.0.0.1',
-  web_port: 10961,
-  safety_output_guard_mode: 'moderate',
-  safety_max_emojis_per_response: 12,
-  safety_tail_repeat_limit: 8,
-  safety_execution_mode: 'warn_confirm',
-  safety_risky_categories: ['destructive', 'system', 'network', 'package'],
-}
-
-const OUTPUT_GUARD_MODE_OPTIONS = ['off', 'moderate', 'strict'] as const
-const EXECUTION_MODE_OPTIONS = ['off', 'warn_confirm', 'strict'] as const
-const RISKY_CATEGORY_OPTIONS = ['destructive', 'system', 'network', 'package'] as const
-
-function riskyCategoryTooltip(category: string, enabled: boolean): string {
-  const meaning =
-    category === 'destructive'
-      ? 'Delete/overwrite commands (for example rm -rf, mkfs).'
-      : category === 'system'
-        ? 'System/service/process control commands (for example systemctl, reboot, sudo).'
-        : category === 'network'
-          ? 'Network commands that can mutate external state (for example POST/PUT/PATCH/DELETE requests).'
-          : 'Package manager install/remove commands (for example apt, npm install/uninstall).'
-
-  const action = enabled
-    ? 'Selected: this category is protected by execution safety mode.'
-    : 'Deselected: this category is not protected by execution safety mode.'
-
-  return `${meaning} ${action}`
-}
 
 const UI_THEME_OPTIONS: { key: UiTheme; label: string; color: string }[] = [
   { key: 'green', label: 'Green', color: '#34d399' },
@@ -177,13 +84,6 @@ const RADIX_ACCENT_BY_THEME: Record<UiTheme, string> = {
   teal: 'teal',
   orange: 'orange',
   indigo: 'indigo',
-}
-
-function defaultModelForProvider(providerRaw: string): string {
-  const provider = providerRaw.trim().toLowerCase()
-  if (provider === 'anthropic') return 'claude-sonnet-4-5-20250929'
-  if (provider === 'ollama') return 'llama3.2'
-  return 'gpt-5.2'
 }
 
 function readAppearance(): Appearance {
@@ -323,82 +223,6 @@ async function api<T>(
     throw new Error(messageForFailedResponse(res.status, data, bodyText))
   }
   return data as T
-}
-
-async function* parseSseFrames(
-  response: Response,
-  signal: AbortSignal,
-): AsyncGenerator<StreamEvent, void> {
-  if (!response.body) {
-    throw new Error('empty stream body')
-  }
-
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let pending = ''
-  let eventName = 'message'
-  let dataLines: string[] = []
-
-  const flush = (): StreamEvent | null => {
-    if (dataLines.length === 0) return null
-    const raw = dataLines.join('\n')
-    dataLines = []
-
-    let payload: Record<string, unknown> = {}
-    try {
-      payload = JSON.parse(raw) as Record<string, unknown>
-    } catch {
-      payload = { raw }
-    }
-
-    const event: StreamEvent = { event: eventName, payload }
-    eventName = 'message'
-    return event
-  }
-
-  const handleLine = (line: string): StreamEvent | null => {
-    if (line === '') return flush()
-    if (line.startsWith(':')) return null
-
-    const sep = line.indexOf(':')
-    const field = sep >= 0 ? line.slice(0, sep) : line
-    let value = sep >= 0 ? line.slice(sep + 1) : ''
-    if (value.startsWith(' ')) value = value.slice(1)
-
-    if (field === 'event') eventName = value
-    if (field === 'data') dataLines.push(value)
-
-    return null
-  }
-
-  while (true) {
-    if (signal.aborted) return
-
-    const { done, value } = await reader.read()
-    pending += decoder.decode(value || new Uint8Array(), { stream: !done })
-
-    while (true) {
-      const idx = pending.indexOf('\n')
-      if (idx < 0) break
-      let line = pending.slice(0, idx)
-      pending = pending.slice(idx + 1)
-      if (line.endsWith('\r')) line = line.slice(0, -1)
-      const event = handleLine(line)
-      if (event) yield event
-    }
-
-    if (done) {
-      if (pending.length > 0) {
-        let line = pending
-        if (line.endsWith('\r')) line = line.slice(0, -1)
-        const event = handleLine(line)
-        if (event) yield event
-      }
-      const event = flush()
-      if (event) yield event
-      return
-    }
-  }
 }
 
 type SendAttachmentPayload = {
@@ -541,22 +365,6 @@ function asObject(value: unknown): Record<string, unknown> {
   return {}
 }
 
-function toJsonValue(value: unknown): ReadonlyJSONValue {
-  try {
-    return JSON.parse(JSON.stringify(value)) as ReadonlyJSONValue
-  } catch {
-    return String(value)
-  }
-}
-
-function toJsonObject(value: unknown): ReadonlyJSONObject {
-  const normalized = toJsonValue(value)
-  if (typeof normalized === 'object' && normalized !== null && !Array.isArray(normalized)) {
-    return normalized as ReadonlyJSONObject
-  }
-  return {}
-}
-
 function formatUnknown(value: unknown): string {
   if (typeof value === 'string') return value
   try {
@@ -564,14 +372,6 @@ function formatUnknown(value: unknown): string {
   } catch {
     return String(value)
   }
-}
-
-function readStringArray(value: unknown, fallback: readonly string[]): string[] {
-  if (!Array.isArray(value)) return [...fallback]
-  const out = value
-    .map((v) => (typeof v === 'string' ? v.trim().toLowerCase() : ''))
-    .filter((v) => v.length > 0)
-  return out.length > 0 ? out : [...fallback]
 }
 
 function ToolCallCard(props: ToolCallMessagePartProps) {
@@ -729,11 +529,6 @@ function App() {
   const [error, setError] = useState<string>('')
   const [statusText, setStatusText] = useState<string>('Idle')
   const [replayNotice, setReplayNotice] = useState<string>('')
-  const [sending, setSending] = useState<boolean>(false)
-  const [configOpen, setConfigOpen] = useState<boolean>(false)
-  const [config, setConfig] = useState<ConfigPayload | null>(null)
-  const [configDraft, setConfigDraft] = useState<Record<string, unknown>>({})
-  const [saveStatus, setSaveStatus] = useState<string>('')
   const [authRequired, setAuthRequired] = useState<boolean>(false)
   const [authTokenInput, setAuthTokenInput] = useState<string>('')
   const [personas, setPersonas] = useState<Persona[]>([])
@@ -747,7 +542,7 @@ function App() {
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
   const [bgJobs, setBgJobs] = useState<BackgroundJob[]>([])
   const [bgJobsOpen, setBgJobsOpen] = useState<boolean>(false)
-  const sendingRef = React.useRef<boolean>(false)
+  const [pendingRunIds, setPendingRunIds] = useState<string[]>([])
 
   React.useEffect(() => {
     const onAuthRequired = () => setAuthRequired(true)
@@ -863,12 +658,7 @@ function App() {
       run: async function* (options): AsyncGenerator<ChatModelRunResult, void> {
         const { text: userText, attachments } = await extractLatestUserInput(options.messages)
         if (!userText && attachments.length === 0) return
-        if (sendingRef.current) {
-          throw new Error('A response is already in progress. Please wait for it to finish.')
-        }
-        sendingRef.current = true
 
-        setSending(true)
         setStatusText('Sending...')
         setReplayNotice('')
         setError('')
@@ -902,191 +692,21 @@ function App() {
           if (!runId) {
             throw new Error('missing run_id')
           }
-
-          let receivedDone = false
-
-          const query = new URLSearchParams({ run_id: runId })
-          const streamResponse = await fetch(`/api/stream?${query.toString()}`, {
-            method: 'GET',
-            headers: makeHeaders(),
-            cache: 'no-store',
-            signal: options.abortSignal,
-          })
-
-          if (streamResponse.status === 401) {
-            window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
-            throw new Error('Unauthorized. Enter the API token (WEB_AUTH_TOKEN from .env).')
-          }
-          if (!streamResponse.ok) {
-            const text = await streamResponse.text().catch(() => '')
-            const msg =
-              streamResponse.status === 429
-                ? 'Too many requests. Please wait a moment before sending again.'
-                : messageForFailedResponse(streamResponse.status, { message: text || undefined }, text)
-            throw new Error(msg)
-          }
-
-          let assistantText = ''
-          const toolState = new Map<
-            string,
-            {
-              name: string
-              args: ReadonlyJSONObject
-              result?: ReadonlyJSONValue
-              isError?: boolean
-            }
-          >()
-
-          const makeContent = () => {
-            const toolParts = Array.from(toolState.entries()).map(([toolCallId, tool]) => ({
-              type: 'tool-call' as const,
-              toolCallId,
-              toolName: tool.name,
-              args: tool.args,
-              argsText: JSON.stringify(tool.args),
-              ...(tool.result ? { result: tool.result } : {}),
-              ...(tool.isError !== undefined ? { isError: tool.isError } : {}),
-            }))
-
-            return [
-              ...(assistantText ? [{ type: 'text' as const, text: assistantText }] : []),
-              ...toolParts,
-            ]
-          }
-
-          for await (const event of parseSseFrames(streamResponse, options.abortSignal)) {
-            const data = event.payload
-
-            if (event.event === 'replay_meta') {
-              if (data.replay_truncated === true) {
-                const oldest = typeof data.oldest_event_id === 'number' ? data.oldest_event_id : null
-                const message =
-                  oldest !== null
-                    ? `Stream history was truncated. Recovery resumed from event #${oldest}.`
-                    : 'Stream history was truncated. Recovery resumed from the earliest available event.'
-                setReplayNotice(message)
-              }
-              continue
-            }
-
-            if (event.event === 'status') {
-              const message = typeof data.message === 'string' ? data.message : ''
-              if (message) setStatusText(message)
-              continue
-            }
-
-            if (event.event === 'tool_start') {
-              const payload = data as ToolStartPayload
-              if (!payload.tool_use_id || !payload.name) continue
-              toolState.set(payload.tool_use_id, {
-                name: payload.name,
-                args: toJsonObject(payload.input),
-              })
-              setStatusText(`tool: ${payload.name}...`)
-              const content = makeContent()
-              if (content.length > 0) yield { content }
-              continue
-            }
-
-            if (event.event === 'tool_result') {
-              const payload = data as ToolResultPayload
-              if (!payload.tool_use_id || !payload.name) continue
-
-              const previous = toolState.get(payload.tool_use_id)
-              const resultPayload: ReadonlyJSONObject = toJsonObject({
-                output: payload.output ?? '',
-                duration_ms: payload.duration_ms ?? null,
-                bytes: payload.bytes ?? null,
-                status_code: payload.status_code ?? null,
-                error_type: payload.error_type ?? null,
-              })
-
-              toolState.set(payload.tool_use_id, {
-                name: payload.name,
-                args: previous?.args ?? {},
-                result: resultPayload,
-                isError: Boolean(payload.is_error),
-              })
-
-              const ms = typeof payload.duration_ms === 'number' ? payload.duration_ms : 0
-              const bytes = typeof payload.bytes === 'number' ? payload.bytes : 0
-              setStatusText(`tool: ${payload.name} ${payload.is_error ? 'error' : 'ok'} ${ms}ms ${bytes}b`)
-              const content = makeContent()
-              if (content.length > 0) yield { content }
-              continue
-            }
-
-            if (event.event === 'delta') {
-              const delta = typeof data.delta === 'string' ? data.delta : ''
-              if (!delta) continue
-              assistantText += delta
-              const content = makeContent()
-              if (content.length > 0) yield { content }
-              continue
-            }
-
-            if (event.event === 'error') {
-              const message = typeof data.error === 'string' ? data.error : 'stream error'
-              throw new Error(message)
-            }
-
-            if (event.event === 'background_job') {
-              const bgMsg = typeof data.message === 'string' ? data.message : 'Task moved to background processing.'
-              assistantText += `\n\n${bgMsg}`
-              const content = makeContent()
-              if (content.length > 0) yield { content }
-              setStatusText('Background job started')
-              loadBackgroundJobs(chatId).catch(() => {})
-              continue
-            }
-
-            if (event.event === 'done') {
-              receivedDone = true
-              // Command shortcuts (e.g. /persona, /reset) return full response in done only, no deltas
-              const doneResponse =
-                typeof (data as { response?: string }).response === 'string'
-                  ? (data as { response: string }).response
-                  : ''
-              if (doneResponse && assistantText.length === 0) {
-                assistantText = doneResponse
-                const content = makeContent()
-                if (content.length > 0) yield { content }
-              }
-              setStatusText('Done')
-              break
-            }
-          }
-
-          // If stream ended without "done" (disconnect, tab close, timeout), poll until run completes so the user sees the result without sending a follow-up message.
-          if (!receivedDone && runId) {
-            const pollIntervalMs = 2500
-            const pollMaxMs = 10 * 60 * 1000 // 10 minutes
-            const start = Date.now()
-            while (Date.now() - start < pollMaxMs) {
-              await new Promise((r) => setTimeout(r, pollIntervalMs))
-              try {
-                const status = await api<{ done?: boolean }>(
-                  `/api/run_status?run_id=${encodeURIComponent(runId)}`,
-                )
-                if (status.done === true) {
-                  setStatusText('Done')
-                  await loadHistory(chatId)
-                  break
-                }
-              } catch {
-                // Run not found (404) or other error — stop polling
-                break
-              }
-            }
+          setPendingRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId]))
+          setStatusText('Queued')
+          yield {
+            content: [
+              {
+                type: 'text',
+                text: 'Queued. I will send the final reply when this run completes.',
+              },
+            ],
           }
         } finally {
-          sendingRef.current = false
-          setSending(false)
-          void loadHistory(chatId, activePersonaId ?? undefined)
         }
       },
     }),
-    [chatId, selectedSessionReadOnly, activePersonaId, sendingRef],
+    [chatId, selectedSessionReadOnly, activePersonaId],
   )
 
   function toggleAppearance(): void {
@@ -1122,150 +742,6 @@ function App() {
       setStatusText('Persona deleted')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  async function openConfig(): Promise<void> {
-    setSaveStatus('')
-    const data = await api<{ config?: ConfigPayload }>('/api/config')
-    setConfig(data.config || null)
-    setConfigDraft({
-      llm_provider: data.config?.llm_provider || '',
-      model: data.config?.model || defaultModelForProvider(String(data.config?.llm_provider || 'anthropic')),
-      llm_base_url: String(data.config?.llm_base_url || ''),
-      api_key: '',
-      max_tokens: Number(data.config?.max_tokens ?? 8192),
-      max_tool_iterations: Number(data.config?.max_tool_iterations ?? 100),
-      max_document_size_mb: Number(data.config?.max_document_size_mb ?? DEFAULT_CONFIG_VALUES.max_document_size_mb),
-      show_thinking: Boolean(data.config?.show_thinking),
-      web_enabled: Boolean(data.config?.web_enabled),
-      web_host: String(data.config?.web_host || '127.0.0.1'),
-      web_port: Number(data.config?.web_port ?? 10961),
-      web_auth_token: '',
-      safety_output_guard_mode: String(
-        data.config?.safety_output_guard_mode || DEFAULT_CONFIG_VALUES.safety_output_guard_mode,
-      ),
-      safety_max_emojis_per_response: Number(
-        data.config?.safety_max_emojis_per_response ?? DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response,
-      ),
-      safety_tail_repeat_limit: Number(
-        data.config?.safety_tail_repeat_limit ?? DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit,
-      ),
-      safety_execution_mode: String(
-        data.config?.safety_execution_mode || DEFAULT_CONFIG_VALUES.safety_execution_mode,
-      ),
-      safety_risky_categories: readStringArray(
-        data.config?.safety_risky_categories,
-        DEFAULT_CONFIG_VALUES.safety_risky_categories,
-      ),
-    })
-    setConfigOpen(true)
-  }
-
-  function setConfigField(field: string, value: unknown): void {
-    setConfigDraft((prev) => ({ ...prev, [field]: value }))
-  }
-
-  function resetConfigField(field: string): void {
-    setConfigDraft((prev) => {
-      const next = { ...prev }
-      switch (field) {
-        case 'llm_provider':
-          next.llm_provider = DEFAULT_CONFIG_VALUES.llm_provider
-          next.model = defaultModelForProvider(DEFAULT_CONFIG_VALUES.llm_provider)
-          break
-        case 'model':
-          next.model = defaultModelForProvider(String(next.llm_provider || DEFAULT_CONFIG_VALUES.llm_provider))
-          break
-        case 'llm_base_url':
-          next.llm_base_url = ''
-          break
-        case 'max_tokens':
-          next.max_tokens = DEFAULT_CONFIG_VALUES.max_tokens
-          break
-        case 'max_tool_iterations':
-          next.max_tool_iterations = DEFAULT_CONFIG_VALUES.max_tool_iterations
-          break
-        case 'max_document_size_mb':
-          next.max_document_size_mb = DEFAULT_CONFIG_VALUES.max_document_size_mb
-          break
-        case 'show_thinking':
-          next.show_thinking = DEFAULT_CONFIG_VALUES.show_thinking
-          break
-        case 'web_enabled':
-          next.web_enabled = DEFAULT_CONFIG_VALUES.web_enabled
-          break
-        case 'web_host':
-          next.web_host = DEFAULT_CONFIG_VALUES.web_host
-          break
-        case 'web_port':
-          next.web_port = DEFAULT_CONFIG_VALUES.web_port
-          break
-        case 'safety_output_guard_mode':
-          next.safety_output_guard_mode = DEFAULT_CONFIG_VALUES.safety_output_guard_mode
-          break
-        case 'safety_max_emojis_per_response':
-          next.safety_max_emojis_per_response = DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response
-          break
-        case 'safety_tail_repeat_limit':
-          next.safety_tail_repeat_limit = DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit
-          break
-        case 'safety_execution_mode':
-          next.safety_execution_mode = DEFAULT_CONFIG_VALUES.safety_execution_mode
-          break
-        case 'safety_risky_categories':
-          next.safety_risky_categories = [...DEFAULT_CONFIG_VALUES.safety_risky_categories]
-          break
-        default:
-          break
-      }
-      return next
-    })
-  }
-
-  async function saveConfigChanges(): Promise<void> {
-    try {
-      const payload: Record<string, unknown> = {
-        llm_provider: String(configDraft.llm_provider || ''),
-        model: String(configDraft.model || ''),
-        max_tokens: Number(configDraft.max_tokens || 8192),
-        max_tool_iterations: Number(configDraft.max_tool_iterations || 100),
-        max_document_size_mb: Number(
-          configDraft.max_document_size_mb || DEFAULT_CONFIG_VALUES.max_document_size_mb,
-        ),
-        show_thinking: Boolean(configDraft.show_thinking),
-        web_enabled: Boolean(configDraft.web_enabled),
-        web_host: String(configDraft.web_host || '127.0.0.1'),
-        web_port: Number(configDraft.web_port || 10961),
-        safety_output_guard_mode: String(
-          configDraft.safety_output_guard_mode || DEFAULT_CONFIG_VALUES.safety_output_guard_mode,
-        ),
-        safety_max_emojis_per_response: Number(
-          configDraft.safety_max_emojis_per_response || DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response,
-        ),
-        safety_tail_repeat_limit: Number(
-          configDraft.safety_tail_repeat_limit || DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit,
-        ),
-        safety_execution_mode: String(
-          configDraft.safety_execution_mode || DEFAULT_CONFIG_VALUES.safety_execution_mode,
-        ),
-        safety_risky_categories: readStringArray(
-          configDraft.safety_risky_categories,
-          DEFAULT_CONFIG_VALUES.safety_risky_categories,
-        ),
-      }
-      if (String(configDraft.llm_provider || '').trim().toLowerCase() === 'custom') {
-        payload.llm_base_url = String(configDraft.llm_base_url || '').trim() || null
-      }
-      const apiKey = String(configDraft.api_key || '').trim()
-      if (apiKey) payload.api_key = apiKey
-      const webAuthToken = String(configDraft.web_auth_token || '').trim()
-      if (webAuthToken) payload.web_auth_token = webAuthToken
-
-      await api('/api/config', { method: 'PUT', body: JSON.stringify(payload) })
-      setSaveStatus('Saved. Restart finally-a-value-bot to apply changes.')
-    } catch (e) {
-      setSaveStatus(`Save failed: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
@@ -1417,6 +893,39 @@ function App() {
     }
   }, [activePersonaId])
 
+  useEffect(() => {
+    setPendingRunIds([])
+  }, [chatId, activePersonaId])
+
+  useEffect(() => {
+    if (pendingRunIds.length === 0) return
+    let cancelled = false
+    const interval = setInterval(() => {
+      ;(async () => {
+        const completed: string[] = []
+        for (const runId of pendingRunIds) {
+          try {
+            const status = await api<{ done?: boolean }>(
+              `/api/run_status?run_id=${encodeURIComponent(runId)}`,
+            )
+            if (status.done === true) completed.push(runId)
+          } catch {
+            // run not found / auth issue / transient error: leave pending
+          }
+        }
+        if (cancelled || completed.length === 0) return
+        setPendingRunIds((prev) => prev.filter((id) => !completed.includes(id)))
+        setStatusText('Done')
+        void loadHistory(chatId, activePersonaId ?? undefined)
+      })()
+    }, 2500)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingRunIds, chatId, activePersonaId])
+
   // Poll background jobs while any are still in active subagent lifecycle states.
   useEffect(() => {
     const hasActive = bgJobs.some((j) =>
@@ -1459,23 +968,6 @@ function App() {
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
-  const currentProvider = String(configDraft.llm_provider || DEFAULT_CONFIG_VALUES.llm_provider).trim().toLowerCase()
-  const providerOptions = Array.from(
-    new Set([currentProvider, ...PROVIDER_SUGGESTIONS.map((p) => p.toLowerCase())].filter(Boolean)),
-  )
-  const modelOptions = MODEL_OPTIONS[currentProvider] || []
-  const sectionCardClass = appearance === 'dark'
-    ? 'rounded-xl border p-5'
-    : 'rounded-xl border border-slate-200/80 p-5'
-  const sectionCardStyle = appearance === 'dark'
-    ? { borderColor: 'color-mix(in srgb, var(--mc-border-soft) 68%, transparent)' }
-    : undefined
-  const toggleCardClass = appearance === 'dark'
-    ? 'rounded-lg border p-3'
-    : 'rounded-lg border border-slate-200/80 p-3'
-  const toggleCardStyle = appearance === 'dark'
-    ? { borderColor: 'color-mix(in srgb, var(--mc-border-soft) 60%, transparent)' }
-    : undefined
 
   function submitAuthToken() {
     const token = sanitizeHttpHeaderValue(authTokenInput)
@@ -1530,7 +1022,6 @@ function App() {
             onPersonaSelect={(name) => void switchPersona(name)}
             onCreatePersona={() => void onCreatePersona()}
             onDeletePersona={(id) => void onDeletePersona(id)}
-            onOpenConfig={openConfig}
           />
 
           <main
@@ -1747,320 +1238,6 @@ function App() {
           </main>
         </div>
 
-        <Dialog.Root open={configOpen} onOpenChange={setConfigOpen}>
-          <Dialog.Content maxWidth="760px">
-            <Dialog.Title>Runtime Config</Dialog.Title>
-            <Dialog.Description size="2" mb="3">
-              Save writes to .env. Restart may be required.
-            </Dialog.Description>
-            {config ? (
-              <Flex direction="column" gap="4">
-                <div className={sectionCardClass} style={sectionCardStyle}>
-                  <Text size="3" weight="bold">
-                    LLM
-                  </Text>
-                  <div className="mt-3 grid grid-cols-1 gap-3">
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Provider</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('llm_provider')}>Reset</Button>
-                      </Flex>
-                      <Select.Root
-                        value={String(configDraft.llm_provider || DEFAULT_CONFIG_VALUES.llm_provider)}
-                        onValueChange={(value) => setConfigField('llm_provider', value)}
-                      >
-                        <Select.Trigger placeholder="Select provider" />
-                        <Select.Content>
-                          {providerOptions.map((provider) => (
-                            <Select.Item key={provider} value={provider}>
-                              {provider}
-                            </Select.Item>
-                          ))}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Model</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('model')}>Reset</Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.model || defaultModelForProvider(String(configDraft.llm_provider || DEFAULT_CONFIG_VALUES.llm_provider)))}
-                        onChange={(e) => setConfigField('model', e.target.value)}
-                        placeholder="claude-sonnet-4-5-20250929"
-                      />
-                      {modelOptions.length > 0 ? (
-                        <Text size="1" color="gray" className="mt-1 block">
-                          Suggested: {modelOptions.join(' / ')}
-                        </Text>
-                      ) : null}
-                    </div>
-
-                    {currentProvider === 'custom' ? (
-                      <div>
-                        <Flex justify="between" align="center" mb="1">
-                          <Text size="1" color="gray">API Host</Text>
-                          <Button size="1" variant="ghost" onClick={() => resetConfigField('llm_base_url')}>Reset</Button>
-                        </Flex>
-                        <TextField.Root
-                          value={String(configDraft.llm_base_url || '')}
-                          onChange={(e) => setConfigField('llm_base_url', e.target.value)}
-                          placeholder="https://your-provider.example/v1"
-                        />
-                      </div>
-                    ) : null}
-
-                    <div>
-                      <Text size="1" color="gray">API key (leave blank to keep existing)</Text>
-                      <TextField.Root
-                        className="mt-2"
-                        value={String(configDraft.api_key || '')}
-                        onChange={(e) => setConfigField('api_key', e.target.value)}
-                        placeholder="api_key"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className={sectionCardClass} style={sectionCardStyle}>
-                  <Text size="3" weight="bold">
-                    Runtime
-                  </Text>
-                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Max tokens</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('max_tokens')}>Reset</Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.max_tokens || DEFAULT_CONFIG_VALUES.max_tokens)}
-                        onChange={(e) => setConfigField('max_tokens', e.target.value)}
-                        placeholder="max_tokens"
-                      />
-                    </div>
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Max tool iterations</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('max_tool_iterations')}>Reset</Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.max_tool_iterations || DEFAULT_CONFIG_VALUES.max_tool_iterations)}
-                        onChange={(e) => setConfigField('max_tool_iterations', e.target.value)}
-                        placeholder="max_tool_iterations"
-                      />
-                    </div>
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Max document size (MB)</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('max_document_size_mb')}>Reset</Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.max_document_size_mb || DEFAULT_CONFIG_VALUES.max_document_size_mb)}
-                        onChange={(e) => setConfigField('max_document_size_mb', e.target.value)}
-                        placeholder="max_document_size_mb"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className={sectionCardClass} style={sectionCardStyle}>
-                  <Text size="3" weight="bold">
-                    Safety
-                  </Text>
-                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Output guard mode</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_output_guard_mode')}>
-                          Reset
-                        </Button>
-                      </Flex>
-                      <Select.Root
-                        value={String(configDraft.safety_output_guard_mode || DEFAULT_CONFIG_VALUES.safety_output_guard_mode)}
-                        onValueChange={(value) => setConfigField('safety_output_guard_mode', value)}
-                      >
-                        <Select.Trigger />
-                        <Select.Content>
-                          {OUTPUT_GUARD_MODE_OPTIONS.map((mode) => (
-                            <Select.Item key={mode} value={mode}>
-                              {mode}
-                            </Select.Item>
-                          ))}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Execution safety mode</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_execution_mode')}>
-                          Reset
-                        </Button>
-                      </Flex>
-                      <Select.Root
-                        value={String(configDraft.safety_execution_mode || DEFAULT_CONFIG_VALUES.safety_execution_mode)}
-                        onValueChange={(value) => setConfigField('safety_execution_mode', value)}
-                      >
-                        <Select.Trigger />
-                        <Select.Content>
-                          {EXECUTION_MODE_OPTIONS.map((mode) => (
-                            <Select.Item key={mode} value={mode}>
-                              {mode}
-                            </Select.Item>
-                          ))}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Max emojis per response</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_max_emojis_per_response')}>
-                          Reset
-                        </Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.safety_max_emojis_per_response || DEFAULT_CONFIG_VALUES.safety_max_emojis_per_response)}
-                        onChange={(e) => setConfigField('safety_max_emojis_per_response', e.target.value)}
-                        placeholder="12"
-                      />
-                    </div>
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Tail repeat limit</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_tail_repeat_limit')}>
-                          Reset
-                        </Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.safety_tail_repeat_limit || DEFAULT_CONFIG_VALUES.safety_tail_repeat_limit)}
-                        onChange={(e) => setConfigField('safety_tail_repeat_limit', e.target.value)}
-                        placeholder="8"
-                      />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <Flex justify="between" align="center" mb="2">
-                      <Text size="1" color="gray">Risky command categories</Text>
-                      <Button size="1" variant="ghost" onClick={() => resetConfigField('safety_risky_categories')}>
-                        Reset
-                      </Button>
-                    </Flex>
-                    <Flex gap="2" wrap="wrap">
-                      {RISKY_CATEGORY_OPTIONS.map((category) => {
-                        const current = readStringArray(
-                          configDraft.safety_risky_categories,
-                          DEFAULT_CONFIG_VALUES.safety_risky_categories,
-                        )
-                        const enabled = current.includes(category)
-                        return (
-                          <Button
-                            key={category}
-                            size="1"
-                            variant={enabled ? 'solid' : 'soft'}
-                            title={riskyCategoryTooltip(category, enabled)}
-                            onClick={() => {
-                              const next = enabled
-                                ? current.filter((c) => c !== category)
-                                : [...current, category]
-                              setConfigField('safety_risky_categories', next)
-                            }}
-                          >
-                            {category}
-                          </Button>
-                        )
-                      })}
-                    </Flex>
-                    <Text size="1" color="gray" className="mt-2 block">
-                      Selected categories are protected by execution safety mode. Deselected categories are allowed without that category-specific safeguard.
-                    </Text>
-                  </div>
-                </div>
-
-                <div className={sectionCardClass} style={sectionCardStyle}>
-                  <Text size="3" weight="bold">
-                    Web
-                  </Text>
-                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Host</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('web_host')}>Reset</Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.web_host || DEFAULT_CONFIG_VALUES.web_host)}
-                        onChange={(e) => setConfigField('web_host', e.target.value)}
-                        placeholder="web_host"
-                      />
-                    </div>
-                    <div>
-                      <Flex justify="between" align="center" mb="1">
-                        <Text size="1" color="gray">Port</Text>
-                        <Button size="1" variant="ghost" onClick={() => resetConfigField('web_port')}>Reset</Button>
-                      </Flex>
-                      <TextField.Root
-                        value={String(configDraft.web_port || DEFAULT_CONFIG_VALUES.web_port)}
-                        onChange={(e) => setConfigField('web_port', e.target.value)}
-                        placeholder="web_port"
-                      />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <Text size="1" color="gray">Web auth token (leave blank to keep existing)</Text>
-                    <TextField.Root
-                      type="password"
-                      className="mt-2"
-                      value={String(configDraft.web_auth_token || '')}
-                      onChange={(e) => setConfigField('web_auth_token', e.target.value)}
-                      placeholder="WEB_AUTH_TOKEN"
-                    />
-                  </div>
-                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <div className={toggleCardClass} style={toggleCardStyle}>
-                      <Flex justify="between" align="center">
-                        <Text size="2">show_thinking</Text>
-                        <Switch
-                          checked={Boolean(configDraft.show_thinking)}
-                          onCheckedChange={(checked) => setConfigField('show_thinking', checked)}
-                        />
-                      </Flex>
-                      <Button size="1" variant="ghost" className="mt-2" onClick={() => resetConfigField('show_thinking')}>
-                        Reset to default
-                      </Button>
-                    </div>
-                    <div className={toggleCardClass} style={toggleCardStyle}>
-                      <Flex justify="between" align="center">
-                        <Text size="2">web_enabled</Text>
-                        <Switch
-                          checked={Boolean(configDraft.web_enabled)}
-                          onCheckedChange={(checked) => setConfigField('web_enabled', checked)}
-                        />
-                      </Flex>
-                      <Button size="1" variant="ghost" className="mt-2" onClick={() => resetConfigField('web_enabled')}>
-                        Reset to default
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-
-                {saveStatus ? (
-                  <Text size="2" color={saveStatus.startsWith('Save failed') ? 'red' : 'green'}>
-                    {saveStatus}
-                  </Text>
-                ) : null}
-                <Flex justify="end" gap="2" mt="1">
-                  <Dialog.Close>
-                    <Button variant="soft">Close</Button>
-                  </Dialog.Close>
-                  <Button onClick={() => void saveConfigChanges()}>Save</Button>
-                </Flex>
-              </Flex>
-            ) : (
-              <Text size="2" color="gray">
-                Loading...
-              </Text>
-            )}
-          </Dialog.Content>
-        </Dialog.Root>
       </div>
     </Theme>
   )

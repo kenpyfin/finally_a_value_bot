@@ -290,7 +290,7 @@ impl Tool for CursorAgentTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default from config, typically 600)"
+                        "description": "Timeout in seconds (default from config, typically 1500)"
                     },
                     "model": {
                         "type": "string",

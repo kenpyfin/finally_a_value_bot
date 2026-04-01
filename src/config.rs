@@ -109,7 +109,7 @@ fn default_cursor_agent_model() -> String {
 }
 
 fn default_cursor_agent_timeout_secs() -> u64 {
-    600
+    1500
 }
 
 fn default_scheduler_task_timeout_secs() -> u64 {
@@ -343,7 +343,7 @@ pub struct Config {
     /// Model for cursor-agent (e.g. "gpt-5"). Leave empty to omit --model (cursor-agent uses its default / "auto").
     #[serde(default = "default_cursor_agent_model")]
     pub cursor_agent_model: String,
-    /// Timeout in seconds for cursor-agent runs. Default: 600.
+    /// Timeout in seconds for cursor-agent runs. Default: 1500.
     #[serde(default = "default_cursor_agent_timeout_secs")]
     pub cursor_agent_timeout_secs: u64,
     #[serde(default)]
@@ -1070,7 +1070,7 @@ mod tests {
             web_search_searxng_url: None,
             cursor_agent_cli_path: default_cursor_agent_cli_path(),
             cursor_agent_model: String::new(),
-            cursor_agent_timeout_secs: 600,
+            cursor_agent_timeout_secs: 1500,
             social: None,
             vault: None,
             orchestrator_enabled: true,

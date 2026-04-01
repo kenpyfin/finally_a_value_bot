@@ -145,7 +145,7 @@ impl Tool for BashTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 600)"
+                        "description": "Timeout in seconds (default: 1500)"
                     }
                 }),
                 &["command"],
@@ -163,7 +163,7 @@ impl Tool for BashTool {
         let timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(600);
+            .unwrap_or(1500);
         let working_dir = super::resolve_tool_working_dir(&self.working_dir);
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
             return ToolResult::error(format!(

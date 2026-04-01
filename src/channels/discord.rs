@@ -278,55 +278,65 @@ impl EventHandler for Handler {
             text.chars().take(100).collect::<String>()
         );
 
-        // Start typing indicator
-        let typing = msg.channel_id.start_typing(&ctx.http);
+        let app_state = self.app_state.clone();
+        let chat_queue = app_state.chat_queue.clone();
+        let channel_id_for_send = msg.channel_id;
+        let is_guild = msg.guild_id.is_some();
+        let http = ctx.http.clone();
+        let queue_position = chat_queue
+            .enqueue(canonical_chat_id, async move {
+                // Start typing indicator while this queued item is running.
+                let typing = channel_id_for_send.start_typing(&http);
 
-        // Process with Claude (reuses the same agentic loop as Telegram)
-        match crate::telegram::process_with_agent(
-            &self.app_state,
-            AgentRequestContext {
-                caller_channel: "discord",
-                chat_id: canonical_chat_id,
-                chat_type: if msg.guild_id.is_some() {
-                    "group"
-                } else {
-                    "private"
-                },
-                persona_id,
-                is_scheduled_task: false,
-                is_background_job: false,
-            },
-            None,
-            image_data,
-        )
-        .await
-        {
-            Ok(response) => {
-                drop(typing);
-                if !response.is_empty() {
-                    if let Err(e) = crate::channel::deliver_to_contact(
-                        self.app_state.db.clone(),
-                        Some(&self.app_state.bot),
-                        self.app_state.discord_http.as_deref(),
-                        &self.app_state.config.bot_username,
-                        canonical_chat_id,
+                match crate::telegram::process_with_agent(
+                    &app_state,
+                    AgentRequestContext {
+                        caller_channel: "discord",
+                        chat_id: canonical_chat_id,
+                        chat_type: if is_guild { "group" } else { "private" },
                         persona_id,
-                        &response,
-                        Some(self.app_state.config.workspace_root_absolute()),
-                    )
-                    .await
-                    {
-                        tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Discord only");
-                        send_discord_response(&ctx, msg.channel_id, &response).await;
+                        is_scheduled_task: false,
+                        is_background_job: false,
+                    },
+                    None,
+                    image_data,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        drop(typing);
+                        if !response.is_empty() {
+                            if let Err(e) = crate::channel::deliver_to_contact(
+                                app_state.db.clone(),
+                                Some(&app_state.bot),
+                                app_state.discord_http.as_deref(),
+                                &app_state.config.bot_username,
+                                canonical_chat_id,
+                                persona_id,
+                                &response,
+                                Some(app_state.config.workspace_root_absolute()),
+                            )
+                            .await
+                            {
+                                tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Discord only");
+                                send_discord_response_to_http(&http, channel_id_for_send, &response).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        drop(typing);
+                        error!("Error processing Discord message: {e}");
+                        let _ = channel_id_for_send.say(&http, format!("Error: {e}")).await;
                     }
                 }
-            }
-            Err(e) => {
-                drop(typing);
-                error!("Error processing Discord message: {e}");
-                let _ = msg.channel_id.say(&ctx.http, format!("Error: {e}")).await;
-            }
-        }
+            })
+            .await;
+        info!(
+            target: "queue",
+            chat_id = canonical_chat_id,
+            queue_position = queue_position,
+            "Enqueued Discord agent run"
+        );
     }
 
     async fn ready(&self, _ctx: Context, ready: Ready) {
@@ -349,12 +359,11 @@ fn sanitize_upload_filename(name: &str) -> String {
     }
 }
 
-/// Split and send long messages (Discord limit is 2000 chars).
-async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
+async fn send_discord_response_to_http(http: &std::sync::Arc<serenity::http::Http>, channel_id: ChannelId, text: &str) {
     const MAX_LEN: usize = 2000;
 
     if text.len() <= MAX_LEN {
-        let _ = channel_id.say(&ctx.http, text).await;
+        let _ = channel_id.say(http, text).await;
         return;
     }
 
@@ -367,7 +376,7 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
         };
 
         let chunk = &remaining[..chunk_len];
-        let _ = channel_id.say(&ctx.http, chunk).await;
+        let _ = channel_id.say(http, chunk).await;
         remaining = &remaining[chunk_len..];
 
         if remaining.starts_with('\n') {

@@ -120,7 +120,19 @@ async fn run_due_tasks(
                 Ok(p) => p,
                 Err(_) => return,
             };
-            run_scheduled_agent_and_finalize(state, prepared, task_timeout_secs).await;
+            let chat_id_for_queue = prepared.chat_id;
+            let chat_queue = state.chat_queue.clone();
+            let queue_position = chat_queue
+                .enqueue(chat_id_for_queue, async move {
+                    run_scheduled_agent_and_finalize(state, prepared, task_timeout_secs).await;
+                })
+                .await;
+            info!(
+                target: "queue",
+                chat_id = chat_id_for_queue,
+                queue_position = queue_position,
+                "Enqueued scheduled agent run"
+            );
         });
     }
 
