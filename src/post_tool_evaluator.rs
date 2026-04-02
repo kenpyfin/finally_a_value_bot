@@ -137,6 +137,34 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
     out
 }
 
+fn has_repeated_stalled_failures(messages: &[Message]) -> bool {
+    let mut repeated_error_markers = 0usize;
+    let mut repeated_no_output_markers = 0usize;
+    for msg in messages.iter().rev().take(8) {
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolResult { content, is_error, .. } = block {
+                    let lower = content.to_ascii_lowercase();
+                    if is_error.unwrap_or(false)
+                        && (lower.contains("timed out")
+                            || lower.contains("no such file")
+                            || lower.contains("no files found"))
+                    {
+                        repeated_error_markers = repeated_error_markers.saturating_add(1);
+                    }
+                    if lower.contains("no files found")
+                        || lower.contains("still no")
+                        || lower.contains("no such file")
+                    {
+                        repeated_no_output_markers = repeated_no_output_markers.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    repeated_error_markers >= 2 && repeated_no_output_markers >= 2
+}
+
 /// Build the user message for PTE evaluation.
 fn build_pte_user_prompt(messages: &[Message], iteration: usize, max_iterations: usize) -> String {
     let original_request = extract_original_request(messages);
@@ -161,6 +189,15 @@ pub async fn evaluate_completion(
         return Ok(PteResult {
             action: PteAction::Continue,
             reason: String::new(),
+        });
+    }
+
+    // Fast-path stall classifier to avoid infinite "continue" loops on repeated
+    // identical failure/no-output states.
+    if has_repeated_stalled_failures(messages) {
+        return Ok(PteResult {
+            action: PteAction::Complete,
+            reason: "Repeated stalled failures detected; stop loop and ask user whether to retry or wait.".to_string(),
         });
     }
 
@@ -303,5 +340,43 @@ mod tests {
         let messages: Vec<Message> = vec![];
         let req = extract_original_request(&messages);
         assert_eq!(req, "(no user request found)");
+    }
+
+    #[test]
+    fn test_has_repeated_stalled_failures_true() {
+        let msg = Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "a".into(),
+                    content: "Tool timed out after 1500s".into(),
+                    is_error: Some(true),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "b".into(),
+                    content: "No files found matching pattern.".into(),
+                    is_error: Some(true),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "c".into(),
+                    content: "ls: No such file or directory".into(),
+                    is_error: Some(true),
+                },
+            ]),
+        };
+        assert!(has_repeated_stalled_failures(&[msg]));
+    }
+
+    #[test]
+    fn test_has_repeated_stalled_failures_false() {
+        let msg = Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "x".into(),
+                content: "Saved swapped image successfully".into(),
+                is_error: Some(false),
+            }]),
+        };
+        assert!(!has_repeated_stalled_failures(&[msg]));
     }
 }

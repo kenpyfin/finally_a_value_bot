@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::unbounded_channel;
 use tracing::{error, info};
 
 use crate::channel::deliver_to_contact;
 use crate::db::{call_blocking, ScheduledTask};
 use crate::error::FinallyAValueBotError;
-use crate::telegram::{AgentRequestContext, AppState};
+use crate::job_heartbeat::{signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType};
+use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 fn channel_from_chat_type(chat_type: &str) -> &'static str {
     match chat_type {
@@ -283,7 +285,28 @@ async fn run_scheduled_agent_and_finalize(
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
 
-    let agent_fut = crate::telegram::process_with_agent(
+    let hb_key = format!("scheduled:{}:{}", task_id, started_at_str);
+    let hb_tx = spawn_shared_heartbeat(
+        state.clone(),
+        hb_key,
+        chat_id,
+        persona_id,
+        JobType::Scheduled,
+    );
+    let _ = hb_tx.send(HeartbeatSignal::Started(format!("scheduled task #{} started", task_id)));
+    let (evt_tx, mut evt_rx) = unbounded_channel();
+    let hb_forward = {
+        let hb_tx = hb_tx.clone();
+        tokio::spawn(async move {
+            while let Some(evt) = evt_rx.recv().await {
+                if let Some(sig) = signal_from_agent_event(&evt) {
+                    let _ = hb_tx.send(sig);
+                }
+            }
+        })
+    };
+
+    let agent_fut = process_with_agent_with_events(
         &state,
         AgentRequestContext {
             caller_channel: channel,
@@ -295,6 +318,7 @@ async fn run_scheduled_agent_and_finalize(
         },
         Some(&prompt),
         None,
+        Some(&evt_tx),
     );
 
     let (success, result_summary) = match tokio::time::timeout(
@@ -304,10 +328,16 @@ async fn run_scheduled_agent_and_finalize(
     .await
     {
         Err(_elapsed) => {
+            drop(evt_tx);
+            let _ = hb_forward.await;
             error!(
                 "Scheduler: task #{} timed out after {}s",
                 task_id, task_timeout_secs
             );
+            let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
+                "scheduled task #{} timed out after {}s",
+                task_id, task_timeout_secs
+            )));
             let err_text = format!(
                 "Scheduled task #{} timed out after {} seconds.",
                 task_id, task_timeout_secs
@@ -334,6 +364,8 @@ async fn run_scheduled_agent_and_finalize(
             (false, summary)
         }
         Ok(Ok(response)) => {
+            drop(evt_tx);
+            let _ = hb_forward.await;
             let response_text = if response.trim().is_empty() {
                 format!("Scheduled task #{} completed.", task_id)
             } else {
@@ -382,6 +414,10 @@ async fn run_scheduled_agent_and_finalize(
                 .await
                 {
                     Ok(()) => {
+                        let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
+                            "scheduled task #{} completed",
+                            task_id
+                        )));
                         let summary = if response_text.len() > 200 {
                             format!(
                                 "{}...",
@@ -393,6 +429,10 @@ async fn run_scheduled_agent_and_finalize(
                         (true, Some(summary))
                     }
                     Err(e) => {
+                        let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
+                            "scheduled task #{} delivery failed: {}",
+                            task_id, e
+                        )));
                         error!(
                             "Scheduler: task #{} produced a response but delivery failed: {}",
                             task_id, e
@@ -408,7 +448,13 @@ async fn run_scheduled_agent_and_finalize(
             }
         }
         Ok(Err(e)) => {
+            drop(evt_tx);
+            let _ = hb_forward.await;
             error!("Scheduler: task #{} failed: {e}", task_id);
+            let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
+                "scheduled task #{} failed: {}",
+                task_id, e
+            )));
             let err_text = format!("Scheduled task #{} failed: {e}", task_id);
             let delivery_ok = deliver_to_contact(
                 state.db.clone(),

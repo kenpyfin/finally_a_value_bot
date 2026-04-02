@@ -20,6 +20,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 <!-- Add entries below this line, newest first. -->
 
+### 2026-04-01 — Memory loop guards and shared job heartbeat
+
+- **Area:** agent / memory / background jobs / scheduler
+- **Summary:** Added memory hygiene normalization for tiered writes, runtime loop guards for repeated no-evidence tool cycles, and a shared heartbeat mechanism used by both manual background jobs and scheduled runs. Added a built-in `background-handoff` skill definition to standardize delegation behavior and status contract.
+- **Rationale:** Repeated "monitoring" loops and stale pending states caused user-facing repetition and unnecessary retries. A shared heartbeat model plus strict memory/status normalization reduces loop risk and improves progress visibility for long-running work.
+- **Key files / symbols:**
+  - `src/tools/tiered_memory.rs` — `normalize_tier2_task_states`, `normalize_tier3_recent_focus`; normalization integrated into `WriteTieredMemoryTool::execute`.
+  - `src/channels/telegram.rs` — loop/evidence helpers (`is_swap_related_tool_use`, `has_new_swap_evidence`), loop-stall short-circuit in main tool loop, `mark_swap_task_stalled_best_effort`, and stricter memory-maintenance prompt contract.
+  - `src/post_tool_evaluator.rs` — `has_repeated_stalled_failures` fast-path to return `complete` on repeated stalled failures (so the loop can stop and ask for user decision).
+  - `src/job_heartbeat.rs` — new shared heartbeat engine (`spawn_shared_heartbeat`), policy by `JobType`, event mapping via `signal_from_agent_event`.
+  - `src/background_jobs.rs` — switched to `process_with_agent_with_events` and heartbeat signaling for manual background runs (with periodic user progress updates).
+  - `src/scheduler.rs` — wired scheduled runs through the same heartbeat engine with quieter policy.
+  - `src/db.rs` — new `job_heartbeats` table and DB methods `upsert_job_heartbeat`, `get_job_heartbeat`.
+  - `workspace/skills/background-handoff/SKILL.md` — built-in skill instructions for background delegation contract.
+- **Follow-ups:** Consider exposing `job_heartbeats` in web `run_status`/SSE for a unified UI timeline that can merge foreground run events and background/scheduled heartbeat snapshots.
+
 ### 2026-04-01 — Restrict write_memory and harden tiered writes
 
 - **Area:** agent / memory tools

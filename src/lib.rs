@@ -16,6 +16,7 @@ pub mod llm;
 pub mod logging;
 pub mod mcp;
 pub mod memory;
+pub mod job_heartbeat;
 pub mod scheduler;
 pub mod setup;
 pub mod skills;

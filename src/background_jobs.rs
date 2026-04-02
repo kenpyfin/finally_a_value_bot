@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
 use tracing::{error, info};
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::channel::deliver_to_contact;
 use crate::db::call_blocking;
-use crate::telegram::{process_with_agent, AgentRequestContext, AppState};
+use crate::job_heartbeat::{signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType};
+use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 /// Spawn a background job and deliver the final result asynchronously.
 pub fn spawn_background_job(
@@ -33,8 +35,28 @@ pub fn spawn_background_job(
             return;
         }
 
+        let hb_tx = spawn_shared_heartbeat(
+            state.clone(),
+            job_id.clone(),
+            chat_id,
+            persona_id,
+            JobType::ManualBackground,
+        );
+        let _ = hb_tx.send(HeartbeatSignal::Started("background job started".to_string()));
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let hb_forward = {
+            let hb_tx = hb_tx.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = evt_rx.recv().await {
+                    if let Some(sig) = signal_from_agent_event(&evt) {
+                        let _ = hb_tx.send(sig);
+                    }
+                }
+            })
+        };
+
         // Run the agent with is_background_job=true (disables further handoff)
-        let bg_result = process_with_agent(
+        let bg_result = process_with_agent_with_events(
             &state,
             AgentRequestContext {
                 caller_channel: "web",
@@ -46,12 +68,22 @@ pub fn spawn_background_job(
             },
             Some(&prompt),
             None,
+            Some(&evt_tx),
         )
         .await;
+        drop(evt_tx);
+        let _ = hb_forward.await;
 
         let (raw_output, raw_success) = match bg_result {
             Ok(text) => (text, true),
             Err(e) => (format!("Background job error: {e}"), false),
+        };
+        let _ = if raw_success {
+            hb_tx.send(HeartbeatSignal::Progress(
+                "main agent finished, preparing final response".to_string(),
+            ))
+        } else {
+            hb_tx.send(HeartbeatSignal::Failed(raw_output.clone()))
         };
 
         // Persist raw background result/error.
@@ -142,6 +174,9 @@ pub fn spawn_background_job(
                     db.mark_background_job_done(&jid)
                 })
                 .await;
+                let _ = hb_tx.send(HeartbeatSignal::Finished(
+                    "background job completed".to_string(),
+                ));
             }
             Err(e) => {
                 error!(
@@ -167,10 +202,12 @@ pub fn spawn_background_job(
 
                 let jid = job_id.clone();
                 let err_text = format!("Background formatting failed: {e}");
+                let err_text_for_db = err_text.clone();
                 let _ = call_blocking(state.db.clone(), move |db| {
-                    db.fail_background_job(&jid, &err_text)
+                    db.fail_background_job(&jid, &err_text_for_db)
                 })
                 .await;
+                let _ = hb_tx.send(HeartbeatSignal::Failed(err_text));
             }
         }
 

@@ -107,6 +107,18 @@ pub struct BackgroundJob {
 }
 
 #[derive(Debug, Clone)]
+pub struct JobHeartbeat {
+    pub run_key: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub job_type: String,
+    pub stage: String,
+    pub message: String,
+    pub active: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
     pub chat_id: i64,
@@ -256,6 +268,21 @@ impl Database {
                 ON background_jobs(chat_id);
             CREATE INDEX IF NOT EXISTS idx_background_jobs_status
                 ON background_jobs(status);
+
+            CREATE TABLE IF NOT EXISTS job_heartbeats (
+                run_key TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                job_type TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_heartbeats_chat_id
+                ON job_heartbeats(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_job_heartbeats_updated
+                ON job_heartbeats(updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS channel_bindings (
                 canonical_chat_id INTEGER NOT NULL,
@@ -1790,6 +1817,70 @@ impl Database {
         );
         match result {
             Ok(job) => Ok(Some(job)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn upsert_job_heartbeat(
+        &self,
+        run_key: &str,
+        chat_id: i64,
+        persona_id: i64,
+        job_type: &str,
+        stage: &str,
+        message: &str,
+        active: bool,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO job_heartbeats (run_key, chat_id, persona_id, job_type, stage, message, active, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(run_key) DO UPDATE SET
+               stage = excluded.stage,
+               message = excluded.message,
+               active = excluded.active,
+               updated_at = excluded.updated_at",
+            params![
+                run_key,
+                chat_id,
+                persona_id,
+                job_type,
+                stage,
+                message,
+                if active { 1 } else { 0 },
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_job_heartbeat(
+        &self,
+        run_key: &str,
+    ) -> Result<Option<JobHeartbeat>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT run_key, chat_id, persona_id, job_type, stage, message, active, updated_at
+             FROM job_heartbeats
+             WHERE run_key = ?1",
+            params![run_key],
+            |row| {
+                Ok(JobHeartbeat {
+                    run_key: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    job_type: row.get(3)?,
+                    stage: row.get(4)?,
+                    message: row.get(5)?,
+                    active: row.get::<_, i32>(6)? != 0,
+                    updated_at: row.get(7)?,
+                })
+            },
+        );
+        match result {
+            Ok(h) => Ok(Some(h)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }

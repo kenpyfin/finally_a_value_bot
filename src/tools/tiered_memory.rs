@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -85,6 +86,74 @@ fn render_memory_document(sections: &[String; 3]) -> String {
         out.push('\n');
     }
     out
+}
+
+fn normalize_tier2_task_states(content: &str) -> String {
+    let mut out = Vec::new();
+    let mut seen_exact = HashSet::new();
+    let mut last_next_goal: Option<String> = None;
+    let mut task_state_latest: HashMap<String, String> = HashMap::new();
+    let mut task_state_order: Vec<String> = Vec::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed
+            .to_ascii_lowercase()
+            .starts_with("- next goal:")
+        {
+            last_next_goal = Some(trimmed.to_string());
+            continue;
+        }
+        // Canonical state line format:
+        // - TaskState|key=<task_key>|status=<queued|running|stalled|completed|cancelled>|updated=<iso>|evidence=<summary>
+        if let Some(rest) = trimmed.strip_prefix("- TaskState|key=") {
+            let key = rest.split('|').next().unwrap_or("").trim().to_string();
+            if !key.is_empty() {
+                if !task_state_latest.contains_key(&key) {
+                    task_state_order.push(key.clone());
+                }
+                task_state_latest.insert(key, trimmed.to_string());
+                continue;
+            }
+        }
+        if seen_exact.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+
+    if !task_state_latest.is_empty() {
+        for key in task_state_order {
+            if let Some(line) = task_state_latest.get(&key) {
+                out.push(line.clone());
+            }
+        }
+    }
+    if let Some(goal) = last_next_goal {
+        out.push(goal);
+    }
+
+    out.join("\n")
+}
+
+fn normalize_tier3_recent_focus(content: &str) -> String {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Keep only one monitoring reference per unique normalized sentence.
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out.join("\n")
 }
 
 /// Replace content for one tier in the full markdown; preserve others. Creates template if needed.
@@ -268,7 +337,12 @@ impl Tool for WriteTieredMemoryTool {
         info!("Writing tiered memory tier {}: {}", tier, path.display());
 
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let new_content = replace_tier_content(&existing, tier, content);
+        let normalized = match tier {
+            2 => normalize_tier2_task_states(content),
+            3 => normalize_tier3_recent_focus(content),
+            _ => content.trim().to_string(),
+        };
+        let new_content = replace_tier_content(&existing, tier, &normalized);
 
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -345,5 +419,34 @@ T3 first"#;
         assert!(new.contains("T2 first"));
         assert!(new.contains("T2 second"));
         assert!(new.contains("Updated T3"));
+    }
+
+    #[test]
+    fn test_normalize_tier2_task_states_dedupes_next_goal_and_taskstate() {
+        let input = r#"
+- Keep this.
+- Next Goal: old one
+- TaskState|key=swap:pz-20260330|status=running|updated=2026-04-01T01:00:00Z|evidence=queued
+- TaskState|key=swap:pz-20260330|status=stalled|updated=2026-04-01T02:00:00Z|evidence=timeout
+- Next Goal: latest one
+- Keep this.
+"#;
+        let out = normalize_tier2_task_states(input);
+        assert_eq!(out.matches("TaskState|key=swap:pz-20260330").count(), 1);
+        assert!(out.contains("status=stalled"));
+        assert_eq!(out.matches("Next Goal:").count(), 1);
+        assert!(out.contains("latest one"));
+    }
+
+    #[test]
+    fn test_normalize_tier3_recent_focus_dedupes_lines() {
+        let input = r#"
+- monitoring queue
+- monitoring queue
+- checking output
+"#;
+        let out = normalize_tier3_recent_focus(input);
+        assert_eq!(out.matches("monitoring queue").count(), 1);
+        assert_eq!(out.matches("checking output").count(), 1);
     }
 }

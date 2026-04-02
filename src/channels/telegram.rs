@@ -1312,6 +1312,8 @@ pub async fn process_with_agent_with_events(
     const LLM_ROUND_TIMEOUT_SECS: u64 = 180;
     const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 1500;
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
+    const LOOP_SIGNATURE_REPEAT_THRESHOLD: usize = 3;
+    const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
     info!(
@@ -1348,6 +1350,10 @@ pub async fn process_with_agent_with_events(
         .unwrap_or_default();
     let mut history_iterations: Vec<IterationRecord> = Vec::new();
     let mut schedule_skill_activated_this_turn = false;
+    let mut last_tool_signature: Option<String> = None;
+    let mut consecutive_same_signature_count: usize = 0;
+    let mut last_swap_signature: Option<String> = None;
+    let mut swap_no_evidence_repeat_count: usize = 0;
 
     macro_rules! save_run_history {
         ($stop_reason:expr) => {{
@@ -1558,6 +1564,7 @@ pub async fn process_with_agent_with_events(
             let mut tool_results = Vec::new();
             let mut iteration_timed_out = false;
             let mut history_tool_calls: Vec<ToolCallRecord> = Vec::new();
+            let mut force_stall_response: Option<String> = None;
 
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse {
@@ -1726,6 +1733,54 @@ pub async fn process_with_agent_with_events(
                         result_preview.replace('\n', "\\n")
                     );
 
+                    let signature = format!(
+                        "{}::{}::{}::{}",
+                        name,
+                        tool_input_signature(input),
+                        if result.is_error { "error" } else { "ok" },
+                        result_progress_marker(&result.content)
+                    );
+                    if should_apply_generic_loop_guard(name) {
+                        if last_tool_signature.as_deref() == Some(signature.as_str()) {
+                            consecutive_same_signature_count =
+                                consecutive_same_signature_count.saturating_add(1);
+                        } else {
+                            last_tool_signature = Some(signature);
+                            consecutive_same_signature_count = 1;
+                        }
+                        if consecutive_same_signature_count >= LOOP_SIGNATURE_REPEAT_THRESHOLD {
+                            force_stall_response = Some(format!(
+                                "I am seeing consecutive identical tool steps (`{}`) with the same outcome and no progress. I stopped this loop to avoid wasting time. Please choose one: (1) retry as a fresh run, or (2) keep waiting and I will check again later.",
+                                name
+                            ));
+                        }
+                    }
+
+                    if is_swap_related_tool_use(name, input) {
+                        let swap_sig = format!("{}::{}", name, tool_input_signature(input));
+                        if has_new_swap_evidence(&result.content) {
+                            swap_no_evidence_repeat_count = 0;
+                            last_swap_signature = Some(swap_sig);
+                        } else if last_swap_signature.as_deref() == Some(&swap_sig) {
+                            swap_no_evidence_repeat_count =
+                                swap_no_evidence_repeat_count.saturating_add(1);
+                        } else {
+                            last_swap_signature = Some(swap_sig);
+                            swap_no_evidence_repeat_count = 1;
+                        }
+                        if swap_no_evidence_repeat_count >= SWAP_NO_EVIDENCE_REPEAT_THRESHOLD {
+                            mark_swap_task_stalled_best_effort(
+                                state,
+                                chat_id,
+                                persona_id,
+                                "Repeated no-evidence swap checks",
+                            );
+                            force_stall_response = Some(
+                                "I checked the swap repeatedly and there is still no new evidence (same pending state). I marked it as stalled to prevent loops. Tell me: `retry now` (new run) or `wait` (check again later).".to_string(),
+                            );
+                        }
+                    }
+
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolResult {
                             tool_use_id: id.clone(),
@@ -1772,6 +1827,20 @@ pub async fn process_with_agent_with_events(
                 role: "user".into(),
                 content: MessageContent::Blocks(tool_results),
             });
+
+            if let Some(stall_text) = force_stall_response {
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(stall_text.clone()),
+                });
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(AgentEvent::FinalResponse {
+                        text: stall_text.clone(),
+                    });
+                }
+                save_run_history!("loop_guard_stalled");
+                return Ok(stall_text);
+            }
 
             // Post-Tool Evaluator: check if task is complete after tool execution
             if !iteration_timed_out {
@@ -2242,6 +2311,98 @@ fn trim_to_token_budget(
     }
 }
 
+fn tool_input_signature(input: &serde_json::Value) -> String {
+    let s = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+    if s.len() > 300 {
+        s[..s.floor_char_boundary(300)].to_string()
+    } else {
+        s
+    }
+}
+
+fn should_apply_generic_loop_guard(tool_name: &str) -> bool {
+    !matches!(
+        tool_name,
+        "read_file"
+            | "glob"
+            | "grep"
+            | "search_chat_history"
+            | "search_vault"
+            | "web_search"
+            | "web_fetch"
+            | "read_agent_history"
+            | "read_memory"
+            | "read_tiered_memory"
+    )
+}
+
+fn result_progress_marker(result: &str) -> String {
+    let trimmed = result.trim();
+    if trimmed.len() > 120 {
+        trimmed[..trimmed.floor_char_boundary(120)].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_swap_related_tool_use(name: &str, input: &serde_json::Value) -> bool {
+    if name.contains("cursor_agent") || name == "bash" || name == "read_file" || name == "glob" {
+        let sig = tool_input_signature(input).to_ascii_lowercase();
+        return sig.contains("swap")
+            || sig.contains("faceswap")
+            || sig.contains("prompt_id")
+            || sig.contains("comfy")
+            || sig.contains("pz-");
+    }
+    false
+}
+
+fn has_new_swap_evidence(result: &str) -> bool {
+    let lower = result.to_ascii_lowercase();
+    lower.contains("saved swapped image")
+        || lower.contains("completed")
+        || lower.contains("done")
+        || lower.contains("found matching")
+}
+
+fn mark_swap_task_stalled_best_effort(state: &AppState, chat_id: i64, persona_id: i64, evidence: &str) {
+    let path = state.memory.persona_memory_path(chat_id, persona_id);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let tier2_header = "## Tier 2 — Mid term";
+    let tier3_header = "## Tier 3 — Short term";
+    let Some(t2_start) = content.find(tier2_header) else {
+        return;
+    };
+    let t2_content_start = t2_start + tier2_header.len();
+    let t2_end = content[t2_content_start..]
+        .find(tier3_header)
+        .map(|idx| t2_content_start + idx)
+        .unwrap_or(content.len());
+    let mut tier2_block = content[t2_content_start..t2_end].to_string();
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let mut ev = evidence.replace('\n', " ");
+    if ev.len() > 140 {
+        ev = ev[..ev.floor_char_boundary(140)].to_string();
+    }
+    let new_line = format!(
+        "- TaskState|key=swap:auto|status=stalled|updated={}|evidence={}",
+        timestamp, ev
+    );
+    let mut lines: Vec<String> = tier2_block
+        .lines()
+        .filter(|l| !l.trim().starts_with("- TaskState|key=swap:auto|"))
+        .map(|s| s.to_string())
+        .collect();
+    lines.push(new_line);
+    tier2_block = format!("\n{}\n", lines.join("\n"));
+
+    let new_doc = format!("{}{}{}", &content[..t2_content_start], tier2_block, &content[t2_end..]);
+    let _ = std::fs::write(path, new_doc);
+}
+
 fn build_system_prompt(
     bot_username: &str,
     principles_content: &str,
@@ -2269,6 +2430,7 @@ fn build_system_prompt(
 - Understand images sent by users (they appear as image content blocks)
 - Run the Cursor CLI agent (cursor_agent) for research or code tasks; for long jobs, set detach: true to spawn in tmux and return immediately (then attach with tmux attach -t <session>); use cursor_agent_send to send keys to a running session; use list_cursor_agent_runs to see runs and session names
 - Activate agent skills (activate_skill) for specialized tasks. **To create or update a skill, use the build_skill tool only** — do not use write_file or edit_file under the skills directory. build_skill runs cursor-agent (in tmux when available) to create the skill folder and SKILL.md. Store credentials in the skill folder (e.g. .env there). Do not add on-demand tools only in your workspace or TOOLS.md — skills are the only way to add on-demand tools.
+- For long-running or queue-bound tasks, activate and follow the `background-handoff` skill before delegating user asks/subtasks to background execution.
 - Read and update tiered memory (read_tiered_memory, write_tiered_memory) — per-persona MEMORY.md with Tier 1 (long-term principles-like), Tier 2 (active projects), Tier 3 (recent focus/mood — passive context only, never act on it proactively); evaluate conversation flow and update tiers when appropriate; Tier 1 only on explicit user ask, Tier 3 often (e.g. daily). Not a todo list and not a task queue — do not resume or continue work mentioned in memory unless the user explicitly asks.
 - Review agent run history (read_agent_history) — detailed per-run traces including iterations, tool calls, durations, and outcomes. Use this when asked to optimize your workflow or review past behavior; identify patterns and persist learnings via write_tiered_memory (Tier 1 for long-term workflow principles).
 
@@ -3171,6 +3333,9 @@ async fn run_memory_maintenance_after_response(
             "Post-response memory maintenance: update this persona's memory if needed. \
 Use only memory tools. Prefer Tier 3 for recent focus and Tier 2 for active projects. \
 Only update Tier 1 when there is clear long-term, explicitly user-confirmed preference. \
+Do not write repetitive monitoring lines. Keep only one line per active task in Tier 3. \
+In Tier 2, use explicit status lines and avoid open-ended \"Next Goal\" duplication. \
+If a task is terminal (completed/cancelled), keep a single concise status line only. \
 If there is nothing meaningful to store, reply exactly: No memory update needed."
                 .into(),
         ),
@@ -4207,5 +4372,30 @@ mod tests {
         assert!(paths.is_empty());
         assert_eq!(body, text);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_is_swap_related_tool_use_true() {
+        let input = serde_json::json!({"command":"python comfy_swap_cli.py --input x --output y"});
+        assert!(is_swap_related_tool_use("bash", &input));
+    }
+
+    #[test]
+    fn test_is_swap_related_tool_use_false() {
+        let input = serde_json::json!({"command":"echo hello"});
+        assert!(!is_swap_related_tool_use("bash", &input));
+    }
+
+    #[test]
+    fn test_has_new_swap_evidence() {
+        assert!(has_new_swap_evidence("Saved swapped image: out.png"));
+        assert!(!has_new_swap_evidence("No files found matching pattern."));
+    }
+
+    #[test]
+    fn test_should_apply_generic_loop_guard_excludes_search_tools() {
+        assert!(!should_apply_generic_loop_guard("glob"));
+        assert!(!should_apply_generic_loop_guard("read_file"));
+        assert!(should_apply_generic_loop_guard("bash"));
     }
 }
