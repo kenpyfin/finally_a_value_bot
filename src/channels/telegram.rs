@@ -72,7 +72,7 @@ const PERSONA_SWITCH_CALLBACK_PREFIX: &str = "persona:switch:";
 /// times out and the work should be retried as a background job.
 pub const BACKGROUND_JOB_HANDOFF_PREFIX: &str = "##BACKGROUND_JOB_HANDOFF##";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AgentRequestContext<'a> {
     pub caller_channel: &'a str,
     pub chat_id: i64,
@@ -80,12 +80,17 @@ pub struct AgentRequestContext<'a> {
     pub persona_id: i64,
     pub is_scheduled_task: bool,
     pub is_background_job: bool,
+    pub run_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Iteration {
         iteration: usize,
+    },
+    WorkflowSelected {
+        workflow_id: i64,
+        confidence: f64,
     },
     ToolStart {
         tool_use_id: String,
@@ -930,6 +935,7 @@ async fn handle_message(
                 persona_id,
                 is_scheduled_task: false,
                 is_background_job: false,
+                run_key: None,
             },
             None,
             image_data,
@@ -1180,7 +1186,7 @@ pub async fn process_with_agent_with_events(
     });
     let tz: chrono_tz::Tz = state.config.timezone.parse().unwrap_or(chrono_tz::Tz::UTC);
     let current_time_in_tz = chrono::Utc::now().with_timezone(&tz).format("%Y-%m-%d %H:%M:%S %Z").to_string();
-    let system_prompt = build_system_prompt(
+    let mut system_prompt = build_system_prompt(
         &state.config.bot_username,
         &principles_content,
         &agents_md_path,
@@ -1287,6 +1293,69 @@ pub async fn process_with_agent_with_events(
     messages = prepended;
 
     let latest_user_text = latest_user_text(&messages);
+    let run_key = context
+        .run_key
+        .clone()
+        .unwrap_or_else(|| format!("run:{}", uuid::Uuid::new_v4()));
+
+    let project_title = derive_project_title(&latest_user_text);
+    let project_type = infer_project_type(&latest_user_text);
+    let project_id = match call_blocking(state.db.clone(), {
+        let project_title = project_title.clone();
+        let project_type = project_type.to_string();
+        move |db| {
+            db.upsert_project(
+                chat_id,
+                &project_title,
+                &project_type,
+                "active",
+                None,
+                Some("{}"),
+            )
+        }
+    })
+    .await
+    {
+        Ok(pid) => Some(pid),
+        Err(e) => {
+            warn!("failed to upsert project context: {}", e);
+            None
+        }
+    };
+    if let Some(pid) = project_id {
+        let _ = call_blocking(state.db.clone(), {
+            let run_key = run_key.clone();
+            move |db| db.link_project_run(pid, &run_key)
+        })
+        .await;
+        system_prompt.push_str(&format!(
+            "\n# Active Project Context\n\n- project_id: {}\n- title: {}\n- type: {}\n- owner_contact: {}\n",
+            pid, project_title, project_type, chat_id
+        ));
+    }
+
+    let intent_signature = normalize_intent_signature(&latest_user_text);
+    let selected_workflow = match call_blocking(state.db.clone(), {
+        let intent_signature = intent_signature.clone();
+        move |db| db.get_best_workflow_for_intent(chat_id, &intent_signature, 0.6)
+    })
+    .await
+    {
+        Ok(Some(wf)) => {
+            system_prompt.push_str(&format!(
+                "\n# Learned Workflow Hint\n\nUse this learned workflow as a starting point (adapt as needed):\n{}\n",
+                wf.steps_json
+            ));
+            if let Some(tx) = event_tx {
+                let _ = tx.send(AgentEvent::WorkflowSelected {
+                    workflow_id: wf.id,
+                    confidence: wf.confidence,
+                });
+            }
+            Some(wf)
+        }
+        _ => None,
+    };
     let intent = classify_user_intent(&latest_user_text, has_image_input);
     let tool_defs = match intent {
         UserIntent::Conversational => Vec::new(),
@@ -1303,6 +1372,19 @@ pub async fn process_with_agent_with_events(
 
     // Token-aware trimming safety net (keeps at least 6 latest messages).
     trim_to_token_budget(&mut messages, &system_prompt, &tool_defs, 12_000, 6);
+    let _ = call_blocking(state.db.clone(), {
+        let run_key = run_key.clone();
+        move |db| {
+            db.append_run_timeline_event(
+                &run_key,
+                chat_id,
+                persona_id,
+                "run_started",
+                Some("{\"status\":\"started\"}"),
+            )
+        }
+    })
+    .await;
 
     // Main agent loop: chat agent has tools and executes directly.
     // Agentic tool-use loop. Timeouts prevent hangs:
@@ -1357,13 +1439,14 @@ pub async fn process_with_agent_with_events(
 
     macro_rules! save_run_history {
         ($stop_reason:expr) => {{
+            let stop_reason_owned = $stop_reason.to_string();
             let record = AgentRunRecord {
                 timestamp: chrono::Utc::now(),
                 channel: context.caller_channel.to_string(),
                 user_message_preview: user_msg_preview.clone(),
                 total_iterations: history_iterations.len(),
                 iterations: std::mem::take(&mut history_iterations),
-                stop_reason: $stop_reason.to_string(),
+                stop_reason: stop_reason_owned.clone(),
                 total_duration_ms: run_start.elapsed().as_millis(),
             };
             write_agent_history_run(
@@ -1372,6 +1455,58 @@ pub async fn process_with_agent_with_events(
                 persona_id,
                 &record,
             );
+            let run_key_for_db = run_key.clone();
+            let intent_for_db = intent_signature.clone();
+            let selected_workflow_id = selected_workflow.as_ref().map(|w| w.id);
+            let project_id_for_db = project_id;
+            let workflow_learning_enabled = state.config.workflow_auto_learn;
+            let mut tool_names: Vec<String> = Vec::new();
+            for it in &record.iterations {
+                for tc in &it.tool_calls {
+                    tool_names.push(tc.name.clone());
+                }
+            }
+            let steps_json = serde_json::to_string(&tool_names).unwrap_or_else(|_| "[]".to_string());
+            let success = matches!(
+                stop_reason_owned.as_str(),
+                "end_turn" | "pte_complete" | "unknown_stop_reason"
+            );
+            tokio::spawn({
+                let db = state.db.clone();
+                async move {
+                    let _ = call_blocking(db.clone(), move |db| {
+                        db.append_run_timeline_event(
+                            &run_key_for_db,
+                            chat_id,
+                            persona_id,
+                            "run_finished",
+                            Some(&format!(r#"{{"stop_reason":"{}"}}"#, stop_reason_owned)),
+                        )?;
+                        if let Some(pid) = project_id_for_db {
+                            db.touch_project_status(pid, if success { "active" } else { "needs_attention" })?;
+                        }
+                        if let Some(wid) = selected_workflow_id {
+                            db.log_workflow_execution(
+                                wid,
+                                &run_key_for_db,
+                                if success { "success" } else { "failure" },
+                                if success { 1.0 } else { 0.2 },
+                            )?;
+                        }
+                        if workflow_learning_enabled && !tool_names.is_empty() {
+                            let _ = db.upsert_workflow_learning(
+                                chat_id,
+                                &intent_for_db,
+                                &steps_json,
+                                success,
+                                if success { 1.0 } else { 0.0 },
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .await;
+                }
+            });
         }};
     }
 
@@ -1381,6 +1516,19 @@ pub async fn process_with_agent_with_events(
                 iteration: iteration + 1,
             });
         }
+        let _ = call_blocking(state.db.clone(), {
+            let run_key = run_key.clone();
+            move |db| {
+                db.append_run_timeline_event(
+                    &run_key,
+                    chat_id,
+                    persona_id,
+                    "iteration",
+                    Some(&format!(r#"{{"iteration":{}}}"#, iteration + 1)),
+                )
+            }
+        })
+        .await;
 
         info!(
             "Main agent iteration {}/{}: sending LLM request ({} messages in context)",
@@ -1577,6 +1725,20 @@ pub async fn process_with_agent_with_events(
                             input: input.clone(),
                         });
                     }
+                    let _ = call_blocking(state.db.clone(), {
+                        let run_key = run_key.clone();
+                        let name = name.clone();
+                        move |db| {
+                            db.append_run_timeline_event(
+                                &run_key,
+                                chat_id,
+                                persona_id,
+                                "tool_start",
+                                Some(&format!(r#"{{"name":"{}"}}"#, name.replace('"', "'"))),
+                            )
+                        }
+                    })
+                    .await;
 
                     let input_str = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
                     let input_preview = if input_str.len() > 10000 {
@@ -1732,6 +1894,27 @@ pub async fn process_with_agent_with_events(
                         result.is_error,
                         result_preview.replace('\n', "\\n")
                     );
+                    if let Some(pid) = project_id {
+                        let artifact = match name.as_str() {
+                            "write_file" | "edit_file" | "read_file" => input
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .map(|p| ("file", p.to_string())),
+                            "browser" => Some(("web", "browser_session".to_string())),
+                            _ => None,
+                        };
+                        if let Some((artifact_type, artifact_ref)) = artifact {
+                            let _ = call_blocking(state.db.clone(), move |db| {
+                                db.upsert_project_artifact(
+                                    pid,
+                                    artifact_type,
+                                    &artifact_ref,
+                                    Some("{}"),
+                                )
+                            })
+                            .await;
+                        }
+                    }
 
                     let signature = format!(
                         "{}::{}::{}::{}",
@@ -1795,6 +1978,25 @@ pub async fn process_with_agent_with_events(
                             error_type: result.error_type.clone(),
                         });
                     }
+                    let _ = call_blocking(state.db.clone(), {
+                        let run_key = run_key.clone();
+                        let tool_name = name.clone();
+                        let is_error = result.is_error;
+                        move |db| {
+                            db.append_run_timeline_event(
+                                &run_key,
+                                chat_id,
+                                persona_id,
+                                "tool_result",
+                                Some(&format!(
+                                    r#"{{"name":"{}","is_error":{}}}"#,
+                                    tool_name.replace('"', "'"),
+                                    is_error
+                                )),
+                            )
+                        }
+                    })
+                    .await;
                     history_tool_calls.push(ToolCallRecord {
                         name: name.clone(),
                         input_preview: truncate_preview(
@@ -1959,6 +2161,41 @@ pub async fn process_with_agent_with_events(
                         }
                         save_run_history!("pte_complete");
                         return Ok(final_text);
+                    }
+                    Ok(pte_result) if pte_result.action == PteAction::AskUser => {
+                        let ask_text = format!(
+                            "I paused because progress is stalled: {}. Choose: retry now, wait, or adjust the request.",
+                            pte_result.reason
+                        );
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(AgentEvent::FinalResponse {
+                                text: ask_text.clone(),
+                            });
+                        }
+                        save_run_history!("pte_ask_user");
+                        return Ok(ask_text);
+                    }
+                    Ok(pte_result) if pte_result.action == PteAction::StopWithSummary => {
+                        let summary_text = format!(
+                            "I stopped this run to avoid repeated no-progress loops. {}",
+                            pte_result.reason
+                        );
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(AgentEvent::FinalResponse {
+                                text: summary_text.clone(),
+                            });
+                        }
+                        save_run_history!("pte_stop_with_summary");
+                        return Ok(summary_text);
+                    }
+                    Ok(pte_result) if pte_result.action == PteAction::HandoffBackground => {
+                        if context.caller_channel == "web" && !context.is_background_job {
+                            save_run_history!("pte_background_handoff");
+                            return Ok(format!(
+                                "{}{}",
+                                BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview
+                            ));
+                        }
                     }
                     Ok(pte_result) => {
                         if state.config.post_tool_evaluator_enabled {
@@ -2221,6 +2458,57 @@ fn latest_user_text(messages: &[Message]) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+fn normalize_intent_signature(input: &str) -> String {
+    let lowered = input.to_ascii_lowercase();
+    let words: Vec<&str> = lowered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .take(12)
+        .collect();
+    if words.is_empty() {
+        "general".to_string()
+    } else {
+        words.join("_")
+    }
+}
+
+fn derive_project_title(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "Untitled Project".to_string();
+    }
+    let max = 72usize;
+    let clipped = if trimmed.chars().count() > max {
+        format!("{}...", trimmed.chars().take(max).collect::<String>())
+    } else {
+        trimmed.to_string()
+    };
+    clipped.replace('\n', " ")
+}
+
+fn infer_project_type(input: &str) -> &'static str {
+    let l = input.to_ascii_lowercase();
+    if l.contains("image") || l.contains("logo") || l.contains("icon") {
+        "image"
+    } else if l.contains("app")
+        || l.contains("web")
+        || l.contains("backend")
+        || l.contains("frontend")
+        || l.contains("api")
+    {
+        "app"
+    } else if l.contains(".rs")
+        || l.contains(".py")
+        || l.contains(".ts")
+        || l.contains("file")
+        || l.contains("code")
+    {
+        "file"
+    } else {
+        "general"
+    }
 }
 
 fn classify_user_intent(text: &str, has_image_input: bool) -> UserIntent {

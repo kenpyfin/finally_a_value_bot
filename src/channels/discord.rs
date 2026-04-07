@@ -297,6 +297,7 @@ impl EventHandler for Handler {
                         persona_id,
                         is_scheduled_task: false,
                         is_background_job: false,
+                        run_key: None,
                     },
                     None,
                     image_data,

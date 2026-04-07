@@ -20,6 +20,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 <!-- Add entries below this line, newest first. -->
 
+### 2026-04-01 — Global projects/workflows and unified runtime timeline
+
+- **Area:** agent / runtime / db / queue / web / config
+- **Summary:** Added a first-class global `project` model, auto-learned global `workflow` model, and DB-backed run timeline events. The shared agent path now attaches project/workflow context to runs, logs timeline events, and learns reusable workflow step patterns from successful tool runs.
+- **Rationale:** Continuous development tasks (single file/image/app over time) and repeated request classes need durable memory beyond transient turn context. Explicit project/workflow persistence plus deterministic loop controls reduce repeated process invention and improve long-run reliability.
+- **Key files / symbols:**
+  - `src/db.rs` — new tables/records/methods: `projects`, `project_artifacts`, `project_runs`, `workflows`, `workflow_executions`, `run_timeline_events`; methods `upsert_project`, `upsert_project_artifact`, `link_project_run`, `get_best_workflow_for_intent`, `upsert_workflow_learning`, `log_workflow_execution`, `append_run_timeline_event`.
+  - `src/channels/telegram.rs` — `AgentRequestContext.run_key`, `AgentEvent::WorkflowSelected`, project/workflow context injection into system prompt, run timeline writes during iteration/tool execution, and workflow auto-learning persistence in `save_run_history!`.
+  - `src/post_tool_evaluator.rs` — new PTE actions (`AskUser`, `HandoffBackground`, `StopWithSummary`) and deterministic no-progress signature detection.
+  - `src/job_heartbeat.rs` — heartbeat writes now also append to `run_timeline_events`; workflow selection progress mapping added.
+  - `src/chat_queue.rs` — queue lane metadata and diagnostics (`QueueTaskMeta`, `LaneDiagnostic`, `diagnostics`, `enqueue_with_meta`) plus long-wait warning.
+  - `src/web.rs` — web runs pass `run_key` into agent context, `/api/run_status` returns timeline event count, and `/api/queue_diagnostics` exposes lane diagnostics.
+  - `src/config.rs`, `src/config_wizard.rs` — reliability/learning controls: `runtime_reliability_profile`, `workflow_auto_learn`, `workflow_min_success_repetitions`, `workflow_replay_strictness`, `project_auto_association_strictness`.
+  - `docs/runtime-gap-analysis.md` — new runtime parity/debt tracking doc for project/workflow learning.
+- **Follow-ups:** Tighten project matching heuristics, enforce workflow replay strictness in deterministic execution policy (currently prompt-guided), and add first-class project/workflow management tools for explicit user control.
+
 ### 2026-04-01 — Memory loop guards and shared job heartbeat
 
 - **Area:** agent / memory / background jobs / scheduler

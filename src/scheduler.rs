@@ -315,6 +315,7 @@ async fn run_scheduled_agent_and_finalize(
             persona_id,
             is_scheduled_task: true,
             is_background_job: false,
+            run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
         },
         Some(&prompt),
         None,

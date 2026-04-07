@@ -41,6 +41,13 @@ pub fn signal_from_agent_event(evt: &AgentEvent) -> Option<HeartbeatSignal> {
         AgentEvent::Iteration { iteration } => {
             Some(HeartbeatSignal::Progress(format!("iteration {}", iteration)))
         }
+        AgentEvent::WorkflowSelected {
+            workflow_id,
+            confidence,
+        } => Some(HeartbeatSignal::Progress(format!(
+            "selected workflow {} (confidence {:.2})",
+            workflow_id, confidence
+        ))),
         AgentEvent::ToolStart { name, .. } => Some(HeartbeatSignal::ToolStart(name.clone())),
         AgentEvent::ToolResult { name, is_error, .. } => Some(HeartbeatSignal::ToolResult {
             tool: name.clone(),
@@ -75,6 +82,12 @@ pub fn spawn_shared_heartbeat(
             let message = message.clone();
             let job_type = job_type.as_str().to_string();
             move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, true)
+        })
+        .await;
+        let _ = call_blocking(state.db.clone(), {
+            let run_key = run_key.clone();
+            let payload = format!(r#"{{"stage":"{}","message":"{}"}}"#, stage, message.replace('"', "'"));
+            move |db| db.append_run_timeline_event(&run_key, chat_id, persona_id, "heartbeat", Some(&payload))
         })
         .await;
 
@@ -125,6 +138,14 @@ pub fn spawn_shared_heartbeat(
                         move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, active)
                     })
                     .await;
+                    let _ = call_blocking(state.db.clone(), {
+                        let run_key = run_key.clone();
+                        let stage = stage.clone();
+                        let message = message.clone();
+                        let payload = format!(r#"{{"stage":"{}","message":"{}"}}"#, stage, message.replace('"', "'"));
+                        move |db| db.append_run_timeline_event(&run_key, chat_id, persona_id, "heartbeat", Some(&payload))
+                    })
+                    .await;
 
                     if job_type.notify_user_periodically() && stage != "completed" && stage != "failed" {
                         let _ = deliver_to_contact(
@@ -153,6 +174,14 @@ pub fn spawn_shared_heartbeat(
                         let job_type = job_type.as_str().to_string();
                         move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, active)
                     }).await;
+                    let _ = call_blocking(state.db.clone(), {
+                        let run_key = run_key.clone();
+                        let stage = stage.clone();
+                        let message = message.clone();
+                        let payload = format!(r#"{{"stage":"{}","message":"{}"}}"#, stage, message.replace('"', "'"));
+                        move |db| db.append_run_timeline_event(&run_key, chat_id, persona_id, "heartbeat", Some(&payload))
+                    })
+                    .await;
 
                     if active
                         && job_type.notify_user_periodically()

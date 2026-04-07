@@ -65,6 +65,7 @@ pub fn spawn_background_job(
                 persona_id,
                 is_scheduled_task: false,
                 is_background_job: true,
+                run_key: Some(job_id.clone()),
             },
             Some(&prompt),
             None,

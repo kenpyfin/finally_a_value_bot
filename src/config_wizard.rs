@@ -467,6 +467,11 @@ fn default_config() -> Config {
         scheduler_stale_running_reclaim_secs: 7200,
         scheduler_max_concurrent_tasks: 2,
         scheduler_poll_interval_secs: 60,
+        runtime_reliability_profile: "balanced".into(),
+        workflow_auto_learn: true,
+        workflow_min_success_repetitions: 2,
+        workflow_replay_strictness: "adaptive".into(),
+        project_auto_association_strictness: "balanced".into(),
     }
 }
 

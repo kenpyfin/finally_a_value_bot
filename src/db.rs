@@ -119,6 +119,43 @@ pub struct JobHeartbeat {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProjectRecord {
+    pub id: i64,
+    pub owner_chat_id: i64,
+    pub title: String,
+    pub project_type: String,
+    pub status: String,
+    pub canonical_path: Option<String>,
+    pub metadata_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowRecord {
+    pub id: i64,
+    pub owner_chat_id: i64,
+    pub intent_signature: String,
+    pub steps_json: String,
+    pub confidence: f64,
+    pub version: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub last_used_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunTimelineEvent {
+    pub id: i64,
+    pub run_key: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
     pub chat_id: i64,
@@ -283,6 +320,83 @@ impl Database {
                 ON job_heartbeats(chat_id);
             CREATE INDEX IF NOT EXISTS idx_job_heartbeats_updated
                 ON job_heartbeats(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_chat_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                project_type TEXT NOT NULL DEFAULT 'general',
+                status TEXT NOT NULL DEFAULT 'active',
+                canonical_path TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_chat_id, title)
+            );
+            CREATE INDEX IF NOT EXISTS idx_projects_owner_updated
+                ON projects(owner_chat_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS project_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                artifact_type TEXT NOT NULL,
+                artifact_ref TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, artifact_type, artifact_ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_artifacts_project
+                ON project_artifacts(project_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS project_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                run_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(project_id, run_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_runs_run_key
+                ON project_runs(run_key);
+
+            CREATE TABLE IF NOT EXISTS workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_chat_id INTEGER NOT NULL,
+                intent_signature TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                version INTEGER NOT NULL DEFAULT 1,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_chat_id, intent_signature)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflows_owner_conf
+                ON workflows(owner_chat_id, confidence DESC, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS workflow_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id INTEGER NOT NULL,
+                run_key TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_executions_workflow
+                ON workflow_executions(workflow_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS run_timeline_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_key TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_timeline_events_run_key
+                ON run_timeline_events(run_key, id ASC);
+            CREATE INDEX IF NOT EXISTS idx_run_timeline_events_chat
+                ON run_timeline_events(chat_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS channel_bindings (
                 canonical_chat_id INTEGER NOT NULL,
@@ -1662,6 +1776,287 @@ impl Database {
             }
         };
         Ok(runs)
+    }
+
+    // --- Projects / workflows / timeline ---
+
+    pub fn upsert_project(
+        &self,
+        owner_chat_id: i64,
+        title: &str,
+        project_type: &str,
+        status: &str,
+        canonical_path: Option<&str>,
+        metadata_json: Option<&str>,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO projects (owner_chat_id, title, project_type, status, canonical_path, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(owner_chat_id, title) DO UPDATE SET
+               project_type = excluded.project_type,
+               status = excluded.status,
+               canonical_path = excluded.canonical_path,
+               metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at",
+            params![
+                owner_chat_id,
+                title,
+                project_type,
+                status,
+                canonical_path,
+                metadata_json.unwrap_or("{}"),
+                now
+            ],
+        )?;
+        let id = conn.query_row(
+            "SELECT id FROM projects WHERE owner_chat_id = ?1 AND title = ?2",
+            params![owner_chat_id, title],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_recent_project_for_contact(
+        &self,
+        owner_chat_id: i64,
+    ) -> Result<Option<ProjectRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, owner_chat_id, title, project_type, status, canonical_path, metadata_json, updated_at
+             FROM projects
+             WHERE owner_chat_id = ?1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+            params![owner_chat_id],
+            |row| {
+                Ok(ProjectRecord {
+                    id: row.get(0)?,
+                    owner_chat_id: row.get(1)?,
+                    title: row.get(2)?,
+                    project_type: row.get(3)?,
+                    status: row.get(4)?,
+                    canonical_path: row.get(5)?,
+                    metadata_json: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        );
+        match result {
+            Ok(project) => Ok(Some(project)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn touch_project_status(
+        &self,
+        project_id: i64,
+        status: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE projects SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now, project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_project_artifact(
+        &self,
+        project_id: i64,
+        artifact_type: &str,
+        artifact_ref: &str,
+        metadata_json: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO project_artifacts (project_id, artifact_type, artifact_ref, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id, artifact_type, artifact_ref) DO UPDATE SET
+               metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at",
+            params![
+                project_id,
+                artifact_type,
+                artifact_ref,
+                metadata_json.unwrap_or("{}"),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn link_project_run(
+        &self,
+        project_id: i64,
+        run_key: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_runs (project_id, run_key, created_at) VALUES (?1, ?2, ?3)",
+            params![project_id, run_key, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_best_workflow_for_intent(
+        &self,
+        owner_chat_id: i64,
+        intent_signature: &str,
+        min_confidence: f64,
+    ) -> Result<Option<WorkflowRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
+             FROM workflows
+             WHERE owner_chat_id = ?1
+               AND intent_signature = ?2
+               AND confidence >= ?3
+             ORDER BY confidence DESC, updated_at DESC
+             LIMIT 1",
+            params![owner_chat_id, intent_signature, min_confidence],
+            |row| {
+                Ok(WorkflowRecord {
+                    id: row.get(0)?,
+                    owner_chat_id: row.get(1)?,
+                    intent_signature: row.get(2)?,
+                    steps_json: row.get(3)?,
+                    confidence: row.get(4)?,
+                    version: row.get(5)?,
+                    success_count: row.get(6)?,
+                    failure_count: row.get(7)?,
+                    last_used_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        );
+        match result {
+            Ok(wf) => Ok(Some(wf)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn upsert_workflow_learning(
+        &self,
+        owner_chat_id: i64,
+        intent_signature: &str,
+        steps_json: &str,
+        success: bool,
+        score: f64,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO workflows (
+                owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, CASE WHEN ?4 THEN ?5 ELSE 0.0 END, 1,
+                CASE WHEN ?4 THEN 1 ELSE 0 END,
+                CASE WHEN ?4 THEN 0 ELSE 1 END,
+                ?6, ?6
+             )
+             ON CONFLICT(owner_chat_id, intent_signature) DO UPDATE SET
+               steps_json = excluded.steps_json,
+               success_count = workflows.success_count + CASE WHEN ?4 THEN 1 ELSE 0 END,
+               failure_count = workflows.failure_count + CASE WHEN ?4 THEN 0 ELSE 1 END,
+               confidence = MIN(
+                   1.0,
+                   MAX(
+                       0.0,
+                       (workflows.confidence * 0.7) + (CASE WHEN ?4 THEN ?5 ELSE 0.0 END * 0.3)
+                   )
+               ),
+               version = workflows.version + 1,
+               updated_at = excluded.updated_at",
+            params![owner_chat_id, intent_signature, steps_json, success, score, now],
+        )?;
+        let id = conn.query_row(
+            "SELECT id FROM workflows WHERE owner_chat_id = ?1 AND intent_signature = ?2",
+            params![owner_chat_id, intent_signature],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn log_workflow_execution(
+        &self,
+        workflow_id: i64,
+        run_key: &str,
+        outcome: &str,
+        score: f64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO workflow_executions (workflow_id, run_key, outcome, score, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![workflow_id, run_key, outcome, score, now],
+        )?;
+        conn.execute(
+            "UPDATE workflows SET last_used_at = ?1 WHERE id = ?2",
+            params![now, workflow_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_run_timeline_event(
+        &self,
+        run_key: &str,
+        chat_id: i64,
+        persona_id: i64,
+        event_type: &str,
+        payload_json: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO run_timeline_events (run_key, chat_id, persona_id, event_type, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_key,
+                chat_id,
+                persona_id,
+                event_type,
+                payload_json.unwrap_or("{}"),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_run_timeline_events(
+        &self,
+        run_key: &str,
+        limit: usize,
+    ) -> Result<Vec<RunTimelineEvent>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, run_key, chat_id, persona_id, event_type, payload_json, created_at
+             FROM run_timeline_events
+             WHERE run_key = ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![run_key, limit as i64], |row| {
+                Ok(RunTimelineEvent {
+                    id: row.get(0)?,
+                    run_key: row.get(1)?,
+                    chat_id: row.get(2)?,
+                    persona_id: row.get(3)?,
+                    event_type: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // --- Background jobs ---

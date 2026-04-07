@@ -611,7 +611,14 @@ async fn api_send(
                     limits.run_history_limit,
                 )
                 .await;
-            match send_and_store_response_with_events(state_for_task.clone(), body, None).await {
+            match send_and_store_response_with_events(
+                state_for_task.clone(),
+                body,
+                None,
+                Some(&run_id_for_task),
+            )
+            .await
+            {
                 Ok(resp) => {
                     let response_text = resp
                         .0
@@ -746,6 +753,23 @@ async fn api_send_stream(
                             )
                             .await;
                     }
+                    AgentEvent::WorkflowSelected {
+                        workflow_id,
+                        confidence,
+                    } => {
+                        run_hub
+                            .publish(
+                                &run_id_for_events,
+                                "workflow_selected",
+                                json!({
+                                    "workflow_id": workflow_id,
+                                    "confidence": confidence
+                                })
+                                .to_string(),
+                                run_history_limit,
+                            )
+                            .await;
+                    }
                     AgentEvent::ToolStart {
                         tool_use_id,
                         name,
@@ -809,7 +833,13 @@ async fn api_send_stream(
             }
         });
 
-        match send_and_store_response_with_events(state_for_task.clone(), body, Some(&evt_tx)).await
+        match send_and_store_response_with_events(
+            state_for_task.clone(),
+            body,
+            Some(&evt_tx),
+            Some(&run_id_for_task),
+        )
+        .await
         {
             Ok(resp) => {
                 let response_text = resp
@@ -1072,11 +1102,44 @@ async fn api_run_status(
     let Some((done, last_event_id)) = state.run_hub.status(&query.run_id).await else {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     };
+    let timeline_count = call_blocking(state.app_state.db.clone(), {
+        let run_key = query.run_id.clone();
+        move |db| Ok(db.get_run_timeline_events(&run_key, 500)?.len() as i64)
+    })
+    .await
+    .unwrap_or(0);
     Ok(Json(json!({
         "ok": true,
         "run_id": query.run_id,
         "done": done,
         "last_event_id": last_event_id,
+        "timeline_events": timeline_count,
+    })))
+}
+
+async fn api_queue_diagnostics(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let lanes = state.app_state.chat_queue.diagnostics().await;
+    let rows = lanes
+        .into_iter()
+        .map(|lane| {
+            json!({
+                "chat_id": lane.chat_id,
+                "pending": lane.pending,
+                "active_for_ms": lane.active_for_ms,
+                "oldest_wait_ms": lane.oldest_wait_ms,
+                "last_error": lane.last_error,
+                "project_id": lane.project_id,
+                "workflow_id": lane.workflow_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "ok": true,
+        "lanes": rows,
     })))
 }
 
@@ -1084,6 +1147,7 @@ async fn send_and_store_response_with_events(
     state: WebState,
     body: SendRequest,
     event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    run_key: Option<&str>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let raw_text = body.message.trim().to_string();
     let mut text = raw_text.clone();
@@ -1246,6 +1310,7 @@ async fn send_and_store_response_with_events(
                 persona_id,
                 is_scheduled_task: false,
                 is_background_job: false,
+                run_key: run_key.map(|s| s.to_string()),
             },
             None,
             image_data,
@@ -1263,6 +1328,7 @@ async fn send_and_store_response_with_events(
                 persona_id,
                 is_scheduled_task: false,
                 is_background_job: false,
+                run_key: run_key.map(|s| s.to_string()),
             },
             None,
             image_data,
@@ -2187,6 +2253,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/send_stream", post(api_send_stream))
         .route("/api/stream", get(api_stream))
         .route("/api/run_status", get(api_run_status))
+        .route("/api/queue_diagnostics", get(api_queue_diagnostics))
         .route("/api/reset", post(api_reset))
         .route("/api/delete_session", post(api_delete_session))
         .route("/api/personas", get(api_personas))

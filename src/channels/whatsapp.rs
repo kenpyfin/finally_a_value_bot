@@ -483,6 +483,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 persona_id,
                                 is_scheduled_task: false,
                                 is_background_job: false,
+                                run_key: None,
                             },
                             None,
                             image_data,

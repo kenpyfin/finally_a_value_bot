@@ -128,6 +128,26 @@ fn default_scheduler_poll_interval_secs() -> u64 {
     60
 }
 
+fn default_runtime_reliability_profile() -> String {
+    "balanced".into()
+}
+
+fn default_workflow_auto_learn() -> bool {
+    true
+}
+
+fn default_workflow_min_success_repetitions() -> usize {
+    2
+}
+
+fn default_workflow_replay_strictness() -> String {
+    "adaptive".into()
+}
+
+fn default_project_auto_association_strictness() -> String {
+    "balanced".into()
+}
+
 fn default_orchestrator_enabled() -> bool {
     true
 }
@@ -390,6 +410,21 @@ pub struct Config {
     /// Seconds between scheduler ticks (reclaim + due-task scan). Default 60.
     #[serde(default = "default_scheduler_poll_interval_secs")]
     pub scheduler_poll_interval_secs: u64,
+    /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
+    #[serde(default = "default_runtime_reliability_profile")]
+    pub runtime_reliability_profile: String,
+    /// Enable auto-learning workflows from successful repeated runs.
+    #[serde(default = "default_workflow_auto_learn")]
+    pub workflow_auto_learn: bool,
+    /// Minimum repeated successful runs before workflow confidence is promoted.
+    #[serde(default = "default_workflow_min_success_repetitions")]
+    pub workflow_min_success_repetitions: usize,
+    /// Workflow replay mode: strict | adaptive | loose.
+    #[serde(default = "default_workflow_replay_strictness")]
+    pub workflow_replay_strictness: String,
+    /// Project auto-linking mode: strict | balanced | loose.
+    #[serde(default = "default_project_auto_association_strictness")]
+    pub project_auto_association_strictness: String,
 }
 
 impl Config {
@@ -738,6 +773,20 @@ impl Config {
                 "SCHEDULER_POLL_INTERVAL_SECS",
                 default_scheduler_poll_interval_secs(),
             ),
+            runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
+                .unwrap_or_else(default_runtime_reliability_profile),
+            workflow_auto_learn: Self::env_bool(
+                "WORKFLOW_AUTO_LEARN",
+                default_workflow_auto_learn(),
+            ),
+            workflow_min_success_repetitions: Self::env_usize(
+                "WORKFLOW_MIN_SUCCESS_REPETITIONS",
+                default_workflow_min_success_repetitions(),
+            ),
+            workflow_replay_strictness: Self::env("WORKFLOW_REPLAY_STRICTNESS")
+                .unwrap_or_else(default_workflow_replay_strictness),
+            project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
+                .unwrap_or_else(default_project_auto_association_strictness),
         }
     }
 
@@ -746,6 +795,12 @@ impl Config {
         self.llm_provider = self.llm_provider.trim().to_lowercase();
         self.safety_output_guard_mode = self.safety_output_guard_mode.trim().to_ascii_lowercase();
         self.safety_execution_mode = self.safety_execution_mode.trim().to_ascii_lowercase();
+        self.runtime_reliability_profile = self.runtime_reliability_profile.trim().to_ascii_lowercase();
+        self.workflow_replay_strictness = self.workflow_replay_strictness.trim().to_ascii_lowercase();
+        self.project_auto_association_strictness = self
+            .project_auto_association_strictness
+            .trim()
+            .to_ascii_lowercase();
         self.safety_risky_categories = self
             .safety_risky_categories
             .iter()
@@ -846,6 +901,31 @@ impl Config {
                 )));
             }
         }
+        match self.runtime_reliability_profile.as_str() {
+            "aggressive_completion" => {
+                if self.max_tool_iterations < 80 {
+                    self.max_tool_iterations = 80;
+                }
+                self.post_tool_evaluator_enabled = true;
+            }
+            "safe_conservative" => {
+                self.max_tool_iterations = self.max_tool_iterations.min(60);
+                self.post_tool_evaluator_enabled = true;
+            }
+            _ => {
+                self.runtime_reliability_profile = "balanced".to_string();
+            }
+        }
+        if !["strict", "adaptive", "loose"].contains(&self.workflow_replay_strictness.as_str()) {
+            self.workflow_replay_strictness = default_workflow_replay_strictness();
+        }
+        if !["strict", "balanced", "loose"].contains(&self.project_auto_association_strictness.as_str()) {
+            self.project_auto_association_strictness =
+                default_project_auto_association_strictness();
+        }
+        if self.workflow_min_success_repetitions == 0 {
+            self.workflow_min_success_repetitions = default_workflow_min_success_repetitions();
+        }
         // Expand ~ in agent_browser_path if present
         if let Some(ref p) = self.agent_browser_path {
             let trimmed = p.trim();
@@ -931,6 +1011,26 @@ impl Config {
         lines.push(format!("MAX_TOKENS={}", self.max_tokens));
         lines.push(format!("MAX_TOOL_ITERATIONS={}", self.max_tool_iterations));
         lines.push(format!("MAX_HISTORY_MESSAGES={}", self.max_history_messages));
+        lines.push(format!(
+            "RUNTIME_RELIABILITY_PROFILE={}",
+            esc(&self.runtime_reliability_profile)
+        ));
+        lines.push(format!(
+            "WORKFLOW_AUTO_LEARN={}",
+            if self.workflow_auto_learn { "true" } else { "false" }
+        ));
+        lines.push(format!(
+            "WORKFLOW_MIN_SUCCESS_REPETITIONS={}",
+            self.workflow_min_success_repetitions
+        ));
+        lines.push(format!(
+            "WORKFLOW_REPLAY_STRICTNESS={}",
+            esc(&self.workflow_replay_strictness)
+        ));
+        lines.push(format!(
+            "PROJECT_AUTO_ASSOCIATION_STRICTNESS={}",
+            esc(&self.project_auto_association_strictness)
+        ));
         lines.push(format!("MAX_DOCUMENT_SIZE_MB={}", self.max_document_size_mb));
         lines.push(format!("SHOW_THINKING={}", if self.show_thinking { "true" } else { "false" }));
         lines.push("".into());
@@ -1089,6 +1189,11 @@ mod tests {
             scheduler_stale_running_reclaim_secs: default_scheduler_stale_running_reclaim_secs(),
             scheduler_max_concurrent_tasks: default_scheduler_max_concurrent_tasks(),
             scheduler_poll_interval_secs: default_scheduler_poll_interval_secs(),
+            runtime_reliability_profile: default_runtime_reliability_profile(),
+            workflow_auto_learn: default_workflow_auto_learn(),
+            workflow_min_success_repetitions: default_workflow_min_success_repetitions(),
+            workflow_replay_strictness: default_workflow_replay_strictness(),
+            project_auto_association_strictness: default_project_auto_association_strictness(),
         }
     }
 
