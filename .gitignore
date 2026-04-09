@@ -13,5 +13,12 @@ shared/*
 
 .cursorrules
 workspace/*
+# Workspace (keep skills/shared, exclude vault)
+workspace/shared/ORIGIN/
+workspace/shared/vault_db/
+workspace/shared/test-venv/
+workspace/shared/.venv-vault/
+workspace/**/.env
+workspace/**/node_modules/
 
-
+docs/development-journal.md

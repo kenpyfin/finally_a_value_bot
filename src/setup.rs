@@ -395,28 +395,6 @@ impl SetupApp {
                     required: false,
                     secret: false,
                 },
-                // ── Delegate ──
-                Field {
-                    key: "DELEGATE_TOOL_ENABLED",
-                    label: "Enable delegate tool",
-                    value: existing.get("DELEGATE_TOOL_ENABLED").cloned().unwrap_or_else(|| "true".into()),
-                    required: false,
-                    secret: false,
-                },
-                Field {
-                    key: "DELEGATE_MAX_ITERATIONS",
-                    label: "Delegate max iterations",
-                    value: existing.get("DELEGATE_MAX_ITERATIONS").cloned().unwrap_or_else(|| "10".into()),
-                    required: false,
-                    secret: false,
-                },
-                Field {
-                    key: "DELEGATE_MODEL",
-                    label: "Delegate model override",
-                    value: existing.get("DELEGATE_MODEL").cloned().unwrap_or_default(),
-                    required: false,
-                    secret: false,
-                },
                 // ── Discord ──
                 Field {
                     key: "DISCORD_BOT_TOKEN",
@@ -957,8 +935,6 @@ impl SetupApp {
             "MAX_TOOL_ITERATIONS" => "100".into(),
             "MAX_HISTORY_MESSAGES" => "50".into(),
             "ORCHESTRATOR_ENABLED" => "true".into(),
-            "DELEGATE_TOOL_ENABLED" => "true".into(),
-            "DELEGATE_MAX_ITERATIONS" => "10".into(),
             "WHATSAPP_WEBHOOK_PORT" => "8080".into(),
             "WEB_ENABLED" => "true".into(),
             "WEB_HOST" => "0.0.0.0".into(),
@@ -996,7 +972,6 @@ impl SetupApp {
                 "LLM_PROVIDER" | "LLM_API_KEY" | "LLM_MODEL" | "LLM_BASE_URL" | "OPENAI_API_KEY" => "LLM",
                 "WORKSPACE_DIR" | "TIMEZONE" | "MAX_TOKENS" | "MAX_TOOL_ITERATIONS" | "MAX_HISTORY_MESSAGES" => "Runtime",
                 "ORCHESTRATOR_ENABLED" | "ORCHESTRATOR_MODEL" => "Orchestrator",
-                "DELEGATE_TOOL_ENABLED" | "DELEGATE_MAX_ITERATIONS" | "DELEGATE_MODEL" => "Delegate",
                 "DISCORD_BOT_TOKEN" | "DISCORD_ALLOWED_CHANNELS" => "Discord",
                 "WHATSAPP_ACCESS_TOKEN" | "WHATSAPP_PHONE_NUMBER_ID" | "WHATSAPP_VERIFY_TOKEN" | "WHATSAPP_WEBHOOK_PORT" => "WhatsApp",
                 "WEB_ENABLED" | "WEB_HOST" | "WEB_PORT" | "WEB_AUTH_TOKEN" => "Web UI",
@@ -1244,11 +1219,6 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
     // Orchestrator
     emit!("Orchestrator", "ORCHESTRATOR_ENABLED", get("ORCHESTRATOR_ENABLED"), false);
     emit!("", "ORCHESTRATOR_MODEL", get("ORCHESTRATOR_MODEL"), false);
-
-    // Delegate
-    emit!("Delegate", "DELEGATE_TOOL_ENABLED", get("DELEGATE_TOOL_ENABLED"), false);
-    emit!("", "DELEGATE_MAX_ITERATIONS", get("DELEGATE_MAX_ITERATIONS"), false);
-    emit!("", "DELEGATE_MODEL", get("DELEGATE_MODEL"), false);
 
     // Discord
     emit!("Discord", "DISCORD_BOT_TOKEN", get("DISCORD_BOT_TOKEN"), false);

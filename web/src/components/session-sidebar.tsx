@@ -9,11 +9,11 @@ type SessionSidebarProps = {
   onUiThemeChange: (theme: string) => void
   uiThemeOptions: Array<{ key: string; label: string; color: string }>
   personas: Persona[]
+  personaHasNew?: Record<number, boolean>
   selectedPersonaId: number | null
   onPersonaSelect: (personaName: string) => void
   onCreatePersona: () => void
   onDeletePersona: (personaId: number) => void
-  onOpenConfig: () => Promise<void>
 }
 
 export function SessionSidebar({
@@ -23,11 +23,11 @@ export function SessionSidebar({
   onUiThemeChange,
   uiThemeOptions,
   personas,
+  personaHasNew,
   selectedPersonaId,
   onPersonaSelect,
   onCreatePersona,
   onDeletePersona,
-  onOpenConfig,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
@@ -196,7 +196,16 @@ export function SessionSidebar({
                     className="min-w-0 flex-1 text-left text-sm font-medium"
                     onClick={() => onPersonaSelect(p.name)}
                   >
-                    {p.name}
+                    <span className="inline-flex items-center gap-2">
+                      <span className="truncate">{p.name}</span>
+                      {personaHasNew?.[p.id] ? (
+                        <span
+                          className={isDark ? 'h-2 w-2 rounded-full bg-[color:var(--mc-accent)]' : 'h-2 w-2 rounded-full bg-[color:var(--mc-accent)]'}
+                          aria-label="New messages"
+                          title="New messages"
+                        />
+                      ) : null}
+                    </span>
                   </button>
                   {p.is_active ? <Badge size="1" variant="soft">active</Badge> : null}
                   {p.name !== 'default' ? (
@@ -232,9 +241,6 @@ export function SessionSidebar({
       </div>
 
       <div className={isDark ? 'mt-4 border-t border-[color:var(--mc-border-soft)] pt-3' : 'mt-4 border-t border-slate-200 pt-3'}>
-        <Button size="2" variant="soft" onClick={() => void onOpenConfig()} style={{ width: '100%' }}>
-          Runtime Config
-        </Button>
         <div className="mt-3 flex flex-col items-center gap-1">
           <a
             href="https://finally-a-value-bot.ai"

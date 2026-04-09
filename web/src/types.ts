@@ -14,6 +14,7 @@ export type Persona = {
   id: number
   name: string
   is_active: boolean
+  last_bot_message_at?: string | null
 }
 
 export type ChannelBinding = {

@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -23,127 +24,146 @@ fn memory_path(groups_dir: &Path, chat_id: i64, persona_id: i64) -> PathBuf {
 }
 
 /// Parse MEMORY.md and extract one tier's content (between its header and the next ## or EOF).
-fn parse_tier_content(full: &str, tier: u8) -> String {
-    let header = TIER_HEADERS
-        .iter()
-        .find(|(n, _)| *n == tier)
-        .map(|(_, h)| *h)
-        .unwrap_or("");
-    if header.is_empty() {
-        return String::new();
-    }
-    let mut in_tier = false;
-    let mut lines = Vec::new();
+fn extract_tier_sections(full: &str) -> [String; 3] {
+    let mut sections = [String::new(), String::new(), String::new()];
+    let mut current_tier: Option<usize> = None;
+    let mut current_lines: Vec<&str> = Vec::new();
+
+    let mut flush_current = |tier_idx: usize, lines: &mut Vec<&str>| {
+        let block = lines.join("\n").trim().to_string();
+        lines.clear();
+        if block.is_empty() {
+            return;
+        }
+        if sections[tier_idx].is_empty() {
+            sections[tier_idx] = block;
+        } else {
+            // If duplicate tier headers exist, preserve content by merging
+            // and canonicalize into a single section on write.
+            sections[tier_idx].push_str("\n\n");
+            sections[tier_idx].push_str(&block);
+        }
+    };
+
     for line in full.lines() {
         if line.starts_with("## ") {
-            if line.trim() == header {
-                in_tier = true;
-                continue;
+            if let Some(prev_idx) = current_tier {
+                flush_current(prev_idx, &mut current_lines);
             }
-            if in_tier {
-                break;
-            }
+            current_tier = TIER_HEADERS
+                .iter()
+                .position(|(_, h)| line.trim() == *h);
             continue;
         }
-        if in_tier {
-            lines.push(line);
+        if current_tier.is_some() {
+            current_lines.push(line);
         }
     }
-    lines.join("\n").trim().to_string()
+    if let Some(prev_idx) = current_tier {
+        flush_current(prev_idx, &mut current_lines);
+    }
+
+    sections
+}
+
+fn parse_tier_content(full: &str, tier: u8) -> String {
+    if !(1..=3).contains(&tier) {
+        return String::new();
+    }
+    let sections = extract_tier_sections(full);
+    sections[(tier - 1) as usize].clone()
+}
+
+fn render_memory_document(sections: &[String; 3]) -> String {
+    let mut out = String::from("# Memory\n\n");
+    for (idx, (_, header)) in TIER_HEADERS.iter().enumerate() {
+        out.push_str(header);
+        out.push_str("\n\n");
+        if !sections[idx].trim().is_empty() {
+            out.push_str(sections[idx].trim());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn normalize_tier2_task_states(content: &str) -> String {
+    let mut out = Vec::new();
+    let mut seen_exact = HashSet::new();
+    let mut last_next_goal: Option<String> = None;
+    let mut task_state_latest: HashMap<String, String> = HashMap::new();
+    let mut task_state_order: Vec<String> = Vec::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed
+            .to_ascii_lowercase()
+            .starts_with("- next goal:")
+        {
+            last_next_goal = Some(trimmed.to_string());
+            continue;
+        }
+        // Canonical state line format:
+        // - TaskState|key=<task_key>|status=<queued|running|stalled|completed|cancelled>|updated=<iso>|evidence=<summary>
+        if let Some(rest) = trimmed.strip_prefix("- TaskState|key=") {
+            let key = rest.split('|').next().unwrap_or("").trim().to_string();
+            if !key.is_empty() {
+                if !task_state_latest.contains_key(&key) {
+                    task_state_order.push(key.clone());
+                }
+                task_state_latest.insert(key, trimmed.to_string());
+                continue;
+            }
+        }
+        if seen_exact.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+
+    if !task_state_latest.is_empty() {
+        for key in task_state_order {
+            if let Some(line) = task_state_latest.get(&key) {
+                out.push(line.clone());
+            }
+        }
+    }
+    if let Some(goal) = last_next_goal {
+        out.push(goal);
+    }
+
+    out.join("\n")
+}
+
+fn normalize_tier3_recent_focus(content: &str) -> String {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Keep only one monitoring reference per unique normalized sentence.
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out.join("\n")
 }
 
 /// Replace content for one tier in the full markdown; preserve others. Creates template if needed.
 fn replace_tier_content(full: &str, tier: u8, new_content: &str) -> String {
-    let mut out = String::new();
-    let header = TIER_HEADERS
-        .iter()
-        .find(|(n, _)| *n == tier)
-        .map(|(_, h)| *h)
-        .unwrap_or("");
-    if header.is_empty() {
+    if !(1..=3).contains(&tier) {
         return full.to_string();
     }
-
-    let mut found_any = false;
-    let mut current_tier: Option<u8> = None;
-    let mut current_lines: Vec<&str> = Vec::new();
-
-    fn flush_tier(
-        out: &mut String,
-        tier_num: u8,
-        lines: &[&str],
-        replace_with: Option<&str>,
-    ) {
-        let (_, header) = TIER_HEADERS.iter().find(|(n, _)| *n == tier_num).unwrap();
-        out.push_str(header);
-        out.push('\n');
-        out.push('\n');
-        if let Some(s) = replace_with {
-            out.push_str(s.trim());
-            if !s.ends_with('\n') {
-                out.push('\n');
-            }
-        } else {
-            for line in lines {
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out.push('\n');
-    }
-
-    for line in full.lines() {
-        if line.starts_with("## ") {
-            if let Some(prev) = current_tier {
-                let replace = if prev == tier {
-                    Some(new_content)
-                } else {
-                    None
-                };
-                flush_tier(&mut out, prev, &current_lines, replace);
-                current_lines.clear();
-            }
-            current_tier = TIER_HEADERS
-                .iter()
-                .find(|(_, h)| line.trim() == *h)
-                .map(|(n, _)| *n);
-            found_any = true;
-            continue;
-        }
-        if let Some(_t) = current_tier {
-            current_lines.push(line);
-        } else if out.is_empty() {
-            // Preamble before any tier
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if let Some(prev) = current_tier {
-        let replace = if prev == tier {
-            Some(new_content)
-        } else {
-            None
-        };
-        flush_tier(&mut out, prev, &current_lines, replace);
-    }
-
-    if !found_any {
-        // No tier headers found; produce full template with only this tier filled
-        out.clear();
-        out.push_str("# Memory\n\n");
-        for (n, h) in &TIER_HEADERS {
-            out.push_str(h);
-            out.push_str("\n\n");
-            if *n == tier {
-                out.push_str(new_content.trim());
-                if !new_content.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            out.push('\n');
-        }
-    }
-    out
+    let mut sections = extract_tier_sections(full);
+    sections[(tier - 1) as usize] = new_content.trim().to_string();
+    render_memory_document(&sections)
 }
 
 pub struct ReadTieredMemoryTool {
@@ -257,7 +277,7 @@ impl Tool for WriteTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_tiered_memory".into(),
-            description: "Write one tier of this persona's MEMORY.md. Tier 1 = long-term (only on explicit user ask); Tier 2 = active projects; Tier 3 = recent focus/mood (update often). Replaces that tier's section; other tiers are preserved.".into(),
+            description: "Write one tier of this persona's MEMORY.md. Tier 1 = long-term (only on explicit user ask); Tier 2 = active projects; Tier 3 = recent focus/mood (update often; use past-tense status language, never 'awaiting/finalizing/TODO' — memory is context, not a task queue). Replaces that tier's section; other tiers are preserved.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -317,23 +337,12 @@ impl Tool for WriteTieredMemoryTool {
         info!("Writing tiered memory tier {}: {}", tier, path.display());
 
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let new_content = if existing.trim().is_empty() {
-            let mut out = String::from("# Memory\n\n");
-            for (n, h) in &TIER_HEADERS {
-                out.push_str(h);
-                out.push_str("\n\n");
-                if *n == tier {
-                    out.push_str(content.trim());
-                    if !content.ends_with('\n') {
-                        out.push('\n');
-                    }
-                }
-                out.push('\n');
-            }
-            out
-        } else {
-            replace_tier_content(&existing, tier, content)
+        let normalized = match tier {
+            2 => normalize_tier2_task_states(content),
+            3 => normalize_tier3_recent_focus(content),
+            _ => content.trim().to_string(),
         };
+        let new_content = replace_tier_content(&existing, tier, &normalized);
 
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -386,5 +395,58 @@ Old T3"#;
         assert!(new.contains("Old T1"));
         assert!(new.contains("New T2 content"));
         assert!(new.contains("Old T3"));
+    }
+
+    #[test]
+    fn test_replace_tier_canonicalizes_duplicate_headers() {
+        let md = r#"# Memory
+
+## Tier 1 — Long term
+T1 first
+
+## Tier 2 — Mid term
+T2 first
+
+## Tier 2 — Mid term
+T2 second
+
+## Tier 3 — Short term
+T3 first"#;
+        let new = replace_tier_content(md, 3, "Updated T3");
+        assert_eq!(new.matches("## Tier 1 — Long term").count(), 1);
+        assert_eq!(new.matches("## Tier 2 — Mid term").count(), 1);
+        assert_eq!(new.matches("## Tier 3 — Short term").count(), 1);
+        assert!(new.contains("T2 first"));
+        assert!(new.contains("T2 second"));
+        assert!(new.contains("Updated T3"));
+    }
+
+    #[test]
+    fn test_normalize_tier2_task_states_dedupes_next_goal_and_taskstate() {
+        let input = r#"
+- Keep this.
+- Next Goal: old one
+- TaskState|key=swap:pz-20260330|status=running|updated=2026-04-01T01:00:00Z|evidence=queued
+- TaskState|key=swap:pz-20260330|status=stalled|updated=2026-04-01T02:00:00Z|evidence=timeout
+- Next Goal: latest one
+- Keep this.
+"#;
+        let out = normalize_tier2_task_states(input);
+        assert_eq!(out.matches("TaskState|key=swap:pz-20260330").count(), 1);
+        assert!(out.contains("status=stalled"));
+        assert_eq!(out.matches("Next Goal:").count(), 1);
+        assert!(out.contains("latest one"));
+    }
+
+    #[test]
+    fn test_normalize_tier3_recent_focus_dedupes_lines() {
+        let input = r#"
+- monitoring queue
+- monitoring queue
+- checking output
+"#;
+        let out = normalize_tier3_recent_focus(input);
+        assert_eq!(out.matches("monitoring queue").count(), 1);
+        assert_eq!(out.matches("checking output").count(), 1);
     }
 }

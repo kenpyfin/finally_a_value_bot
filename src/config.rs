@@ -35,12 +35,6 @@ fn default_workspace_dir() -> String {
 fn default_timezone() -> String {
     "UTC".into()
 }
-fn default_max_session_messages() -> usize {
-    40
-}
-fn default_compact_keep_recent() -> usize {
-    20
-}
 fn default_whatsapp_webhook_port() -> u16 {
     8080
 }
@@ -115,7 +109,43 @@ fn default_cursor_agent_model() -> String {
 }
 
 fn default_cursor_agent_timeout_secs() -> u64 {
-    600
+    1500
+}
+
+fn default_scheduler_task_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_scheduler_stale_running_reclaim_secs() -> u64 {
+    7200
+}
+
+fn default_scheduler_max_concurrent_tasks() -> usize {
+    2
+}
+
+fn default_scheduler_poll_interval_secs() -> u64 {
+    60
+}
+
+fn default_runtime_reliability_profile() -> String {
+    "balanced".into()
+}
+
+fn default_workflow_auto_learn() -> bool {
+    true
+}
+
+fn default_workflow_min_success_repetitions() -> usize {
+    2
+}
+
+fn default_workflow_replay_strictness() -> String {
+    "adaptive".into()
+}
+
+fn default_project_auto_association_strictness() -> String {
+    "balanced".into()
 }
 
 fn default_orchestrator_enabled() -> bool {
@@ -139,18 +169,6 @@ fn default_post_tool_evaluator_enabled() -> bool {
 }
 
 fn default_post_tool_evaluator_model() -> String {
-    String::new()
-}
-
-fn default_delegate_tool_enabled() -> bool {
-    true
-}
-
-fn default_delegate_max_iterations() -> usize {
-    10
-}
-
-fn default_delegate_model() -> String {
     String::new()
 }
 
@@ -272,10 +290,6 @@ pub struct Config {
     pub allowed_groups: Vec<i64>,
     #[serde(default = "default_control_chat_ids")]
     pub control_chat_ids: Vec<i64>,
-    #[serde(default = "default_max_session_messages")]
-    pub max_session_messages: usize,
-    #[serde(default = "default_compact_keep_recent")]
-    pub compact_keep_recent: usize,
     #[serde(default)]
     pub whatsapp_access_token: Option<String>,
     #[serde(default)]
@@ -349,7 +363,7 @@ pub struct Config {
     /// Model for cursor-agent (e.g. "gpt-5"). Leave empty to omit --model (cursor-agent uses its default / "auto").
     #[serde(default = "default_cursor_agent_model")]
     pub cursor_agent_model: String,
-    /// Timeout in seconds for cursor-agent runs. Default: 600.
+    /// Timeout in seconds for cursor-agent runs. Default: 1500.
     #[serde(default = "default_cursor_agent_timeout_secs")]
     pub cursor_agent_timeout_secs: u64,
     #[serde(default)]
@@ -375,15 +389,6 @@ pub struct Config {
     /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_post_tool_evaluator_model")]
     pub post_tool_evaluator_model: String,
-    /// Enable the delegate tool for sub-agent task delegation. Default true.
-    #[serde(default = "default_delegate_tool_enabled")]
-    pub delegate_tool_enabled: bool,
-    /// Maximum tool iterations for delegated sub-agent tasks. Default 10.
-    #[serde(default = "default_delegate_max_iterations")]
-    pub delegate_max_iterations: usize,
-    /// Optional model override for delegate sub-agent. If empty, use main model.
-    #[serde(default = "default_delegate_model")]
-    pub delegate_model: String,
     /// Tmux session name prefix for cursor_agent when detach=true (e.g. finally_a_value_bot-cursor).
     #[serde(default = "default_cursor_agent_tmux_session_prefix")]
     pub cursor_agent_tmux_session_prefix: String,
@@ -393,6 +398,33 @@ pub struct Config {
     /// URL of a host runner that executes cursor-agent (e.g. http://host.docker.internal:3847). When set, the bot POSTs spawn requests instead of running cursor-agent locally.
     #[serde(default)]
     pub cursor_agent_runner_url: Option<String>,
+    /// Max wall-clock time (seconds) for a single scheduled-agent run. Default 3600.
+    #[serde(default = "default_scheduler_task_timeout_secs")]
+    pub scheduler_task_timeout_secs: u64,
+    /// Reclaim `scheduled_tasks` stuck in `running` if the claim timestamp is older than this (seconds). Default 7200.
+    #[serde(default = "default_scheduler_stale_running_reclaim_secs")]
+    pub scheduler_stale_running_reclaim_secs: u64,
+    /// Max concurrent scheduled task runs (semaphore). Default 2.
+    #[serde(default = "default_scheduler_max_concurrent_tasks")]
+    pub scheduler_max_concurrent_tasks: usize,
+    /// Seconds between scheduler ticks (reclaim + due-task scan). Default 60.
+    #[serde(default = "default_scheduler_poll_interval_secs")]
+    pub scheduler_poll_interval_secs: u64,
+    /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
+    #[serde(default = "default_runtime_reliability_profile")]
+    pub runtime_reliability_profile: String,
+    /// Enable auto-learning workflows from successful repeated runs.
+    #[serde(default = "default_workflow_auto_learn")]
+    pub workflow_auto_learn: bool,
+    /// Minimum repeated successful runs before workflow confidence is promoted.
+    #[serde(default = "default_workflow_min_success_repetitions")]
+    pub workflow_min_success_repetitions: usize,
+    /// Workflow replay mode: strict | adaptive | loose.
+    #[serde(default = "default_workflow_replay_strictness")]
+    pub workflow_replay_strictness: String,
+    /// Project auto-linking mode: strict | balanced | loose.
+    #[serde(default = "default_project_auto_association_strictness")]
+    pub project_auto_association_strictness: String,
 }
 
 impl Config {
@@ -631,8 +663,6 @@ impl Config {
             timezone: Self::env("TIMEZONE").unwrap_or_else(default_timezone),
             allowed_groups: Self::env_vec_i64("ALLOWED_GROUPS"),
             control_chat_ids: Self::env_vec_i64("CONTROL_CHAT_IDS"),
-            max_session_messages: Self::env_usize("MAX_SESSION_MESSAGES", default_max_session_messages()),
-            compact_keep_recent: Self::env_usize("COMPACT_KEEP_RECENT", default_compact_keep_recent()),
             whatsapp_access_token: Self::env("WHATSAPP_ACCESS_TOKEN"),
             whatsapp_phone_number_id: Self::env("WHATSAPP_PHONE_NUMBER_ID"),
             whatsapp_verify_token: Self::env("WHATSAPP_VERIFY_TOKEN"),
@@ -719,15 +749,6 @@ impl Config {
                 default_post_tool_evaluator_enabled(),
             ),
             post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
-            delegate_tool_enabled: Self::env_bool(
-                "DELEGATE_TOOL_ENABLED",
-                default_delegate_tool_enabled(),
-            ),
-            delegate_max_iterations: Self::env_usize(
-                "DELEGATE_MAX_ITERATIONS",
-                default_delegate_max_iterations(),
-            ),
-            delegate_model: Self::env("DELEGATE_MODEL").unwrap_or_default(),
             cursor_agent_tmux_session_prefix: Self::env("CURSOR_AGENT_TMUX_SESSION_PREFIX")
                 .unwrap_or_else(default_cursor_agent_tmux_session_prefix),
             cursor_agent_tmux_enabled: Self::env_bool(
@@ -736,6 +757,36 @@ impl Config {
             ),
             cursor_agent_runner_url: Self::env("CURSOR_AGENT_RUNNER_URL")
                 .filter(|s| !s.trim().is_empty()),
+            scheduler_task_timeout_secs: Self::env_u64(
+                "SCHEDULER_TASK_TIMEOUT_SECS",
+                default_scheduler_task_timeout_secs(),
+            ),
+            scheduler_stale_running_reclaim_secs: Self::env_u64(
+                "SCHEDULER_STALE_RUNNING_RECLAIM_SECS",
+                default_scheduler_stale_running_reclaim_secs(),
+            ),
+            scheduler_max_concurrent_tasks: Self::env_usize(
+                "SCHEDULER_MAX_CONCURRENT_TASKS",
+                default_scheduler_max_concurrent_tasks(),
+            ),
+            scheduler_poll_interval_secs: Self::env_u64(
+                "SCHEDULER_POLL_INTERVAL_SECS",
+                default_scheduler_poll_interval_secs(),
+            ),
+            runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
+                .unwrap_or_else(default_runtime_reliability_profile),
+            workflow_auto_learn: Self::env_bool(
+                "WORKFLOW_AUTO_LEARN",
+                default_workflow_auto_learn(),
+            ),
+            workflow_min_success_repetitions: Self::env_usize(
+                "WORKFLOW_MIN_SUCCESS_REPETITIONS",
+                default_workflow_min_success_repetitions(),
+            ),
+            workflow_replay_strictness: Self::env("WORKFLOW_REPLAY_STRICTNESS")
+                .unwrap_or_else(default_workflow_replay_strictness),
+            project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
+                .unwrap_or_else(default_project_auto_association_strictness),
         }
     }
 
@@ -744,6 +795,12 @@ impl Config {
         self.llm_provider = self.llm_provider.trim().to_lowercase();
         self.safety_output_guard_mode = self.safety_output_guard_mode.trim().to_ascii_lowercase();
         self.safety_execution_mode = self.safety_execution_mode.trim().to_ascii_lowercase();
+        self.runtime_reliability_profile = self.runtime_reliability_profile.trim().to_ascii_lowercase();
+        self.workflow_replay_strictness = self.workflow_replay_strictness.trim().to_ascii_lowercase();
+        self.project_auto_association_strictness = self
+            .project_auto_association_strictness
+            .trim()
+            .to_ascii_lowercase();
         self.safety_risky_categories = self
             .safety_risky_categories
             .iter()
@@ -850,6 +907,31 @@ impl Config {
                 )));
             }
         }
+        match self.runtime_reliability_profile.as_str() {
+            "aggressive_completion" => {
+                if self.max_tool_iterations < 80 {
+                    self.max_tool_iterations = 80;
+                }
+                self.post_tool_evaluator_enabled = true;
+            }
+            "safe_conservative" => {
+                self.max_tool_iterations = self.max_tool_iterations.min(60);
+                self.post_tool_evaluator_enabled = true;
+            }
+            _ => {
+                self.runtime_reliability_profile = "balanced".to_string();
+            }
+        }
+        if !["strict", "adaptive", "loose"].contains(&self.workflow_replay_strictness.as_str()) {
+            self.workflow_replay_strictness = default_workflow_replay_strictness();
+        }
+        if !["strict", "balanced", "loose"].contains(&self.project_auto_association_strictness.as_str()) {
+            self.project_auto_association_strictness =
+                default_project_auto_association_strictness();
+        }
+        if self.workflow_min_success_repetitions == 0 {
+            self.workflow_min_success_repetitions = default_workflow_min_success_repetitions();
+        }
         // Expand ~ in agent_browser_path if present
         if let Some(ref p) = self.agent_browser_path {
             let trimmed = p.trim();
@@ -934,10 +1016,65 @@ impl Config {
                 lines.push(format!("LLM_BASE_URL={}", esc(u)));
             }
         }
+        lines.push(format!("MAX_TOKENS={}", self.max_tokens));
+        lines.push(format!("MAX_TOOL_ITERATIONS={}", self.max_tool_iterations));
+        lines.push(format!("MAX_HISTORY_MESSAGES={}", self.max_history_messages));
+        lines.push(format!(
+            "RUNTIME_RELIABILITY_PROFILE={}",
+            esc(&self.runtime_reliability_profile)
+        ));
+        lines.push(format!(
+            "WORKFLOW_AUTO_LEARN={}",
+            if self.workflow_auto_learn { "true" } else { "false" }
+        ));
+        lines.push(format!(
+            "WORKFLOW_MIN_SUCCESS_REPETITIONS={}",
+            self.workflow_min_success_repetitions
+        ));
+        lines.push(format!(
+            "WORKFLOW_REPLAY_STRICTNESS={}",
+            esc(&self.workflow_replay_strictness)
+        ));
+        lines.push(format!(
+            "PROJECT_AUTO_ASSOCIATION_STRICTNESS={}",
+            esc(&self.project_auto_association_strictness)
+        ));
+        lines.push(format!("MAX_DOCUMENT_SIZE_MB={}", self.max_document_size_mb));
+        lines.push(format!("SHOW_THINKING={}", if self.show_thinking { "true" } else { "false" }));
         lines.push("".into());
         lines.push("# Workspace".into());
         lines.push(format!("WORKSPACE_DIR={}", esc(&self.workspace_dir)));
         lines.push(format!("TIMEZONE={}", esc(&self.timezone)));
+        if let Some(id) = self.universal_chat_id {
+            lines.push(format!("UNIVERSAL_CHAT_ID={id}"));
+        }
+        lines.push("".into());
+        lines.push("# Web".into());
+        lines.push(format!("WEB_ENABLED={}", if self.web_enabled { "true" } else { "false" }));
+        lines.push(format!("WEB_HOST={}", esc(&self.web_host)));
+        lines.push(format!("WEB_PORT={}", self.web_port));
+        if let Some(ref token) = self.web_auth_token {
+            if !token.is_empty() {
+                lines.push(format!("WEB_AUTH_TOKEN={}", esc(token)));
+            }
+        }
+        lines.push(format!(
+            "WEB_MAX_INFLIGHT_PER_SESSION={}",
+            self.web_max_inflight_per_session
+        ));
+        lines.push(format!(
+            "WEB_MAX_REQUESTS_PER_WINDOW={}",
+            self.web_max_requests_per_window
+        ));
+        lines.push(format!(
+            "WEB_RATE_WINDOW_SECONDS={}",
+            self.web_rate_window_seconds
+        ));
+        lines.push(format!("WEB_RUN_HISTORY_LIMIT={}", self.web_run_history_limit));
+        lines.push(format!(
+            "WEB_SESSION_IDLE_TTL_SECONDS={}",
+            self.web_session_idle_ttl_seconds
+        ));
         lines.push("".into());
         lines.push("# Runtime safety".into());
         lines.push(format!(
@@ -1041,7 +1178,7 @@ mod tests {
             web_search_searxng_url: None,
             cursor_agent_cli_path: default_cursor_agent_cli_path(),
             cursor_agent_model: String::new(),
-            cursor_agent_timeout_secs: 600,
+            cursor_agent_timeout_secs: 1500,
             social: None,
             vault: None,
             orchestrator_enabled: true,
@@ -1056,6 +1193,15 @@ mod tests {
             cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
             cursor_agent_tmux_enabled: true,
             cursor_agent_runner_url: None,
+            scheduler_task_timeout_secs: default_scheduler_task_timeout_secs(),
+            scheduler_stale_running_reclaim_secs: default_scheduler_stale_running_reclaim_secs(),
+            scheduler_max_concurrent_tasks: default_scheduler_max_concurrent_tasks(),
+            scheduler_poll_interval_secs: default_scheduler_poll_interval_secs(),
+            runtime_reliability_profile: default_runtime_reliability_profile(),
+            workflow_auto_learn: default_workflow_auto_learn(),
+            workflow_min_success_repetitions: default_workflow_min_success_repetitions(),
+            workflow_replay_strictness: default_workflow_replay_strictness(),
+            project_auto_association_strictness: default_project_auto_association_strictness(),
         }
     }
 
@@ -1314,6 +1460,44 @@ discord_allowed_channels: [111, 222]
         config.save_yaml(path.to_str().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("telegram_bot_token"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_config_save_env_includes_runtime_and_web_keys() {
+        let mut config = test_config();
+        config.max_tokens = 4096;
+        config.max_tool_iterations = 55;
+        config.max_document_size_mb = 77;
+        config.show_thinking = true;
+        config.web_enabled = true;
+        config.web_host = "0.0.0.0".into();
+        config.web_port = 11999;
+        config.web_auth_token = Some("secret123".into());
+        config.web_max_inflight_per_session = 4;
+        config.web_max_requests_per_window = 12;
+        config.web_rate_window_seconds = 30;
+        config.web_run_history_limit = 900;
+        config.web_session_idle_ttl_seconds = 600;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("finally_a_value_bot_test_config.env");
+        config.save_env(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(content.contains("MAX_TOKENS=4096"));
+        assert!(content.contains("MAX_TOOL_ITERATIONS=55"));
+        assert!(content.contains("MAX_DOCUMENT_SIZE_MB=77"));
+        assert!(content.contains("SHOW_THINKING=true"));
+        assert!(content.contains("WEB_ENABLED=true"));
+        assert!(content.contains("WEB_HOST=0.0.0.0"));
+        assert!(content.contains("WEB_PORT=11999"));
+        assert!(content.contains("WEB_AUTH_TOKEN=secret123"));
+        assert!(content.contains("WEB_MAX_INFLIGHT_PER_SESSION=4"));
+        assert!(content.contains("WEB_MAX_REQUESTS_PER_WINDOW=12"));
+        assert!(content.contains("WEB_RATE_WINDOW_SECONDS=30"));
+        assert!(content.contains("WEB_RUN_HISTORY_LIMIT=900"));
+        assert!(content.contains("WEB_SESSION_IDLE_TTL_SECONDS=600"));
         std::fs::remove_file(path).ok();
     }
 }

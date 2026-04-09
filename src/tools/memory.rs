@@ -124,21 +124,21 @@ impl Tool for WriteMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_memory".into(),
-            description: "Write memory. Use scope 'chat' to replace this persona's full MEMORY.md, or 'chat_daily' to append to the daily log (today/yesterday are injected at session start). Principles (AGENTS.md at workspace root) are read-only. For tiered updates use write_tiered_memory.".into(),
+            description: "Write memory daily log only. Use scope 'chat_daily' to append a note to groups/{chat_id}/{persona_id}/memory/YYYY-MM-DD.md. For tiered MEMORY.md updates use write_tiered_memory.".into(),
             input_schema: schema_object(
                 json!({
                     "scope": {
                         "type": "string",
-                        "description": "Memory scope: 'chat' (replaces persona MEMORY.md) or 'chat_daily' (appends)",
-                        "enum": ["chat", "chat_daily"]
+                        "description": "Memory scope: 'chat_daily' only (appends daily log)",
+                        "enum": ["chat_daily"]
                     },
                     "chat_id": {
                         "type": "integer",
-                        "description": "Chat ID (required for scope 'chat' or 'chat_daily')"
+                        "description": "Chat ID (optional; defaults from auth context)"
                     },
                     "persona_id": {
                         "type": "integer",
-                        "description": "Persona ID (required for scope 'chat'; for 'chat_daily' defaults from context)"
+                        "description": "Persona ID (optional; defaults from auth context)"
                     },
                     "date": {
                         "type": "string",
@@ -159,106 +159,66 @@ impl Tool for WriteMemoryTool {
             Some(s) => s,
             None => return ToolResult::error("Missing 'scope' parameter".into()),
         };
+        if scope != "chat_daily" {
+            return ToolResult::error(
+                "scope must be 'chat_daily'. Use write_tiered_memory to update MEMORY.md tiers."
+                    .into(),
+            );
+        }
         let content = match input.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => return ToolResult::error("Missing 'content' parameter".into()),
         };
 
-        if scope == "chat_daily" {
-            let auth = match auth_context_from_input(&input) {
-                Some(a) => a,
-                None => return ToolResult::error("Missing auth context for chat_daily scope".into()),
-            };
-            let chat_id = input
-                .get("chat_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(auth.caller_chat_id);
-            let persona_id = input
-                .get("persona_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(auth.caller_persona_id);
-            if let Err(e) = authorize_chat_persona_access(&input, chat_id, persona_id) {
-                return ToolResult::error(e);
-            }
-            let date = input
-                .get("date")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-            let path = self
-                .groups_dir
-                .join(chat_id.to_string())
-                .join(persona_id.to_string())
-                .join("memory")
-                .join(format!("{date}.md"));
-            info!("Appending to daily log: {}", path.display());
-            if let Some(parent) = path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return ToolResult::error(format!("Failed to create directory: {e}"));
-                }
-            }
-            return match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    if !content.ends_with('\n') {
-                        let _ = f.write_all(b"\n");
-                    }
-                    match f.write_all(content.as_bytes()) {
-                        Ok(()) => ToolResult::success(format!(
-                            "Appended to daily log for {date} (chat_daily scope)."
-                        )),
-                        Err(e) => ToolResult::error(format!("Failed to append to daily log: {e}")),
-                    }
-                }
-                Err(e) => ToolResult::error(format!("Failed to open daily log: {e}")),
-            };
-        }
-
-        if scope == "global" {
-            return ToolResult::error(
-                "Writing to global scope is not allowed. Principles are in AGENTS.md at workspace root (read-only). Use write_tiered_memory for per-persona memory.".into(),
-            );
-        }
-
-        let path = match scope {
-            "chat" => {
-                let auth = match auth_context_from_input(&input) {
-                    Some(a) => a,
-                    None => return ToolResult::error("Missing auth context".into()),
-                };
-                let chat_id = input
-                    .get("chat_id")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(auth.caller_chat_id);
-                let persona_id = input
-                    .get("persona_id")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(auth.caller_persona_id);
-                if let Err(e) = authorize_chat_persona_access(&input, chat_id, persona_id) {
-                    return ToolResult::error(e);
-                }
-                self.groups_dir
-                    .join(chat_id.to_string())
-                    .join(persona_id.to_string())
-                    .join("MEMORY.md")
-            }
-            _ => return ToolResult::error("scope must be 'chat' or 'chat_daily'".into()),
+        let auth = match auth_context_from_input(&input) {
+            Some(a) => a,
+            None => return ToolResult::error("Missing auth context for chat_daily scope".into()),
         };
-
-        info!("Writing memory: {}", path.display());
-
+        let chat_id = input
+            .get("chat_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(auth.caller_chat_id);
+        let persona_id = input
+            .get("persona_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(auth.caller_persona_id);
+        if let Err(e) = authorize_chat_persona_access(&input, chat_id, persona_id) {
+            return ToolResult::error(e);
+        }
+        let date = input
+            .get("date")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+        let path = self
+            .groups_dir
+            .join(chat_id.to_string())
+            .join(persona_id.to_string())
+            .join("memory")
+            .join(format!("{date}.md"));
+        info!("Appending to daily log: {}", path.display());
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return ToolResult::error(format!("Failed to create directory: {e}"));
             }
         }
-
-        match std::fs::write(&path, content) {
-            Ok(()) => ToolResult::success(format!("Memory saved to {} scope.", scope)),
-            Err(e) => ToolResult::error(format!("Failed to write memory: {e}")),
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                if !content.ends_with('\n') {
+                    let _ = f.write_all(b"\n");
+                }
+                match f.write_all(content.as_bytes()) {
+                    Ok(()) => ToolResult::success(format!(
+                        "Appended to daily log for {date} (chat_daily scope)."
+                    )),
+                    Err(e) => ToolResult::error(format!("Failed to append to daily log: {e}")),
+                }
+            }
+            Err(e) => ToolResult::error(format!("Failed to open daily log: {e}")),
         }
     }
 }
@@ -303,12 +263,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_memory_global_not_allowed() {
+    async fn test_write_memory_invalid_scope_not_allowed() {
         let dir = test_dir();
         let (_, tool) = test_tools(&dir);
         let result = tool
             .execute(json!({
-                "scope": "global",
+                "scope": "chat",
                 "content": "user prefers Rust",
                 "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
@@ -318,14 +278,14 @@ mod tests {
             }))
             .await;
         assert!(result.is_error);
-        assert!(result.content.contains("not allowed"));
+        assert!(result.content.contains("chat_daily"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn test_write_and_read_memory_chat() {
+    async fn test_write_memory_chat_daily_appends_file() {
         let dir = test_dir();
-        let (read_tool, write_tool) = test_tools(&dir);
+        let (_, write_tool) = test_tools(&dir);
         let auth = json!({
             "__finally_a_value_bot_auth": {
                 "caller_chat_id": 42,
@@ -334,20 +294,26 @@ mod tests {
             }
         });
 
-        let mut write_input = json!({"scope": "chat", "chat_id": 42, "persona_id": 1, "content": "chat 42 persona 1 notes"});
+        let mut write_input = json!({
+            "scope": "chat_daily",
+            "chat_id": 42,
+            "persona_id": 1,
+            "date": "2026-04-01",
+            "content": "daily note"
+        });
         if let (Some(obj), Some(auth_obj)) = (write_input.as_object_mut(), auth.get("__finally_a_value_bot_auth")) {
             obj.insert("__finally_a_value_bot_auth".to_string(), auth_obj.clone());
         }
         let result = write_tool.execute(write_input).await;
         assert!(!result.is_error);
-
-        let mut read_input = json!({"scope": "chat", "chat_id": 42, "persona_id": 1});
-        if let (Some(obj), Some(auth_obj)) = (read_input.as_object_mut(), auth.get("__finally_a_value_bot_auth")) {
-            obj.insert("__finally_a_value_bot_auth".to_string(), auth_obj.clone());
-        }
-        let result = read_tool.execute(read_input).await;
-        assert!(!result.is_error);
-        assert_eq!(result.content, "chat 42 persona 1 notes");
+        let path = dir
+            .join("groups")
+            .join("42")
+            .join("1")
+            .join("memory")
+            .join("2026-04-01.md");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.contains("daily note"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -416,12 +382,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_memory_chat_allowed_for_control_chat_cross_chat() {
+    async fn test_write_memory_chat_daily_allowed_for_control_chat_cross_chat() {
         let dir = test_dir();
-        let (read_tool, write_tool) = test_tools(&dir);
-        write_tool
+        let (_, write_tool) = test_tools(&dir);
+        let result = write_tool
             .execute(json!({
-                "scope": "chat",
+                "scope": "chat_daily",
                 "chat_id": 200,
                 "persona_id": 2,
                 "content": "chat200",
@@ -432,20 +398,7 @@ mod tests {
                 }
             }))
             .await;
-        let result = read_tool
-            .execute(json!({
-                "scope": "chat",
-                "chat_id": 200,
-                "persona_id": 2,
-                "__finally_a_value_bot_auth": {
-                    "caller_chat_id": 100,
-                    "caller_persona_id": 1,
-                    "control_chat_ids": [100]
-                }
-            }))
-            .await;
         assert!(!result.is_error, "{}", result.content);
-        assert_eq!(result.content, "chat200");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

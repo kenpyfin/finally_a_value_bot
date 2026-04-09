@@ -4,7 +4,6 @@ pub mod bash;
 pub mod browser;
 pub mod command_runner;
 pub mod cursor_agent;
-pub mod delegate;
 pub mod edit_file;
 pub mod export_chat;
 pub mod glob;
@@ -103,7 +102,6 @@ pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
         "bash" => ToolRisk::High,
         "cursor_agent"
-        | "delegate"
         | "write_file"
         | "edit_file"
         | "write_memory"
@@ -125,6 +123,8 @@ pub struct ToolAuthContext {
     pub caller_chat_id: i64,
     pub caller_persona_id: i64,
     pub control_chat_ids: Vec<i64>,
+    /// True when the agent run was started by the scheduler (cron / one-shot task).
+    pub is_scheduled_task: bool,
 }
 
 impl ToolAuthContext {
@@ -162,11 +162,16 @@ pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthCont
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
         .unwrap_or_default();
+    let is_scheduled_task = ctx
+        .get("is_scheduled_task")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Some(ToolAuthContext {
         caller_channel,
         caller_chat_id,
         caller_persona_id,
         control_chat_ids,
+        is_scheduled_task,
     })
 }
 
@@ -211,6 +216,7 @@ fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serd
             "caller_chat_id": auth.caller_chat_id,
             "caller_persona_id": auth.caller_persona_id,
             "control_chat_ids": auth.control_chat_ids,
+            "is_scheduled_task": auth.is_scheduled_task,
         }),
     );
     serde_json::Value::Object(obj)
@@ -411,6 +417,38 @@ impl ToolRegistry {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.iter().map(|t| t.definition()).collect()
+    }
+
+    pub fn definitions_filtered(&self, read_only: bool) -> Vec<ToolDefinition> {
+        if !read_only {
+            return self.definitions();
+        }
+        self.tools
+            .iter()
+            .filter_map(|t| {
+                let name = t.name();
+                let allowed = matches!(
+                    name,
+                    "read_file"
+                        | "glob"
+                        | "grep"
+                        | "read_memory"
+                        | "read_tiered_memory"
+                        | "search_chat_history"
+                        | "search_vault"
+                        | "web_search"
+                        | "web_fetch"
+                        | "read_agent_history"
+                        | "list_scheduled_tasks"
+                        | "get_task_history"
+                );
+                if allowed {
+                    Some(t.definition())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub async fn execute(&self, name: &str, input: serde_json::Value) -> ToolResult {
