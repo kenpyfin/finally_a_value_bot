@@ -441,6 +441,21 @@ function mapBackendHistory(messages: BackendMessage[]): ThreadMessageLike[] {
   }))
 }
 
+function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i]
+    const y = b[i]
+    if (x.id !== y.id) return false
+    if (x.role !== y.role) return false
+    if (x.content !== y.content) return false
+    const xMs = x.createdAt instanceof Date ? x.createdAt.getTime() : Date.parse(String(x.createdAt ?? ''))
+    const yMs = y.createdAt instanceof Date ? y.createdAt.getTime() : Date.parse(String(y.createdAt ?? ''))
+    if (xMs !== yMs) return false
+  }
+  return true
+}
+
 function asObject(value: unknown): Record<string, unknown> {
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
     return value as Record<string, unknown>
@@ -746,18 +761,21 @@ function App() {
     const rawMessages = Array.isArray(data.messages) ? data.messages : []
     const mapped = mapBackendHistory(rawMessages)
     if (day) {
-      setHistoryByDay((prev) => {
-        const next = { ...prev, [day]: mapped }
-        const allDays = Object.keys(next).sort()
-        const combined = allDays.flatMap((d) => (next[d] ?? []))
+      const nextByDay = { ...historyByDay, [day]: mapped }
+      const allDays = Object.keys(nextByDay).sort()
+      const combined = allDays.flatMap((d) => (nextByDay[d] ?? []))
+      setHistoryByDay(nextByDay)
+      if (!historiesEqual(historySeed, combined)) {
         setHistorySeed(combined)
-        return next
-      })
+        setRuntimeNonce((x) => x + 1)
+      }
     } else {
       setHistoryByDay({})
-      setHistorySeed(mapped)
+      if (!historiesEqual(historySeed, mapped)) {
+        setHistorySeed(mapped)
+        setRuntimeNonce((x) => x + 1)
+      }
     }
-    setRuntimeNonce((x) => x + 1)
   }
 
   async function loadPersonaMemory(pid: number): Promise<void> {
