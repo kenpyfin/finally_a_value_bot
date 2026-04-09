@@ -32,18 +32,18 @@ bash skills/search-vault/setup_vault_env.sh
 
 This creates `shared/.venv-vault/` with the required packages.
 
-The canonical configuration source is the repository-root `.env` (or `FINALLY_A_VALUE_BOT_CONFIG` if set). Skill-local `.env` files are not used.
+`query_vault.py` loads `.env` from **this skill directory** (`search-vault/.env`). Set `VAULT_EMBEDDING_SERVER_URL` there (required; there is no default URL). When the script is spawned by the bot, variables already present in the process environment are left unchanged (dotenv does not override them).
 
-An embedding server must be running and accessible at `VAULT_EMBEDDING_SERVER_URL` (default: `http://127.0.0.1:8080`). Any OpenAI-compatible embedding API works (e.g. llama.cpp with `--embedding`).
+An embedding server must be running at that URL. Any OpenAI-compatible embedding API works (e.g. llama.cpp with `--embedding`).
 
 ### Environment variables
 
 
-| Variable                     | Description                      | Default                 |
-| ---------------------------- | -------------------------------- | ----------------------- |
-| `VAULT_EMBEDDING_SERVER_URL` | Embedding API base URL           | `http://127.0.0.1:8080` |
-| `VAULT_VECTOR_DB_PATH`       | ChromaDB persistent storage path | `shared/vault_db`       |
-| `VAULT_VECTOR_DB_COLLECTION` | ChromaDB collection name         | `origin_vault`          |
+| Variable                     | Description                      | Default / notes           |
+| ---------------------------- | -------------------------------- | ------------------------- |
+| `VAULT_EMBEDDING_SERVER_URL` | Embedding API base URL           | **Required** (no default) |
+| `VAULT_VECTOR_DB_PATH`       | ChromaDB persistent storage path | `shared/vault_db`         |
+| `VAULT_VECTOR_DB_COLLECTION` | ChromaDB collection name         | `origin_vault`            |
 
 
 ### Usage

@@ -20,6 +20,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 <!-- Add entries below this line, newest first. -->
 
+### 2026-04-09 — Vault Python: skill-directory `.env` only, embedding URL required
+
+- **Area:** vault / builtin skills
+- **Summary:** Reverted the “canonical repo-root `.env` walk” for vault Python. `index_vault.py` and `query_vault.py` (in both `builtin_skills/*/…` and `scripts/vault/`) now call `load_dotenv(SCRIPT_DIR / ".env")` only. Neither `VAULT_EMBEDDING_SERVER_URL` nor `VAULT_EMBED_URL` has a default URL; if both are missing/empty after load, the script prints to stderr and exits with code 1. Standard `python-dotenv` behavior applies: variables already set in the process environment are not overridden by the file.
+- **Rationale:** Skills stay self-contained for manual runs; avoids implying a fixed localhost embedding server. Operators set embedding URL explicitly in the skill’s `.env` or export it; when the bot spawns the script, inherited env still works.
+- **Key files / symbols:** `builtin_skills/index-vault/index_vault.py`, `builtin_skills/search-vault/query_vault.py`, `scripts/vault/index_vault.py`, `scripts/vault/query_vault.py` — `_require_embed_openai_base()`; `.env.example`, `builtin_skills/*/SKILL.md`, `scripts/vault/.env.example`.
+- **Follow-ups:** Restart or re-sync builtin skills into `workspace/skills/` so deployed copies pick up script changes; native Rust `search_vault` path still uses app config for `VAULT_EMBEDDING_SERVER_URL` separately from these scripts.
+
 ### 2026-04-09 — Web chat file uploads (UI + `shared/upload` storage)
 
 - **Area:** web / api / agent workspace

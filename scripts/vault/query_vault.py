@@ -6,22 +6,26 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-_CONFIG_PATH = os.environ.get("FINALLY_A_VALUE_BOT_CONFIG")
-load_dotenv(Path(_CONFIG_PATH) if _CONFIG_PATH else ROOT_DIR / ".env")
+SCRIPT_DIR = Path(__file__).parent.resolve()
+load_dotenv(SCRIPT_DIR / ".env")
 
 def _default_vault_db_path() -> str:
     root = os.environ.get("WORKSPACE_DIR") or os.environ.get("FINALLY_A_VALUE_BOT_WORKSPACE_DIR") or os.getcwd()
     return os.path.abspath(os.path.join(root, "shared", "vault_db"))
 
-def _default_embed_url() -> str:
-    url = os.environ.get("VAULT_EMBEDDING_SERVER_URL") or os.environ.get("VAULT_EMBED_URL", "")
-    if url:
-        return url.rstrip("/") + "/v1" if not url.endswith("/v1") else url
-    return "http://127.0.0.1:8080/v1"
+def _require_embed_openai_base() -> str:
+    url = (os.environ.get("VAULT_EMBEDDING_SERVER_URL") or os.environ.get("VAULT_EMBED_URL") or "").strip()
+    if not url:
+        print(
+            "error: VAULT_EMBEDDING_SERVER_URL or VAULT_EMBED_URL must be set (no default). "
+            "Add `.env` beside this script or export the variable before running.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return url.rstrip("/") + "/v1" if not url.endswith("/v1") else url
 
 DB_PATH = os.environ.get("VAULT_VECTOR_DB_PATH") or os.environ.get("VAULT_DB_PATH") or _default_vault_db_path()
-EMBED_URL = _default_embed_url()
+EMBED_URL = _require_embed_openai_base()
 COLLECTION = os.environ.get("VAULT_VECTOR_DB_COLLECTION", "origin_vault")
 
 import chromadb

@@ -120,18 +120,21 @@ Telegram message
 
 ### Key types
 
-| Type | Location | Description |
-|------|----------|-------------|
-| `AppState` | `telegram.rs` | Shared state: config, bot, db, memory, claude client, tool registry |
-| `Database` | `db.rs` | SQLite wrapper with `Mutex<Connection>` |
-| `ToolRegistry` | `tools/mod.rs` | Holds all `Box<dyn Tool>`, dispatches by name |
-| `Tool` trait | `tools/mod.rs` | `name()`, `definition()`, `execute()` |
-| `ClaudeClient` | `claude.rs` | HTTP client for Anthropic API |
-| `MemoryManager` | `memory.rs` | CLAUDE.md file reader/writer |
+
+| Type            | Location       | Description                                                         |
+| --------------- | -------------- | ------------------------------------------------------------------- |
+| `AppState`      | `telegram.rs`  | Shared state: config, bot, db, memory, claude client, tool registry |
+| `Database`      | `db.rs`        | SQLite wrapper with `Mutex<Connection>`                             |
+| `ToolRegistry`  | `tools/mod.rs` | Holds all `Box<dyn Tool>`, dispatches by name                       |
+| `Tool` trait    | `tools/mod.rs` | `name()`, `definition()`, `execute()`                               |
+| `ClaudeClient`  | `claude.rs`    | HTTP client for Anthropic API                                       |
+| `MemoryManager` | `memory.rs`    | CLAUDE.md file reader/writer                                        |
+
 
 ### Shared state
 
 `AppState` is wrapped in `Arc` and shared:
+
 - Telegram handler has `Arc<AppState>` via dptree dependencies
 - Scheduler gets `Arc<AppState>` at spawn time
 - Tools that need `Bot` or `Database` hold their own clones/arcs (passed at construction)
@@ -148,54 +151,69 @@ Telegram message
 ### Database tables
 
 **chats:**
-| Column | Type | Description |
-|--------|------|-------------|
-| chat_id | INTEGER PK | Telegram chat ID |
-| chat_title | TEXT | Chat title (nullable) |
-| chat_type | TEXT | "private" or "group" |
-| last_message_time | TEXT | ISO 8601 timestamp |
+
+
+| Column            | Type       | Description           |
+| ----------------- | ---------- | --------------------- |
+| chat_id           | INTEGER PK | Telegram chat ID      |
+| chat_title        | TEXT       | Chat title (nullable) |
+| chat_type         | TEXT       | "private" or "group"  |
+| last_message_time | TEXT       | ISO 8601 timestamp    |
+
 
 **messages:**
-| Column | Type | Description |
-|--------|------|-------------|
-| id | TEXT | Message ID (PK with chat_id) |
-| chat_id | INTEGER | Telegram chat ID |
-| sender_name | TEXT | Username or first name |
-| content | TEXT | Message text |
-| is_from_bot | INTEGER | 0 or 1 |
-| timestamp | TEXT | ISO 8601 timestamp |
+
+
+| Column      | Type    | Description                  |
+| ----------- | ------- | ---------------------------- |
+| id          | TEXT    | Message ID (PK with chat_id) |
+| chat_id     | INTEGER | Telegram chat ID             |
+| sender_name | TEXT    | Username or first name       |
+| content     | TEXT    | Message text                 |
+| is_from_bot | INTEGER | 0 or 1                       |
+| timestamp   | TEXT    | ISO 8601 timestamp           |
+
 
 **scheduled_tasks:**
-| Column | Type | Description |
-|--------|------|-------------|
-| id | INTEGER PK | Auto-increment task ID |
-| chat_id | INTEGER | Target chat for results |
-| prompt | TEXT | Instruction to execute |
-| schedule_type | TEXT | "cron" or "once" |
-| schedule_value | TEXT | Cron expression or ISO timestamp |
-| next_run | TEXT | Next scheduled execution time |
-| last_run | TEXT | Last execution time (nullable) |
-| status | TEXT | "active", "paused", "completed", "cancelled" |
-| created_at | TEXT | Creation timestamp |
+
+
+| Column         | Type       | Description                                  |
+| -------------- | ---------- | -------------------------------------------- |
+| id             | INTEGER PK | Auto-increment task ID                       |
+| chat_id        | INTEGER    | Target chat for results                      |
+| prompt         | TEXT       | Instruction to execute                       |
+| schedule_type  | TEXT       | "cron" or "once"                             |
+| schedule_value | TEXT       | Cron expression or ISO timestamp             |
+| next_run       | TEXT       | Next scheduled execution time                |
+| last_run       | TEXT       | Last execution time (nullable)               |
+| status         | TEXT       | "active", "paused", "completed", "cancelled" |
+| created_at     | TEXT       | Creation timestamp                           |
+
 
 **sessions:**
-| Column | Type | Description |
-|--------|------|-------------|
-| chat_id | INTEGER PK | Telegram chat ID |
-| messages_json | TEXT | Serialized Vec<Message> JSON (full conversation state) |
-| updated_at | TEXT | ISO 8601 timestamp of last save |
+
+
+| Column        | Type       | Description                                   |
+| ------------- | ---------- | --------------------------------------------- |
+| chat_id       | INTEGER PK | Telegram chat ID                              |
+| messages_json | TEXT       | Serialized Vec JSON (full conversation state) |
+| updated_at    | TEXT       | ISO 8601 timestamp of last save               |
+
 
 **task_run_logs:**
-| Column | Type | Description |
-|--------|------|-------------|
-| id | INTEGER PK | Auto-increment log ID |
-| task_id | INTEGER | Associated scheduled task |
-| chat_id | INTEGER | Chat the task ran in |
-| started_at | TEXT | Run start timestamp |
-| finished_at | TEXT | Run end timestamp |
-| duration_ms | INTEGER | Run duration in milliseconds |
-| success | INTEGER | 0 or 1 |
-| result_summary | TEXT | Summary of run result (nullable) |
+
+
+| Column         | Type       | Description                      |
+| -------------- | ---------- | -------------------------------- |
+| id             | INTEGER PK | Auto-increment log ID            |
+| task_id        | INTEGER    | Associated scheduled task        |
+| chat_id        | INTEGER    | Chat the task ran in             |
+| started_at     | TEXT       | Run start timestamp              |
+| finished_at    | TEXT       | Run end timestamp                |
+| duration_ms    | INTEGER    | Run duration in milliseconds     |
+| success        | INTEGER    | 0 or 1                           |
+| result_summary | TEXT       | Summary of run result (nullable) |
+
 
 ## Adding a new tool
 
@@ -242,14 +260,15 @@ impl Tool for MyTool {
 }
 ```
 
-2. Add `pub mod my_tool;` to `src/tools/mod.rs`
+1. Add `pub mod my_tool;` to `src/tools/mod.rs`
+2. Register in `ToolRegistry::new()`:
 
-3. Register in `ToolRegistry::new()`:
 ```rust
 Box::new(my_tool::MyTool),
 ```
 
 If your tool needs shared state (like `Bot` or `Arc<Database>`), add a constructor:
+
 ```rust
 pub struct MyTool {
     db: Arc<Database>,
@@ -263,6 +282,7 @@ impl MyTool {
 ```
 
 And pass it in `ToolRegistry::new()`:
+
 ```rust
 Box::new(my_tool::MyTool::new(db.clone())),
 ```
@@ -300,17 +320,19 @@ sqlite> SELECT * FROM chats;
 
 ## Common tasks
 
-| Task | How |
-|------|-----|
-| Change the model | Set `model: "claude-sonnet-4-20250514"` in `finally-a-value-bot.config.yaml` |
-| Increase context window | Set `max_history_messages: 100` in `finally-a-value-bot.config.yaml` (uses more tokens) |
-| Increase tool iterations | Set `max_tool_iterations: 200` in `finally-a-value-bot.config.yaml` |
-| Reset memory | Delete files under `finally-a-value-bot.data/runtime/groups/` |
-| Reset all data | Delete the `finally-a-value-bot.data/` directory |
-| Tune compaction threshold | Set `max_session_messages: 60` in `finally-a-value-bot.config.yaml` (higher = more context before compaction) |
-| Keep more recent messages | Set `compact_keep_recent: 30` in `finally-a-value-bot.config.yaml` (more recent messages kept verbatim) |
-| Reset a chat session | Send `/reset` in the chat, or: `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "DELETE FROM sessions WHERE chat_id=XXXX;"` |
-| Cancel all scheduled tasks | `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "UPDATE scheduled_tasks SET status='cancelled' WHERE status='active';"` |
+
+| Task                       | How                                                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Change the model           | Set `model: "claude-sonnet-4-20250514"` in `finally-a-value-bot.config.yaml`                                                                |
+| Increase context window    | Set `max_history_messages: 100` in `finally-a-value-bot.config.yaml` (uses more tokens)                                                     |
+| Increase tool iterations   | Set `max_tool_iterations: 200` in `finally-a-value-bot.config.yaml`                                                                         |
+| Reset memory               | Delete files under `finally-a-value-bot.data/runtime/groups/`                                                                               |
+| Reset all data             | Delete the `finally-a-value-bot.data/` directory                                                                                            |
+| Tune compaction threshold  | Set `max_session_messages: 60` in `finally-a-value-bot.config.yaml` (higher = more context before compaction)                               |
+| Keep more recent messages  | Set `compact_keep_recent: 30` in `finally-a-value-bot.config.yaml` (more recent messages kept verbatim)                                     |
+| Reset a chat session       | Send `/reset` in the chat, or: `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "DELETE FROM sessions WHERE chat_id=XXXX;"` |
+| Cancel all scheduled tasks | `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "UPDATE scheduled_tasks SET status='cancelled' WHERE status='active';"`    |
+
 
 ## Build
 
@@ -325,20 +347,23 @@ The release binary is fully self-contained -- no runtime dependencies, no databa
 
 ## Dependencies
 
-| Crate | Version | Purpose |
-|-------|---------|---------|
-| teloxide | 0.17 | Telegram Bot API |
-| tokio | 1 | Async runtime |
-| reqwest | 0.12 | HTTP client (Anthropic API, web fetch/search) |
-| rusqlite | 0.32 | SQLite (bundled) |
-| serde / serde_json | 1 | Serialization |
-| async-trait | 0.1 | Async trait support |
-| chrono | 0.4 | Date/time handling |
-| cron | 0.13 | Cron expression parsing |
-| urlencoding | 2 | URL encoding for web search |
-| regex | 1 | Regex for grep tool and HTML parsing |
-| glob | 0.3 | File pattern matching |
-| uuid | 1 | Message ID generation |
-| thiserror | 2 | Error derive macro |
-| anyhow | 1 | Error propagation |
-| tracing | 0.1 | Logging |
+
+| Crate              | Version | Purpose                                       |
+| ------------------ | ------- | --------------------------------------------- |
+| teloxide           | 0.17    | Telegram Bot API                              |
+| tokio              | 1       | Async runtime                                 |
+| reqwest            | 0.12    | HTTP client (Anthropic API, web fetch/search) |
+| rusqlite           | 0.32    | SQLite (bundled)                              |
+| serde / serde_json | 1       | Serialization                                 |
+| async-trait        | 0.1     | Async trait support                           |
+| chrono             | 0.4     | Date/time handling                            |
+| cron               | 0.13    | Cron expression parsing                       |
+| urlencoding        | 2       | URL encoding for web search                   |
+| regex              | 1       | Regex for grep tool and HTML parsing          |
+| glob               | 0.3     | File pattern matching                         |
+| uuid               | 1       | Message ID generation                         |
+| thiserror          | 2       | Error derive macro                            |
+| anyhow             | 1       | Error propagation                             |
+| tracing            | 0.1     | Logging                                       |
+
+
