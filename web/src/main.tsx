@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   AssistantRuntimeProvider,
@@ -441,6 +441,7 @@ function mapBackendHistory(messages: BackendMessage[]): ThreadMessageLike[] {
   }))
 }
 
+/** Compare history for sync/remount decisions: id, role, content only — ignore `createdAt` (server timestamps can jitter between polls). */
 function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): boolean {
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i += 1) {
@@ -449,11 +450,19 @@ function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): boolean
     if (x.id !== y.id) return false
     if (x.role !== y.role) return false
     if (x.content !== y.content) return false
-    const xMs = x.createdAt instanceof Date ? x.createdAt.getTime() : Date.parse(String(x.createdAt ?? ''))
-    const yMs = y.createdAt instanceof Date ? y.createdAt.getTime() : Date.parse(String(y.createdAt ?? ''))
-    if (xMs !== yMs) return false
   }
   return true
+}
+
+function shouldDeferHistoryRemount(): boolean {
+  if (typeof document === 'undefined') return false
+  const inComposer = Boolean(document.activeElement?.closest?.('.aui-composer-root'))
+  const vp = document.querySelector('.aui-thread-viewport')
+  if (!vp) return inComposer
+  const el = vp as HTMLElement
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  const scrolledAwayFromBottom = gap > 100
+  return inComposer || scrolledAwayFromBottom
 }
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -652,6 +661,22 @@ function App() {
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
 
+  const historySeedRef = useRef<ThreadMessageLike[]>([])
+  const deferredHistoryRef = useRef<ThreadMessageLike[] | null>(null)
+
+  useEffect(() => {
+    historySeedRef.current = historySeed
+  }, [historySeed])
+
+  const flushDeferredHistory = useCallback(() => {
+    const pending = deferredHistoryRef.current
+    if (!pending) return
+    deferredHistoryRef.current = null
+    if (historiesEqual(historySeedRef.current, pending)) return
+    setHistorySeed(pending)
+    setRuntimeNonce((x) => x + 1)
+  }, [])
+
   const personaHasNew = useMemo<Record<number, boolean>>(() => {
     if (chatId == null) return {}
     const out: Record<number, boolean> = {}
@@ -746,13 +771,19 @@ function App() {
     const p = personas.find((x) => x.name === personaName)
     if (p) writeStoredPersonaId(p.id)
     await loadPersonas(chatId)
-    await loadHistory(chatId, p?.id ?? undefined)
+    await loadHistory(chatId, p?.id ?? undefined, null, { force: true })
     if (p) markPersonaRead(p.id)
     setRuntimeNonce((x) => x + 1)
   }
 
-  async function loadHistory(cid: number | null = chatId, personaId?: number | null, day?: string | null): Promise<void> {
+  async function loadHistory(
+    cid: number | null = chatId,
+    personaId?: number | null,
+    day?: string | null,
+    opts?: { force?: boolean },
+  ): Promise<void> {
     if (cid == null) return
+    const force = opts?.force === true
     const query = new URLSearchParams({ chat_id: String(cid) })
     if (personaId != null && personaId > 0) query.set('persona_id', String(personaId))
     if (day) query.set('day', day)
@@ -765,13 +796,19 @@ function App() {
       const allDays = Object.keys(nextByDay).sort()
       const combined = allDays.flatMap((d) => (nextByDay[d] ?? []))
       setHistoryByDay(nextByDay)
-      if (!historiesEqual(historySeed, combined)) {
+      if (!historiesEqual(historySeedRef.current, combined)) {
+        deferredHistoryRef.current = null
         setHistorySeed(combined)
         setRuntimeNonce((x) => x + 1)
       }
     } else {
       setHistoryByDay({})
-      if (!historiesEqual(historySeed, mapped)) {
+      if (!historiesEqual(historySeedRef.current, mapped)) {
+        if (!force && shouldDeferHistoryRemount()) {
+          deferredHistoryRef.current = mapped
+          return
+        }
+        deferredHistoryRef.current = null
         setHistorySeed(mapped)
         setRuntimeNonce((x) => x + 1)
       }
@@ -834,7 +871,7 @@ function App() {
         })()
       const idx = allDays.indexOf(oldestLoaded)
       const nextOlder = idx >= 0 && idx < allDays.length - 1 ? allDays[idx + 1] : null
-      if (nextOlder) await loadHistory(chatId, activePersonaId ?? undefined, nextOlder)
+      if (nextOlder) await loadHistory(chatId, activePersonaId ?? undefined, nextOlder, { force: true })
     } finally {
       setLoadingOlder(false)
     }
@@ -928,7 +965,7 @@ function App() {
         body: JSON.stringify({ chat_id: chatId, persona_id: personaId }),
       })
       await loadPersonas(chatId)
-      if (activePersonaId === personaId) await loadHistory(chatId)
+      if (activePersonaId === personaId) await loadHistory(chatId, undefined, null, { force: true })
       setStatusText('Persona deleted')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -959,7 +996,7 @@ function App() {
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
           loadQueueDiagnostics(cid).catch(() => { })
-          await loadHistory(cid, chosen?.id ?? pid)
+          await loadHistory(cid, chosen?.id ?? pid, null, { force: true })
           const readId = chosen?.id ?? pid ?? null
           if (readId != null) markPersonaRead(readId)
         }
@@ -1040,7 +1077,7 @@ function App() {
       body: JSON.stringify({ contact_chat_id: contactChatId }),
     })
     await loadBindings(chatId)
-    await loadHistory(chatId)
+    await loadHistory(chatId, undefined, null, { force: true })
     setRuntimeNonce((x) => x + 1)
   }
 
@@ -1100,7 +1137,9 @@ function App() {
           // ignore; we still load history for the chosen persona
         }
       }
-      loadHistory(chatId, chosen?.id).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      loadHistory(chatId, chosen?.id, null, { force: true }).catch((e) =>
+        setError(e instanceof Error ? e.message : String(e)),
+      )
     }
     init()
     return () => { cancelled = true }
@@ -1165,6 +1204,32 @@ function App() {
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
+
+  useEffect(() => {
+    const onFocusOut = (e: FocusEvent) => {
+      const t = e.target as HTMLElement | null
+      if (!t?.closest?.('.aui-composer-root')) return
+      const rt = e.relatedTarget as HTMLElement | null
+      if (!rt?.closest?.('.aui-composer-root')) {
+        flushDeferredHistory()
+      }
+    }
+    document.addEventListener('focusout', onFocusOut, true)
+    return () => document.removeEventListener('focusout', onFocusOut, true)
+  }, [flushDeferredHistory])
+
+  useEffect(() => {
+    const vp = document.querySelector('.aui-thread-viewport')
+    if (!vp) return
+    const onScroll = () => {
+      const el = vp as HTMLElement
+      if (el.scrollHeight - el.scrollTop - el.clientHeight <= 100) {
+        flushDeferredHistory()
+      }
+    }
+    vp.addEventListener('scroll', onScroll, { passive: true })
+    return () => vp.removeEventListener('scroll', onScroll)
+  }, [flushDeferredHistory, runtimeNonce])
 
   function submitAuthToken() {
     const token = sanitizeHttpHeaderValue(authTokenInput)

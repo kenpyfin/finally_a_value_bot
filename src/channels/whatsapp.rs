@@ -336,16 +336,6 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     .and_then(|p| p.name.clone())
                     .unwrap_or_else(|| message.from.clone());
 
-                // Resolve persona
-                let persona_id = call_blocking(state.app_state.db.clone(), move |db| {
-                    db.get_current_persona_id(chat_id)
-                })
-                .await
-                .unwrap_or(0);
-                if persona_id == 0 {
-                    continue;
-                }
-
                 let mut image_data: Option<(String, String)> = None;
                 if message.msg_type == "image" || message.msg_type == "document" {
                     let preferred_mime = message
@@ -455,6 +445,32 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 }
 
                 if text.trim().is_empty() && image_data.is_none() {
+                    continue;
+                }
+
+                // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
+                let text_for_resolve = text.clone();
+                let (persona_id, text) = match call_blocking(state.app_state.db.clone(), move |db| {
+                    crate::persona::resolve_incoming_run_persona(&db, chat_id, &text_for_resolve)
+                })
+                .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "persona",
+                            error = %e,
+                            "resolve_incoming_run_persona failed; falling back to active persona"
+                        );
+                        let pid = call_blocking(state.app_state.db.clone(), move |db| {
+                            db.get_current_persona_id(chat_id)
+                        })
+                        .await
+                        .unwrap_or(0);
+                        (pid, text)
+                    }
+                };
+                if persona_id == 0 {
                     continue;
                 }
 

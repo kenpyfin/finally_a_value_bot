@@ -146,6 +146,17 @@ impl ToolAuthContext {
 
 const AUTH_CONTEXT_KEY: &str = "__finally_a_value_bot_auth";
 
+/// When the tool targets the same chat as the agent run, prefer the run's persona (`caller_persona_id`)
+/// over DB active/default (e.g. `get_or_create_default_persona`).
+pub fn default_persona_id_for_chat(input: &serde_json::Value, target_chat_id: i64) -> Option<i64> {
+    let auth = auth_context_from_input(input)?;
+    if auth.caller_chat_id == target_chat_id && auth.caller_persona_id > 0 {
+        Some(auth.caller_persona_id)
+    } else {
+        None
+    }
+}
+
 pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthContext> {
     let ctx = input.get(AUTH_CONTEXT_KEY)?;
     let caller_channel = ctx
@@ -549,6 +560,27 @@ mod tests {
         let schema = schema_object(json!({}), &[]);
         let required = schema["required"].as_array().unwrap();
         assert!(required.is_empty());
+    }
+
+    #[test]
+    fn test_default_persona_id_for_chat_matches_run() {
+        let input = json!({
+            "__finally_a_value_bot_auth": {
+                "caller_chat_id": 50,
+                "caller_persona_id": 9,
+                "control_chat_ids": []
+            }
+        });
+        assert_eq!(default_persona_id_for_chat(&input, 50), Some(9));
+        assert_eq!(default_persona_id_for_chat(&input, 51), None);
+        let no_pid = json!({
+            "__finally_a_value_bot_auth": {
+                "caller_chat_id": 50,
+                "caller_persona_id": 0,
+                "control_chat_ids": []
+            }
+        });
+        assert_eq!(default_persona_id_for_chat(&no_pid, 50), None);
     }
 
     #[test]
