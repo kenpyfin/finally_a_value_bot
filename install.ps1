@@ -115,6 +115,13 @@ try {
     Write-Info "  npm install -g agent-browser"
     Write-Info "  agent-browser install"
   }
+
+  Write-Info ""
+  Write-Info "Next steps:"
+  Write-Info "  1) In a project folder, add .env (copy .env.example from the repo if needed)"
+  Write-Info "  2) Run: finally-a-value-bot config   (or: finally-a-value-bot setup)"
+  Write-Info "  3) Start: finally-a-value-bot start"
+  Write-Info "See README.md — finally-a-value-bot doctor for preflight checks."
 } finally {
   Remove-Item -Recurse -Force $tmpDir.FullName -ErrorAction SilentlyContinue
 }

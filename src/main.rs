@@ -49,7 +49,7 @@ SETUP:
        (or run finally_a_value_bot start and follow auto-config on first launch)
     2. Copy .env.example to .env and fill in required values (or run finally_a_value_bot setup):
 
-       api_key               LLM API key (optional when llm_provider=ollama)
+       api_key               LLM API key (optional when llm_provider=ollama|llama|llamacpp)
        At least one channel token must be set (Telegram or Discord)
 
     3. Run: finally_a_value_bot start
@@ -60,7 +60,7 @@ CONFIG FILE (.env):
 
     Core fields:
       llm_provider           Provider preset (default: anthropic)
-      api_key                LLM API key (optional when llm_provider=ollama)
+      api_key                LLM API key (optional when llm_provider=ollama|llama|llamacpp)
       model                  Model name (auto-detected from provider if empty)
       llm_base_url           Custom base URL (optional)
 
@@ -170,12 +170,23 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    finally_a_value_bot::claude::ResponseContentBlock::Text { text } => Some(text.as_str()),
+                    finally_a_value_bot::claude::ResponseContentBlock::Text { text } => {
+                        Some(text.as_str())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            let usage = resp.usage.as_ref().map(|u| format!(" (input: {} output: {} tokens)", u.input_tokens, u.output_tokens)).unwrap_or_default();
+            let usage = resp
+                .usage
+                .as_ref()
+                .map(|u| {
+                    format!(
+                        " (input: {} output: {} tokens)",
+                        u.input_tokens, u.output_tokens
+                    )
+                })
+                .unwrap_or_default();
             println!("LLM OK. Response: {}{}", text.trim(), usage);
         }
         Err(e) => {
@@ -215,7 +226,10 @@ fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
 fn ensure_workspace_shared_dir(data_root: &Path) {
     let shared = data_root.join("shared");
     if std::fs::create_dir_all(&shared).is_err() {
-        tracing::warn!("Failed to create workspace shared dir: {}", shared.display());
+        tracing::warn!(
+            "Failed to create workspace shared dir: {}",
+            shared.display()
+        );
     }
 }
 
@@ -352,7 +366,11 @@ fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if name_str == "skills" || name_str == "runtime" || name_str == "shared" || name_str == "mcp.json" {
+        if name_str == "skills"
+            || name_str == "runtime"
+            || name_str == "shared"
+            || name_str == "mcp.json"
+        {
             continue;
         }
         let src = entry.path();
@@ -391,7 +409,7 @@ async fn main() -> anyhow::Result<()> {
         Some("setup") => {
             let saved = setup::run_setup_wizard()?;
             if saved {
-                println!("Setup saved to finally_a_value_bot.config.yaml");
+                println!("Setup saved to .env");
             } else {
                 println!("Setup canceled");
             }
@@ -458,7 +476,10 @@ async fn main() -> anyhow::Result<()> {
     let workspace_root = config.workspace_root_absolute();
     migrate_legacy_runtime_layout(&data_root_dir, Path::new(&runtime_data_dir));
     migrate_repo_shared_into_workspace(Path::new(config.working_dir()));
-    migrate_agents_md_to_workspace_root(Path::new(config.working_dir()), Path::new(&runtime_data_dir));
+    migrate_agents_md_to_workspace_root(
+        Path::new(config.working_dir()),
+        Path::new(&runtime_data_dir),
+    );
     builtin_skills::ensure_builtin_skills(&data_root_dir)?;
 
     if std::env::var("FINALLY_A_VALUE_BOT_GATEWAY").is_ok() {
@@ -481,7 +502,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("Failed to seed onboarding task: {}", e);
     }
 
-    let principles_path = config.vault.as_ref().and_then(|v| v.principles_path.clone());
+    let principles_path = config
+        .vault
+        .as_ref()
+        .and_then(|v| v.principles_path.clone());
     let memory_manager = memory::MemoryManager::with_principles_path(
         &runtime_data_dir,
         config.working_dir(),
@@ -508,14 +532,7 @@ async fn main() -> anyhow::Result<()> {
         info!("MCP initialized: {} tools available", mcp_tool_count);
     }
 
-    telegram::run_bot(
-        config,
-        db,
-        memory_manager,
-        skill_manager,
-        mcp_manager,
-    )
-    .await?;
+    telegram::run_bot(config, db, memory_manager, skill_manager, mcp_manager).await?;
 
     Ok(())
 }

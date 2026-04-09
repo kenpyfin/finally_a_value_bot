@@ -16,6 +16,7 @@ fn test_auth_context_control_chat() {
         caller_chat_id: 100,
         caller_persona_id: 1,
         control_chat_ids: vec![100, 200],
+        is_scheduled_task: false,
     };
     assert!(auth.is_control_chat());
     assert!(auth.can_access_chat(999)); // control can access any chat
@@ -28,6 +29,7 @@ fn test_auth_context_regular_chat() {
         caller_chat_id: 300,
         caller_persona_id: 1,
         control_chat_ids: vec![100, 200],
+        is_scheduled_task: false,
     };
     assert!(!auth.is_control_chat());
     assert!(auth.can_access_chat(300)); // can access own chat
@@ -41,6 +43,7 @@ fn test_auth_context_empty_control_list() {
         caller_chat_id: 100,
         caller_persona_id: 0,
         control_chat_ids: vec![],
+        is_scheduled_task: false,
     };
     assert!(!auth.is_control_chat());
     assert!(auth.can_access_chat(100)); // can access own

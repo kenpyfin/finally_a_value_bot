@@ -33,18 +33,23 @@ async fn get_token_or_authorize(
     let chat_id = auth.caller_chat_id;
     let platform_owned = platform.to_string();
 
-    let token_opt = match call_blocking(db, move |db| db.get_social_token(&platform_owned, chat_id)).await {
-        Ok(opt) => opt.map(|t| t.access_token),
-        Err(e) => return Err(ToolResult::error(e.to_string())),
-    };
+    let token_opt =
+        match call_blocking(db, move |db| db.get_social_token(&platform_owned, chat_id)).await {
+            Ok(opt) => opt.map(|t| t.access_token),
+            Err(e) => return Err(ToolResult::error(e.to_string())),
+        };
 
     if let Some(t) = token_opt {
         return Ok(t);
     }
 
-    let base = social_oauth::oauth_base_url(config)
-        .unwrap_or_else(|| "http://127.0.0.1:10961".into());
-    let auth_path = format!("{}/api/oauth/authorize/{}", base.trim_end_matches('/'), platform);
+    let base =
+        social_oauth::oauth_base_url(config).unwrap_or_else(|| "http://127.0.0.1:10961".into());
+    let auth_path = format!(
+        "{}/api/oauth/authorize/{}",
+        base.trim_end_matches('/'),
+        platform
+    );
     let url = format!(
         "{}?chat_id={}",
         auth_path,
@@ -100,16 +105,22 @@ impl Tool for FetchTiktokFeedTool {
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
-        if input.get("username").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        if input
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
             return ToolResult::error(
                 "Public profile fetch by username is not supported by the TikTok API. Omit username to fetch your own feed.".into(),
             );
         }
 
-        let token = match get_token_or_authorize(&self.config, self.db.clone(), "tiktok", &input).await {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
+        let token =
+            match get_token_or_authorize(&self.config, self.db.clone(), "tiktok", &input).await {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
 
         let max_count = input
             .get("max_items")
@@ -231,13 +242,20 @@ impl Tool for FetchInstagramFeedTool {
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
-        if input.get("username").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        if input
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
             return ToolResult::error(
                 "Public profile fetch by username is not supported. Omit username to fetch your own feed.".into(),
             );
         }
 
-        let token = match get_token_or_authorize(&self.config, self.db.clone(), "instagram", &input).await {
+        let token = match get_token_or_authorize(&self.config, self.db.clone(), "instagram", &input)
+            .await
+        {
             Ok(t) => t,
             Err(e) => return e,
         };
@@ -285,7 +303,10 @@ impl Tool for FetchInstagramFeedTool {
             .clamp(1, 50);
         let limit_str = limit.to_string();
         let mut params = vec![
-            ("fields", "id,caption,media_type,media_url,permalink,timestamp"),
+            (
+                "fields",
+                "id,caption,media_type,media_url,permalink,timestamp",
+            ),
             ("limit", limit_str.as_str()),
         ];
         if let Some(c) = input.get("cursor").and_then(|v| v.as_str()) {
@@ -307,8 +328,13 @@ impl Tool for FetchInstagramFeedTool {
             Err(e) => return ToolResult::error(e.to_string()),
         };
 
-        let data = media.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
-        let next = media.get("paging")
+        let data = media
+            .get("data")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let next = media
+            .get("paging")
             .and_then(|p| p.get("cursors"))
             .and_then(|c| c.get("after"))
             .and_then(|a| a.as_str())
@@ -368,16 +394,22 @@ impl Tool for FetchLinkedinFeedTool {
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
-        if input.get("username").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        if input
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
             return ToolResult::error(
                 "Public profile fetch by username is not supported. Omit username to fetch your own feed.".into(),
             );
         }
 
-        let token = match get_token_or_authorize(&self.config, self.db.clone(), "linkedin", &input).await {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
+        let token =
+            match get_token_or_authorize(&self.config, self.db.clone(), "linkedin", &input).await {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
 
         // LinkedIn Posts API: GET /posts with author URN
         // First get current user URN via /me

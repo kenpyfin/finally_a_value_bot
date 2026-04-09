@@ -63,10 +63,8 @@ impl SkillManager {
     /// both workspace/skills and workspace/shared/skills so all personas see skills
     /// regardless of where they were created.
     pub fn from_skills_dirs(dirs: impl IntoIterator<Item = impl AsRef<std::path::Path>>) -> Self {
-        let skills_dirs: Vec<PathBuf> = dirs
-            .into_iter()
-            .map(|p| p.as_ref().to_path_buf())
-            .collect();
+        let skills_dirs: Vec<PathBuf> =
+            dirs.into_iter().map(|p| p.as_ref().to_path_buf()).collect();
         SkillManager { skills_dirs }
     }
 
@@ -93,36 +91,36 @@ impl SkillManager {
                 Err(_) => continue,
             };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let skill_md = {
-                let p = path.join("SKILL.md");
-                if p.exists() {
-                    p
-                } else {
-                    let p = path.join("skill.md");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let skill_md = {
+                    let p = path.join("SKILL.md");
                     if p.exists() {
                         p
                     } else {
-                        continue;
+                        let p = path.join("skill.md");
+                        if p.exists() {
+                            p
+                        } else {
+                            continue;
+                        }
                     }
-                }
-            };
-            if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                if let Some((meta, _body)) = parse_skill_md(&content, &path) {
-                    if seen_names.contains(&meta.name) {
-                        continue;
-                    }
-                    if include_unavailable || self.skill_is_available(&meta).is_ok() {
-                        seen_names.insert(meta.name.clone());
-                        skills.push(meta);
+                };
+                if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                    if let Some((meta, _body)) = parse_skill_md(&content, &path) {
+                        if seen_names.contains(&meta.name) {
+                            continue;
+                        }
+                        if include_unavailable || self.skill_is_available(&meta).is_ok() {
+                            seen_names.insert(meta.name.clone());
+                            skills.push(meta);
+                        }
                     }
                 }
             }
-        }
         }
 
         skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -279,7 +277,9 @@ impl SkillManager {
 
     #[allow(dead_code)]
     pub fn skills_dir(&self) -> &PathBuf {
-        self.skills_dirs.first().expect("SkillManager has at least one directory")
+        self.skills_dirs
+            .first()
+            .expect("SkillManager has at least one directory")
     }
 }
 
@@ -518,8 +518,10 @@ Instructions.
 
     #[test]
     fn test_build_skills_catalog_empty() {
-        let dir =
-            std::env::temp_dir().join(format!("finally_a_value_bot_skills_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_skills_test_{}",
+            uuid::Uuid::new_v4()
+        ));
         let sm = SkillManager::new(dir.to_str().unwrap());
         let catalog = sm.build_skills_catalog();
         assert!(catalog.is_empty());

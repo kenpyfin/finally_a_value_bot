@@ -1,4 +1,5 @@
 ---
+
 name: index-vault
 description: Index ORIGIN vault markdown files into ChromaDB for semantic search.
 license: MIT
@@ -7,7 +8,8 @@ compatibility:
     - darwin
     - linux
   deps:
-    - python3
+- python3
+
 ---
 
 # Index Vault
@@ -26,16 +28,18 @@ Same as the search-vault skill — a Python venv with `chromadb` and `openai`:
 bash skills/index-vault/setup_vault_env.sh
 ```
 
-An embedding server must be running at `VAULT_EMBEDDING_SERVER_URL`.
+`index_vault.py` loads `.env` from **this skill directory** (`index-vault/.env`). Set `VAULT_EMBEDDING_SERVER_URL` there (**required**; no default). When spawned by the bot, existing process environment variables are not overridden by dotenv.
 
 ### Environment variables
 
-| Variable | Description | Default |
-|---|---|---|
-| `VAULT_ORIGIN_VAULT_PATH` | Path to the ORIGIN vault (relative to workspace) | `shared/ORIGIN` |
-| `VAULT_EMBEDDING_SERVER_URL` | Embedding API base URL | `http://127.0.0.1:8080` |
-| `VAULT_VECTOR_DB_PATH` | ChromaDB persistent storage path | `shared/vault_db` |
-| `VAULT_VECTOR_DB_COLLECTION` | ChromaDB collection name | `origin_vault` |
+
+| Variable                     | Description                                      | Default / notes        |
+| ---------------------------- | ------------------------------------------------ | ---------------------- |
+| `VAULT_ORIGIN_VAULT_PATH`    | Path to the ORIGIN vault (relative to workspace) | `shared/ORIGIN`        |
+| `VAULT_EMBEDDING_SERVER_URL` | Embedding API base URL                           | **Required** (no default) |
+| `VAULT_VECTOR_DB_PATH`       | ChromaDB persistent storage path                 | `shared/vault_db`      |
+| `VAULT_VECTOR_DB_COLLECTION` | ChromaDB collection name                         | `origin_vault`         |
+
 
 ### Usage
 
@@ -61,3 +65,4 @@ Indexing is automatically scheduled to run every 6 hours. The agent receives a p
 - Overlap: 200 characters
 - Whitespace is normalized before chunking
 - Each chunk is stored with its source file path as metadata
+

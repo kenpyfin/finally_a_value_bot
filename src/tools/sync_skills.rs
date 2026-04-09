@@ -136,7 +136,9 @@ impl SyncSkillsTool {
         let description = if !get("description").trim().is_empty() {
             get("description").trim().to_string()
         } else {
-            format!("Synced from {source_repo} skill '{skill_name}' and adapted for FinallyAValueBot.")
+            format!(
+                "Synced from {source_repo} skill '{skill_name}' and adapted for FinallyAValueBot."
+            )
         };
 
         let mut platforms = Self::str_seq(fm.get("platforms"));

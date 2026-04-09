@@ -195,7 +195,7 @@ html.dark .aui-root {
   --aui-border: 154 26% 20%;
   --aui-input: 154 26% 22%;
   --aui-ring: var(--mc-accent-hsl);
-  --aui-thread-max-width: 48rem;
+  --aui-thread-max-width: 72rem;
 }
 
 html.dark .aui-thread-root {
@@ -228,7 +228,7 @@ html.dark .aui-avatar-fallback {
 }
 
 html.dark .aui-assistant-message-content {
-  max-width: calc(var(--aui-thread-max-width) * 0.9);
+  max-width: calc(var(--aui-thread-max-width) * 0.98);
   border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #10181a);
   border-radius: 14px;
   background: linear-gradient(
@@ -308,7 +308,36 @@ html.dark .aui-assistant-message-content blockquote {
   color: hsl(146 18% 82%);
 }
 
+.mc-md-table-scroll {
+  margin: 10px 0;
+  overflow-x: auto;
+}
+
+html.dark .aui-assistant-message-content .aui-md-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+html.dark .aui-assistant-message-content .aui-md-th,
+html.dark .aui-assistant-message-content .aui-md-td {
+  border: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #1a2530);
+  padding: 6px 10px;
+  white-space: nowrap;
+}
+
+html.dark .aui-assistant-message-content .aui-md-th {
+  background: color-mix(in srgb, var(--mc-accent) 18%, #0b1216);
+  color: hsl(145 26% 90%);
+}
+
+html.dark .aui-assistant-message-content .aui-md-td {
+  background: color-mix(in srgb, var(--mc-accent) 8%, #090f12);
+}
+
 html.dark .aui-user-message-content {
+  max-width: calc(var(--aui-thread-max-width) * 0.98);
   border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #10181a);
   border-radius: 14px;
   background: linear-gradient(
@@ -390,7 +419,7 @@ html.dark .rt-BaseButton:where(.rt-variant-solid):active {
 }
 
 html:not(.dark) .aui-root {
-  --aui-thread-max-width: 48rem;
+  --aui-thread-max-width: 72rem;
 }
 
 html:not(.dark) .aui-thread-root {
@@ -423,7 +452,7 @@ html:not(.dark) .aui-avatar-fallback {
 }
 
 html:not(.dark) .aui-assistant-message-content {
-  max-width: calc(var(--aui-thread-max-width) * 0.9);
+  max-width: calc(var(--aui-thread-max-width) * 0.98);
   border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #cbd5e1);
   border-radius: 14px;
   background: linear-gradient(
@@ -474,7 +503,31 @@ html:not(.dark) .aui-assistant-message-content blockquote {
   color: hsl(216 22% 32%);
 }
 
+html:not(.dark) .aui-assistant-message-content .aui-md-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+html:not(.dark) .aui-assistant-message-content .aui-md-th,
+html:not(.dark) .aui-assistant-message-content .aui-md-td {
+  border: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #cbd5e1);
+  padding: 6px 10px;
+  white-space: nowrap;
+}
+
+html:not(.dark) .aui-assistant-message-content .aui-md-th {
+  background: color-mix(in srgb, var(--mc-accent) 12%, #f8fafc);
+  color: hsl(218 30% 17%);
+}
+
+html:not(.dark) .aui-assistant-message-content .aui-md-td {
+  background: #ffffff;
+}
+
 html:not(.dark) .aui-user-message-content {
+  max-width: calc(var(--aui-thread-max-width) * 0.98);
   border: 1px solid color-mix(in srgb, var(--mc-accent) 44%, #cbd5e1);
   border-radius: 14px;
   background: linear-gradient(

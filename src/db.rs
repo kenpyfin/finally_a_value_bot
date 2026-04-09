@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Mutex;
@@ -8,7 +9,10 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
-pub async fn call_blocking<T, F>(db: std::sync::Arc<Database>, f: F) -> Result<T, FinallyAValueBotError>
+pub async fn call_blocking<T, F>(
+    db: std::sync::Arc<Database>,
+    f: F,
+) -> Result<T, FinallyAValueBotError>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T, FinallyAValueBotError> + Send + 'static,
@@ -88,6 +92,70 @@ pub struct ChannelBinding {
     pub canonical_chat_id: i64,
     pub channel_type: String,
     pub channel_handle: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackgroundJob {
+    pub id: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub prompt: String,
+    pub status: String, // "pending", "running", "completed_raw", "main_agent_processing", "done", "failed"
+    pub trigger_reason: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub result_text: Option<String>,
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobHeartbeat {
+    pub run_key: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub job_type: String,
+    pub stage: String,
+    pub message: String,
+    pub active: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectRecord {
+    pub id: i64,
+    pub owner_chat_id: i64,
+    pub title: String,
+    pub project_type: String,
+    pub status: String,
+    pub canonical_path: Option<String>,
+    pub metadata_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowRecord {
+    pub id: i64,
+    pub owner_chat_id: i64,
+    pub intent_signature: String,
+    pub steps_json: String,
+    pub confidence: f64,
+    pub version: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub last_used_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunTimelineEvent {
+    pub id: i64,
+    pub run_key: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +291,116 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_cursor_agent_runs_finished_at
                 ON cursor_agent_runs(finished_at DESC);
 
+            CREATE TABLE IF NOT EXISTS background_jobs (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                trigger_reason TEXT NOT NULL DEFAULT 'timeout',
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                result_text TEXT,
+                error_text TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_chat_id
+                ON background_jobs(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_status
+                ON background_jobs(status);
+
+            CREATE TABLE IF NOT EXISTS job_heartbeats (
+                run_key TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                job_type TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_heartbeats_chat_id
+                ON job_heartbeats(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_job_heartbeats_updated
+                ON job_heartbeats(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_chat_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                project_type TEXT NOT NULL DEFAULT 'general',
+                status TEXT NOT NULL DEFAULT 'active',
+                canonical_path TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_chat_id, title)
+            );
+            CREATE INDEX IF NOT EXISTS idx_projects_owner_updated
+                ON projects(owner_chat_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS project_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                artifact_type TEXT NOT NULL,
+                artifact_ref TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, artifact_type, artifact_ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_artifacts_project
+                ON project_artifacts(project_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS project_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                run_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(project_id, run_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_runs_run_key
+                ON project_runs(run_key);
+
+            CREATE TABLE IF NOT EXISTS workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_chat_id INTEGER NOT NULL,
+                intent_signature TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                version INTEGER NOT NULL DEFAULT 1,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_chat_id, intent_signature)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflows_owner_conf
+                ON workflows(owner_chat_id, confidence DESC, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS workflow_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id INTEGER NOT NULL,
+                run_key TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_executions_workflow
+                ON workflow_executions(workflow_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS run_timeline_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_key TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_timeline_events_run_key
+                ON run_timeline_events(run_key, id ASC);
+            CREATE INDEX IF NOT EXISTS idx_run_timeline_events_chat
+                ON run_timeline_events(chat_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS channel_bindings (
                 canonical_chat_id INTEGER NOT NULL,
                 channel_type TEXT NOT NULL,
@@ -251,9 +429,7 @@ impl Database {
             .prepare("PRAGMA table_info(messages)")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows
-                    .filter_map(|r| r.ok())
-                    .any(|c| c == "persona_id"))
+                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "persona_id"))
             })
             .unwrap_or(false);
 
@@ -266,7 +442,9 @@ impl Database {
             .prepare("PRAGMA table_info(chats)")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "active_persona_id"))
+                Ok(rows
+                    .filter_map(|r| r.ok())
+                    .any(|c| c == "active_persona_id"))
             })
             .unwrap_or(false);
         if !has_active {
@@ -380,7 +558,10 @@ impl Database {
             return Ok(());
         }
 
-        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN persona_id INTEGER", [])?;
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN persona_id INTEGER",
+            [],
+        )?;
         conn.execute_batch(
             "UPDATE scheduled_tasks
              SET persona_id = (
@@ -400,7 +581,8 @@ impl Database {
              WHERE persona_id IS NULL;",
         )?;
 
-        let mut stmt = conn.prepare("SELECT DISTINCT chat_id FROM scheduled_tasks WHERE persona_id IS NULL")?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT chat_id FROM scheduled_tasks WHERE persona_id IS NULL")?;
         let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
         for row in rows {
             let chat_id = row?;
@@ -479,10 +661,12 @@ impl Database {
         // One-time migration: populate FTS from existing messages if FTS is empty but messages has data
         let fts_count: i64 =
             conn.query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0))?;
-        let msg_count: i64 =
-            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
+        let msg_count: i64 = conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
         if fts_count == 0 && msg_count > 0 {
-            conn.execute("INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages", [])?;
+            conn.execute(
+                "INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages",
+                [],
+            )?;
         }
 
         Ok(())
@@ -493,13 +677,14 @@ impl Database {
             .prepare("PRAGMA table_info(cursor_agent_runs)")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows
-                    .filter_map(|r| r.ok())
-                    .any(|c| c == "tmux_session"))
+                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "tmux_session"))
             })
             .unwrap_or(false);
         if !has_tmux {
-            conn.execute("ALTER TABLE cursor_agent_runs ADD COLUMN tmux_session TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE cursor_agent_runs ADD COLUMN tmux_session TEXT",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -576,6 +761,49 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// True when the **latest** row for this chat is a bot message with the same body as `content`
+    /// and a recent timestamp. That usually means `send_message` already posted this text and the
+    /// main agent is about to deliver the same final reply again.
+    pub fn should_skip_duplicate_final_delivery(
+        &self,
+        chat_id: i64,
+        content: &str,
+        max_age_secs: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        use rusqlite::OptionalExtension;
+
+        let conn = self.conn.lock().unwrap();
+        let last: Option<(bool, String, String)> = conn
+            .query_row(
+                "SELECT is_from_bot, content, timestamp FROM messages
+                 WHERE chat_id = ?1
+                 ORDER BY timestamp DESC
+                 LIMIT 1",
+                params![chat_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i32>(0)? != 0,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((is_bot, last_content, ts)) = last else {
+            return Ok(false);
+        };
+        if !is_bot || last_content != content {
+            return Ok(false);
+        }
+        let Ok(parsed) = DateTime::parse_from_rfc3339(&ts) else {
+            return Ok(false);
+        };
+        let parsed = parsed.with_timezone(&Utc);
+        let age = Utc::now().signed_duration_since(parsed);
+        Ok(age.num_seconds() >= 0 && age.num_seconds() <= max_age_secs)
     }
 
     pub fn get_recent_messages(
@@ -678,7 +906,11 @@ impl Database {
         Ok(messages)
     }
 
-    pub fn get_message_days(&self, chat_id: i64, persona_id: i64) -> Result<Vec<String>, FinallyAValueBotError> {
+    pub fn get_message_days(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT date(timestamp) AS d FROM messages
@@ -729,7 +961,10 @@ impl Database {
         Ok(chats)
     }
 
-    pub fn get_recent_chats(&self, limit: usize) -> Result<Vec<ChatSummary>, FinallyAValueBotError> {
+    pub fn get_recent_chats(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ChatSummary>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT
@@ -799,12 +1034,23 @@ impl Database {
             return Ok(canonical);
         }
         let canonical = match channel_type {
-            "telegram" | "discord" => channel_handle
-                .parse::<i64>()
-                .map_err(|_| FinallyAValueBotError::ToolExecution(format!("invalid handle for {}: {}", channel_type, channel_handle)))?,
-            "web" => create_with_canonical_id
-                .ok_or_else(|| FinallyAValueBotError::ToolExecution("web resolve requires create_with_canonical_id".into()))?,
-            _ => return Err(FinallyAValueBotError::ToolExecution(format!("unknown channel_type: {}", channel_type))),
+            "telegram" | "discord" => channel_handle.parse::<i64>().map_err(|_| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "invalid handle for {}: {}",
+                    channel_type, channel_handle
+                ))
+            })?,
+            "web" => create_with_canonical_id.ok_or_else(|| {
+                FinallyAValueBotError::ToolExecution(
+                    "web resolve requires create_with_canonical_id".into(),
+                )
+            })?,
+            _ => {
+                return Err(FinallyAValueBotError::ToolExecution(format!(
+                    "unknown channel_type: {}",
+                    channel_type
+                )))
+            }
         };
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -834,7 +1080,11 @@ impl Database {
     }
 
     /// Remove the binding for (channel_type, channel_handle).
-    pub fn unlink_channel(&self, channel_type: &str, channel_handle: &str) -> Result<bool, FinallyAValueBotError> {
+    pub fn unlink_channel(
+        &self,
+        channel_type: &str,
+        channel_handle: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
@@ -844,7 +1094,10 @@ impl Database {
     }
 
     /// List all channel bindings for this contact (canonical_chat_id).
-    pub fn list_bindings_for_contact(&self, canonical_chat_id: i64) -> Result<Vec<ChannelBinding>, FinallyAValueBotError> {
+    pub fn list_bindings_for_contact(
+        &self,
+        canonical_chat_id: i64,
+    ) -> Result<Vec<ChannelBinding>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT canonical_chat_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
@@ -1067,11 +1320,8 @@ impl Database {
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         // Only seed if no messages exist yet (fresh install)
-        let message_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages",
-            [],
-            |row| row.get(0),
-        )?;
+        let message_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
 
         if message_count == 0 {
             let exists: bool = conn.query_row(
@@ -1097,7 +1347,8 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
              FROM scheduled_tasks
-             WHERE status = 'active' AND next_run <= ?1",
+             WHERE status = 'active' AND next_run <= ?1
+             ORDER BY next_run ASC, id ASC",
         )?;
         let tasks = stmt
             .query_map(params![now], |row| {
@@ -1147,7 +1398,9 @@ impl Database {
 
     /// All scheduled tasks for /schedule and list_scheduled_tasks:
     /// active, running, paused, and completed (all chats/personas).
-    pub fn get_all_scheduled_tasks_for_display(&self) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+    pub fn get_all_scheduled_tasks_for_display(
+        &self,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -1174,7 +1427,10 @@ impl Database {
         Ok(tasks)
     }
 
-    pub fn get_tasks_for_chat(&self, chat_id: i64) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+    pub fn get_tasks_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -1201,7 +1457,10 @@ impl Database {
         Ok(tasks)
     }
 
-    pub fn get_task_by_id(&self, task_id: i64) -> Result<Option<ScheduledTask>, FinallyAValueBotError> {
+    pub fn get_task_by_id(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -1230,7 +1489,11 @@ impl Database {
         }
     }
 
-    pub fn update_task_status(&self, task_id: i64, status: &str) -> Result<bool, FinallyAValueBotError> {
+    pub fn update_task_status(
+        &self,
+        task_id: i64,
+        status: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2",
@@ -1305,6 +1568,77 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Atomic conditional claim: only marks running if the task is still active and due.
+    /// Returns true iff exactly one row was updated. Callers should skip spawn when false.
+    pub fn try_mark_task_running(
+        &self,
+        task_id: i64,
+        started_at: &str,
+        next_run: Option<&str>,
+        now_upper_bound: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = match next_run {
+            Some(next) => conn.execute(
+                "UPDATE scheduled_tasks
+                 SET last_run = ?1, next_run = ?2, status = 'running'
+                 WHERE id = ?3 AND status = 'active' AND next_run <= ?4",
+                params![started_at, next, task_id, now_upper_bound],
+            )?,
+            None => conn.execute(
+                "UPDATE scheduled_tasks
+                 SET last_run = ?1, status = 'running'
+                 WHERE id = ?2 AND status = 'active' AND next_run <= ?3",
+                params![started_at, task_id, now_upper_bound],
+            )?,
+        };
+        Ok(rows == 1)
+    }
+
+    /// Reset tasks stuck in `running` (e.g. process crash or hung agent) back to `active`.
+    /// `last_run` holds the claim/start time from `mark_task_running`. Does not change `next_run`.
+    /// Returns IDs of reclaimed tasks.
+    pub fn reclaim_stale_running_tasks(
+        &self,
+        now_rfc3339: &str,
+        max_age_secs: i64,
+    ) -> Result<Vec<i64>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "reclaim_stale_running_tasks: invalid now timestamp: {e}"
+                ))
+            })?;
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, last_run FROM scheduled_tasks WHERE status = 'running' AND last_run IS NOT NULL",
+        )?;
+        let pending: Vec<(i64, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut reclaimed = Vec::new();
+        for (id, last_run) in pending {
+            let Ok(started) = DateTime::parse_from_rfc3339(&last_run) else {
+                continue;
+            };
+            let started = started.with_timezone(&Utc);
+            if now.signed_duration_since(started).num_seconds() > max_age_secs {
+                conn.execute(
+                    "UPDATE scheduled_tasks SET status = 'active' WHERE id = ?1",
+                    params![id],
+                )?;
+                reclaimed.push(id);
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// Finalize a running task after execution.
@@ -1490,6 +1824,512 @@ impl Database {
         Ok(runs)
     }
 
+    // --- Projects / workflows / timeline ---
+
+    pub fn upsert_project(
+        &self,
+        owner_chat_id: i64,
+        title: &str,
+        project_type: &str,
+        status: &str,
+        canonical_path: Option<&str>,
+        metadata_json: Option<&str>,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO projects (owner_chat_id, title, project_type, status, canonical_path, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(owner_chat_id, title) DO UPDATE SET
+               project_type = excluded.project_type,
+               status = excluded.status,
+               canonical_path = excluded.canonical_path,
+               metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at",
+            params![
+                owner_chat_id,
+                title,
+                project_type,
+                status,
+                canonical_path,
+                metadata_json.unwrap_or("{}"),
+                now
+            ],
+        )?;
+        let id = conn.query_row(
+            "SELECT id FROM projects WHERE owner_chat_id = ?1 AND title = ?2",
+            params![owner_chat_id, title],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_recent_project_for_contact(
+        &self,
+        owner_chat_id: i64,
+    ) -> Result<Option<ProjectRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, owner_chat_id, title, project_type, status, canonical_path, metadata_json, updated_at
+             FROM projects
+             WHERE owner_chat_id = ?1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+            params![owner_chat_id],
+            |row| {
+                Ok(ProjectRecord {
+                    id: row.get(0)?,
+                    owner_chat_id: row.get(1)?,
+                    title: row.get(2)?,
+                    project_type: row.get(3)?,
+                    status: row.get(4)?,
+                    canonical_path: row.get(5)?,
+                    metadata_json: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        );
+        match result {
+            Ok(project) => Ok(Some(project)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn touch_project_status(
+        &self,
+        project_id: i64,
+        status: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE projects SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now, project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_project_artifact(
+        &self,
+        project_id: i64,
+        artifact_type: &str,
+        artifact_ref: &str,
+        metadata_json: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO project_artifacts (project_id, artifact_type, artifact_ref, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id, artifact_type, artifact_ref) DO UPDATE SET
+               metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at",
+            params![
+                project_id,
+                artifact_type,
+                artifact_ref,
+                metadata_json.unwrap_or("{}"),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn link_project_run(
+        &self,
+        project_id: i64,
+        run_key: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_runs (project_id, run_key, created_at) VALUES (?1, ?2, ?3)",
+            params![project_id, run_key, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_best_workflow_for_intent(
+        &self,
+        owner_chat_id: i64,
+        intent_signature: &str,
+        min_confidence: f64,
+    ) -> Result<Option<WorkflowRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
+             FROM workflows
+             WHERE owner_chat_id = ?1
+               AND intent_signature = ?2
+               AND confidence >= ?3
+             ORDER BY confidence DESC, updated_at DESC
+             LIMIT 1",
+            params![owner_chat_id, intent_signature, min_confidence],
+            |row| {
+                Ok(WorkflowRecord {
+                    id: row.get(0)?,
+                    owner_chat_id: row.get(1)?,
+                    intent_signature: row.get(2)?,
+                    steps_json: row.get(3)?,
+                    confidence: row.get(4)?,
+                    version: row.get(5)?,
+                    success_count: row.get(6)?,
+                    failure_count: row.get(7)?,
+                    last_used_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        );
+        match result {
+            Ok(wf) => Ok(Some(wf)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn upsert_workflow_learning(
+        &self,
+        owner_chat_id: i64,
+        intent_signature: &str,
+        steps_json: &str,
+        success: bool,
+        score: f64,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO workflows (
+                owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, CASE WHEN ?4 THEN ?5 ELSE 0.0 END, 1,
+                CASE WHEN ?4 THEN 1 ELSE 0 END,
+                CASE WHEN ?4 THEN 0 ELSE 1 END,
+                ?6, ?6
+             )
+             ON CONFLICT(owner_chat_id, intent_signature) DO UPDATE SET
+               steps_json = excluded.steps_json,
+               success_count = workflows.success_count + CASE WHEN ?4 THEN 1 ELSE 0 END,
+               failure_count = workflows.failure_count + CASE WHEN ?4 THEN 0 ELSE 1 END,
+               confidence = MIN(
+                   1.0,
+                   MAX(
+                       0.0,
+                       (workflows.confidence * 0.7) + (CASE WHEN ?4 THEN ?5 ELSE 0.0 END * 0.3)
+                   )
+               ),
+               version = workflows.version + 1,
+               updated_at = excluded.updated_at",
+            params![owner_chat_id, intent_signature, steps_json, success, score, now],
+        )?;
+        let id = conn.query_row(
+            "SELECT id FROM workflows WHERE owner_chat_id = ?1 AND intent_signature = ?2",
+            params![owner_chat_id, intent_signature],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn log_workflow_execution(
+        &self,
+        workflow_id: i64,
+        run_key: &str,
+        outcome: &str,
+        score: f64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO workflow_executions (workflow_id, run_key, outcome, score, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![workflow_id, run_key, outcome, score, now],
+        )?;
+        conn.execute(
+            "UPDATE workflows SET last_used_at = ?1 WHERE id = ?2",
+            params![now, workflow_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_run_timeline_event(
+        &self,
+        run_key: &str,
+        chat_id: i64,
+        persona_id: i64,
+        event_type: &str,
+        payload_json: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO run_timeline_events (run_key, chat_id, persona_id, event_type, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_key,
+                chat_id,
+                persona_id,
+                event_type,
+                payload_json.unwrap_or("{}"),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_run_timeline_events(
+        &self,
+        run_key: &str,
+        limit: usize,
+    ) -> Result<Vec<RunTimelineEvent>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, run_key, chat_id, persona_id, event_type, payload_json, created_at
+             FROM run_timeline_events
+             WHERE run_key = ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![run_key, limit as i64], |row| {
+                Ok(RunTimelineEvent {
+                    id: row.get(0)?,
+                    run_key: row.get(1)?,
+                    chat_id: row.get(2)?,
+                    persona_id: row.get(3)?,
+                    event_type: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // --- Background jobs ---
+
+    pub fn create_background_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        prompt: &str,
+        trigger_reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+            params![id, chat_id, persona_id, prompt, trigger_reason, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_running(&self, id: &str) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'running', started_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_completed_raw(
+        &self,
+        id: &str,
+        result_text: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs
+             SET status = 'completed_raw', finished_at = ?1, result_text = ?2
+             WHERE id = ?3",
+            params![now, result_text, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_main_agent_processing(
+        &self,
+        id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'main_agent_processing' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_done(&self, id: &str) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'done' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_background_job(
+        &self,
+        id: &str,
+        error_text: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'failed', finished_at = ?1, error_text = ?2 WHERE id = ?3",
+            params![now, error_text, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_active_background_jobs_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             WHERE chat_id = ?1
+               AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
+            params![chat_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn list_background_jobs_for_chat(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
+             FROM background_jobs
+             WHERE chat_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let jobs = stmt
+            .query_map(params![chat_id, limit as i64], |row| {
+                Ok(BackgroundJob {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    status: row.get(4)?,
+                    trigger_reason: row.get(5)?,
+                    created_at: row.get(6)?,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                    result_text: row.get(9)?,
+                    error_text: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn get_background_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
+             FROM background_jobs WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(BackgroundJob {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    status: row.get(4)?,
+                    trigger_reason: row.get(5)?,
+                    created_at: row.get(6)?,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                    result_text: row.get(9)?,
+                    error_text: row.get(10)?,
+                })
+            },
+        );
+        match result {
+            Ok(job) => Ok(Some(job)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn upsert_job_heartbeat(
+        &self,
+        run_key: &str,
+        chat_id: i64,
+        persona_id: i64,
+        job_type: &str,
+        stage: &str,
+        message: &str,
+        active: bool,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO job_heartbeats (run_key, chat_id, persona_id, job_type, stage, message, active, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(run_key) DO UPDATE SET
+               stage = excluded.stage,
+               message = excluded.message,
+               active = excluded.active,
+               updated_at = excluded.updated_at",
+            params![
+                run_key,
+                chat_id,
+                persona_id,
+                job_type,
+                stage,
+                message,
+                if active { 1 } else { 0 },
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_job_heartbeat(
+        &self,
+        run_key: &str,
+    ) -> Result<Option<JobHeartbeat>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT run_key, chat_id, persona_id, job_type, stage, message, active, updated_at
+             FROM job_heartbeats
+             WHERE run_key = ?1",
+            params![run_key],
+            |row| {
+                Ok(JobHeartbeat {
+                    run_key: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    job_type: row.get(3)?,
+                    stage: row.get(4)?,
+                    message: row.get(5)?,
+                    active: row.get::<_, i32>(6)? != 0,
+                    updated_at: row.get(7)?,
+                })
+            },
+        );
+        match result {
+            Ok(h) => Ok(Some(h)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn delete_task(&self, task_id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
@@ -1539,7 +2379,11 @@ impl Database {
         }
     }
 
-    pub fn delete_session(&self, chat_id: i64, persona_id: i64) -> Result<bool, FinallyAValueBotError> {
+    pub fn delete_session(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM sessions WHERE chat_id = ?1 AND persona_id = ?2",
@@ -1553,7 +2397,10 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         let mut affected = 0usize;
 
-        affected += tx.execute("UPDATE chats SET active_persona_id = NULL WHERE chat_id = ?1", params![chat_id])?;
+        affected += tx.execute(
+            "UPDATE chats SET active_persona_id = NULL WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
         affected += tx.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM personas WHERE chat_id = ?1", params![chat_id])?;
@@ -1565,7 +2412,10 @@ impl Database {
             "DELETE FROM social_oauth_tokens WHERE chat_id = ?1",
             params![chat_id],
         )?;
-        affected += tx.execute("DELETE FROM channel_bindings WHERE canonical_chat_id = ?1", params![chat_id])?;
+        affected += tx.execute(
+            "DELETE FROM channel_bindings WHERE canonical_chat_id = ?1",
+            params![chat_id],
+        )?;
         affected += tx.execute("DELETE FROM chats WHERE chat_id = ?1", params![chat_id])?;
 
         tx.commit()?;
@@ -1623,7 +2473,11 @@ impl Database {
         }
     }
 
-    pub fn delete_social_token(&self, platform: &str, chat_id: i64) -> Result<bool, FinallyAValueBotError> {
+    pub fn delete_social_token(
+        &self,
+        platform: &str,
+        chat_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM social_oauth_tokens WHERE platform = ?1 AND chat_id = ?2",
@@ -1666,7 +2520,10 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        conn.execute("DELETE FROM oauth_pending_states WHERE state_token = ?1", params![state_token])?;
+        conn.execute(
+            "DELETE FROM oauth_pending_states WHERE state_token = ?1",
+            params![state_token],
+        )?;
         Ok(Some(pair))
     }
 
@@ -1701,7 +2558,10 @@ impl Database {
 
     // --- Personas ---
 
-    pub fn get_or_create_default_persona(&self, chat_id: i64) -> Result<i64, FinallyAValueBotError> {
+    pub fn get_or_create_default_persona(
+        &self,
+        chat_id: i64,
+    ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result: Option<i64> = conn
             .query_row(
@@ -1735,7 +2595,10 @@ impl Database {
         Ok(persona_id)
     }
 
-    pub fn get_active_persona_id(&self, chat_id: i64) -> Result<Option<i64>, FinallyAValueBotError> {
+    pub fn get_active_persona_id(
+        &self,
+        chat_id: i64,
+    ) -> Result<Option<i64>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT active_persona_id FROM chats WHERE chat_id = ?1",
@@ -1806,6 +2669,25 @@ impl Database {
         Ok(personas)
     }
 
+    /// Returns a `(persona_id, last_bot_message_at)` row for each persona that has at least one bot message.
+    /// `last_bot_message_at` is the max `messages.timestamp` for rows where `is_from_bot = 1`.
+    pub fn list_persona_last_bot_message_at(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<(i64, String)>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT persona_id, MAX(timestamp) AS last_at
+             FROM messages
+             WHERE chat_id = ?1 AND is_from_bot = 1
+             GROUP BY persona_id",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn create_persona(
         &self,
         chat_id: i64,
@@ -1866,7 +2748,11 @@ impl Database {
         }
     }
 
-    pub fn delete_persona(&self, chat_id: i64, persona_id: i64) -> Result<bool, FinallyAValueBotError> {
+    pub fn delete_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let name: String = conn
             .query_row(
@@ -1964,7 +2850,8 @@ mod tests {
     use super::*;
 
     fn test_db() -> (Database, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_test_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("finally_a_value_bot_test_{}", uuid::Uuid::new_v4()));
         let db = Database::new(dir.to_str().unwrap()).unwrap();
         (db, dir)
     }
@@ -2172,7 +3059,9 @@ mod tests {
         }
 
         // Fallback to last 3
-        let messages = db.get_messages_since_last_bot_response(100, pid, 50, 3).unwrap();
+        let messages = db
+            .get_messages_since_last_bot_response(100, pid, 50, 3)
+            .unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "msg 2");
         assert_eq!(messages[2].content, "msg 4");

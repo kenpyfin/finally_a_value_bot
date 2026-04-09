@@ -46,6 +46,12 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         models: &["llama3.2", "qwen2.5-coder:7b", "mistral"],
     },
     ProviderPreset {
+        id: "llama",
+        label: "Llama.cpp (local)",
+        default_base_url: "http://127.0.0.1:8080/v1",
+        models: &["local"],
+    },
+    ProviderPreset {
         id: "google",
         label: "Google DeepMind",
         default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -356,11 +362,20 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Fina
     lines.push("# FinallyAValueBot configuration".into());
     lines.push("".into());
     lines.push("# Telegram".into());
-    lines.push(format!("TELEGRAM_BOT_TOKEN={}", escape_env_val(&config.telegram_bot_token)));
-    lines.push(format!("BOT_USERNAME={}", escape_env_val(&config.bot_username)));
+    lines.push(format!(
+        "TELEGRAM_BOT_TOKEN={}",
+        escape_env_val(&config.telegram_bot_token)
+    ));
+    lines.push(format!(
+        "BOT_USERNAME={}",
+        escape_env_val(&config.bot_username)
+    ));
     lines.push("".into());
     lines.push("# LLM".into());
-    lines.push(format!("LLM_PROVIDER={}", escape_env_val(&config.llm_provider)));
+    lines.push(format!(
+        "LLM_PROVIDER={}",
+        escape_env_val(&config.llm_provider)
+    ));
     lines.push(format!("LLM_API_KEY={}", escape_env_val(&config.api_key)));
     if !config.model.is_empty() {
         lines.push(format!("LLM_MODEL={}", escape_env_val(&config.model)));
@@ -372,7 +387,10 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Fina
     }
     lines.push("".into());
     lines.push("# Workspace".into());
-    lines.push(format!("WORKSPACE_DIR={}", escape_env_val(&config.workspace_dir)));
+    lines.push(format!(
+        "WORKSPACE_DIR={}",
+        escape_env_val(&config.workspace_dir)
+    ));
     lines.push(format!("TIMEZONE={}", escape_env_val(&config.timezone)));
     if let Some(ref v) = config.vault {
         lines.push("".into());
@@ -415,8 +433,6 @@ fn default_config() -> Config {
         timezone: "UTC".into(),
         allowed_groups: vec![],
         control_chat_ids: vec![],
-        max_session_messages: 40,
-        compact_keep_recent: 20,
         whatsapp_access_token: None,
         whatsapp_phone_number_id: None,
         whatsapp_verify_token: None,
@@ -453,7 +469,7 @@ fn default_config() -> Config {
         web_search_searxng_url: None,
         cursor_agent_cli_path: crate::config::default_cursor_agent_cli_path(),
         cursor_agent_model: String::new(),
-        cursor_agent_timeout_secs: 600,
+        cursor_agent_timeout_secs: 1500,
         social: None,
         vault: None,
         orchestrator_enabled: true,
@@ -462,12 +478,18 @@ fn default_config() -> Config {
         tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
-        delegate_tool_enabled: true,
-        delegate_max_iterations: 10,
-        delegate_model: String::new(),
         cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
         cursor_agent_tmux_enabled: true,
         cursor_agent_runner_url: None,
+        scheduler_task_timeout_secs: 3600,
+        scheduler_stale_running_reclaim_secs: 7200,
+        scheduler_max_concurrent_tasks: 2,
+        scheduler_poll_interval_secs: 60,
+        runtime_reliability_profile: "balanced".into(),
+        workflow_auto_learn: true,
+        workflow_min_success_repetitions: 2,
+        workflow_replay_strictness: "adaptive".into(),
+        project_auto_association_strictness: "balanced".into(),
     }
 }
 
@@ -528,15 +550,20 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
     };
 
     let api_default = existing.api_key.clone();
-    let api_prompt = if provider.eq_ignore_ascii_case("ollama") {
-        "LLM API key (optional for ollama)"
+    let api_prompt = if provider.eq_ignore_ascii_case("ollama")
+        || provider.eq_ignore_ascii_case("llama")
+        || provider.eq_ignore_ascii_case("llamacpp")
+    {
+        "LLM API key (optional for local providers: ollama/llama)"
     } else {
         "LLM API key"
     };
     let api_key = match prompt_line(
         api_prompt,
         Some(&api_default),
-        !provider.eq_ignore_ascii_case("ollama"),
+        !(provider.eq_ignore_ascii_case("ollama")
+            || provider.eq_ignore_ascii_case("llama")
+            || provider.eq_ignore_ascii_case("llamacpp")),
     )? {
         Some(v) => v,
         None => return Ok(false),
@@ -561,7 +588,11 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
         None => return Ok(false),
     };
 
-    let workspace_dir = match prompt_line("Workspace directory (root for runtime, skills, shared)", Some(&existing.workspace_dir), false)? {
+    let workspace_dir = match prompt_line(
+        "Workspace directory (root for runtime, skills, shared)",
+        Some(&existing.workspace_dir),
+        false,
+    )? {
         Some(v) => {
             if v.trim().is_empty() {
                 "./workspace".to_string()

@@ -68,6 +68,13 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         models: &["llama3.2", "qwen2.5-coder:7b", "mistral"],
     },
     ProviderPreset {
+        id: "llama",
+        label: "Llama.cpp (local)",
+        protocol: ProviderProtocol::OpenAiCompat,
+        default_base_url: "http://127.0.0.1:8080/v1",
+        models: &["local"],
+    },
+    ProviderPreset {
         id: "google",
         label: "Google DeepMind",
         protocol: ProviderProtocol::OpenAiCompat,
@@ -388,28 +395,6 @@ impl SetupApp {
                     required: false,
                     secret: false,
                 },
-                // ── Delegate ──
-                Field {
-                    key: "DELEGATE_TOOL_ENABLED",
-                    label: "Enable delegate tool",
-                    value: existing.get("DELEGATE_TOOL_ENABLED").cloned().unwrap_or_else(|| "true".into()),
-                    required: false,
-                    secret: false,
-                },
-                Field {
-                    key: "DELEGATE_MAX_ITERATIONS",
-                    label: "Delegate max iterations",
-                    value: existing.get("DELEGATE_MAX_ITERATIONS").cloned().unwrap_or_else(|| "10".into()),
-                    required: false,
-                    secret: false,
-                },
-                Field {
-                    key: "DELEGATE_MODEL",
-                    label: "Delegate model override",
-                    value: existing.get("DELEGATE_MODEL").cloned().unwrap_or_default(),
-                    required: false,
-                    secret: false,
-                },
                 // ── Discord ──
                 Field {
                     key: "DISCORD_BOT_TOKEN",
@@ -616,11 +601,7 @@ impl SetupApp {
             }
             if let Some((k, v)) = line.split_once('=') {
                 let k = k.trim();
-                let v = v
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
+                let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
                 if !k.is_empty() {
                     map.insert(k.to_string(), v);
                 }
@@ -676,17 +657,27 @@ impl SetupApp {
 
     fn validate_local(&self) -> Result<(), FinallyAValueBotError> {
         for field in &self.fields {
-            if field.key == "LLM_API_KEY" && self.field_value("LLM_PROVIDER") == "ollama" {
+            if field.key == "LLM_API_KEY"
+                && matches!(
+                    self.field_value("LLM_PROVIDER").as_str(),
+                    "ollama" | "llama" | "llamacpp"
+                )
+            {
                 continue;
             }
             if field.required && field.value.trim().is_empty() {
-                return Err(FinallyAValueBotError::Config(format!("{} is required", field.key)));
+                return Err(FinallyAValueBotError::Config(format!(
+                    "{} is required",
+                    field.key
+                )));
             }
         }
 
         let provider = self.field_value("LLM_PROVIDER");
         if provider.is_empty() {
-            return Err(FinallyAValueBotError::Config("LLM_PROVIDER is required".into()));
+            return Err(FinallyAValueBotError::Config(
+                "LLM_PROVIDER is required".into(),
+            ));
         }
 
         // At least one channel must be configured
@@ -945,8 +936,6 @@ impl SetupApp {
             "MAX_TOOL_ITERATIONS" => "100".into(),
             "MAX_HISTORY_MESSAGES" => "50".into(),
             "ORCHESTRATOR_ENABLED" => "true".into(),
-            "DELEGATE_TOOL_ENABLED" => "true".into(),
-            "DELEGATE_MAX_ITERATIONS" => "10".into(),
             "WHATSAPP_WEBHOOK_PORT" => "8080".into(),
             "WEB_ENABLED" => "true".into(),
             "WEB_HOST" => "0.0.0.0".into(),
@@ -980,17 +969,33 @@ impl SetupApp {
         // Find the section by looking at the field key at the current index
         if self.selected < self.fields.len() {
             match self.fields[self.selected].key {
-                "TELEGRAM_BOT_TOKEN" | "BOT_USERNAME" | "ALLOWED_GROUPS" | "CONTROL_CHAT_IDS" => "Telegram",
-                "LLM_PROVIDER" | "LLM_API_KEY" | "LLM_MODEL" | "LLM_BASE_URL" | "OPENAI_API_KEY" => "LLM",
-                "WORKSPACE_DIR" | "TIMEZONE" | "MAX_TOKENS" | "MAX_TOOL_ITERATIONS" | "MAX_HISTORY_MESSAGES" => "Runtime",
+                "TELEGRAM_BOT_TOKEN" | "BOT_USERNAME" | "ALLOWED_GROUPS" | "CONTROL_CHAT_IDS" => {
+                    "Telegram"
+                }
+                "LLM_PROVIDER" | "LLM_API_KEY" | "LLM_MODEL" | "LLM_BASE_URL"
+                | "OPENAI_API_KEY" => "LLM",
+                "WORKSPACE_DIR"
+                | "TIMEZONE"
+                | "MAX_TOKENS"
+                | "MAX_TOOL_ITERATIONS"
+                | "MAX_HISTORY_MESSAGES" => "Runtime",
                 "ORCHESTRATOR_ENABLED" | "ORCHESTRATOR_MODEL" => "Orchestrator",
-                "DELEGATE_TOOL_ENABLED" | "DELEGATE_MAX_ITERATIONS" | "DELEGATE_MODEL" => "Delegate",
                 "DISCORD_BOT_TOKEN" | "DISCORD_ALLOWED_CHANNELS" => "Discord",
-                "WHATSAPP_ACCESS_TOKEN" | "WHATSAPP_PHONE_NUMBER_ID" | "WHATSAPP_VERIFY_TOKEN" | "WHATSAPP_WEBHOOK_PORT" => "WhatsApp",
+                "WHATSAPP_ACCESS_TOKEN"
+                | "WHATSAPP_PHONE_NUMBER_ID"
+                | "WHATSAPP_VERIFY_TOKEN"
+                | "WHATSAPP_WEBHOOK_PORT" => "WhatsApp",
                 "WEB_ENABLED" | "WEB_HOST" | "WEB_PORT" | "WEB_AUTH_TOKEN" => "Web UI",
                 "BROWSER_MANAGED" | "AGENT_BROWSER_PATH" => "Browser",
-                "CURSOR_AGENT_CLI_PATH" | "CURSOR_AGENT_MODEL" | "CURSOR_AGENT_RUNNER_URL" => "Cursor Agent",
-                "VAULT_ORIGIN_VAULT_PATH" | "VAULT_VECTOR_DB_PATH" | "VAULT_GIT_URL" | "VAULT_SEARCH_COMMAND" | "VAULT_INDEX_COMMAND" | "VAULT_VECTOR_DB_URL" => "Vault",
+                "CURSOR_AGENT_CLI_PATH" | "CURSOR_AGENT_MODEL" | "CURSOR_AGENT_RUNNER_URL" => {
+                    "Cursor Agent"
+                }
+                "VAULT_ORIGIN_VAULT_PATH"
+                | "VAULT_VECTOR_DB_PATH"
+                | "VAULT_GIT_URL"
+                | "VAULT_SEARCH_COMMAND"
+                | "VAULT_INDEX_COMMAND"
+                | "VAULT_VECTOR_DB_URL" => "Vault",
                 "UNIVERSAL_CHAT_ID" => "Universal",
                 "GIT_USERNAME" | "GIT_TOKEN" => "Git",
                 _ => "Setup",
@@ -1047,7 +1052,10 @@ fn perform_online_validation(
             .and_then(|u| u.as_str())
             .unwrap_or_default()
             .to_string();
-        if !env_username.is_empty() && !actual_username.is_empty() && env_username != actual_username {
+        if !env_username.is_empty()
+            && !actual_username.is_empty()
+            && env_username != actual_username
+        {
             checks.push(format!(
                 "Telegram OK (token user={actual_username}, configured={env_username})"
             ));
@@ -1159,7 +1167,10 @@ fn mask_secret(s: &str) -> String {
     format!("{}***{}", &s[..3], &s[s.len() - 2..])
 }
 
-fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Option<String>, FinallyAValueBotError> {
+fn save_config_env(
+    path: &Path,
+    values: &HashMap<String, String>,
+) -> Result<Option<String>, FinallyAValueBotError> {
     let mut backup = None;
     if path.exists() {
         let ts = Utc::now().format("%Y%m%d%H%M%S").to_string();
@@ -1168,7 +1179,14 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
         backup = Some(backup_path);
     }
 
-    let get = |key: &str| values.get(key).cloned().unwrap_or_default().trim().to_string();
+    let get = |key: &str| {
+        values
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
 
     let mut lines = Vec::new();
 
@@ -1188,7 +1206,11 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
 
     let workspace_dir = {
         let w = get("WORKSPACE_DIR");
-        if w.is_empty() { "./workspace".to_string() } else { w }
+        if w.is_empty() {
+            "./workspace".to_string()
+        } else {
+            w
+        }
     };
 
     // Clone vault if needed
@@ -1210,7 +1232,12 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
     lines.push("# FinallyAValueBot configuration".into());
 
     // Telegram
-    emit!("Telegram", "TELEGRAM_BOT_TOKEN", get("TELEGRAM_BOT_TOKEN"), true);
+    emit!(
+        "Telegram",
+        "TELEGRAM_BOT_TOKEN",
+        get("TELEGRAM_BOT_TOKEN"),
+        true
+    );
     emit!("", "BOT_USERNAME", get("BOT_USERNAME"), false);
     emit!("", "ALLOWED_GROUPS", get("ALLOWED_GROUPS"), false);
     emit!("", "CONTROL_CHAT_IDS", get("CONTROL_CHAT_IDS"), false);
@@ -1227,26 +1254,61 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
     emit!("", "TIMEZONE", get("TIMEZONE"), true);
     emit!("", "MAX_TOKENS", get("MAX_TOKENS"), false);
     emit!("", "MAX_TOOL_ITERATIONS", get("MAX_TOOL_ITERATIONS"), false);
-    emit!("", "MAX_HISTORY_MESSAGES", get("MAX_HISTORY_MESSAGES"), false);
+    emit!(
+        "",
+        "MAX_HISTORY_MESSAGES",
+        get("MAX_HISTORY_MESSAGES"),
+        false
+    );
 
     // Orchestrator
-    emit!("Orchestrator", "ORCHESTRATOR_ENABLED", get("ORCHESTRATOR_ENABLED"), false);
+    emit!(
+        "Orchestrator",
+        "ORCHESTRATOR_ENABLED",
+        get("ORCHESTRATOR_ENABLED"),
+        false
+    );
     emit!("", "ORCHESTRATOR_MODEL", get("ORCHESTRATOR_MODEL"), false);
 
-    // Delegate
-    emit!("Delegate", "DELEGATE_TOOL_ENABLED", get("DELEGATE_TOOL_ENABLED"), false);
-    emit!("", "DELEGATE_MAX_ITERATIONS", get("DELEGATE_MAX_ITERATIONS"), false);
-    emit!("", "DELEGATE_MODEL", get("DELEGATE_MODEL"), false);
-
     // Discord
-    emit!("Discord", "DISCORD_BOT_TOKEN", get("DISCORD_BOT_TOKEN"), false);
-    emit!("", "DISCORD_ALLOWED_CHANNELS", get("DISCORD_ALLOWED_CHANNELS"), false);
+    emit!(
+        "Discord",
+        "DISCORD_BOT_TOKEN",
+        get("DISCORD_BOT_TOKEN"),
+        false
+    );
+    emit!(
+        "",
+        "DISCORD_ALLOWED_CHANNELS",
+        get("DISCORD_ALLOWED_CHANNELS"),
+        false
+    );
 
     // WhatsApp
-    emit!("WhatsApp", "WHATSAPP_ACCESS_TOKEN", get("WHATSAPP_ACCESS_TOKEN"), false);
-    emit!("", "WHATSAPP_PHONE_NUMBER_ID", get("WHATSAPP_PHONE_NUMBER_ID"), false);
-    emit!("", "WHATSAPP_VERIFY_TOKEN", get("WHATSAPP_VERIFY_TOKEN"), false);
-    emit!("", "WHATSAPP_WEBHOOK_PORT", get("WHATSAPP_WEBHOOK_PORT"), false);
+    emit!(
+        "WhatsApp",
+        "WHATSAPP_ACCESS_TOKEN",
+        get("WHATSAPP_ACCESS_TOKEN"),
+        false
+    );
+    emit!(
+        "",
+        "WHATSAPP_PHONE_NUMBER_ID",
+        get("WHATSAPP_PHONE_NUMBER_ID"),
+        false
+    );
+    emit!(
+        "",
+        "WHATSAPP_VERIFY_TOKEN",
+        get("WHATSAPP_VERIFY_TOKEN"),
+        false
+    );
+    emit!(
+        "",
+        "WHATSAPP_WEBHOOK_PORT",
+        get("WHATSAPP_WEBHOOK_PORT"),
+        false
+    );
 
     // Web UI
     emit!("Web UI", "WEB_ENABLED", get("WEB_ENABLED"), false);
@@ -1259,23 +1321,53 @@ fn save_config_env(path: &Path, values: &HashMap<String, String>) -> Result<Opti
     emit!("", "AGENT_BROWSER_PATH", get("AGENT_BROWSER_PATH"), false);
 
     // Cursor Agent
-    emit!("Cursor Agent", "CURSOR_AGENT_CLI_PATH", get("CURSOR_AGENT_CLI_PATH"), false);
+    emit!(
+        "Cursor Agent",
+        "CURSOR_AGENT_CLI_PATH",
+        get("CURSOR_AGENT_CLI_PATH"),
+        false
+    );
     emit!("", "CURSOR_AGENT_MODEL", get("CURSOR_AGENT_MODEL"), false);
-    emit!("", "CURSOR_AGENT_RUNNER_URL", get("CURSOR_AGENT_RUNNER_URL"), false);
+    emit!(
+        "",
+        "CURSOR_AGENT_RUNNER_URL",
+        get("CURSOR_AGENT_RUNNER_URL"),
+        false
+    );
 
     // Vault
-    emit!("Vault", "VAULT_ORIGIN_VAULT_PATH", get("VAULT_ORIGIN_VAULT_PATH"), false);
-    emit!("", "VAULT_VECTOR_DB_PATH", get("VAULT_VECTOR_DB_PATH"), false);
+    emit!(
+        "Vault",
+        "VAULT_ORIGIN_VAULT_PATH",
+        get("VAULT_ORIGIN_VAULT_PATH"),
+        false
+    );
+    emit!(
+        "",
+        "VAULT_VECTOR_DB_PATH",
+        get("VAULT_VECTOR_DB_PATH"),
+        false
+    );
     if !vault_url.is_empty() {
         emit!("", "VAULT_ORIGIN_VAULT_REPO", vault_url.clone(), false);
     }
     emit!("", "VAULT_GIT_URL", vault_url, false);
-    emit!("", "VAULT_SEARCH_COMMAND", get("VAULT_SEARCH_COMMAND"), false);
+    emit!(
+        "",
+        "VAULT_SEARCH_COMMAND",
+        get("VAULT_SEARCH_COMMAND"),
+        false
+    );
     emit!("", "VAULT_INDEX_COMMAND", get("VAULT_INDEX_COMMAND"), false);
     emit!("", "VAULT_VECTOR_DB_URL", get("VAULT_VECTOR_DB_URL"), false);
 
     // Universal
-    emit!("Universal", "UNIVERSAL_CHAT_ID", get("UNIVERSAL_CHAT_ID"), false);
+    emit!(
+        "Universal",
+        "UNIVERSAL_CHAT_ID",
+        get("UNIVERSAL_CHAT_ID"),
+        false
+    );
 
     // Git
     emit!("Git", "GIT_USERNAME", get("GIT_USERNAME"), false);

@@ -160,7 +160,9 @@ impl Tool for SearchVaultTool {
                 vault_search_command,
                 working_dir,
             } => {
-                return self.execute_command_mode(vault_search_command, working_dir, &query).await;
+                return self
+                    .execute_command_mode(vault_search_command, working_dir, &query)
+                    .await;
             }
             SearchVaultMode::Native { .. } => {
                 // Fall through to native implementation below
@@ -197,40 +199,35 @@ impl Tool for SearchVaultTool {
         if !embed_resp.status().is_success() {
             let status = embed_resp.status();
             let body = embed_resp.text().await.unwrap_or_default();
-            return ToolResult::error(format!(
-                "Embedding server returned {status}: {body}"
-            ));
+            return ToolResult::error(format!("Embedding server returned {status}: {body}"));
         }
 
         let embed_json: serde_json::Value = match embed_resp.json().await {
             Ok(j) => j,
-            Err(e) => {
-                return ToolResult::error(format!("Failed to parse embedding response: {e}"))
-            }
+            Err(e) => return ToolResult::error(format!("Failed to parse embedding response: {e}")),
         };
 
         // Handle both llama.cpp formats:
         //   {"embedding": [[0.1, 0.2, ...]]}  — list of embedding vectors
         //   {"embedding": [0.1, 0.2, ...]}     — single flat vector
-        let embedding: Vec<serde_json::Value> = if let Some(outer) =
-            embed_json.get("embedding").and_then(|v| v.as_array())
-        {
-            if outer.first().and_then(|v| v.as_array()).is_some() {
-                // Nested: [[...]] — take first vector
-                outer
-                    .first()
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
+        let embedding: Vec<serde_json::Value> =
+            if let Some(outer) = embed_json.get("embedding").and_then(|v| v.as_array()) {
+                if outer.first().and_then(|v| v.as_array()).is_some() {
+                    // Nested: [[...]] — take first vector
+                    outer
+                        .first()
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    // Flat: [...] — use directly
+                    outer.clone()
+                }
             } else {
-                // Flat: [...] — use directly
-                outer.clone()
-            }
-        } else {
-            return ToolResult::error(
-                "Unexpected embedding response format (missing 'embedding' field)".into(),
-            );
-        };
+                return ToolResult::error(
+                    "Unexpected embedding response format (missing 'embedding' field)".into(),
+                );
+            };
 
         if embedding.is_empty() {
             return ToolResult::error("Embedding server returned empty embedding vector".into());
@@ -307,9 +304,7 @@ impl Tool for SearchVaultTool {
         let results_json: serde_json::Value = match query_resp.json().await {
             Ok(j) => j,
             Err(e) => {
-                return ToolResult::error(format!(
-                    "Failed to parse ChromaDB query response: {e}"
-                ))
+                return ToolResult::error(format!("Failed to parse ChromaDB query response: {e}"))
             }
         };
 
@@ -354,10 +349,7 @@ impl Tool for SearchVaultTool {
                     text_truncated
                 };
 
-                let dist = distances
-                    .get(i)
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
+                let dist = distances.get(i).and_then(|v| v.as_f64()).unwrap_or(0.0);
 
                 let source = metadatas
                     .get(i)

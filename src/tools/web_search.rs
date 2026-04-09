@@ -70,9 +70,18 @@ impl Tool for WebSearchTool {
         };
 
         let result = if let Some(ref base) = self.searxng_url {
-            let categories = input.get("categories").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
-            let engines = input.get("engines").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
-            let time_range = input.get("time_range").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+            let categories = input
+                .get("categories")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
+            let engines = input
+                .get("engines")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
+            let time_range = input
+                .get("time_range")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
             search_searxng(base, query, categories, engines, time_range).await
         } else {
             search_ddg(query).await
@@ -123,11 +132,7 @@ async fn search_ddg(query: &str) -> Result<String, String> {
 
     let client = build_http_client()?;
 
-    let form = [
-        ("q", query),
-        ("b", ""),
-        ("kl", "wt-wt"),
-    ];
+    let form = [("q", query), ("b", ""), ("kl", "wt-wt")];
 
     let resp = client
         .post(url)
@@ -147,7 +152,10 @@ async fn search_ddg(query: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
 
     if !resp.status().is_success() {
-        return Err(format!("DuckDuckGo returned HTTP {} (bot detection may be blocking; try again later)", resp.status()));
+        return Err(format!(
+            "DuckDuckGo returned HTTP {} (bot detection may be blocking; try again later)",
+            resp.status()
+        ));
     }
 
     let body = resp.text().await.map_err(|e| e.to_string())?;
@@ -224,9 +232,18 @@ async fn search_searxng(
 
     let mut output = String::new();
     for (i, item) in results.iter().take(8).enumerate() {
-        let title = item.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
-        let url = item.get("url").and_then(serde_json::Value::as_str).unwrap_or("");
-        let content = item.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+        let title = item
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let url = item
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let content = item
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if url.is_empty() && title.is_empty() {
             continue;
         }

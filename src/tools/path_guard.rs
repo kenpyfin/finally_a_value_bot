@@ -157,9 +157,15 @@ mod tests {
 
     #[test]
     fn test_allows_env_files_under_skills_dir() {
-        assert!(!is_blocked(Path::new("/project/workspace/skills/linkedin/.env")));
-        assert!(!is_blocked(Path::new("/project/workspace/skills/check-email/.env")));
-        assert!(!is_blocked(Path::new("workspace/skills/my-skill/token.json")));
+        assert!(!is_blocked(Path::new(
+            "/project/workspace/skills/linkedin/.env"
+        )));
+        assert!(!is_blocked(Path::new(
+            "/project/workspace/skills/check-email/.env"
+        )));
+        assert!(!is_blocked(Path::new(
+            "workspace/skills/my-skill/token.json"
+        )));
     }
 
     #[test]

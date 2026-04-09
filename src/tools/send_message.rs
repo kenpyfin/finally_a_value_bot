@@ -6,7 +6,7 @@ use serde_json::json;
 use teloxide::prelude::*;
 use teloxide::types::InputFile;
 
-use super::{authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
 use crate::channel::{deliver_and_store_bot_message, enforce_channel_policy};
 use crate::claude::ToolDefinition;
 use crate::config::Config;
@@ -44,24 +44,6 @@ impl SendMessageTool {
             config: Some(config),
             http_client: reqwest::Client::new(),
         }
-    }
-
-    async fn store_bot_message(&self, chat_id: i64, content: String) -> Result<(), String> {
-        let persona_id = call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(chat_id))
-            .await
-            .map_err(|e| format!("Failed to resolve persona: {e}"))?;
-        let msg = StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id,
-            persona_id,
-            sender_name: self.bot_username.clone(),
-            content,
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
-        call_blocking(self.db.clone(), move |db| db.store_message(&msg))
-            .await
-            .map_err(|e| format!("Failed to store sent message: {e}"))
     }
 
     async fn send_telegram_attachment(
@@ -379,6 +361,10 @@ impl Tool for SendMessageTool {
                     "caption": {
                         "type": "string",
                         "description": "Optional caption used when sending attachment"
+                    },
+                    "persona_id": {
+                        "type": "integer",
+                        "description": "Optional persona ID to override the default for this message"
                     }
                 }),
                 &["chat_id"],
@@ -408,12 +394,23 @@ impl Tool for SendMessageTool {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let persona_id_override = input.get("persona_id").and_then(|v| v.as_i64());
+
         if text.is_empty() && attachment_path.is_none() {
             return ToolResult::error("Provide text and/or attachment_path".into());
         }
 
         if let Err(e) = authorize_chat_access(&input, chat_id) {
             return ToolResult::error(e);
+        }
+
+        if let Some(auth) = auth_context_from_input(&input) {
+            if auth.is_scheduled_task && chat_id == auth.caller_chat_id {
+                return ToolResult::error(
+                    "Scheduled runs deliver the final reply automatically; do not use send_message for this chat. Put all user-facing output in your final assistant message."
+                        .into(),
+                );
+            }
         }
 
         if let Err(e) = enforce_channel_policy(self.db.clone(), &input, chat_id).await {
@@ -475,8 +472,34 @@ impl Tool for SendMessageTool {
 
             match send_result {
                 Ok(content) => {
-                    if let Err(e) = self.store_bot_message(chat_id, content).await {
-                        return ToolResult::error(e);
+                    let db = self.db.clone();
+                    let pid_result = match persona_id_override {
+                        Some(id) => Ok(id),
+                        None => {
+                            call_blocking(db.clone(), move |db| {
+                                db.get_or_create_default_persona(chat_id)
+                            })
+                            .await
+                        }
+                    };
+                    let pid = match pid_result {
+                        Ok(pid) => pid,
+                        Err(e) => {
+                            return ToolResult::error(format!("Failed to resolve persona: {e}"))
+                        }
+                    };
+
+                    let msg = StoredMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        chat_id,
+                        persona_id: pid,
+                        sender_name: self.bot_username.clone(),
+                        content,
+                        is_from_bot: true,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    if let Err(e) = call_blocking(db, move |db| db.store_message(&msg)).await {
+                        return ToolResult::error(e.to_string());
                     }
                     ToolResult::success("Attachment sent successfully.".into())
                 }
@@ -484,10 +507,21 @@ impl Tool for SendMessageTool {
             }
         } else {
             let cid = chat_id;
-            let persona_id = match call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(cid)).await {
+            let persona_id_result = match persona_id_override {
+                Some(id) => Ok(id),
+                None => {
+                    call_blocking(self.db.clone(), move |db| {
+                        db.get_or_create_default_persona(cid)
+                    })
+                    .await
+                }
+            };
+            let persona_id = match persona_id_result {
                 Ok(pid) => pid,
                 Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
             };
+
+            let workspace_root = self.config.as_ref().map(|c| c.workspace_root_absolute());
             match deliver_and_store_bot_message(
                 &self.bot,
                 self.db.clone(),
@@ -495,6 +529,7 @@ impl Tool for SendMessageTool {
                 chat_id,
                 persona_id,
                 &text,
+                workspace_root,
             )
             .await
             {
@@ -511,7 +546,10 @@ mod tests {
     use serde_json::json;
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_sendmsg_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_sendmsg_{}",
+            uuid::Uuid::new_v4()
+        ));
         let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
         (db, dir)
     }

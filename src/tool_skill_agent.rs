@@ -37,7 +37,11 @@ Rules:
 - Keep reason and suggestion concise (one sentence each)."#;
 
 /// Build a short context string from the last few messages (for TSA prompt).
-fn build_context_snippet(messages: &[Message], max_messages: usize, max_chars_per_msg: usize) -> String {
+fn build_context_snippet(
+    messages: &[Message],
+    max_messages: usize,
+    max_chars_per_msg: usize,
+) -> String {
     let start = messages.len().saturating_sub(max_messages);
     let mut out = String::new();
     for msg in messages.iter().skip(start) {
@@ -47,7 +51,10 @@ fn build_context_snippet(messages: &[Message], max_messages: usize, max_chars_pe
             MessageContent::Blocks(_) => "[blocks]",
         };
         let truncated = if content.chars().count() > max_chars_per_msg {
-            format!("{}...", content.chars().take(max_chars_per_msg).collect::<String>())
+            format!(
+                "{}...",
+                content.chars().take(max_chars_per_msg).collect::<String>()
+            )
         } else {
             content.to_string()
         };
@@ -73,9 +80,7 @@ pub async fn evaluate_tool_use(
     }
 
     let mut llm_config = config.clone();
-    let model = config
-        .tool_skill_agent_model
-        .trim();
+    let model = config.tool_skill_agent_model.trim();
     if !model.is_empty() {
         llm_config.model = model.to_string();
     } else if !config.orchestrator_model.trim().is_empty() {
