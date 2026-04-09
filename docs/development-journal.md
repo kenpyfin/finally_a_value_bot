@@ -18,8 +18,6 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
-<!-- Add entries below this line, newest first. -->
-
 ### 2026-04-09 — Vault Python: skill-directory `.env` only, embedding URL required
 
 - **Area:** vault / builtin skills
@@ -36,7 +34,7 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Key files / symbols:**
   - `web/src/main.tsx` — `CompositeAttachmentAdapter` with `SimpleImageAttachmentAdapter`, `SimpleTextAttachmentAdapter`, `WebWildcardAttachmentAdapter` (`accept: "*"`), passed as `adapters.attachments` to `useLocalRuntime`.
   - `src/web.rs` — `process_web_attachments` directory `workspace_root_absolute().join("shared/upload/web/...")`; note format `tool_path=...`.
-  - `web/dist/*` — rebuilt production bundle (`npm run build`).
+  - `web/dist/`* — rebuilt production bundle (`npm run build`).
 - **Follow-ups:** Optional migration of files left in legacy `uploads/web/`; consider size limits for very large JSON bodies on `/api/send_stream`.
 
 ### 2026-04-08 — Web chat “master view” (queue, schedules modal, persona indicators, memory editor)
@@ -50,7 +48,7 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
   - `web/src/types.ts` — `Persona.last_bot_message_at`.
   - `src/db.rs` — `list_persona_last_bot_message_at`.
   - `src/web.rs` — `api_personas` includes `last_bot_message_at`; new routes `GET/PUT /api/personas/:persona_id/memory`.
-  - `web/dist/*` — rebuilt production bundle.
+  - `web/dist/`* — rebuilt production bundle.
 - **Follow-ups:** Consider tier-aware memory editing (Tier 1/2/3) in the UI; consider SSE-driven history refresh to avoid periodic polling.
 
 ### 2026-04-01 — Global projects/workflows and unified runtime timeline
@@ -169,11 +167,12 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 ### 2026-03-22 — Persona indicator on all bot messages
 
 - **Area:** channels / delivery
-- **Summary:** Every outbound bot message now starts with `[PersonaName] ` so users can see which persona sent it, across all channels (Telegram, Discord, web, WhatsApp, scheduler, background jobs, and send_message tool).
+- **Summary:** Every outbound bot message now starts with `[PersonaName]`  so users can see which persona sent it, across all channels (Telegram, Discord, web, WhatsApp, scheduler, background jobs, and send_message tool).
 - **Rationale:** Users with multiple personas had no visual cue in the message text itself about which persona was active. The bracket-prefix format is lightweight, channel-agnostic, and always shown (including the default persona).
 - **Key files / symbols:**
-  - `src/channel.rs` — `with_persona_indicator(db, persona_id, text)`: shared helper that resolves persona name via `db.get_persona()` and prepends `[Name] `.
+  - `src/channel.rs` — `with_persona_indicator(db, persona_id, text)`: shared helper that resolves persona name via `db.get_persona()` and prepends `[Name]` .
   - `src/channel.rs` — `deliver_and_store_bot_message`: calls helper before storing/sending (covers send_message tool and Telegram/web direct sends).
   - `src/channel.rs` — `deliver_to_contact`: calls helper before storing and fanning out to Telegram/Discord/web bindings.
   - `src/channels/whatsapp.rs` — agent response branch: calls helper before `send_whatsapp_message` and `store_message`.
 - **Follow-ups:** If users want the indicator styled differently per channel (e.g., bold in Telegram HTML, or hidden in web UI via metadata), the helper can be extended with a channel-type parameter.
+
