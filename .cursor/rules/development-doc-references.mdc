@@ -1,0 +1,14 @@
+---
+description: Require consulting development docs before implementing changes
+alwaysApply: true
+---
+
+# Development Documentation References
+
+Before implementing, refactoring, or fixing code, review project documentation and conventions from:
+
+- `docs/` folder
+- `DEVELOP.md`
+- `TEST.md`
+
+If guidance conflicts, prioritize the most specific document for the area being changed and call out assumptions when unclear.

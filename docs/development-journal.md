@@ -18,6 +18,21 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-09 — System prompt: repository layout and `.env` resolution
+
+- **Area:** agent / channels / workspace principles
+- **Summary:** Extended `build_system_prompt` with explicit **Repository layout and environment variables** text: config root / `FINALLY_A_VALUE_BOT_CONFIG`, `WORKSPACE_DIR` as data root, `shared/` as tool cwd, skills under `skills/`, where to put secrets vs bot-wide keys, and honest skill `load_dotenv` behavior (fills unset vars; does not override existing process env by default). The call site passes absolute workspace data root and a resolved config-path summary from `Config::resolve_config_path`.
+- **Rationale:** Gives the model a single, accurate mental model for paths and env layering aligned with `workspace_root_absolute` and bundled Python skills.
+- **Key files / symbols:** `src/channels/telegram.rs` — `process_with_agent_with_events`, `build_system_prompt`; `workspace/AGENTS.md` — layout bullet under on-demand tools; handling-security-keys bullet clarified for skill vs config `.env`.
+- **Follow-ups:** Optional: stricter skill-overrides-repo semantics in skill scripts if product requires it.
+
+### 2026-04-09 — Added always-applied documentation reference rule
+
+- **Area:** repo policy / agent rules
+- **Summary:** Added a new Cursor rule requiring development work to consult `docs/`, `DEVELOP.md`, and `TEST.md` before implementing/refactoring/fixing code.
+- **Rationale:** Makes documentation consultation explicit and consistent during development turns, reducing drift from project conventions.
+- **Key files / symbols:** `.cursor/rules/development-doc-references.mdc` (`alwaysApply: true`).
+
 ### 2026-04-09 — Vault Python: skill-directory `.env` only, embedding URL required
 
 - **Area:** vault / builtin skills
