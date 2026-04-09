@@ -7,9 +7,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-load_dotenv(SCRIPT_DIR / ".env")
-load_dotenv(Path.cwd() / ".env")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+_CONFIG_PATH = os.environ.get("FINALLY_A_VALUE_BOT_CONFIG")
+load_dotenv(Path(_CONFIG_PATH) if _CONFIG_PATH else ROOT_DIR / ".env")
 
 
 def _default_vault_db_path() -> str:

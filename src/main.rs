@@ -49,7 +49,7 @@ SETUP:
        (or run finally_a_value_bot start and follow auto-config on first launch)
     2. Copy .env.example to .env and fill in required values (or run finally_a_value_bot setup):
 
-       api_key               LLM API key (optional when llm_provider=ollama)
+       api_key               LLM API key (optional when llm_provider=ollama|llama|llamacpp)
        At least one channel token must be set (Telegram or Discord)
 
     3. Run: finally_a_value_bot start
@@ -60,7 +60,7 @@ CONFIG FILE (.env):
 
     Core fields:
       llm_provider           Provider preset (default: anthropic)
-      api_key                LLM API key (optional when llm_provider=ollama)
+      api_key                LLM API key (optional when llm_provider=ollama|llama|llamacpp)
       model                  Model name (auto-detected from provider if empty)
       llm_base_url           Custom base URL (optional)
 

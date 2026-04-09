@@ -46,6 +46,12 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         models: &["llama3.2", "qwen2.5-coder:7b", "mistral"],
     },
     ProviderPreset {
+        id: "llama",
+        label: "Llama.cpp (local)",
+        default_base_url: "http://127.0.0.1:8080/v1",
+        models: &["local"],
+    },
+    ProviderPreset {
         id: "google",
         label: "Google DeepMind",
         default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -528,15 +534,20 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
     };
 
     let api_default = existing.api_key.clone();
-    let api_prompt = if provider.eq_ignore_ascii_case("ollama") {
-        "LLM API key (optional for ollama)"
+    let api_prompt = if provider.eq_ignore_ascii_case("ollama")
+        || provider.eq_ignore_ascii_case("llama")
+        || provider.eq_ignore_ascii_case("llamacpp")
+    {
+        "LLM API key (optional for local providers: ollama/llama)"
     } else {
         "LLM API key"
     };
     let api_key = match prompt_line(
         api_prompt,
         Some(&api_default),
-        !provider.eq_ignore_ascii_case("ollama"),
+        !(provider.eq_ignore_ascii_case("ollama")
+            || provider.eq_ignore_ascii_case("llama")
+            || provider.eq_ignore_ascii_case("llamacpp")),
     )? {
         Some(v) => v,
         None => return Ok(false),

@@ -756,6 +756,7 @@ impl Config {
             self.model = match self.llm_provider.as_str() {
                 "anthropic" => "claude-sonnet-4-5-20250929".into(),
                 "ollama" => "llama3.2".into(),
+                "llama" | "llamacpp" => "local".into(),
                 "google" => "gemini-2.5-flash".into(),
                 _ => "gpt-5.2".into(),
             };
@@ -771,6 +772,11 @@ impl Config {
             if url.trim().is_empty() {
                 self.llm_base_url = None;
             }
+        }
+        if self.llm_base_url.is_none()
+            && matches!(self.llm_provider.as_str(), "llama" | "llamacpp")
+        {
+            self.llm_base_url = Some("http://127.0.0.1:8080/v1".into());
         }
         if let Ok(dir) = std::env::var("FINALLY_A_VALUE_BOT_WORKSPACE_DIR") {
             let trimmed = dir.trim();
@@ -883,7 +889,9 @@ impl Config {
                 "At least one of telegram_bot_token or discord_bot_token must be set".into(),
             ));
         }
-        if self.api_key.is_empty() && self.llm_provider != "ollama" {
+        if self.api_key.is_empty()
+            && !matches!(self.llm_provider.as_str(), "ollama" | "llama" | "llamacpp")
+        {
             return Err(FinallyAValueBotError::Config("api_key is required".into()));
         }
 
@@ -1200,6 +1208,18 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert_eq!(config.model, "llama3.2");
+    }
+
+    #[test]
+    fn test_post_deserialize_llama_default_model_base_url_and_empty_key() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: llama\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.model, "local");
+        assert_eq!(
+            config.llm_base_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
     }
 
     #[test]

@@ -68,6 +68,13 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         models: &["llama3.2", "qwen2.5-coder:7b", "mistral"],
     },
     ProviderPreset {
+        id: "llama",
+        label: "Llama.cpp (local)",
+        protocol: ProviderProtocol::OpenAiCompat,
+        default_base_url: "http://127.0.0.1:8080/v1",
+        models: &["local"],
+    },
+    ProviderPreset {
         id: "google",
         label: "Google DeepMind",
         protocol: ProviderProtocol::OpenAiCompat,
@@ -676,7 +683,12 @@ impl SetupApp {
 
     fn validate_local(&self) -> Result<(), FinallyAValueBotError> {
         for field in &self.fields {
-            if field.key == "LLM_API_KEY" && self.field_value("LLM_PROVIDER") == "ollama" {
+            if field.key == "LLM_API_KEY"
+                && matches!(
+                    self.field_value("LLM_PROVIDER").as_str(),
+                    "ollama" | "llama" | "llamacpp"
+                )
+            {
                 continue;
             }
             if field.required && field.value.trim().is_empty() {
