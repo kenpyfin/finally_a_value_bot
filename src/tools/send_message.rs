@@ -394,9 +394,7 @@ impl Tool for SendMessageTool {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
-        let persona_id_override = input
-            .get("persona_id")
-            .and_then(|v| v.as_i64());
+        let persona_id_override = input.get("persona_id").and_then(|v| v.as_i64());
 
         if text.is_empty() && attachment_path.is_none() {
             return ToolResult::error("Provide text and/or attachment_path".into());
@@ -477,11 +475,18 @@ impl Tool for SendMessageTool {
                     let db = self.db.clone();
                     let pid_result = match persona_id_override {
                         Some(id) => Ok(id),
-                        None => call_blocking(db.clone(), move |db| db.get_or_create_default_persona(chat_id)).await
+                        None => {
+                            call_blocking(db.clone(), move |db| {
+                                db.get_or_create_default_persona(chat_id)
+                            })
+                            .await
+                        }
                     };
                     let pid = match pid_result {
                         Ok(pid) => pid,
-                        Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
+                        Err(e) => {
+                            return ToolResult::error(format!("Failed to resolve persona: {e}"))
+                        }
                     };
 
                     let msg = StoredMessage {
@@ -504,7 +509,12 @@ impl Tool for SendMessageTool {
             let cid = chat_id;
             let persona_id_result = match persona_id_override {
                 Some(id) => Ok(id),
-                None => call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(cid)).await,
+                None => {
+                    call_blocking(self.db.clone(), move |db| {
+                        db.get_or_create_default_persona(cid)
+                    })
+                    .await
+                }
             };
             let persona_id = match persona_id_result {
                 Ok(pid) => pid,
@@ -536,7 +546,10 @@ mod tests {
     use serde_json::json;
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_sendmsg_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_sendmsg_{}",
+            uuid::Uuid::new_v4()
+        ));
         let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
         (db, dir)
     }

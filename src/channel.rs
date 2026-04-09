@@ -184,18 +184,25 @@ pub async fn deliver_to_contact(
         .await
         .map_err(|e| format!("Failed to store message: {e}"))?;
 
-    let bindings = call_blocking(db.clone(), move |d| d.list_bindings_for_contact(canonical_chat_id))
-        .await
-        .map_err(|e| format!("Failed to list bindings: {e}"))?;
+    let bindings = call_blocking(db.clone(), move |d| {
+        d.list_bindings_for_contact(canonical_chat_id)
+    })
+    .await
+    .map_err(|e| format!("Failed to list bindings: {e}"))?;
 
     for b in &bindings {
         match b.channel_type.as_str() {
             "telegram" => {
                 if let Some(bot) = bot {
                     if let Ok(chat_id) = b.channel_handle.parse::<i64>() {
-                        if let Err(e) =
-                            send_response_result(bot, ChatId(chat_id), text, None, workspace_root.as_deref())
-                                .await
+                        if let Err(e) = send_response_result(
+                            bot,
+                            ChatId(chat_id),
+                            text,
+                            None,
+                            workspace_root.as_deref(),
+                        )
+                        .await
                         {
                             let err_str = e.to_string();
                             if !err_str.contains("chat not found")

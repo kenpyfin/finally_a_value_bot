@@ -8,7 +8,9 @@ use tracing::info;
 
 use crate::claude::ToolDefinition;
 
-use super::{auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult};
+use super::{
+    auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult,
+};
 
 const TIER_HEADERS: [(u8, &str); 3] = [
     (1, "## Tier 1 — Long term"),
@@ -50,9 +52,7 @@ fn extract_tier_sections(full: &str) -> [String; 3] {
             if let Some(prev_idx) = current_tier {
                 flush_current(prev_idx, &mut current_lines);
             }
-            current_tier = TIER_HEADERS
-                .iter()
-                .position(|(_, h)| line.trim() == *h);
+            current_tier = TIER_HEADERS.iter().position(|(_, h)| line.trim() == *h);
             continue;
         }
         if current_tier.is_some() {
@@ -101,10 +101,7 @@ fn normalize_tier2_task_states(content: &str) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed
-            .to_ascii_lowercase()
-            .starts_with("- next goal:")
-        {
+        if trimmed.to_ascii_lowercase().starts_with("- next goal:") {
             last_next_goal = Some(trimmed.to_string());
             continue;
         }
@@ -322,12 +319,11 @@ impl Tool for WriteTieredMemoryTool {
             .filter(|&n| (1..=3).contains(&n))
         {
             Some(n) => n as u8,
-            None => return ToolResult::error("Missing or invalid 'tier' (must be 1, 2, or 3)".into()),
+            None => {
+                return ToolResult::error("Missing or invalid 'tier' (must be 1, 2, or 3)".into())
+            }
         };
-        let content = input
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
         if let Err(e) = authorize_chat_persona_access(&input, chat_id, persona_id) {
             return ToolResult::error(e);

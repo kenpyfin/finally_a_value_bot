@@ -9,23 +9,22 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use include_dir::{include_dir, Dir};
 use base64::Engine;
+use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info};
 
 use crate::channel::deliver_to_contact;
+use crate::claude::{Message, MessageContent};
 use crate::config::Config;
 use crate::db::{call_blocking, Persona, StoredMessage};
-use crate::social_oauth;
-use crate::claude::{Message, MessageContent};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
+use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent,
-    process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
-    BACKGROUND_JOB_HANDOFF_PREFIX,
+    archive_conversation, process_with_agent, process_with_agent_with_events, AgentEvent,
+    AgentRequestContext, AppState, BACKGROUND_JOB_HANDOFF_PREFIX,
 };
 use std::time::SystemTime;
 
@@ -377,7 +376,7 @@ struct SchedulesQuery {
 struct ScheduleCreateRequest {
     chat_id: Option<i64>,
     prompt: String,
-    schedule_type: String,  // "cron" | "once"
+    schedule_type: String, // "cron" | "once"
     schedule_value: String,
     timezone: Option<String>,
     persona_id: Option<i64>,
@@ -425,8 +424,13 @@ const DEFAULT_UNIVERSAL_CHAT_ID: i64 = 997894126;
 
 /// Resolve chat_id for web requests. Always returns the single universal chat.
 /// chat_id in request is ignored; there is only one conversation across all channels.
-fn resolve_chat_id_for_web(_chat_id: Option<i64>, config: &Config) -> Result<i64, (StatusCode, String)> {
-    Ok(config.universal_chat_id.unwrap_or(DEFAULT_UNIVERSAL_CHAT_ID))
+fn resolve_chat_id_for_web(
+    _chat_id: Option<i64>,
+    config: &Config,
+) -> Result<i64, (StatusCode, String)> {
+    Ok(config
+        .universal_chat_id
+        .unwrap_or(DEFAULT_UNIVERSAL_CHAT_ID))
 }
 
 /// Ensure web/default always points to the configured universal chat.
@@ -456,9 +460,11 @@ async fn api_chat(
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
     let cid = chat_id;
-    let persona_id = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let persona_id = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_current_persona_id(cid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
         "ok": true,
@@ -481,9 +487,11 @@ async fn api_history(
     let persona_id = if let Some(pid) = query.persona_id {
         pid
     } else {
-        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     let cid2 = chat_id;
     let pid = persona_id;
@@ -491,14 +499,22 @@ async fn api_history(
     let messages = if let Some(ref day) = query.day {
         let (from_date, to_date) = day_range(day);
         call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_messages_for_date_range(cid2, pid, Some(from_date.as_str()), Some(to_date.as_str()), 2000)
+            db.get_messages_for_date_range(
+                cid2,
+                pid,
+                Some(from_date.as_str()),
+                Some(to_date.as_str()),
+                2000,
+            )
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        let mut msgs = call_blocking(state.app_state.db.clone(), move |db| db.get_all_messages(cid2, pid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut msgs = call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_all_messages(cid2, pid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if let Some(limit) = query.limit {
             if msgs.len() > limit {
                 msgs = msgs[msgs.len() - limit..].to_vec();
@@ -556,15 +572,19 @@ async fn api_history_days(
     let persona_id = if let Some(pid) = query.persona_id {
         pid
     } else {
-        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     let cid2 = chat_id;
     let pid = persona_id;
-    let days = call_blocking(state.app_state.db.clone(), move |db| db.get_message_days(cid2, pid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let days = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_message_days(cid2, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
         "ok": true,
@@ -986,10 +1006,7 @@ async fn api_send_stream(
             limits.run_history_limit,
         )
         .await;
-    state
-        .request_hub
-        .end_with_limits(&key, &state.limits)
-        .await;
+    state.request_hub.end_with_limits(&key, &state.limits).await;
     info!(
         target: "web",
         endpoint = "/api/send_stream",
@@ -1155,13 +1172,8 @@ async fn send_and_store_response_with_events(
     let mut image_data: Option<(String, String)> = None;
 
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
-    let attachment_notes = process_web_attachments(
-        &state,
-        chat_id,
-        &body.attachments,
-        &mut image_data,
-    )
-    .await?;
+    let attachment_notes =
+        process_web_attachments(&state, chat_id, &body.attachments, &mut image_data).await?;
     if !attachment_notes.is_empty() {
         let note_text = attachment_notes.join("\n");
         if text.trim().is_empty() {
@@ -1187,9 +1199,11 @@ async fn send_and_store_response_with_events(
         let persona_id = if let Some(pid) = body.persona_id {
             pid
         } else {
-            call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_current_persona_id(cid)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         };
 
         let resp = match cmd {
@@ -1203,10 +1217,19 @@ async fn send_and_store_response_with_events(
             }
             SlashCommand::Skills => state.app_state.skills.list_skills_formatted(),
             SlashCommand::Persona => {
-                crate::persona::handle_persona_command(state.app_state.db.clone(), chat_id, text.trim(), Some(&state.app_state.config)).await
+                crate::persona::handle_persona_command(
+                    state.app_state.db.clone(),
+                    chat_id,
+                    text.trim(),
+                    Some(&state.app_state.config),
+                )
+                .await
             }
             SlashCommand::Schedule => {
-                let tasks = call_blocking(state.app_state.db.clone(), |db| db.get_all_scheduled_tasks_for_display()).await;
+                let tasks = call_blocking(state.app_state.db.clone(), |db| {
+                    db.get_all_scheduled_tasks_for_display()
+                })
+                .await;
                 match &tasks {
                     Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
                     Err(e) => format!("Error listing tasks: {e}"),
@@ -1392,8 +1415,12 @@ async fn process_web_attachments(
 
     let mut notes = Vec::new();
     for (idx, att) in attachments.iter().enumerate() {
-        let bytes = decode_base64_payload(&att.data_base64)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid attachment base64: {e}")))?;
+        let bytes = decode_base64_payload(&att.data_base64).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid attachment base64: {e}"),
+            )
+        })?;
         let mime = att
             .media_type
             .clone()
@@ -1420,10 +1447,7 @@ async fn process_web_attachments(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let saved_file = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
+        let saved_file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
         let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
 
         if image_data.is_none() && mime.starts_with("image/") {
@@ -1482,13 +1506,17 @@ async fn api_reset(
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
     let cid = chat_id;
-    let pid = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let pid = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_current_persona_id(cid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let cid2 = chat_id;
-    let deleted = call_blocking(state.app_state.db.clone(), move |db| db.delete_session(cid2, pid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_session(cid2, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
         "ok": true,
@@ -1531,14 +1559,17 @@ async fn api_personas(
     ensure_web_binding_for_universal(&state, chat_id).await?;
     let cid = chat_id;
 
-    let personas: Vec<Persona> = call_blocking(state.app_state.db.clone(), move |db| db.list_personas(cid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let personas: Vec<Persona> =
+        call_blocking(state.app_state.db.clone(), move |db| db.list_personas(cid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let cid2 = chat_id;
-    let active_id = call_blocking(state.app_state.db.clone(), move |db| db.get_active_persona_id(cid2))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let active_id = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_active_persona_id(cid2)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let cid3 = chat_id;
     let last_bot_rows = call_blocking(state.app_state.db.clone(), move |db| {
@@ -1622,7 +1653,8 @@ fn ensure_persona_memory_file_exists_for_web(state: &AppState, chat_id: i64, per
     if path.exists() {
         return;
     }
-    let template = "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
+    let template =
+        "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1646,9 +1678,11 @@ async fn api_persona_memory_get(
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
     let pid = path.persona_id;
-    let exists = call_blocking(state.app_state.db.clone(), move |db| db.persona_exists(chat_id, pid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !exists {
         return Err((StatusCode::NOT_FOUND, "persona not found".into()));
     }
@@ -1683,13 +1717,18 @@ async fn api_persona_memory_put(
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
     if body.content.len() > 256 * 1024 {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "memory content too large".into()));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "memory content too large".into(),
+        ));
     }
 
     let pid = path.persona_id;
-    let exists = call_blocking(state.app_state.db.clone(), move |db| db.persona_exists(chat_id, pid))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !exists {
         return Err((StatusCode::NOT_FOUND, "persona not found".into()));
     }
@@ -1699,14 +1738,19 @@ async fn api_persona_memory_put(
     let current_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
     if let Some(expected) = body.if_match_mtime_ms {
         if expected != current_mtime {
-            return Err((StatusCode::CONFLICT, "memory was modified; reload and retry".into()));
+            return Err((
+                StatusCode::CONFLICT,
+                "memory was modified; reload and retry".into(),
+            ));
         }
     }
 
     if let Some(parent) = mem_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
-    std::fs::write(&mem_path, body.content).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(&mem_path, body.content)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let new_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
     Ok(Json(json!({
@@ -1727,7 +1771,10 @@ async fn api_personas_create(
     ensure_web_binding_for_universal(&state, chat_id).await?;
     let name = body.name.trim();
     if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Persona name cannot be empty".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Persona name cannot be empty".into(),
+        ));
     }
     let name_owned = name.to_string();
     let persona_id = call_blocking(state.app_state.db.clone(), move |db| {
@@ -1816,9 +1863,11 @@ async fn api_schedules_list(
 
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
-    let tasks = call_blocking(state.app_state.db.clone(), move |db| db.get_tasks_for_chat(chat_id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let tasks = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_tasks_for_chat(chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<serde_json::Value> = tasks
         .into_iter()
@@ -1854,11 +1903,14 @@ async fn api_schedules_create(
 
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
-    let effective_tz = body.timezone.as_deref()
-        .or_else(|| {
-            let default = state.app_state.config.timezone.trim();
-            if default.is_empty() { None } else { Some(default) }
-        });
+    let effective_tz = body.timezone.as_deref().or_else(|| {
+        let default = state.app_state.config.timezone.trim();
+        if default.is_empty() {
+            None
+        } else {
+            Some(default)
+        }
+    });
     let preflight = crate::tools::schedule::preflight_schedule_request(
         &body.schedule_type,
         &body.schedule_value,
@@ -1940,13 +1992,18 @@ async fn api_schedules_update(
     }
     if let Some(pid) = persona_id {
         if pid <= 0 {
-            return Err((StatusCode::BAD_REQUEST, "persona_id must be a positive integer".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "persona_id must be a positive integer".into(),
+            ));
         }
     }
 
-    let task = call_blocking(state.app_state.db.clone(), move |db| db.get_task_by_id(task_id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let task = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_task_by_id(task_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Some(task) = task else {
         return Err((StatusCode::NOT_FOUND, "Task not found".into()));
     };
@@ -2120,10 +2177,7 @@ async fn asset_file(Path(file): Path<String>) -> impl IntoResponse {
     }
 }
 
-async fn upload_file(
-    State(state): State<WebState>,
-    Path(path): Path<String>,
-) -> impl IntoResponse {
+async fn upload_file(State(state): State<WebState>, Path(path): Path<String>) -> impl IntoResponse {
     let clean = path.replace("..", "");
     if clean.is_empty() {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
@@ -2195,7 +2249,13 @@ async fn api_oauth_authorize(
     if !["tiktok", "instagram", "linkedin"].contains(&platform.as_str()) {
         return Err((StatusCode::BAD_REQUEST, "Unknown platform".into()));
     }
-    if state.app_state.config.social.as_ref().map_or(true, |s| !s.is_platform_enabled(&platform)) {
+    if state
+        .app_state
+        .config
+        .social
+        .as_ref()
+        .map_or(true, |s| !s.is_platform_enabled(&platform))
+    {
         return Err((StatusCode::BAD_REQUEST, "Platform not configured".into()));
     }
 
@@ -2214,7 +2274,12 @@ async fn api_oauth_authorize(
 
     let auth_url = social_oauth::authorize_url(&state.app_state.config, &platform, &state_token)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build authorize URL".into()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build authorize URL".into(),
+            )
+        })?;
 
     Ok(axum::response::Redirect::temporary(&auth_url))
 }
@@ -2241,7 +2306,9 @@ async fn api_oauth_callback(
             Html(format!(
                 r#"<!DOCTYPE html><html><head><title>OAuth Error</title></head><body>
                 <h1>Authorization failed</h1><p>{}</p></body></html>"#,
-                msg.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+                msg.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
             )),
         )
             .into_response();
@@ -2266,8 +2333,7 @@ async fn api_oauth_callback(
     })
     .await
     .ok()
-    .flatten()
-    else {
+    .flatten() else {
         return (
             StatusCode::BAD_REQUEST,
             Html(
@@ -2290,29 +2356,32 @@ async fn api_oauth_callback(
     }
 
     let base = social_oauth::oauth_base_url(&state.app_state.config).unwrap_or_default();
-    let redirect_uri = format!("{}/api/oauth/callback/{}", base.trim_end_matches('/'), platform);
+    let redirect_uri = format!(
+        "{}/api/oauth/callback/{}",
+        base.trim_end_matches('/'),
+        platform
+    );
 
-    let token_result = match social_oauth::exchange_code(
-        &state.app_state.config,
-        &platform,
-        &code,
-        &redirect_uri,
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(format!(
-                    r#"<!DOCTYPE html><html><head><title>OAuth Error</title></head><body>
+    let token_result =
+        match social_oauth::exchange_code(&state.app_state.config, &platform, &code, &redirect_uri)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Html(format!(
+                        r#"<!DOCTYPE html><html><head><title>OAuth Error</title></head><body>
                     <h1>Token exchange failed</h1><p>{}</p></body></html>"#,
-                    e.to_string().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-                )),
-            )
-                .into_response();
-        }
-    };
+                        e.to_string()
+                            .replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     let platform_for_db = platform.clone();
     if let Err(e) = call_blocking(state.app_state.db.clone(), move |db| {
@@ -2369,7 +2438,10 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/contacts/bind", post(api_contacts_bind))
         .route("/api/contacts/unlink", post(api_contacts_unlink))
         .route("/api/contacts/bindings", get(api_contacts_bindings))
-        .route("/api/schedules", get(api_schedules_list).post(api_schedules_create))
+        .route(
+            "/api/schedules",
+            get(api_schedules_list).post(api_schedules_create),
+        )
         .route("/api/schedules/:id", patch(api_schedules_update))
         .route("/api/background_jobs", get(api_background_jobs_list))
         .route("/api/history", get(api_history))
@@ -2597,7 +2669,10 @@ mod tests {
             scheduler_max_concurrent_tasks: 2,
             scheduler_poll_interval_secs: 60,
         };
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_webtest_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_webtest_{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         cfg.workspace_dir = dir.to_string_lossy().to_string();
         let runtime_dir = cfg.runtime_data_dir();
@@ -2648,9 +2723,7 @@ mod tests {
             .method("POST")
             .uri("/api/send_stream")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender_name":"u","message":"hi"}"#,
-            ))
+            .body(Body::from(r#"{"sender_name":"u","message":"hi"}"#))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2684,9 +2757,7 @@ mod tests {
             .method("POST")
             .uri("/api/send_stream")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender_name":"u","message":"/reset"}"#,
-            ))
+            .body(Body::from(r#"{"sender_name":"u","message":"/reset"}"#))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2756,17 +2827,13 @@ mod tests {
             .method("POST")
             .uri("/api/send")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender_name":"u","message":"one"}"#,
-            ))
+            .body(Body::from(r#"{"sender_name":"u","message":"one"}"#))
             .unwrap();
         let req2 = Request::builder()
             .method("POST")
             .uri("/api/send")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender_name":"u","message":"two"}"#,
-            ))
+            .body(Body::from(r#"{"sender_name":"u","message":"two"}"#))
             .unwrap();
 
         let app_a = app.clone();
@@ -2794,9 +2861,7 @@ mod tests {
             .method("POST")
             .uri("/api/send_stream")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender_name":"u","message":"do tool"}"#,
-            ))
+            .body(Body::from(r#"{"sender_name":"u","message":"do tool"}"#))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2866,9 +2931,7 @@ mod tests {
             .method("POST")
             .uri("/api/send_stream")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender_name":"u","message":"reconnect"}"#,
-            ))
+            .body(Body::from(r#"{"sender_name":"u","message":"reconnect"}"#))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2957,12 +3020,15 @@ mod tests {
         let state = test_state(Arc::new(DummyLlm));
         let chat_id = 12345_i64;
         let cid = chat_id;
-        let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(cid)).await.unwrap_or(0);
-        let cid2 = chat_id;
-        let message_count = call_blocking(state.db.clone(), move |db| db.get_all_messages(cid2, pid))
+        let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(cid))
             .await
-            .unwrap()
-            .len();
+            .unwrap_or(0);
+        let cid2 = chat_id;
+        let message_count =
+            call_blocking(state.db.clone(), move |db| db.get_all_messages(cid2, pid))
+                .await
+                .unwrap()
+                .len();
         assert_eq!(message_count, 0);
     }
 }

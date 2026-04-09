@@ -99,7 +99,10 @@ mod tests {
 
         // Verify bundled scripts are also copied
         let search_script = skills_root.join("search-vault").join("query_vault.py");
-        assert!(search_script.exists(), "missing search-vault/query_vault.py");
+        assert!(
+            search_script.exists(),
+            "missing search-vault/query_vault.py"
+        );
         let index_script = skills_root.join("index-vault").join("index_vault.py");
         assert!(index_script.exists(), "missing index-vault/index_vault.py");
 

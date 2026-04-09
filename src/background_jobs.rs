@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use tracing::{error, info};
 use tokio::sync::mpsc::unbounded_channel;
+use tracing::{error, info};
 
-use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::channel::deliver_to_contact;
+use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::db::call_blocking;
-use crate::job_heartbeat::{signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType};
+use crate::job_heartbeat::{
+    signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
+};
 use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 /// Spawn a background job and deliver the final result asynchronously.
@@ -42,7 +44,9 @@ pub fn spawn_background_job(
             persona_id,
             JobType::ManualBackground,
         );
-        let _ = hb_tx.send(HeartbeatSignal::Started("background job started".to_string()));
+        let _ = hb_tx.send(HeartbeatSignal::Started(
+            "background job started".to_string(),
+        ));
         let (evt_tx, mut evt_rx) = unbounded_channel();
         let hb_forward = {
             let hb_tx = hb_tx.clone();

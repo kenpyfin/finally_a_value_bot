@@ -262,7 +262,11 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
 }
 
 /// Run a command with a timeout. If it doesn't finish in time, returns an error (command may still be running).
-fn run_command_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<std::process::Output> {
+fn run_command_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<std::process::Output> {
     let cmd_str = cmd.to_string();
     let args_vec: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     let (tx, rx) = mpsc::channel();
@@ -582,13 +586,14 @@ fn start_macos() -> Result<()> {
 
 fn stop_macos() -> Result<()> {
     let target = mac_target_label()?;
-    let output = match run_command_with_timeout("launchctl", &["bootout", &target], STOP_TIMEOUT_SECS) {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("{}", e);
-            return Err(e);
-        }
-    };
+    let output =
+        match run_command_with_timeout("launchctl", &["bootout", &target], STOP_TIMEOUT_SECS) {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("{}", e);
+                return Err(e);
+            }
+        };
     if output.status.success() {
         println!("Gateway service stopped");
         return Ok(());
@@ -602,10 +607,7 @@ fn stop_macos() -> Result<()> {
         return Ok(());
     }
 
-    Err(anyhow!(
-        "Failed to stop service: {}",
-        stderr.trim()
-    ))
+    Err(anyhow!("Failed to stop service: {}", stderr.trim()))
 }
 
 fn status_macos() -> Result<()> {
@@ -635,7 +637,9 @@ mod tests {
         let ctx = ServiceContext {
             exe_path: PathBuf::from("/usr/local/bin/finally_a_value_bot"),
             working_dir: PathBuf::from("/tmp/finally_a_value_bot"),
-            config_path: Some(PathBuf::from("/tmp/finally_a_value_bot/finally_a_value_bot.config.yaml")),
+            config_path: Some(PathBuf::from(
+                "/tmp/finally_a_value_bot/finally_a_value_bot.config.yaml",
+            )),
             runtime_logs_dir: PathBuf::from("/tmp/finally_a_value_bot/runtime/logs"),
             path_env: None,
             home_env: None,
@@ -645,7 +649,9 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/local/bin/finally_a_value_bot start"));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("FINALLY_A_VALUE_BOT_GATEWAY=1"));
-        assert!(unit.contains("FINALLY_A_VALUE_BOT_CONFIG=/tmp/finally_a_value_bot/finally_a_value_bot.config.yaml"));
+        assert!(unit.contains(
+            "FINALLY_A_VALUE_BOT_CONFIG=/tmp/finally_a_value_bot/finally_a_value_bot.config.yaml"
+        ));
     }
 
     #[test]
@@ -653,7 +659,9 @@ mod tests {
         let ctx = ServiceContext {
             exe_path: PathBuf::from("/usr/local/bin/finally_a_value_bot"),
             working_dir: PathBuf::from("/tmp/finally_a_value_bot"),
-            config_path: Some(PathBuf::from("/tmp/finally_a_value_bot/finally_a_value_bot.config.yaml")),
+            config_path: Some(PathBuf::from(
+                "/tmp/finally_a_value_bot/finally_a_value_bot.config.yaml",
+            )),
             runtime_logs_dir: PathBuf::from("/tmp/finally_a_value_bot/runtime/logs"),
             path_env: None,
             home_env: None,

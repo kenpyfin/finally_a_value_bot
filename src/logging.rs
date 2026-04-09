@@ -209,7 +209,10 @@ mod tests {
     use uuid::Uuid;
 
     fn test_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("finally_a_value_bot_logging_test_{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "finally_a_value_bot_logging_test_{}",
+            Uuid::new_v4()
+        ))
     }
 
     #[test]

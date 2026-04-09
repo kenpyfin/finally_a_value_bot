@@ -9,7 +9,10 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
-pub async fn call_blocking<T, F>(db: std::sync::Arc<Database>, f: F) -> Result<T, FinallyAValueBotError>
+pub async fn call_blocking<T, F>(
+    db: std::sync::Arc<Database>,
+    f: F,
+) -> Result<T, FinallyAValueBotError>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T, FinallyAValueBotError> + Send + 'static,
@@ -426,9 +429,7 @@ impl Database {
             .prepare("PRAGMA table_info(messages)")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows
-                    .filter_map(|r| r.ok())
-                    .any(|c| c == "persona_id"))
+                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "persona_id"))
             })
             .unwrap_or(false);
 
@@ -441,7 +442,9 @@ impl Database {
             .prepare("PRAGMA table_info(chats)")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "active_persona_id"))
+                Ok(rows
+                    .filter_map(|r| r.ok())
+                    .any(|c| c == "active_persona_id"))
             })
             .unwrap_or(false);
         if !has_active {
@@ -555,7 +558,10 @@ impl Database {
             return Ok(());
         }
 
-        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN persona_id INTEGER", [])?;
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN persona_id INTEGER",
+            [],
+        )?;
         conn.execute_batch(
             "UPDATE scheduled_tasks
              SET persona_id = (
@@ -575,7 +581,8 @@ impl Database {
              WHERE persona_id IS NULL;",
         )?;
 
-        let mut stmt = conn.prepare("SELECT DISTINCT chat_id FROM scheduled_tasks WHERE persona_id IS NULL")?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT chat_id FROM scheduled_tasks WHERE persona_id IS NULL")?;
         let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
         for row in rows {
             let chat_id = row?;
@@ -654,10 +661,12 @@ impl Database {
         // One-time migration: populate FTS from existing messages if FTS is empty but messages has data
         let fts_count: i64 =
             conn.query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0))?;
-        let msg_count: i64 =
-            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
+        let msg_count: i64 = conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
         if fts_count == 0 && msg_count > 0 {
-            conn.execute("INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages", [])?;
+            conn.execute(
+                "INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages",
+                [],
+            )?;
         }
 
         Ok(())
@@ -668,13 +677,14 @@ impl Database {
             .prepare("PRAGMA table_info(cursor_agent_runs)")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows
-                    .filter_map(|r| r.ok())
-                    .any(|c| c == "tmux_session"))
+                Ok(rows.filter_map(|r| r.ok()).any(|c| c == "tmux_session"))
             })
             .unwrap_or(false);
         if !has_tmux {
-            conn.execute("ALTER TABLE cursor_agent_runs ADD COLUMN tmux_session TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE cursor_agent_runs ADD COLUMN tmux_session TEXT",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -896,7 +906,11 @@ impl Database {
         Ok(messages)
     }
 
-    pub fn get_message_days(&self, chat_id: i64, persona_id: i64) -> Result<Vec<String>, FinallyAValueBotError> {
+    pub fn get_message_days(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT date(timestamp) AS d FROM messages
@@ -947,7 +961,10 @@ impl Database {
         Ok(chats)
     }
 
-    pub fn get_recent_chats(&self, limit: usize) -> Result<Vec<ChatSummary>, FinallyAValueBotError> {
+    pub fn get_recent_chats(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ChatSummary>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT
@@ -1017,12 +1034,23 @@ impl Database {
             return Ok(canonical);
         }
         let canonical = match channel_type {
-            "telegram" | "discord" => channel_handle
-                .parse::<i64>()
-                .map_err(|_| FinallyAValueBotError::ToolExecution(format!("invalid handle for {}: {}", channel_type, channel_handle)))?,
-            "web" => create_with_canonical_id
-                .ok_or_else(|| FinallyAValueBotError::ToolExecution("web resolve requires create_with_canonical_id".into()))?,
-            _ => return Err(FinallyAValueBotError::ToolExecution(format!("unknown channel_type: {}", channel_type))),
+            "telegram" | "discord" => channel_handle.parse::<i64>().map_err(|_| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "invalid handle for {}: {}",
+                    channel_type, channel_handle
+                ))
+            })?,
+            "web" => create_with_canonical_id.ok_or_else(|| {
+                FinallyAValueBotError::ToolExecution(
+                    "web resolve requires create_with_canonical_id".into(),
+                )
+            })?,
+            _ => {
+                return Err(FinallyAValueBotError::ToolExecution(format!(
+                    "unknown channel_type: {}",
+                    channel_type
+                )))
+            }
         };
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -1052,7 +1080,11 @@ impl Database {
     }
 
     /// Remove the binding for (channel_type, channel_handle).
-    pub fn unlink_channel(&self, channel_type: &str, channel_handle: &str) -> Result<bool, FinallyAValueBotError> {
+    pub fn unlink_channel(
+        &self,
+        channel_type: &str,
+        channel_handle: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
@@ -1062,7 +1094,10 @@ impl Database {
     }
 
     /// List all channel bindings for this contact (canonical_chat_id).
-    pub fn list_bindings_for_contact(&self, canonical_chat_id: i64) -> Result<Vec<ChannelBinding>, FinallyAValueBotError> {
+    pub fn list_bindings_for_contact(
+        &self,
+        canonical_chat_id: i64,
+    ) -> Result<Vec<ChannelBinding>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT canonical_chat_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
@@ -1285,11 +1320,8 @@ impl Database {
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         // Only seed if no messages exist yet (fresh install)
-        let message_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages",
-            [],
-            |row| row.get(0),
-        )?;
+        let message_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
 
         if message_count == 0 {
             let exists: bool = conn.query_row(
@@ -1366,7 +1398,9 @@ impl Database {
 
     /// All scheduled tasks for /schedule and list_scheduled_tasks:
     /// active, running, paused, and completed (all chats/personas).
-    pub fn get_all_scheduled_tasks_for_display(&self) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+    pub fn get_all_scheduled_tasks_for_display(
+        &self,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -1393,7 +1427,10 @@ impl Database {
         Ok(tasks)
     }
 
-    pub fn get_tasks_for_chat(&self, chat_id: i64) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+    pub fn get_tasks_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -1420,7 +1457,10 @@ impl Database {
         Ok(tasks)
     }
 
-    pub fn get_task_by_id(&self, task_id: i64) -> Result<Option<ScheduledTask>, FinallyAValueBotError> {
+    pub fn get_task_by_id(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<ScheduledTask>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
@@ -1449,7 +1489,11 @@ impl Database {
         }
     }
 
-    pub fn update_task_status(&self, task_id: i64, status: &str) -> Result<bool, FinallyAValueBotError> {
+    pub fn update_task_status(
+        &self,
+        task_id: i64,
+        status: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2",
@@ -1574,7 +1618,9 @@ impl Database {
             "SELECT id, last_run FROM scheduled_tasks WHERE status = 'running' AND last_run IS NOT NULL",
         )?;
         let pending: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
 
@@ -2188,7 +2234,10 @@ impl Database {
         Ok(jobs)
     }
 
-    pub fn get_background_job(&self, id: &str) -> Result<Option<BackgroundJob>, FinallyAValueBotError> {
+    pub fn get_background_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<BackgroundJob>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
@@ -2330,7 +2379,11 @@ impl Database {
         }
     }
 
-    pub fn delete_session(&self, chat_id: i64, persona_id: i64) -> Result<bool, FinallyAValueBotError> {
+    pub fn delete_session(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM sessions WHERE chat_id = ?1 AND persona_id = ?2",
@@ -2344,7 +2397,10 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         let mut affected = 0usize;
 
-        affected += tx.execute("UPDATE chats SET active_persona_id = NULL WHERE chat_id = ?1", params![chat_id])?;
+        affected += tx.execute(
+            "UPDATE chats SET active_persona_id = NULL WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
         affected += tx.execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
         affected += tx.execute("DELETE FROM personas WHERE chat_id = ?1", params![chat_id])?;
@@ -2356,7 +2412,10 @@ impl Database {
             "DELETE FROM social_oauth_tokens WHERE chat_id = ?1",
             params![chat_id],
         )?;
-        affected += tx.execute("DELETE FROM channel_bindings WHERE canonical_chat_id = ?1", params![chat_id])?;
+        affected += tx.execute(
+            "DELETE FROM channel_bindings WHERE canonical_chat_id = ?1",
+            params![chat_id],
+        )?;
         affected += tx.execute("DELETE FROM chats WHERE chat_id = ?1", params![chat_id])?;
 
         tx.commit()?;
@@ -2414,7 +2473,11 @@ impl Database {
         }
     }
 
-    pub fn delete_social_token(&self, platform: &str, chat_id: i64) -> Result<bool, FinallyAValueBotError> {
+    pub fn delete_social_token(
+        &self,
+        platform: &str,
+        chat_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "DELETE FROM social_oauth_tokens WHERE platform = ?1 AND chat_id = ?2",
@@ -2457,7 +2520,10 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        conn.execute("DELETE FROM oauth_pending_states WHERE state_token = ?1", params![state_token])?;
+        conn.execute(
+            "DELETE FROM oauth_pending_states WHERE state_token = ?1",
+            params![state_token],
+        )?;
         Ok(Some(pair))
     }
 
@@ -2492,7 +2558,10 @@ impl Database {
 
     // --- Personas ---
 
-    pub fn get_or_create_default_persona(&self, chat_id: i64) -> Result<i64, FinallyAValueBotError> {
+    pub fn get_or_create_default_persona(
+        &self,
+        chat_id: i64,
+    ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result: Option<i64> = conn
             .query_row(
@@ -2526,7 +2595,10 @@ impl Database {
         Ok(persona_id)
     }
 
-    pub fn get_active_persona_id(&self, chat_id: i64) -> Result<Option<i64>, FinallyAValueBotError> {
+    pub fn get_active_persona_id(
+        &self,
+        chat_id: i64,
+    ) -> Result<Option<i64>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
             "SELECT active_persona_id FROM chats WHERE chat_id = ?1",
@@ -2676,7 +2748,11 @@ impl Database {
         }
     }
 
-    pub fn delete_persona(&self, chat_id: i64, persona_id: i64) -> Result<bool, FinallyAValueBotError> {
+    pub fn delete_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let name: String = conn
             .query_row(
@@ -2774,7 +2850,8 @@ mod tests {
     use super::*;
 
     fn test_db() -> (Database, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_test_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("finally_a_value_bot_test_{}", uuid::Uuid::new_v4()));
         let db = Database::new(dir.to_str().unwrap()).unwrap();
         (db, dir)
     }
@@ -2982,7 +3059,9 @@ mod tests {
         }
 
         // Fallback to last 3
-        let messages = db.get_messages_since_last_bot_response(100, pid, 50, 3).unwrap();
+        let messages = db
+            .get_messages_since_last_bot_response(100, pid, 50, 3)
+            .unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "msg 2");
         assert_eq!(messages[2].content, "msg 4");

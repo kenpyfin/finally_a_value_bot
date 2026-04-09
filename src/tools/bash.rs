@@ -304,7 +304,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_uses_working_dir() {
-        let root = std::env::temp_dir().join(format!("finally_a_value_bot_bash_{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("finally_a_value_bot_bash_{}", uuid::Uuid::new_v4()));
         let work = root.join("workspace");
         std::fs::create_dir_all(&work).unwrap();
 
@@ -318,11 +319,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_warn_confirm_requires_prefix_for_risky_command() {
-        let tool = BashTool::new_with_safety(
-            ".",
-            "warn_confirm".into(),
-            vec!["destructive".into()],
-        );
+        let tool =
+            BashTool::new_with_safety(".", "warn_confirm".into(), vec!["destructive".into()]);
         let result = tool.execute(json!({"command": "rm -rf /tmp/foo"})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Execution paused by safety policy"));
@@ -331,28 +329,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_warn_confirm_allows_risky_command_with_prefix() {
-        let tool = BashTool::new_with_safety(
-            ".",
-            "warn_confirm".into(),
-            vec!["destructive".into()],
-        );
+        let tool =
+            BashTool::new_with_safety(".", "warn_confirm".into(), vec!["destructive".into()]);
         let result = tool
-            .execute(json!({"command": "CONFIRM_EXECUTE rm -rf /tmp/finally_a_value_bot_test_confirm"}))
+            .execute(
+                json!({"command": "CONFIRM_EXECUTE rm -rf /tmp/finally_a_value_bot_test_confirm"}),
+            )
             .await;
         assert!(!result.is_error);
     }
 
     #[tokio::test]
     async fn test_bash_strict_blocks_risky_command() {
-        let tool = BashTool::new_with_safety(
-            ".",
-            "strict".into(),
-            vec!["package".into()],
-        );
+        let tool = BashTool::new_with_safety(".", "strict".into(), vec!["package".into()]);
         let result = tool.execute(json!({"command": "npm install lodash"})).await;
         assert!(result.is_error);
-        assert!(result.content.contains("Blocked by safety_execution_mode=strict"));
+        assert!(result
+            .content
+            .contains("Blocked by safety_execution_mode=strict"));
         assert_eq!(result.error_type.as_deref(), Some("blocked_by_policy"));
     }
-
 }

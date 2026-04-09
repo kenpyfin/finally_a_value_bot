@@ -6,7 +6,10 @@
 use finally_a_value_bot::db::{Database, StoredMessage};
 
 fn test_db() -> (Database, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("finally_a_value_bot_integ_{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!(
+        "finally_a_value_bot_integ_{}",
+        uuid::Uuid::new_v4()
+    ));
     let db = Database::new(dir.to_str().unwrap()).unwrap();
     (db, dir)
 }
