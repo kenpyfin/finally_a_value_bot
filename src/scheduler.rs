@@ -2,14 +2,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::channel::deliver_to_contact;
 use crate::db::{call_blocking, ScheduledTask};
 use crate::error::FinallyAValueBotError;
-use crate::job_heartbeat::{signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType};
+use crate::job_heartbeat::{
+    signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
+};
 use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 fn channel_from_chat_type(chat_type: &str) -> &'static str {
@@ -85,7 +87,8 @@ async fn run_due_tasks(
         let now_for_due = now.clone();
         move |db| db.get_due_tasks(&now_for_due)
     })
-    .await {
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             error!("Scheduler: failed to query due tasks: {e}");
@@ -100,7 +103,8 @@ async fn run_due_tasks(
     for task in tasks {
         // Claim synchronously before spawning so the next tick cannot re-list the same task
         // while workers are still waiting on the semaphore.
-        let (prepared, did_claim) = match claim_and_prepare_scheduled_task(state, task, &now).await {
+        let (prepared, did_claim) = match claim_and_prepare_scheduled_task(state, task, &now).await
+        {
             Ok(pair) => pair,
             Err(e) => {
                 error!("Scheduler: failed to prepare task: {e}");
@@ -139,9 +143,7 @@ async fn run_due_tasks(
     }
 
     if due_count > 0 {
-        info!(
-            "Scheduler tick: due_count={due_count}, claimed={claimed}, spawned={spawned}"
-        );
+        info!("Scheduler tick: due_count={due_count}, claimed={claimed}, spawned={spawned}");
     }
 }
 
@@ -202,15 +204,17 @@ async fn claim_and_prepare_scheduled_task(
     })
     .await?;
     if !claimed {
-        info!("Scheduler: task #{} already claimed or not due, skipping", task_id);
+        info!(
+            "Scheduler: task #{} already claimed or not due, skipping",
+            task_id
+        );
         return Ok((None, false));
     }
 
-    let channel =
-        match call_blocking(state.db.clone(), move |db| db.get_chat_type(chat_id)).await {
-            Ok(Some(chat_type)) => channel_from_chat_type(&chat_type),
-            _ => "telegram",
-        };
+    let channel = match call_blocking(state.db.clone(), move |db| db.get_chat_type(chat_id)).await {
+        Ok(Some(chat_type)) => channel_from_chat_type(&chat_type),
+        _ => "telegram",
+    };
 
     let persona_id = call_blocking(state.db.clone(), move |db| {
         if scheduled_persona_id > 0 && db.persona_exists(chat_id, scheduled_persona_id)? {
@@ -255,13 +259,13 @@ async fn claim_and_prepare_scheduled_task(
 
     Ok((
         Some(PreparedScheduledRun {
-        task_id,
-        chat_id,
-        persona_id,
-        channel,
-        prompt,
-        next_run,
-        started_at_str,
+            task_id,
+            chat_id,
+            persona_id,
+            channel,
+            prompt,
+            next_run,
+            started_at_str,
         }),
         true,
     ))
@@ -293,7 +297,10 @@ async fn run_scheduled_agent_and_finalize(
         persona_id,
         JobType::Scheduled,
     );
-    let _ = hb_tx.send(HeartbeatSignal::Started(format!("scheduled task #{} started", task_id)));
+    let _ = hb_tx.send(HeartbeatSignal::Started(format!(
+        "scheduled task #{} started",
+        task_id
+    )));
     let (evt_tx, mut evt_rx) = unbounded_channel();
     let hb_forward = {
         let hb_tx = hb_tx.clone();
@@ -373,12 +380,17 @@ async fn run_scheduled_agent_and_finalize(
                 response
             };
             const DEDUPE_WINDOW_SECS: i64 = 120;
-            let dedupe_text =
-                crate::channel::with_persona_indicator(state.db.clone(), persona_id, &response_text)
-                    .await;
+            let dedupe_text = crate::channel::with_persona_indicator(
+                state.db.clone(),
+                persona_id,
+                &response_text,
+            )
+            .await;
             let skip_dup = match call_blocking(state.db.clone(), {
                 let text = dedupe_text;
-                move |db| db.should_skip_duplicate_final_delivery(chat_id, &text, DEDUPE_WINDOW_SECS)
+                move |db| {
+                    db.should_skip_duplicate_final_delivery(chat_id, &text, DEDUPE_WINDOW_SECS)
+                }
             })
             .await
             {
@@ -440,9 +452,7 @@ async fn run_scheduled_agent_and_finalize(
                         );
                         (
                             false,
-                            Some(format!(
-                                "Delivery error after successful execution: {e}"
-                            )),
+                            Some(format!("Delivery error after successful execution: {e}")),
                         )
                     }
                 }

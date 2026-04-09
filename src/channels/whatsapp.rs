@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -200,9 +200,16 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 if let Some(cmd) = parse_slash_command(&text) {
                     match cmd {
                         SlashCommand::Reset => {
-                            let pid = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                            let pid = call_blocking(state.app_state.db.clone(), move |db| {
+                                db.get_current_persona_id(chat_id)
+                            })
+                            .await
+                            .unwrap_or(0);
                             if pid > 0 {
-                                let _ = call_blocking(state.app_state.db.clone(), move |db| db.delete_session(chat_id, pid)).await;
+                                let _ = call_blocking(state.app_state.db.clone(), move |db| {
+                                    db.delete_session(chat_id, pid)
+                                })
+                                .await;
                             }
                             send_whatsapp_message(
                                 &state.http_client,
@@ -225,7 +232,13 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             .await;
                         }
                         SlashCommand::Persona => {
-                            let resp = crate::persona::handle_persona_command(state.app_state.db.clone(), chat_id, text.trim(), Some(&state.app_state.config)).await;
+                            let resp = crate::persona::handle_persona_command(
+                                state.app_state.db.clone(),
+                                chat_id,
+                                text.trim(),
+                                Some(&state.app_state.config),
+                            )
+                            .await;
                             send_whatsapp_message(
                                 &state.http_client,
                                 &state.access_token,
@@ -236,7 +249,10 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             .await;
                         }
                         SlashCommand::Schedule => {
-                            let tasks = call_blocking(state.app_state.db.clone(), |db| db.get_all_scheduled_tasks_for_display()).await;
+                            let tasks = call_blocking(state.app_state.db.clone(), |db| {
+                                db.get_all_scheduled_tasks_for_display()
+                            })
+                            .await;
                             let text = match &tasks {
                                 Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
                                 Err(e) => format!("Error listing tasks: {e}"),
@@ -251,7 +267,11 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             .await;
                         }
                         SlashCommand::Archive => {
-                            let pid = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                            let pid = call_blocking(state.app_state.db.clone(), move |db| {
+                                db.get_current_persona_id(chat_id)
+                            })
+                            .await
+                            .unwrap_or(0);
                             if pid == 0 {
                                 send_whatsapp_message(
                                     &state.http_client,
@@ -263,15 +283,17 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 .await;
                             } else {
                                 let pid_f = pid;
-                                let history = call_blocking(state.app_state.db.clone(), move |db| {
-                                    db.get_recent_messages(chat_id, pid_f, 500)
-                                })
-                                .await
-                                .unwrap_or_default();
+                                let history =
+                                    call_blocking(state.app_state.db.clone(), move |db| {
+                                        db.get_recent_messages(chat_id, pid_f, 500)
+                                    })
+                                    .await
+                                    .unwrap_or_default();
                                 let messages: Vec<crate::claude::Message> = history
                                     .into_iter()
                                     .map(|m| crate::claude::Message {
-                                        role: if m.is_from_bot { "assistant" } else { "user" }.into(),
+                                        role: if m.is_from_bot { "assistant" } else { "user" }
+                                            .into(),
                                         content: crate::claude::MessageContent::Text(m.content),
                                     })
                                     .collect();
@@ -315,7 +337,11 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     .unwrap_or_else(|| message.from.clone());
 
                 // Resolve persona
-                let persona_id = call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(chat_id)).await.unwrap_or(0);
+                let persona_id = call_blocking(state.app_state.db.clone(), move |db| {
+                    db.get_current_persona_id(chat_id)
+                })
+                .await
+                .unwrap_or(0);
                 if persona_id == 0 {
                     continue;
                 }
@@ -326,16 +352,9 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                         .image
                         .as_ref()
                         .and_then(|m| m.mime_type.clone())
-                        .or_else(|| {
-                            message
-                                .document
-                                .as_ref()
-                                .and_then(|d| d.mime_type.clone())
-                        });
-                    let preferred_filename = message
-                        .document
-                        .as_ref()
-                        .and_then(|d| d.filename.clone());
+                        .or_else(|| message.document.as_ref().and_then(|d| d.mime_type.clone()));
+                    let preferred_filename =
+                        message.document.as_ref().and_then(|d| d.filename.clone());
                     let media_id = if let Some(img) = &message.image {
                         Some(img.id.as_str())
                     } else {
@@ -378,7 +397,8 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                         state.app_state.config.working_dir(),
                                         chat_id,
                                         fetched_name
-                                            .as_deref().or(preferred_filename.as_deref())
+                                            .as_deref()
+                                            .or(preferred_filename.as_deref())
                                             .unwrap_or("whatsapp-media.bin"),
                                         &bytes,
                                     )
@@ -492,7 +512,12 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                         {
                             Ok(response) => {
                                 if !response.is_empty() {
-                                    let response = with_persona_indicator(app_state.db.clone(), persona_id, &response).await;
+                                    let response = with_persona_indicator(
+                                        app_state.db.clone(),
+                                        persona_id,
+                                        &response,
+                                    )
+                                    .await;
                                     send_whatsapp_message(
                                         &http_client,
                                         &access_token,
@@ -568,7 +593,9 @@ async fn download_whatsapp_media(
         anyhow::bail!("media metadata request failed ({status}): {body}");
     }
     let info: WhatsAppMediaInfo = info_resp.json().await?;
-    let download_url = info.url.ok_or_else(|| anyhow::anyhow!("missing media url"))?;
+    let download_url = info
+        .url
+        .ok_or_else(|| anyhow::anyhow!("missing media url"))?;
 
     let media_resp = client
         .get(&download_url)

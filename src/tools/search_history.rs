@@ -113,9 +113,7 @@ impl Tool for SearchHistoryTool {
         match result {
             Ok(Ok(messages)) => {
                 if messages.is_empty() {
-                    return ToolResult::success(format!(
-                        "No messages found matching '{query}'"
-                    ));
+                    return ToolResult::success(format!("No messages found matching '{query}'"));
                 }
                 let results: Vec<serde_json::Value> = messages
                     .iter()
@@ -134,9 +132,7 @@ impl Tool for SearchHistoryTool {
                         })
                     })
                     .collect();
-                ToolResult::success(
-                    serde_json::to_string_pretty(&results).unwrap_or_default(),
-                )
+                ToolResult::success(serde_json::to_string_pretty(&results).unwrap_or_default())
             }
             Ok(Err(e)) => ToolResult::error(format!(
                 "Search failed: {e}. Try simpler keywords or check the query syntax."

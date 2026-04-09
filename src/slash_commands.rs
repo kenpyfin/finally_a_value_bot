@@ -16,7 +16,8 @@ fn normalize(text: &str) -> String {
     // Strip BOM, zero-width, and bidirectional/format characters that can appear before the slash
     let invisibles = [
         '\u{feff}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', // zero-width, BOM
-        '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', // RTL/LTR format
+        '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+        '\u{202e}', // RTL/LTR format
     ];
     let mut s = text.trim().to_string();
     for c in invisibles {
@@ -24,16 +25,16 @@ fn normalize(text: &str) -> String {
     }
     s = s.trim().to_string();
     // Normalize slash-like characters to ASCII / (before any starts_with check)
-    s = s.replace('\u{ff0f}', "/");   // fullwidth solidus
-    s = s.replace('\u{2044}', "/");   // fraction slash
-    s = s.replace('\u{2215}', "/");   // division slash
-    // Normalize homoglyphs so e.g. Cyrillic 'а' (U+0430) in "personа" becomes Latin "persona"
-    s = s.replace('\u{0430}', "a");   // Cyrillic small a
-    s = s.replace('\u{0435}', "e");   // Cyrillic small e
-    s = s.replace('\u{043e}', "o");   // Cyrillic small o
-    s = s.replace('\u{0440}', "p");   // Cyrillic small r
-    s = s.replace('\u{043d}', "n");   // Cyrillic small n
-    s = s.replace('\u{0441}', "s");   // Cyrillic small s
+    s = s.replace('\u{ff0f}', "/"); // fullwidth solidus
+    s = s.replace('\u{2044}', "/"); // fraction slash
+    s = s.replace('\u{2215}', "/"); // division slash
+                                    // Normalize homoglyphs so e.g. Cyrillic 'а' (U+0430) in "personа" becomes Latin "persona"
+    s = s.replace('\u{0430}', "a"); // Cyrillic small a
+    s = s.replace('\u{0435}', "e"); // Cyrillic small e
+    s = s.replace('\u{043e}', "o"); // Cyrillic small o
+    s = s.replace('\u{0440}', "p"); // Cyrillic small r
+    s = s.replace('\u{043d}', "n"); // Cyrillic small n
+    s = s.replace('\u{0441}', "s"); // Cyrillic small s
     s.trim().to_string()
 }
 
@@ -65,12 +66,21 @@ pub fn parse(text: &str) -> Option<SlashCommand> {
     if lower == "/archive" || lower.starts_with("/archive ") {
         return Some(SlashCommand::Archive);
     }
-    if lower == "/schedule" || lower.starts_with("/schedule ")
+    if lower == "/schedule"
+        || lower.starts_with("/schedule ")
         || lower.starts_with("/schedule@")
-        || lower == "/jobs" || lower.starts_with("/jobs ") || lower.starts_with("/jobs@")
-        || lower == "/scheduled" || lower.starts_with("/scheduled ") || lower.starts_with("/scheduled@")
-        || lower == "/scheduledjob" || lower.starts_with("/scheduledjob ") || lower.starts_with("/scheduledjob@")
-        || lower == "/scheduled_job" || lower.starts_with("/scheduled_job ") || lower.starts_with("/scheduled_job@")
+        || lower == "/jobs"
+        || lower.starts_with("/jobs ")
+        || lower.starts_with("/jobs@")
+        || lower == "/scheduled"
+        || lower.starts_with("/scheduled ")
+        || lower.starts_with("/scheduled@")
+        || lower == "/scheduledjob"
+        || lower.starts_with("/scheduledjob ")
+        || lower.starts_with("/scheduledjob@")
+        || lower == "/scheduled_job"
+        || lower.starts_with("/scheduled_job ")
+        || lower.starts_with("/scheduled_job@")
     {
         return Some(SlashCommand::Schedule);
     }
@@ -114,7 +124,10 @@ mod tests {
         assert_eq!(parse("/scheduled_job"), Some(SlashCommand::Schedule));
         // Telegram group commands with @botname
         assert_eq!(parse("/schedule@MyBot"), Some(SlashCommand::Schedule));
-        assert_eq!(parse("/jobs@FinallyAValueBot"), Some(SlashCommand::Schedule));
+        assert_eq!(
+            parse("/jobs@FinallyAValueBot"),
+            Some(SlashCommand::Schedule)
+        );
     }
 
     #[test]

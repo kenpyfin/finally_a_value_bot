@@ -57,7 +57,8 @@ impl ChatRunQueue {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.enqueue_with_meta(chat_id, QueueTaskMeta::default(), fut).await
+        self.enqueue_with_meta(chat_id, QueueTaskMeta::default(), fut)
+            .await
     }
 
     pub async fn enqueue_with_meta<F>(&self, chat_id: i64, meta: QueueTaskMeta, fut: F) -> usize

@@ -6,11 +6,10 @@ use crate::error::FinallyAValueBotError;
 /// Build the OAuth redirect base URL from config. Uses social.base_url if set,
 /// otherwise derives from web_host:web_port (for local dev).
 pub fn oauth_base_url(config: &Config) -> Option<String> {
-    let base = config.social.as_ref().and_then(|s| {
-        s.base_url
-            .clone()
-            .filter(|u| !u.trim().is_empty())
-    });
+    let base = config
+        .social
+        .as_ref()
+        .and_then(|s| s.base_url.clone().filter(|u| !u.trim().is_empty()));
     if let Some(b) = base {
         return Some(b);
     }
@@ -37,17 +36,25 @@ pub fn authorize_url(
         return Ok(None);
     };
     let social = config.social.as_ref();
-    let redirect_uri = format!("{}/api/oauth/callback/{}", base.trim_end_matches('/'), platform);
+    let redirect_uri = format!(
+        "{}/api/oauth/callback/{}",
+        base.trim_end_matches('/'),
+        platform
+    );
 
     let url = match platform {
         "tiktok" => {
-            let cfg = social.and_then(|s| {
-                if s.tiktok.client_id.is_some() && s.tiktok.client_secret.is_some() {
-                    Some(&s.tiktok)
-                } else {
-                    None
-                }
-            }).ok_or_else(|| FinallyAValueBotError::Config("TikTok OAuth not configured".into()))?;
+            let cfg = social
+                .and_then(|s| {
+                    if s.tiktok.client_id.is_some() && s.tiktok.client_secret.is_some() {
+                        Some(&s.tiktok)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    FinallyAValueBotError::Config("TikTok OAuth not configured".into())
+                })?;
             let client_id = cfg.client_id.as_deref().unwrap_or("");
             if client_id.is_empty() {
                 return Ok(None);
@@ -62,13 +69,17 @@ pub fn authorize_url(
             )
         }
         "instagram" => {
-            let cfg = social.and_then(|s| {
-                if s.instagram.client_id.is_some() && s.instagram.client_secret.is_some() {
-                    Some(&s.instagram)
-                } else {
-                    None
-                }
-            }).ok_or_else(|| FinallyAValueBotError::Config("Instagram OAuth not configured".into()))?;
+            let cfg = social
+                .and_then(|s| {
+                    if s.instagram.client_id.is_some() && s.instagram.client_secret.is_some() {
+                        Some(&s.instagram)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    FinallyAValueBotError::Config("Instagram OAuth not configured".into())
+                })?;
             let client_id = cfg.client_id.as_deref().unwrap_or("");
             if client_id.is_empty() {
                 return Ok(None);
@@ -83,13 +94,17 @@ pub fn authorize_url(
             )
         }
         "linkedin" => {
-            let cfg = social.and_then(|s| {
-                if s.linkedin.client_id.is_some() && s.linkedin.client_secret.is_some() {
-                    Some(&s.linkedin)
-                } else {
-                    None
-                }
-            }).ok_or_else(|| FinallyAValueBotError::Config("LinkedIn OAuth not configured".into()))?;
+            let cfg = social
+                .and_then(|s| {
+                    if s.linkedin.client_id.is_some() && s.linkedin.client_secret.is_some() {
+                        Some(&s.linkedin)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    FinallyAValueBotError::Config("LinkedIn OAuth not configured".into())
+                })?;
             let client_id = cfg.client_id.as_deref().unwrap_or("");
             if client_id.is_empty() {
                 return Ok(None);
@@ -124,9 +139,10 @@ pub async fn exchange_code(
     code: &str,
     redirect_uri: &str,
 ) -> Result<TokenResult, FinallyAValueBotError> {
-    let social = config.social.as_ref().ok_or_else(|| {
-        FinallyAValueBotError::Config("Social OAuth not configured".into())
-    })?;
+    let social = config
+        .social
+        .as_ref()
+        .ok_or_else(|| FinallyAValueBotError::Config("Social OAuth not configured".into()))?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -135,10 +151,13 @@ pub async fn exchange_code(
 
     match platform {
         "tiktok" => {
-            let client_key = social.tiktok.client_id.as_deref()
-                .ok_or_else(|| FinallyAValueBotError::Config("TikTok client_id not set".into()))?;
-            let client_secret = social.tiktok.client_secret.as_deref()
-                .ok_or_else(|| FinallyAValueBotError::Config("TikTok client_secret not set".into()))?;
+            let client_key =
+                social.tiktok.client_id.as_deref().ok_or_else(|| {
+                    FinallyAValueBotError::Config("TikTok client_id not set".into())
+                })?;
+            let client_secret = social.tiktok.client_secret.as_deref().ok_or_else(|| {
+                FinallyAValueBotError::Config("TikTok client_secret not set".into())
+            })?;
 
             let params = [
                 ("client_key", client_key),
@@ -169,24 +188,30 @@ pub async fn exchange_code(
                 return Err(FinallyAValueBotError::ToolExecution(err_msg.to_string()));
             }
 
-            let data = body.get("data").and_then(|d| d.as_object()).ok_or_else(|| {
-                FinallyAValueBotError::ToolExecution("Invalid TikTok token response".into())
-            })?;
+            let data = body
+                .get("data")
+                .and_then(|d| d.as_object())
+                .ok_or_else(|| {
+                    FinallyAValueBotError::ToolExecution("Invalid TikTok token response".into())
+                })?;
 
             let access_token = data
                 .get("access_token")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| FinallyAValueBotError::ToolExecution("No access_token in response".into()))?
+                .ok_or_else(|| {
+                    FinallyAValueBotError::ToolExecution("No access_token in response".into())
+                })?
                 .to_string();
 
-            let refresh_token = data.get("refresh_token").and_then(|v| v.as_str()).map(String::from);
+            let refresh_token = data
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             let expires_at = data
                 .get("expires_in")
                 .and_then(|v| v.as_i64())
-                .map(|secs| {
-                    chrono::Utc::now() + chrono::Duration::seconds(secs)
-                })
+                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs))
                 .map(|dt| dt.to_rfc3339());
 
             Ok(TokenResult {
@@ -196,10 +221,12 @@ pub async fn exchange_code(
             })
         }
         "instagram" => {
-            let client_id = social.instagram.client_id.as_deref()
-                .ok_or_else(|| FinallyAValueBotError::Config("Instagram client_id not set".into()))?;
-            let client_secret = social.instagram.client_secret.as_deref()
-                .ok_or_else(|| FinallyAValueBotError::Config("Instagram client_secret not set".into()))?;
+            let client_id = social.instagram.client_id.as_deref().ok_or_else(|| {
+                FinallyAValueBotError::Config("Instagram client_id not set".into())
+            })?;
+            let client_secret = social.instagram.client_secret.as_deref().ok_or_else(|| {
+                FinallyAValueBotError::Config("Instagram client_secret not set".into())
+            })?;
 
             let params = [
                 ("client_id", client_id),
@@ -234,7 +261,9 @@ pub async fn exchange_code(
             let access_token = body
                 .get("access_token")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| FinallyAValueBotError::ToolExecution("No access_token in response".into()))?
+                .ok_or_else(|| {
+                    FinallyAValueBotError::ToolExecution("No access_token in response".into())
+                })?
                 .to_string();
 
             Ok(TokenResult {
@@ -244,10 +273,12 @@ pub async fn exchange_code(
             })
         }
         "linkedin" => {
-            let client_id = social.linkedin.client_id.as_deref()
-                .ok_or_else(|| FinallyAValueBotError::Config("LinkedIn client_id not set".into()))?;
-            let client_secret = social.linkedin.client_secret.as_deref()
-                .ok_or_else(|| FinallyAValueBotError::Config("LinkedIn client_secret not set".into()))?;
+            let client_id = social.linkedin.client_id.as_deref().ok_or_else(|| {
+                FinallyAValueBotError::Config("LinkedIn client_id not set".into())
+            })?;
+            let client_secret = social.linkedin.client_secret.as_deref().ok_or_else(|| {
+                FinallyAValueBotError::Config("LinkedIn client_secret not set".into())
+            })?;
 
             let params = [
                 ("grant_type", "authorization_code"),
@@ -282,17 +313,20 @@ pub async fn exchange_code(
             let access_token = body
                 .get("access_token")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| FinallyAValueBotError::ToolExecution("No access_token in response".into()))?
+                .ok_or_else(|| {
+                    FinallyAValueBotError::ToolExecution("No access_token in response".into())
+                })?
                 .to_string();
 
-            let refresh_token = body.get("refresh_token").and_then(|v| v.as_str()).map(String::from);
+            let refresh_token = body
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             let expires_at = body
                 .get("expires_in")
                 .and_then(|v| v.as_i64())
-                .map(|secs| {
-                    chrono::Utc::now() + chrono::Duration::seconds(secs)
-                })
+                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs))
                 .map(|dt| dt.to_rfc3339());
 
             Ok(TokenResult {
@@ -301,6 +335,8 @@ pub async fn exchange_code(
                 expires_at,
             })
         }
-        _ => Err(FinallyAValueBotError::Config(format!("Unknown platform: {platform}"))),
+        _ => Err(FinallyAValueBotError::Config(format!(
+            "Unknown platform: {platform}"
+        ))),
     }
 }

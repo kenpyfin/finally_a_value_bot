@@ -195,11 +195,8 @@ impl Tool for BrowserTool {
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&args);
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -223,7 +220,8 @@ impl Tool for BrowserTool {
                 }
 
                 // Detect wrong binary (finally_a_value_bot-browser expects --port, not open/snapshot)
-                let wrong_binary = stderr.contains("finally_a_value_bot-browser") || stderr.contains("missing --port");
+                let wrong_binary = stderr.contains("finally_a_value_bot-browser")
+                    || stderr.contains("missing --port");
                 if wrong_binary {
                     result_text = format!(
                         "Wrong agent-browser binary. The program at '{}' appears to be finally_a_value_bot-browser (Rust), not the npm agent-browser. The browser tool requires the npm agent-browser CLI (open, snapshot, click, etc.). Fix: set AGENT_BROWSER_PATH in .env to the npm binary, e.g. \"/opt/homebrew/bin/agent-browser\" or \"~/.local/bin/agent-browser\". Raw output:\n\n{}",
@@ -249,7 +247,9 @@ impl Tool for BrowserTool {
                 }
             }
             Ok(Err(e)) => {
-                let msg = if e.to_string().contains("No such file") || e.to_string().contains("not found") {
+                let msg = if e.to_string().contains("No such file")
+                    || e.to_string().contains("not found")
+                {
                     format!(
                         "Browser automation is not available: the command '{}' was not found. \
                         Fix: install with `npm install -g agent-browser` and `agent-browser install`. In Docker the image sets AGENT_BROWSER_PATH. Raw error: {e}",

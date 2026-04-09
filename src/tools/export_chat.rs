@@ -57,7 +57,11 @@ impl Tool for ExportChatTool {
         }
 
         let cid = chat_id;
-        let persona_id = match call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(cid)).await {
+        let persona_id = match call_blocking(self.db.clone(), move |db| {
+            db.get_or_create_default_persona(cid)
+        })
+        .await
+        {
             Ok(pid) => pid,
             Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
         };
@@ -123,7 +127,10 @@ mod tests {
     use crate::db::{Database, StoredMessage};
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_export_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_export_{}",
+            uuid::Uuid::new_v4()
+        ));
         let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
         (db, dir)
     }

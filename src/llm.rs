@@ -194,10 +194,7 @@ pub async fn test_model(config: &Config, model_override: &str) -> Result<(), Str
         role: "user".into(),
         content: MessageContent::Text("Hi".into()),
     }];
-    match provider
-        .send_message("Test.", messages, None)
-        .await
-    {
+    match provider.send_message("Test.", messages, None).await {
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
@@ -256,7 +253,9 @@ impl AnthropicProvider {
                     api_err.error.error_type, api_err.error.message
                 )));
             }
-            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {body}")));
+            return Err(FinallyAValueBotError::LlmApi(format!(
+                "HTTP {status}: {body}"
+            )));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -522,7 +521,11 @@ fn process_openai_stream_event(
             if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                 entry.id = id.to_string();
             }
-            if let Some(s) = tc.get("thought_signature").or_else(|| tc.get("thoughtSignature")).and_then(|v| v.as_str()) {
+            if let Some(s) = tc
+                .get("thought_signature")
+                .or_else(|| tc.get("thoughtSignature"))
+                .and_then(|v| v.as_str())
+            {
                 entry.thought_signature = Some(s.to_string());
             }
             if let Some(function) = tc.get("function") {
@@ -533,7 +536,11 @@ fn process_openai_stream_event(
                     entry.input_json.push_str(args);
                 }
                 if entry.thought_signature.is_none() {
-                    if let Some(s) = function.get("thought_signature").or_else(|| function.get("thoughtSignature")).and_then(|v| v.as_str()) {
+                    if let Some(s) = function
+                        .get("thought_signature")
+                        .or_else(|| function.get("thoughtSignature"))
+                        .and_then(|v| v.as_str())
+                    {
                         entry.thought_signature = Some(s.to_string());
                     }
                 }
@@ -646,7 +653,9 @@ impl LlmProvider for AnthropicProvider {
             if status.is_success() {
                 let body = response.text().await?;
                 let parsed: MessagesResponse = serde_json::from_str(&body).map_err(|e| {
-                    FinallyAValueBotError::LlmApi(format!("Failed to parse response: {e}\nBody: {body}"))
+                    FinallyAValueBotError::LlmApi(format!(
+                        "Failed to parse response: {e}\nBody: {body}"
+                    ))
                 })?;
                 return Ok(parsed);
             }
@@ -669,7 +678,9 @@ impl LlmProvider for AnthropicProvider {
                     api_err.error.error_type, api_err.error.message
                 )));
             }
-            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {body}")));
+            return Err(FinallyAValueBotError::LlmApi(format!(
+                "HTTP {status}: {body}"
+            )));
         }
     }
 
@@ -870,7 +881,9 @@ impl LlmProvider for OpenAiProvider {
                 let msg = format_oai_error(status, &err.error, &text);
                 return Err(FinallyAValueBotError::LlmApi(msg));
             }
-            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(FinallyAValueBotError::LlmApi(format!(
+                "HTTP {status}: {text}"
+            )));
         }
     }
 
@@ -912,7 +925,9 @@ impl LlmProvider for OpenAiProvider {
                 let msg = format_oai_error(status, &err.error, &text);
                 return Err(FinallyAValueBotError::LlmApi(msg));
             }
-            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(FinallyAValueBotError::LlmApi(format!(
+                "HTTP {status}: {text}"
+            )));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -1080,7 +1095,9 @@ impl LlmProvider for GeminiProvider {
                     err.error.code, err.error.message
                 )));
             }
-            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {body}")));
+            return Err(FinallyAValueBotError::LlmApi(format!(
+                "HTTP {status}: {body}"
+            )));
         }
     }
 
@@ -1111,7 +1128,9 @@ impl LlmProvider for GeminiProvider {
                     err.error.code, err.error.message
                 )));
             }
-            return Err(FinallyAValueBotError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(FinallyAValueBotError::LlmApi(format!(
+                "HTTP {status}: {text}"
+            )));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -1197,10 +1216,7 @@ fn process_gemini_stream_event(
 
     if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
         if let Some(candidate) = candidates.first() {
-            if let Some(reason) = candidate
-                .get("finishReason")
-                .and_then(|r| r.as_str())
-            {
+            if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
                 *stop_reason = Some(reason.to_string());
             }
 
@@ -1209,7 +1225,10 @@ fn process_gemini_stream_event(
                     for part in parts {
                         // Text parts (skip if thought == true)
                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+                            let is_thought = part
+                                .get("thought")
+                                .and_then(|t| t.as_bool())
+                                .unwrap_or(false);
                             if !is_thought {
                                 accumulated_text.push_str(text);
                                 if let Some(tx) = text_tx {
@@ -1220,8 +1239,7 @@ fn process_gemini_stream_event(
                         // Function call parts
                         if let Some(fc) = part.get("functionCall") {
                             if let (Some(name), Some(args)) =
-                                (fc.get("name").and_then(|n| n.as_str()),
-                                 fc.get("args"))
+                                (fc.get("name").and_then(|n| n.as_str()), fc.get("args"))
                             {
                                 let id = Uuid::new_v4().to_string();
                                 let thought_sig = part
@@ -1312,7 +1330,11 @@ fn translate_messages_to_gemini(messages: &[Message]) -> Vec<serde_json::Value> 
     let mut out: Vec<serde_json::Value> = Vec::new();
 
     for msg in messages {
-        let role = if msg.role == "assistant" { "model" } else { "user" };
+        let role = if msg.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
 
         match &msg.content {
             MessageContent::Text(text) => {
@@ -1399,7 +1421,10 @@ fn translate_messages_to_gemini(messages: &[Message]) -> Vec<serde_json::Value> 
     if !out.is_empty() {
         let first_role = out[0].get("role").and_then(|r| r.as_str());
         if first_role != Some("user") {
-            out.insert(0, json!({"role": "user", "parts": [{"text": GEMINI_MINIMAL_PARTS}]}));
+            out.insert(
+                0,
+                json!({"role": "user", "parts": [{"text": GEMINI_MINIMAL_PARTS}]}),
+            );
         }
     }
 
@@ -1407,8 +1432,11 @@ fn translate_messages_to_gemini(messages: &[Message]) -> Vec<serde_json::Value> 
 }
 
 fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBotError> {
-    let v: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| FinallyAValueBotError::LlmApi(format!("Failed to parse Gemini response: {e}\nBody: {body}")))?;
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        FinallyAValueBotError::LlmApi(format!(
+            "Failed to parse Gemini response: {e}\nBody: {body}"
+        ))
+    })?;
 
     let mut content = Vec::new();
     let mut stop_reason: Option<String> = None;
@@ -1416,10 +1444,7 @@ fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBo
 
     if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
         if let Some(candidate) = candidates.first() {
-            if let Some(reason) = candidate
-                .get("finishReason")
-                .and_then(|r| r.as_str())
-            {
+            if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
                 stop_reason = Some(reason.to_string());
             }
 
@@ -1432,8 +1457,10 @@ fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBo
                 for part in parts {
                     // Text parts (skip if thought == true)
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        let is_thought =
-                            part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+                        let is_thought = part
+                            .get("thought")
+                            .and_then(|t| t.as_bool())
+                            .unwrap_or(false);
                         if !is_thought && !text.is_empty() {
                             content.push(ResponseContentBlock::Text {
                                 text: text.to_string(),
@@ -1444,8 +1471,7 @@ fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBo
                     if let Some(fc) = part.get("functionCall") {
                         has_tool_calls = true;
                         if let (Some(name), Some(args)) =
-                            (fc.get("name").and_then(|n| n.as_str()),
-                             fc.get("args"))
+                            (fc.get("name").and_then(|n| n.as_str()), fc.get("args"))
                         {
                             let id = Uuid::new_v4().to_string();
                             let thought_sig = part
@@ -1698,15 +1724,14 @@ fn translate_messages_to_oai(system: &str, messages: &[Message]) -> Vec<serde_js
     // have no user content). When the first message is system, gateways typically put it in
     // system_instruction and use the next user message as the prompt — so we must not prepend
     // a fake "user: ." or the model will respond to "." and may return nothing for the real request.
-    let first_role = out.first().and_then(|m| m.get("role").and_then(|r| r.as_str()));
+    let first_role = out
+        .first()
+        .and_then(|m| m.get("role").and_then(|r| r.as_str()));
     if !out.is_empty()
         && first_role != Some("user")
         && (first_role == Some("assistant") || first_role == Some("tool"))
     {
-        out.insert(
-            0,
-            json!({"role": "user", "content": GEMINI_MINIMAL_PARTS}),
-        );
+        out.insert(0, json!({"role": "user", "content": GEMINI_MINIMAL_PARTS}));
     }
 
     out
@@ -2079,7 +2104,12 @@ mod tests {
         });
         let out = sanitize_oai_parameters(&schema);
         // When no valid required keys, we omit "required" or send empty.
-        assert!(out.get("required").map(|r| r.as_array().unwrap().len()).unwrap_or(0) == 0);
+        assert!(
+            out.get("required")
+                .map(|r| r.as_array().unwrap().len())
+                .unwrap_or(0)
+                == 0
+        );
         assert!(out.get("properties").is_some());
     }
 
@@ -2099,10 +2129,15 @@ mod tests {
         let props = out["properties"].as_object().unwrap();
         assert!(props.contains_key("tier"));
         assert!(props.contains_key("content"));
-        assert!(props["tier"].get("enum").is_none(), "enum should be stripped");
+        assert!(
+            props["tier"].get("enum").is_none(),
+            "enum should be stripped"
+        );
         let required = out["required"].as_array().unwrap();
         assert_eq!(required.len(), 2);
-        assert!(required.iter().all(|r| props.contains_key(r.as_str().unwrap())));
+        assert!(required
+            .iter()
+            .all(|r| props.contains_key(r.as_str().unwrap())));
     }
 
     // -----------------------------------------------------------------------

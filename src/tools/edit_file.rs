@@ -106,7 +106,8 @@ mod tests {
     use serde_json::json;
 
     fn setup_file(content: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_ef_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("finally_a_value_bot_ef_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("edit_me.txt");
         std::fs::write(&file, content).unwrap();
@@ -189,7 +190,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_file_resolves_relative_to_working_dir() {
-        let root = std::env::temp_dir().join(format!("finally_a_value_bot_ef2_{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("finally_a_value_bot_ef2_{}", uuid::Uuid::new_v4()));
         let work = root.join("workspace");
         let shared = work.join("shared");
         std::fs::create_dir_all(&shared).unwrap();

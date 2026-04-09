@@ -139,7 +139,8 @@ impl ToolAuthContext {
     /// True if the caller can access the given (chat_id, persona_id) for memory/tiered operations.
     pub fn can_access_chat_persona(&self, target_chat_id: i64, target_persona_id: i64) -> bool {
         self.is_control_chat()
-            || (self.caller_chat_id == target_chat_id && self.caller_persona_id == target_persona_id)
+            || (self.caller_chat_id == target_chat_id
+                && self.caller_persona_id == target_persona_id)
     }
 }
 
@@ -260,18 +261,18 @@ fn detect_vault_search_command(config: &Config) -> Option<String> {
         return None;
     }
 
-    let venv_python = workspace.join("shared").join(".venv-vault").join("bin").join("python");
+    let venv_python = workspace
+        .join("shared")
+        .join(".venv-vault")
+        .join("bin")
+        .join("python");
     let python = if venv_python.exists() {
         venv_python.to_string_lossy().to_string()
     } else {
         "python3".to_string()
     };
 
-    Some(format!(
-        "{} {} \"{{query}}\"",
-        python,
-        script.display()
-    ))
+    Some(format!("{} {} \"{{query}}\"", python, script.display()))
 }
 
 impl ToolRegistry {
@@ -303,10 +304,18 @@ impl ToolRegistry {
             Box::new(edit_file::EditFileTool::new(config.working_dir())),
             Box::new(glob::GlobTool::new(config.working_dir())),
             Box::new(grep::GrepTool::new(config.working_dir())),
-            Box::new(memory::ReadMemoryTool::new(&config.runtime_data_dir(), config.working_dir())),
-            Box::new(memory::WriteMemoryTool::new(&config.runtime_data_dir(), config.working_dir())),
+            Box::new(memory::ReadMemoryTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
+            Box::new(memory::WriteMemoryTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
             Box::new(web_fetch::WebFetchTool),
-            Box::new(web_search::WebSearchTool::new(config.web_search_searxng_url.clone())),
+            Box::new(web_search::WebSearchTool::new(
+                config.web_search_searxng_url.clone(),
+            )),
             Box::new(send_message::SendMessageTool::new_with_config(
                 bot,
                 db.clone(),
@@ -322,7 +331,10 @@ impl ToolRegistry {
             Box::new(schedule::ResumeTaskTool::new(db.clone())),
             Box::new(schedule::CancelTaskTool::new(db.clone())),
             Box::new(schedule::GetTaskHistoryTool::new(db.clone())),
-            Box::new(export_chat::ExportChatTool::new(db.clone(), &config.runtime_data_dir())),
+            Box::new(export_chat::ExportChatTool::new(
+                db.clone(),
+                &config.runtime_data_dir(),
+            )),
             Box::new(cursor_agent::CursorAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
             Box::new(cursor_agent::CursorAgentSendTool::new(config)),
@@ -332,10 +344,16 @@ impl ToolRegistry {
                 &shared_skills,
             ])),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
-            Box::new(tiered_memory::ReadTieredMemoryTool::new(&config.runtime_data_dir())),
-            Box::new(tiered_memory::WriteTieredMemoryTool::new(&config.runtime_data_dir())),
+            Box::new(tiered_memory::ReadTieredMemoryTool::new(
+                &config.runtime_data_dir(),
+            )),
+            Box::new(tiered_memory::WriteTieredMemoryTool::new(
+                &config.runtime_data_dir(),
+            )),
             Box::new(search_history::SearchHistoryTool::new(db.clone())),
-            Box::new(agent_history::ReadAgentHistoryTool::new(&config.runtime_data_dir())),
+            Box::new(agent_history::ReadAgentHistoryTool::new(
+                &config.runtime_data_dir(),
+            )),
         ];
 
         let mut tools: Vec<Box<dyn Tool>> = tools;
@@ -352,19 +370,12 @@ impl ToolRegistry {
             if use_native {
                 let embed_url = vault.embedding_server_url.as_ref().unwrap();
                 let db_url = vault.vector_db_url.as_ref().unwrap();
-                let collection = vault
-                    .vector_db_collection
-                    .as_deref()
-                    .unwrap_or("vault");
+                let collection = vault.vector_db_collection.as_deref().unwrap_or("vault");
                 tools.push(Box::new(search_vault::SearchVaultTool::new_native(
-                    embed_url,
-                    db_url,
-                    collection,
+                    embed_url, db_url, collection,
                 )));
                 tools.push(Box::new(vault_add::AddVaultItemTool::new(
-                    embed_url,
-                    db_url,
-                    collection,
+                    embed_url, db_url, collection,
                 )));
                 tracing::info!(
                     "search_vault and add_vault_item tools registered (native: collection={}, db={})",
@@ -393,15 +404,23 @@ impl ToolRegistry {
         let mut social_added = Vec::new();
         if let Some(ref social) = config.social {
             if social.is_platform_enabled("tiktok") {
-                tools.push(Box::new(social_feed::FetchTiktokFeedTool::new(config, db.clone())));
+                tools.push(Box::new(social_feed::FetchTiktokFeedTool::new(
+                    config,
+                    db.clone(),
+                )));
                 social_added.push("fetch_tiktok_feed");
             }
             if social.is_platform_enabled("instagram") {
-                tools.push(Box::new(social_feed::FetchInstagramFeedTool::new(config, db.clone())));
+                tools.push(Box::new(social_feed::FetchInstagramFeedTool::new(
+                    config,
+                    db.clone(),
+                )));
                 social_added.push("fetch_instagram_feed");
             }
             if social.is_platform_enabled("linkedin") {
-                tools.push(Box::new(social_feed::FetchLinkedinFeedTool::new(config, db)));
+                tools.push(Box::new(social_feed::FetchLinkedinFeedTool::new(
+                    config, db,
+                )));
                 social_added.push("fetch_linkedin_feed");
             }
         }
@@ -598,5 +617,4 @@ mod tests {
         assert_eq!(tool_risk("sync_skills"), ToolRisk::Medium);
         assert_eq!(tool_risk("read_file"), ToolRisk::Low);
     }
-
 }

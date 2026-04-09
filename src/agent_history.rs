@@ -76,10 +76,7 @@ impl AgentRunRecord {
             }
 
             if !iter.assistant_text_preview.is_empty() {
-                md.push_str(&format!(
-                    "Assistant: \"{}\"\n",
-                    iter.assistant_text_preview
-                ));
+                md.push_str(&format!("Assistant: \"{}\"\n", iter.assistant_text_preview));
             }
         }
 
@@ -124,11 +121,7 @@ fn rotate_old_files(dir: &PathBuf) {
     let mut entries: Vec<_> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map_or(false, |ext| ext == "md")
-            })
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
             .collect(),
         Err(_) => return,
     };

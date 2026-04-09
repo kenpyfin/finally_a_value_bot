@@ -105,9 +105,14 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                             } else {
                                 input_str
                             };
-                            out.push_str(&format!("Tool called: {} with {}\n", name, input_preview));
+                            out.push_str(&format!(
+                                "Tool called: {} with {}\n",
+                                name, input_preview
+                            ));
                         }
-                        ContentBlock::ToolResult { content, is_error, .. } => {
+                        ContentBlock::ToolResult {
+                            content, is_error, ..
+                        } => {
                             let status = if is_error.unwrap_or(false) {
                                 "ERROR"
                             } else {
@@ -146,7 +151,10 @@ fn has_repeated_stalled_failures(messages: &[Message]) -> bool {
     for msg in messages.iter().rev().take(8) {
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
-                if let ContentBlock::ToolResult { content, is_error, .. } = block {
+                if let ContentBlock::ToolResult {
+                    content, is_error, ..
+                } = block
+                {
                     let lower = content.to_ascii_lowercase();
                     if is_error.unwrap_or(false)
                         && (lower.contains("timed out")
@@ -173,7 +181,10 @@ fn has_repeated_no_progress_signatures(messages: &[Message]) -> bool {
     for msg in messages.iter().rev().take(10) {
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
-                if let ContentBlock::ToolResult { content, is_error, .. } = block {
+                if let ContentBlock::ToolResult {
+                    content, is_error, ..
+                } = block
+                {
                     let marker = if *is_error == Some(true) { "err" } else { "ok" };
                     let lowered = content.to_ascii_lowercase();
                     let bucket = if lowered.contains("no files found")
@@ -199,7 +210,10 @@ fn has_repeated_no_progress_signatures(messages: &[Message]) -> bool {
         return false;
     }
     let head = signatures[0].clone();
-    signatures.iter().take(3).all(|s| s == &head && s.contains("no_progress"))
+    signatures
+        .iter()
+        .take(3)
+        .all(|s| s == &head && s.contains("no_progress"))
 }
 
 /// Build the user message for PTE evaluation.
@@ -240,7 +254,8 @@ pub async fn evaluate_completion(
     if has_repeated_no_progress_signatures(messages) {
         return Ok(PteResult {
             action: PteAction::StopWithSummary,
-            reason: "Repeated no-progress tool outcomes detected; stop and return concise summary.".to_string(),
+            reason: "Repeated no-progress tool outcomes detected; stop and return concise summary."
+                .to_string(),
         });
     }
 

@@ -211,13 +211,18 @@ impl Tool for ScheduleTaskTool {
         };
         let timezone_input = input.get("timezone").and_then(|v| v.as_str());
         let configured_default_tz = self.default_timezone.trim();
-        let effective_tz = timezone_input
-            .or_else(|| if configured_default_tz.is_empty() { None } else { Some(configured_default_tz) });
-        let preflight = match preflight_schedule_request(schedule_type, schedule_value, effective_tz)
-        {
-            Ok(p) => p,
-            Err(e) => return ToolResult::error(e),
-        };
+        let effective_tz = timezone_input.or_else(|| {
+            if configured_default_tz.is_empty() {
+                None
+            } else {
+                Some(configured_default_tz)
+            }
+        });
+        let preflight =
+            match preflight_schedule_request(schedule_type, schedule_value, effective_tz) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::error(e),
+            };
 
         let prompt_owned = prompt.to_string();
         let schedule_type_owned = schedule_type.to_string();
@@ -311,7 +316,11 @@ impl Tool for ListTasksTool {
             return ToolResult::error(e);
         }
 
-        match call_blocking(self.db.clone(), |db| db.get_all_scheduled_tasks_for_display()).await {
+        match call_blocking(self.db.clone(), |db| {
+            db.get_all_scheduled_tasks_for_display()
+        })
+        .await
+        {
             Ok(tasks) => ToolResult::success(format_tasks_list_all(&tasks)),
             Err(e) => ToolResult::error(format!("Failed to list tasks: {e}")),
         }
@@ -604,7 +613,10 @@ mod tests {
     use serde_json::json;
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_sched_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_sched_{}",
+            uuid::Uuid::new_v4()
+        ));
         let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
         (db, dir)
     }

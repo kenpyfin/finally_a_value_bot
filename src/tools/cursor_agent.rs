@@ -128,7 +128,10 @@ impl CursorAgentTool {
                     let prompt_preview: String = if prompt.len() <= PROMPT_PREVIEW_LEN {
                         prompt.to_string()
                     } else {
-                        format!("{}...", &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)])
+                        format!(
+                            "{}...",
+                            &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)]
+                        )
                     };
                     let started_at = chrono::Utc::now().to_rfc3339();
                     let output_preview = format!(
@@ -167,8 +170,7 @@ impl CursorAgentTool {
                 .output
                 .unwrap_or_else(|| "Runner returned no output".into());
             if parsed.success == Some(false) {
-                ToolResult::error(output)
-                    .with_error_type("process_exit")
+                ToolResult::error(output).with_error_type("process_exit")
             } else {
                 ToolResult::success(output)
             }
@@ -191,10 +193,7 @@ impl CursorAgentTool {
             )
             .with_error_type("tmux_unavailable");
         }
-        let prefix = self
-            .config
-            .cursor_agent_tmux_session_prefix
-            .trim();
+        let prefix = self.config.cursor_agent_tmux_session_prefix.trim();
         let prefix = if prefix.is_empty() {
             "finally_a_value_bot-cursor"
         } else {
@@ -205,12 +204,23 @@ impl CursorAgentTool {
         let prompt_preview: String = if prompt.len() <= PROMPT_PREVIEW_LEN {
             prompt.to_string()
         } else {
-            format!("{}...", &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)])
+            format!(
+                "{}...",
+                &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)]
+            )
         };
         let cli_path = self.config.cursor_agent_cli_path.trim();
         let mut tmux_cmd = tokio::process::Command::new("tmux");
         tmux_cmd
-            .args(["new-session", "-d", "-s", &session_name, "-c", workdir_str, "--"])
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-c",
+                workdir_str,
+                "--",
+            ])
             .arg(cli_path)
             .arg("-p")
             .arg(prompt)
@@ -322,7 +332,8 @@ impl Tool for CursorAgentTool {
         let auth = auth_context_from_input(&input);
         let started_at = chrono::Utc::now().to_rfc3339();
         let workdir_str_storage;
-        let working_dir = super::resolve_tool_working_dir(PathBuf::from(self.config.working_dir()).as_path());
+        let working_dir =
+            super::resolve_tool_working_dir(PathBuf::from(self.config.working_dir()).as_path());
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
             return ToolResult::error(format!(
                 "Failed to create working directory {}: {e}",
@@ -338,18 +349,31 @@ impl Tool for CursorAgentTool {
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(self.config.cursor_agent_timeout_secs);
-        let model_override = input.get("model").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let model_override = input
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let model = model_override
             .unwrap_or_else(|| self.config.cursor_agent_model.as_str())
             .trim();
 
-        let detach = input.get("detach").and_then(|v| v.as_bool()).unwrap_or(false);
+        let detach = input
+            .get("detach")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // When runner URL is set (e.g. Docker), POST to host instead of running locally
         if let Some(ref runner_url) = self.config.cursor_agent_runner_url {
             let url = runner_url.trim().trim_end_matches('/').to_string() + "/spawn";
             return self
-                .execute_via_runner(&url, prompt, &workdir_str_storage, model, detach, auth.as_ref())
+                .execute_via_runner(
+                    &url,
+                    prompt,
+                    &workdir_str_storage,
+                    model,
+                    detach,
+                    auth.as_ref(),
+                )
                 .await;
         }
 
@@ -374,17 +398,17 @@ impl Tool for CursorAgentTool {
         cmd.arg("--output-format").arg("text");
         cmd.current_dir(&working_dir);
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
 
         let finished_at = chrono::Utc::now().to_rfc3339();
         let prompt_preview: String = if prompt.len() <= PROMPT_PREVIEW_LEN {
             prompt.to_string()
         } else {
-            format!("{}...", &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)])
+            format!(
+                "{}...",
+                &prompt[..prompt.floor_char_boundary(PROMPT_PREVIEW_LEN)]
+            )
         };
 
         let (success, exit_code, result_content) = match &result {
@@ -514,9 +538,10 @@ impl Tool for ListCursorAgentRunsTool {
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
         let auth = auth_context_from_input(&input);
-        let chat_id = input.get("chat_id").and_then(|v| v.as_i64()).or_else(|| {
-            auth.as_ref().map(|a| a.caller_chat_id)
-        });
+        let chat_id = input
+            .get("chat_id")
+            .and_then(|v| v.as_i64())
+            .or_else(|| auth.as_ref().map(|a| a.caller_chat_id));
         let limit = input
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -562,7 +587,11 @@ impl Tool for ListCursorAgentRunsTool {
                         .map(|c| format!(" exit_code={}", c))
                         .unwrap_or_default();
                     let preview = r.prompt_preview.chars().take(60).collect::<String>();
-                    let suffix = if r.prompt_preview.chars().count() > 60 { "..." } else { "" };
+                    let suffix = if r.prompt_preview.chars().count() > 60 {
+                        "..."
+                    } else {
+                        ""
+                    };
                     out.push_str(&format!(
                         "#{} {} {} {} | prompt: {}{}\n",
                         r.id, r.finished_at, status, code, preview, suffix
@@ -581,7 +610,10 @@ impl Tool for ListCursorAgentRunsTool {
                     }
                     if let Some(ref prev) = r.output_preview {
                         let first_line = prev.lines().next().unwrap_or("");
-                        out.push_str(&format!("  -> {}\n", &first_line[..first_line.len().min(80)]));
+                        out.push_str(&format!(
+                            "  -> {}\n",
+                            &first_line[..first_line.len().min(80)]
+                        ));
                     }
                 }
                 if let Some(err) = tmux_probe_error {
@@ -592,7 +624,7 @@ impl Tool for ListCursorAgentRunsTool {
                 }
                 ToolResult::success(out)
             }
-            Err(e) =>                 ToolResult::error(format!("Failed to list cursor-agent runs: {e}")),
+            Err(e) => ToolResult::error(format!("Failed to list cursor-agent runs: {e}")),
         }
     }
 }
@@ -638,16 +670,21 @@ impl Tool for CursorAgentSendTool {
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
-        let session = input.get("tmux_session").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let session = input
+            .get("tmux_session")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let keys = input.get("keys").and_then(|v| v.as_str()).unwrap_or("");
         if session.is_empty() {
             return ToolResult::error("Missing tmux_session".into());
         }
-        let prefix = self
-            .config
-            .cursor_agent_tmux_session_prefix
-            .trim();
-        let prefix = if prefix.is_empty() { "finally_a_value_bot-cursor" } else { prefix };
+        let prefix = self.config.cursor_agent_tmux_session_prefix.trim();
+        let prefix = if prefix.is_empty() {
+            "finally_a_value_bot-cursor"
+        } else {
+            prefix
+        };
         if !session.starts_with(prefix) {
             return ToolResult::error(format!(
                 "Session name must start with '{}' (got '{}'). Only cursor-agent sessions are allowed.",
@@ -722,7 +759,11 @@ impl Tool for BuildSkillTool {
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
-        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let name = input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let description = input
             .get("description")
             .and_then(|v| v.as_str())
@@ -772,9 +813,7 @@ Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{
 
         // Fallback: when cursor-agent is unavailable (Docker, runner down, etc.), create skill directly
         if result.is_error && is_cursor_agent_unavailable(&result.content) {
-            info!(
-                "build_skill: cursor-agent unavailable, falling back to direct file creation"
-            );
+            info!("build_skill: cursor-agent unavailable, falling back to direct file creation");
             return create_skill_via_write(&skills_dir, name, description, instructions).await;
         }
 
@@ -845,7 +884,11 @@ Put credentials in `{}/.env` if needed.
         return ToolResult::error(format!("Failed to write SKILL.md: {}", e));
     }
 
-    info!("build_skill fallback: created {} at {}", name, skill_md.display());
+    info!(
+        "build_skill fallback: created {} at {}",
+        name,
+        skill_md.display()
+    );
     ToolResult::success(format!(
         "Created skill '{}' at {}/SKILL.md (cursor-agent unavailable; used direct file creation). \
          Add credentials to {}/.env if needed.",

@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use crate::claude::ToolDefinition;
 
-use super::{auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult};
+use super::{
+    auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult,
+};
 
 pub struct ReadAgentHistoryTool {
     data_dir: String,
@@ -98,10 +100,7 @@ impl Tool for ReadAgentHistoryTool {
 
         if let Some(ref since) = since_filter {
             files.retain(|name| {
-                let stem = name
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let stem = name.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 let date_part: String = stem.chars().take(8).collect();
                 date_part >= *since
             });

@@ -25,8 +25,7 @@ impl MemoryManager {
         MemoryManager {
             data_dir: PathBuf::from(data_dir).join("groups"),
             working_dir: PathBuf::from(working_dir),
-            principles_path_override: principles_path_override
-                .filter(|p| !p.trim().is_empty()),
+            principles_path_override: principles_path_override.filter(|p| !p.trim().is_empty()),
         }
     }
 
@@ -103,7 +102,9 @@ impl MemoryManager {
     /// Returns empty string if neither file exists.
     pub fn read_daily_logs_today_yesterday(&self, chat_id: i64, persona_id: i64) -> String {
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let yesterday = (Utc::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let yesterday = (Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
         let mut out = String::new();
         if let Some(content) = self.read_daily_log(chat_id, persona_id, &yesterday) {
             if !content.trim().is_empty() {
@@ -120,7 +121,13 @@ impl MemoryManager {
 
     /// Append content to the daily log for the given date. Creates file and parent dir if needed.
     /// `date` must be "YYYY-MM-DD".
-    pub fn append_daily_log(&self, chat_id: i64, persona_id: i64, date: &str, content: &str) -> std::io::Result<()> {
+    pub fn append_daily_log(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        date: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
         let path = self.daily_log_path(chat_id, persona_id, date);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -183,7 +190,10 @@ mod tests {
     use super::*;
 
     fn test_memory_manager() -> (MemoryManager, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("finally_a_value_bot_mem_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_mem_test_{}",
+            uuid::Uuid::new_v4()
+        ));
         let dir_str = dir.to_str().unwrap();
         let mm = MemoryManager::new(dir_str, dir_str);
         (mm, dir)
@@ -197,7 +207,11 @@ mod tests {
     fn test_global_memory_path() {
         let (mm, dir) = test_memory_manager();
         let path = mm.global_memory_path();
-        assert!(path.ends_with("shared/AGENTS.md"), "path = {}", path.display());
+        assert!(
+            path.ends_with("shared/AGENTS.md"),
+            "path = {}",
+            path.display()
+        );
         cleanup(&dir);
     }
 
@@ -335,13 +349,14 @@ mod tests {
     #[test]
     fn test_daily_log_append_and_read() {
         let (mm, dir) = test_memory_manager();
-        mm.append_daily_log(100, 1, "2025-01-15", "Note from day one.\n").unwrap();
-        mm.append_daily_log(100, 1, "2025-01-15", "Second line.").unwrap();
+        mm.append_daily_log(100, 1, "2025-01-15", "Note from day one.\n")
+            .unwrap();
+        mm.append_daily_log(100, 1, "2025-01-15", "Second line.")
+            .unwrap();
         let content = mm.read_daily_log(100, 1, "2025-01-15").unwrap();
         assert!(content.contains("Note from day one."));
         assert!(content.contains("Second line."));
         assert!(mm.read_daily_log(100, 1, "2025-01-14").is_none());
         cleanup(&dir);
     }
-
 }

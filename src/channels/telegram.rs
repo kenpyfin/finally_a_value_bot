@@ -3,29 +3,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use regex::Regex;
 use serenity::http::Http as SerenityHttp;
 use teloxide::prelude::*;
 use teloxide::types::{
     BotCommand, CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
     ParseMode, ThreadId,
 };
-use regex::Regex;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 
-use crate::claude::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
+use crate::agent_history::{
+    truncate_preview, write_agent_history_run, AgentRunRecord, IterationRecord, ToolCallRecord,
+};
 use crate::chat_queue::ChatRunQueue;
+use crate::claude::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
 use crate::db::{call_blocking, Database, StoredMessage};
-use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
-use crate::skills::SkillManager;
-use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
 use crate::post_tool_evaluator::{evaluate_completion, PteAction};
-use crate::agent_history::{
-    AgentRunRecord, IterationRecord, ToolCallRecord, truncate_preview, write_agent_history_run,
-};
+use crate::skills::SkillManager;
+use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
+use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
 use crate::tools::{ToolAuthContext, ToolRegistry};
 
 /// Escape XML special characters in user-supplied content to prevent prompt injection.
@@ -167,9 +167,10 @@ pub async fn run_bot(
         tools.add_tool(Box::new(crate::tools::mcp::McpTool::new(server, tool_info)));
     }
 
-    let discord_http = config.discord_bot_token.as_ref().map(|token| {
-        Arc::new(SerenityHttp::new(token.as_str()))
-    });
+    let discord_http = config
+        .discord_bot_token
+        .as_ref()
+        .map(|token| Arc::new(SerenityHttp::new(token.as_str())));
 
     let state = Arc::new(AppState {
         config,
@@ -285,17 +286,23 @@ async fn build_persona_menu_payload(
     state: Arc<AppState>,
     canonical_chat_id: i64,
 ) -> Result<(String, InlineKeyboardMarkup), String> {
-    let _ = call_blocking(state.db.clone(), move |db| db.get_or_create_default_persona(canonical_chat_id))
-        .await
-        .map_err(|e| format!("ensure default persona: {e}"))?;
+    let _ = call_blocking(state.db.clone(), move |db| {
+        db.get_or_create_default_persona(canonical_chat_id)
+    })
+    .await
+    .map_err(|e| format!("ensure default persona: {e}"))?;
 
-    let personas = call_blocking(state.db.clone(), move |db| db.list_personas(canonical_chat_id))
-        .await
-        .map_err(|e| format!("list personas: {e}"))?;
-    let active_id = call_blocking(state.db.clone(), move |db| db.get_active_persona_id(canonical_chat_id))
-        .await
-        .map_err(|e| format!("get active persona: {e}"))?
-        .unwrap_or(0);
+    let personas = call_blocking(state.db.clone(), move |db| {
+        db.list_personas(canonical_chat_id)
+    })
+    .await
+    .map_err(|e| format!("list personas: {e}"))?;
+    let active_id = call_blocking(state.db.clone(), move |db| {
+        db.get_active_persona_id(canonical_chat_id)
+    })
+    .await
+    .map_err(|e| format!("get active persona: {e}"))?
+    .unwrap_or(0);
 
     if personas.is_empty() {
         return Ok((
@@ -352,12 +359,20 @@ async fn send_persona_menu(
             }
             if let Err(e) = req.await {
                 error!("Failed to send persona menu: {}", e);
-                let _ = send_response_plain(bot, chat_id, "Failed to show persona menu.", thread_id, None).await;
+                let _ = send_response_plain(
+                    bot,
+                    chat_id,
+                    "Failed to show persona menu.",
+                    thread_id,
+                    None,
+                )
+                .await;
             }
         }
         Err(e) => {
             error!("Failed to build persona menu: {}", e);
-            let _ = send_response_plain(bot, chat_id, &format!("Error: {e}"), thread_id, None).await;
+            let _ =
+                send_response_plain(bot, chat_id, &format!("Error: {e}"), thread_id, None).await;
         }
     }
 }
@@ -398,21 +413,24 @@ async fn handle_callback_query(
         }
     };
 
-    let canonical_chat_id = match resolve_canonical_chat_id_for_telegram(state.clone(), chat_id.0).await {
-        Ok(id) => id,
-        Err(e) => {
-            error!("Persona callback resolve chat failed: {}", e);
-            let _ = bot
-                .answer_callback_query(q.id)
-                .text("Could not resolve chat for persona switch.")
-                .await;
-            return Ok(());
-        }
-    };
+    let canonical_chat_id =
+        match resolve_canonical_chat_id_for_telegram(state.clone(), chat_id.0).await {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Persona callback resolve chat failed: {}", e);
+                let _ = bot
+                    .answer_callback_query(q.id)
+                    .text("Could not resolve chat for persona switch.")
+                    .await;
+                return Ok(());
+            }
+        };
 
-    let exists = call_blocking(state.db.clone(), move |db| db.persona_exists(canonical_chat_id, persona_id))
-        .await
-        .unwrap_or(false);
+    let exists = call_blocking(state.db.clone(), move |db| {
+        db.persona_exists(canonical_chat_id, persona_id)
+    })
+    .await
+    .unwrap_or(false);
     if !exists {
         let _ = bot
             .answer_callback_query(q.id)
@@ -422,9 +440,11 @@ async fn handle_callback_query(
         return Ok(());
     }
 
-    let switched = call_blocking(state.db.clone(), move |db| db.set_active_persona(canonical_chat_id, persona_id))
-        .await
-        .unwrap_or(false);
+    let switched = call_blocking(state.db.clone(), move |db| {
+        db.set_active_persona(canonical_chat_id, persona_id)
+    })
+    .await
+    .unwrap_or(false);
     if !switched {
         let _ = bot
             .answer_callback_query(q.id)
@@ -433,7 +453,10 @@ async fn handle_callback_query(
         return Ok(());
     }
 
-    let _ = bot.answer_callback_query(q.id).text("Persona switched.").await;
+    let _ = bot
+        .answer_callback_query(q.id)
+        .text("Persona switched.")
+        .await;
 
     match build_persona_menu_payload(state, canonical_chat_id).await {
         Ok((text, keyboard)) => {
@@ -443,7 +466,8 @@ async fn handle_callback_query(
                 .await
             {
                 warn!("Failed to update persona menu message: {}", e);
-                let _ = send_response_plain(&bot, chat_id, "Persona switched.", thread_id, None).await;
+                let _ =
+                    send_response_plain(&bot, chat_id, "Persona switched.", thread_id, None).await;
             }
         }
         Err(e) => {
@@ -479,15 +503,31 @@ async fn handle_message(
     // Single entry point: parse slash command first. If command, run backend handler and return — never send to LLM.
     let cmd = parse_slash_command(&text);
     if text.len() <= 80 {
-        let codepoints: Vec<String> = text.chars().take(12).map(|c| format!("U+{:04X}", c as u32)).collect();
-        info!("slash_parse len={} codepoints={:?} result={:?}", text.len(), codepoints, cmd);
+        let codepoints: Vec<String> = text
+            .chars()
+            .take(12)
+            .map(|c| format!("U+{:04X}", c as u32))
+            .collect();
+        info!(
+            "slash_parse len={} codepoints={:?} result={:?}",
+            text.len(),
+            codepoints,
+            cmd
+        );
     }
     if let Some(cmd) = cmd {
         match cmd {
             SlashCommand::Reset => {
-                let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
+                let pid = call_blocking(state.db.clone(), move |db| {
+                    db.get_current_persona_id(canonical_chat_id)
+                })
+                .await
+                .unwrap_or(0);
                 if pid > 0 {
-                    let _ = call_blocking(state.db.clone(), move |db| db.delete_session(canonical_chat_id, pid)).await;
+                    let _ = call_blocking(state.db.clone(), move |db| {
+                        db.delete_session(canonical_chat_id, pid)
+                    })
+                    .await;
                 }
                 let mut req = bot.send_message(
                     msg.chat.id,
@@ -506,9 +546,22 @@ async fn handle_message(
                 let parts: Vec<&str> = text.split_whitespace().collect();
                 let sub = parts.get(1).map(|s| *s).unwrap_or("");
                 if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
-                    send_persona_menu(&bot, state.clone(), msg.chat.id, canonical_chat_id, msg.thread_id).await;
+                    send_persona_menu(
+                        &bot,
+                        state.clone(),
+                        msg.chat.id,
+                        canonical_chat_id,
+                        msg.thread_id,
+                    )
+                    .await;
                 } else {
-                    let resp = crate::persona::handle_persona_command(state.db.clone(), canonical_chat_id, text.trim(), Some(&state.config)).await;
+                    let resp = crate::persona::handle_persona_command(
+                        state.db.clone(),
+                        canonical_chat_id,
+                        text.trim(),
+                        Some(&state.config),
+                    )
+                    .await;
                     send_response(&bot, msg.chat.id, &resp, msg.thread_id, None).await;
                 }
             }
@@ -518,13 +571,23 @@ async fn handle_message(
                     Ok(t) => crate::tools::schedule::format_tasks_list_persona(t),
                     Err(e) => format!("Error listing tasks: {e}"),
                 };
-                info!("schedule_cmd: {} tasks, sending response (len={})", tasks.as_ref().map(|v| v.len()).unwrap_or(0), text.len());
-                if let Err(e) = send_response_plain(&bot, msg.chat.id, &text, msg.thread_id, None).await {
+                info!(
+                    "schedule_cmd: {} tasks, sending response (len={})",
+                    tasks.as_ref().map(|v| v.len()).unwrap_or(0),
+                    text.len()
+                );
+                if let Err(e) =
+                    send_response_plain(&bot, msg.chat.id, &text, msg.thread_id, None).await
+                {
                     error!("schedule_cmd: failed to send response: {e}");
                 }
             }
             SlashCommand::Archive => {
-                let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
+                let pid = call_blocking(state.db.clone(), move |db| {
+                    db.get_current_persona_id(canonical_chat_id)
+                })
+                .await
+                .unwrap_or(0);
                 let send_archive_msg = |text: &str| {
                     let mut req = bot.send_message(msg.chat.id, text);
                     if let Some(tid) = msg.thread_id {
@@ -546,8 +609,13 @@ async fn handle_message(
                     if messages.is_empty() {
                         let _ = send_archive_msg("No conversation to archive.").await;
                     } else {
-                        archive_conversation(&state.config.runtime_data_dir(), canonical_chat_id, &messages);
-                        let _ = send_archive_msg(&format!("Archived {} messages.", messages.len())).await;
+                        archive_conversation(
+                            &state.config.runtime_data_dir(),
+                            canonical_chat_id,
+                            &messages,
+                        );
+                        let _ = send_archive_msg(&format!("Archived {} messages.", messages.len()))
+                            .await;
                     }
                 }
             }
@@ -710,17 +778,10 @@ async fn handle_message(
         if let Some(venue) = msg.venue() {
             text = format!(
                 "[location] Title: {}, Address: {}, lat: {}, lon: {}",
-                venue.title,
-                venue.address,
-                venue.location.latitude,
-                venue.location.longitude
+                venue.title, venue.address, venue.location.latitude, venue.location.longitude
             );
         } else if let Some(loc) = msg.location() {
-            text = format!(
-                "[location] lat: {}, lon: {}",
-                loc.latitude,
-                loc.longitude
-            );
+            text = format!("[location] lat: {}, lon: {}", loc.latitude, loc.longitude);
         }
     }
 
@@ -753,7 +814,11 @@ async fn handle_message(
     let chat_title = msg.chat.title().map(|t| t.to_string());
 
     // Resolve persona for this contact
-    let persona_id = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(canonical_chat_id)).await.unwrap_or(0);
+    let persona_id = call_blocking(state.db.clone(), move |db| {
+        db.get_current_persona_id(canonical_chat_id)
+    })
+    .await
+    .unwrap_or(0);
     if persona_id == 0 {
         return Ok(());
     }
@@ -767,7 +832,11 @@ async fn handle_message(
         let chat_title_owned = chat_title.clone();
         let chat_type_owned = db_chat_type.to_string();
         let _ = call_blocking(state.db.clone(), move |db| {
-            db.upsert_chat(canonical_chat_id, chat_title_owned.as_deref(), &chat_type_owned)
+            db.upsert_chat(
+                canonical_chat_id,
+                chat_title_owned.as_deref(),
+                &chat_type_owned,
+            )
         })
         .await;
         let stored_content = if image_data.is_some() {
@@ -805,7 +874,11 @@ async fn handle_message(
     let chat_title_owned = chat_title.clone();
     let chat_type_owned = db_chat_type.to_string();
     let _ = call_blocking(state.db.clone(), move |db| {
-        db.upsert_chat(canonical_chat_id, chat_title_owned.as_deref(), &chat_type_owned)
+        db.upsert_chat(
+            canonical_chat_id,
+            chat_title_owned.as_deref(),
+            &chat_type_owned,
+        )
     })
     .await;
 
@@ -1110,7 +1183,11 @@ pub async fn process_with_agent_with_events(
     let workspace_path = workspace_dir.to_string_lossy();
     let agents_md_path = state.memory.groups_root_memory_path_display();
     // Use absolute skills path so the bot writes to the real skills dir; file tools resolve relative paths from workspace_dir/shared.
-    let skills_dir_for_prompt = state.config.skills_data_dir_absolute().to_string_lossy().to_string();
+    let skills_dir_for_prompt = state
+        .config
+        .skills_data_dir_absolute()
+        .to_string_lossy()
+        .to_string();
     // Build vault paths section when vault config is set (injected into system prompt).
     let vault_paths_section = state.config.vault.as_ref().and_then(|v| {
         let root = state.config.workspace_root_absolute().to_string_lossy().to_string();
@@ -1215,7 +1292,10 @@ pub async fn process_with_agent_with_events(
             .unwrap_or_else(|_| "(unknown)".into()),
     };
     let tz: chrono_tz::Tz = state.config.timezone.parse().unwrap_or(chrono_tz::Tz::UTC);
-    let current_time_in_tz = chrono::Utc::now().with_timezone(&tz).format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    let current_time_in_tz = chrono::Utc::now()
+        .with_timezone(&tz)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string();
     let mut system_prompt = build_system_prompt(
         &state.config.bot_username,
         &principles_content,
@@ -1498,7 +1578,8 @@ pub async fn process_with_agent_with_events(
                     tool_names.push(tc.name.clone());
                 }
             }
-            let steps_json = serde_json::to_string(&tool_names).unwrap_or_else(|_| "[]".to_string());
+            let steps_json =
+                serde_json::to_string(&tool_names).unwrap_or_else(|_| "[]".to_string());
             let success = matches!(
                 stop_reason_owned.as_str(),
                 "end_turn" | "pte_complete" | "unknown_stop_reason"
@@ -1515,7 +1596,10 @@ pub async fn process_with_agent_with_events(
                             Some(&format!(r#"{{"stop_reason":"{}"}}"#, stop_reason_owned)),
                         )?;
                         if let Some(pid) = project_id_for_db {
-                            db.touch_project_status(pid, if success { "active" } else { "needs_attention" })?;
+                            db.touch_project_status(
+                                pid,
+                                if success { "active" } else { "needs_attention" },
+                            )?;
                         }
                         if let Some(wid) = selected_workflow_id {
                             db.log_workflow_execution(
@@ -1622,7 +1706,10 @@ pub async fn process_with_agent_with_events(
             .join("");
 
         let assistant_text_preview = if assistant_text.len() > 10000 {
-            format!("{}...", &assistant_text[..assistant_text.floor_char_boundary(10000)])
+            format!(
+                "{}...",
+                &assistant_text[..assistant_text.floor_char_boundary(10000)]
+            )
         } else {
             assistant_text.clone()
         };
@@ -1749,7 +1836,8 @@ pub async fn process_with_agent_with_events(
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse {
                     id, name, input, ..
-                } = block {
+                } = block
+                {
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolStart {
                             tool_use_id: id.clone(),
@@ -1795,8 +1883,8 @@ pub async fn process_with_agent_with_events(
                         && requested_skill_name
                             .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_SCHEDULING_SKILL))
                             .unwrap_or(false);
-                    let missing_schedule_skill = name == "schedule_task"
-                        && !schedule_skill_activated_this_turn;
+                    let missing_schedule_skill =
+                        name == "schedule_task" && !schedule_skill_activated_this_turn;
 
                     // TSA: allow or deny before execution
                     let tsa_deny = if state.config.tool_skill_agent_enabled {
@@ -1829,7 +1917,10 @@ pub async fn process_with_agent_with_events(
                                     tsa_start.elapsed().as_millis(),
                                     tsa_result.reason
                                 );
-                                Some(crate::tools::ToolResult::error(msg).with_error_type("tsa_deny"))
+                                Some(
+                                    crate::tools::ToolResult::error(msg)
+                                        .with_error_type("tsa_deny"),
+                                )
                             }
                             Ok(tsa_result) => {
                                 info!(
@@ -1868,35 +1959,38 @@ pub async fn process_with_agent_with_events(
                     } else {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
-                            state.tools.execute_with_auth(name, input.clone(), &tool_auth),
+                            state
+                                .tools
+                                .execute_with_auth(name, input.clone(), &tool_auth),
                         )
                         .await
                         {
                             Ok(tool_result) => tool_result,
                             Err(_) => {
-                            info!(
-                                "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
-                                iteration + 1,
-                                state.config.max_tool_iterations,
-                                name,
-                                TOOL_EXECUTION_TIMEOUT_SECS
-                            );
-                            iteration_timed_out = true;
-                            let error_content = format!(
+                                info!(
+                                    "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    name,
+                                    TOOL_EXECUTION_TIMEOUT_SECS
+                                );
+                                iteration_timed_out = true;
+                                let error_content = format!(
                                 "Tool execution timed out after {}s. The tool took too long to complete. This may indicate a network issue or the service is slow. Please try again later or break the request into smaller steps.",
                                 TOOL_EXECUTION_TIMEOUT_SECS
                             );
-                            let error_bytes = error_content.len();
-                            crate::tools::ToolResult {
-                                content: error_content,
-                                is_error: true,
-                                duration_ms: Some(started.elapsed().as_millis()),
-                                status_code: Some(1),
-                                bytes: error_bytes,
-                                error_type: Some("timeout".into()),
+                                let error_bytes = error_content.len();
+                                crate::tools::ToolResult {
+                                    content: error_content,
+                                    is_error: true,
+                                    duration_ms: Some(started.elapsed().as_millis()),
+                                    status_code: Some(1),
+                                    bytes: error_bytes,
+                                    error_type: Some("timeout".into()),
+                                }
                             }
                         }
-                    } };
+                    };
                     if activates_required_schedule_skill && !result.is_error {
                         schedule_skill_activated_this_turn = true;
                         info!(
@@ -2106,7 +2200,9 @@ pub async fn process_with_agent_with_events(
                         let synth_start = std::time::Instant::now();
                         let final_response = match tokio::time::timeout(
                             std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                            state.llm.send_message(&system_prompt, messages.clone(), None),
+                            state
+                                .llm
+                                .send_message(&system_prompt, messages.clone(), None),
                         )
                         .await
                         {
@@ -2265,7 +2361,10 @@ pub async fn process_with_agent_with_events(
                         state.config.max_tool_iterations
                     );
                     save_run_history!("background_handoff");
-                    return Ok(format!("{}{}", BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview));
+                    return Ok(format!(
+                        "{}{}",
+                        BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview
+                    ));
                 }
 
                 info!(
@@ -2368,7 +2467,9 @@ pub async fn process_with_agent_with_events(
             "(no response)".into()
         } else {
             if let Some(tx) = event_tx {
-                let _ = tx.send(AgentEvent::FinalResponse { text: assistant_text.clone() });
+                let _ = tx.send(AgentEvent::FinalResponse {
+                    text: assistant_text.clone(),
+                });
             }
             assistant_text
         });
@@ -2414,7 +2515,8 @@ fn ensure_persona_memory_file_exists(state: &AppState, chat_id: i64, persona_id:
     if path.exists() {
         return;
     }
-    let template = "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
+    let template =
+        "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warn!(
@@ -2561,13 +2663,34 @@ fn classify_user_intent(text: &str, has_image_input: bool) -> UserIntent {
         return UserIntent::Conversational;
     }
     let task_keywords = [
-        "search", "find", "create", "write", "edit", "schedule", "browse", "fetch", "run",
-        "execute", "build", "deploy", "fix", "update", "implement",
+        "search",
+        "find",
+        "create",
+        "write",
+        "edit",
+        "schedule",
+        "browse",
+        "fetch",
+        "run",
+        "execute",
+        "build",
+        "deploy",
+        "fix",
+        "update",
+        "implement",
     ];
-    if task_keywords.iter().any(|k| lower.contains(k)) || lower.contains("http://") || lower.contains("https://") {
+    if task_keywords.iter().any(|k| lower.contains(k))
+        || lower.contains("http://")
+        || lower.contains("https://")
+    {
         return UserIntent::Task;
     }
-    if lower.ends_with('?') || lower.starts_with("what ") || lower.starts_with("how ") || lower.starts_with("why ") || lower.starts_with("when ") {
+    if lower.ends_with('?')
+        || lower.starts_with("what ")
+        || lower.starts_with("how ")
+        || lower.starts_with("why ")
+        || lower.starts_with("when ")
+    {
         return UserIntent::Question;
     }
     UserIntent::Task
@@ -2595,7 +2718,11 @@ fn estimate_message_tokens(message: &Message) -> usize {
                 chars += match b {
                     ContentBlock::Text { text } => text.chars().count(),
                     ContentBlock::ToolUse { name, input, .. } => {
-                        name.chars().count() + serde_json::to_string(input).unwrap_or_default().chars().count()
+                        name.chars().count()
+                            + serde_json::to_string(input)
+                                .unwrap_or_default()
+                                .chars()
+                                .count()
                     }
                     ContentBlock::ToolResult { content, .. } => content.chars().count(),
                     ContentBlock::Image { .. } => 40,
@@ -2617,7 +2744,10 @@ fn trim_to_token_budget(
     for d in tool_defs {
         total += (d.name.chars().count()
             + d.description.chars().count()
-            + serde_json::to_string(&d.input_schema).unwrap_or_default().chars().count())
+            + serde_json::to_string(&d.input_schema)
+                .unwrap_or_default()
+                .chars()
+                .count())
             / 4
             + 6;
     }
@@ -2685,7 +2815,12 @@ fn has_new_swap_evidence(result: &str) -> bool {
         || lower.contains("found matching")
 }
 
-fn mark_swap_task_stalled_best_effort(state: &AppState, chat_id: i64, persona_id: i64, evidence: &str) {
+fn mark_swap_task_stalled_best_effort(
+    state: &AppState,
+    chat_id: i64,
+    persona_id: i64,
+    evidence: &str,
+) {
     let path = state.memory.persona_memory_path(chat_id, persona_id);
     let Ok(content) = std::fs::read_to_string(&path) else {
         return;
@@ -2719,7 +2854,12 @@ fn mark_swap_task_stalled_best_effort(state: &AppState, chat_id: i64, persona_id
     lines.push(new_line);
     tier2_block = format!("\n{}\n", lines.join("\n"));
 
-    let new_doc = format!("{}{}{}", &content[..t2_content_start], tier2_block, &content[t2_end..]);
+    let new_doc = format!(
+        "{}{}{}",
+        &content[..t2_content_start],
+        tier2_block,
+        &content[t2_end..]
+    );
     let _ = std::fs::write(path, new_doc);
 }
 
@@ -3052,7 +3192,7 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
         result.push_str(&rest[..open]);
         let after_open = open + 3;
         rest = &rest[after_open..];
-        
+
         // Skip optional language line
         let mut content_start = rest;
         if rest.starts_with('\n') {
@@ -3101,14 +3241,14 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
     // 3) Apply formatting to the "safe" text (bold, italic)
     // We use a simple stack-based parser to ensure tags are nested correctly.
     // e.g. **bold *italic*** -> <b>bold <i>italic</i></b>
-    
+
     let mut result = String::with_capacity(s.len());
     let mut stack: Vec<&'static str> = Vec::new();
     let mut byte_idx = 0;
 
     while byte_idx < s.len() {
         let remaining = &s[byte_idx..];
-        
+
         // Bold: ** or __
         if remaining.starts_with("**") || remaining.starts_with("__") {
             let tag = "b";
@@ -3116,7 +3256,9 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
                 // Close tags until we reach our tag
                 while let Some(top) = stack.pop() {
                     result.push_str(&format!("</{}>", top));
-                    if top == tag { break; }
+                    if top == tag {
+                        break;
+                    }
                 }
             } else {
                 result.push_str("<b>");
@@ -3131,15 +3273,16 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
                 // Close tags until we reach our tag
                 while let Some(top) = stack.pop() {
                     result.push_str(&format!("</{}>", top));
-                    if top == tag { break; }
+                    if top == tag {
+                        break;
+                    }
                 }
             } else {
                 result.push_str("<i>");
                 stack.push(tag);
             }
             byte_idx += 1;
-        }
-        else {
+        } else {
             let c = remaining.chars().next().unwrap();
             result.push(c);
             byte_idx += c.len_utf8();
@@ -3353,8 +3496,7 @@ fn backtick_abs_image_regex() -> &'static Regex {
 fn is_telegram_sendable_image_file(path: &Path) -> bool {
     path.is_file()
         && matches!(
-            path
-                .extension()
+            path.extension()
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_ascii_lowercase())
                 .as_deref(),
@@ -3638,8 +3780,7 @@ pub async fn send_response(
     thread_id: Option<ThreadId>,
     workspace_auto_images: Option<&Path>,
 ) {
-    if let Err(e) =
-        send_response_result(bot, chat_id, text, thread_id, workspace_auto_images).await
+    if let Err(e) = send_response_result(bot, chat_id, text, thread_id, workspace_auto_images).await
     {
         error!(
             "Telegram send failed after HTML/plain handling inside send_response_result: {}",
@@ -3695,7 +3836,11 @@ If there is nothing meaningful to store, reply exactly: No memory update needed.
     for _ in 0..MEMORY_MAINTENANCE_MAX_ITERATIONS {
         let response = match state
             .llm
-            .send_message(system_prompt, maintenance_messages.clone(), Some(tool_defs.clone()))
+            .send_message(
+                system_prompt,
+                maintenance_messages.clone(),
+                Some(tool_defs.clone()),
+            )
             .await
         {
             Ok(r) => r,
@@ -3773,13 +3918,12 @@ fn message_to_text(msg: &Message) -> String {
             .iter()
             .map(|block| match block {
                 ContentBlock::Text { text } => text.clone(),
-                ContentBlock::ToolUse { name, input, .. } => format!("[tool_use: {name}({})]", input),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[tool_use: {name}({})]", input)
+                }
                 ContentBlock::ToolResult { content, .. } => {
                     if content.len() > 200 {
-                        format!(
-                            "{}...",
-                            &content[..content.floor_char_boundary(200)]
-                        )
+                        format!("{}...", &content[..content.floor_char_boundary(200)])
                     } else {
                         content.clone()
                     }
@@ -3819,7 +3963,11 @@ pub fn archive_conversation(data_dir: &str, chat_id: i64, messages: &[Message]) 
     let path = dir.join(format!("{now}.md"));
     let mut content = String::new();
     for msg in messages {
-        content.push_str(&format!("## {}\n\n{}\n\n---\n\n", msg.role, message_to_text(msg)));
+        content.push_str(&format!(
+            "## {}\n\n{}\n\n---\n\n",
+            msg.role,
+            message_to_text(msg)
+        ));
     }
     if let Err(e) = std::fs::write(&path, &content) {
         tracing::warn!("Failed to archive conversation to {}: {e}", path.display());
@@ -3834,10 +3982,7 @@ mod tests {
     #[test]
     fn test_markdown_to_telegram_html() {
         // Plain text unchanged except HTML escape
-        assert_eq!(
-            markdown_to_telegram_html("hello"),
-            "hello"
-        );
+        assert_eq!(markdown_to_telegram_html("hello"), "hello");
         assert_eq!(
             markdown_to_telegram_html("a < b & c > d"),
             "a &lt; b &amp; c &gt; d"
@@ -3861,10 +4006,7 @@ mod tests {
             "No <pre>\n**bold**\n</pre> here"
         );
         // Emoji regression (multi-byte characters before formatting)
-        assert_eq!(
-            markdown_to_telegram_html("🔥 **bold**"),
-            "🔥 <b>bold</b>"
-        );
+        assert_eq!(markdown_to_telegram_html("🔥 **bold**"), "🔥 <b>bold</b>");
         // Fenced code block
         let input = "text\n```rust\nfn main() {}\n```\nmore";
         let out = markdown_to_telegram_html(input);
@@ -3908,7 +4050,10 @@ mod tests {
         // Unclosed code
         assert_eq!(balance_markdown("text `code"), "text `code` ");
         // Unclosed triple backticks
-        assert_eq!(balance_markdown("text ```rust\ncode"), "text ```rust\ncode\n```\n");
+        assert_eq!(
+            balance_markdown("text ```rust\ncode"),
+            "text ```rust\ncode\n```\n"
+        );
         // Mixed
         assert_eq!(balance_markdown("**bold *italic"), "**bold *italic***");
     }
@@ -4011,7 +4156,21 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_basic() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 12345, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            12345,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("testbot"));
         assert!(prompt.contains("12345"));
         assert!(prompt.contains("bash commands"));
@@ -4022,7 +4181,21 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_memory() {
         let principles = "User likes Rust";
-        let prompt = build_system_prompt("testbot", principles, "finally_a_value_bot.data/AGENTS.md", "", 42, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            principles,
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("finally_a_value_bot.data/AGENTS.md"));
         assert!(prompt.contains("User likes Rust"));
@@ -4031,7 +4204,21 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_skills() {
         let catalog = "<available_skills>\n- pdf: Convert to PDF\n</available_skills>";
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 42, 1, catalog, "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            catalog,
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("# Agent Skills"));
         assert!(prompt.contains("activate_skill"));
         assert!(prompt.contains("pdf: Convert to PDF"));
@@ -4039,13 +4226,41 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_without_skills() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 42, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(!prompt.contains("# Agent Skills"));
     }
 
     #[test]
     fn test_build_system_prompt_includes_workspace_path() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 42, 1, "", "/home/user/tmp/shared", "/home/user/finally_a_value_bot.data/skills", None, "UTC", "/home/user/tmp", "/home/user — bot loads `/home/user/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            "",
+            "/home/user/tmp/shared",
+            "/home/user/finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "/home/user/tmp",
+            "/home/user — bot loads `/home/user/.env`",
+        );
         assert!(prompt.contains("Your workspace path is: /home/user/tmp/shared"));
     }
 
@@ -4094,7 +4309,21 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_includes_persona_id_and_tiered_memory() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 42, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("persona_id is 1"));
         assert!(prompt.contains("read_tiered_memory"));
         assert!(prompt.contains("write_tiered_memory"));
@@ -4321,8 +4550,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn test_sanitize_xml() {
         assert_eq!(sanitize_xml("hello"), "hello");
@@ -4354,7 +4581,21 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_xml_security() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 12345, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            12345,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("user_message"));
         assert!(prompt.contains("untrusted"));
     }
@@ -4548,7 +4789,21 @@ mod tests {
     fn test_build_system_prompt_with_memory_and_skills() {
         let principles = "Test";
         let skills = "- translate: Translate text";
-        let prompt = build_system_prompt("bot", principles, "finally_a_value_bot.data/AGENTS.md", "", 42, 1, skills, "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "bot",
+            principles,
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            skills,
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("Test"));
         assert!(prompt.contains("# Agent Skills"));
@@ -4557,27 +4812,83 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_tiered_memory() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 12345, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            12345,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("read_tiered_memory"));
         assert!(prompt.contains("write_tiered_memory"));
     }
 
     #[test]
     fn test_build_system_prompt_mentions_export() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 12345, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            12345,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("export_chat"));
     }
 
     #[test]
     fn test_build_system_prompt_mentions_schedule() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 12345, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "UTC", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            12345,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("schedule_task"));
         assert!(prompt.contains("6-field cron"));
     }
 
     #[test]
     fn test_build_system_prompt_includes_timezone() {
-        let prompt = build_system_prompt("testbot", "", "finally_a_value_bot.data/AGENTS.md", "", 42, 1, "", "./tmp/shared", "./finally_a_value_bot.data/skills", None, "US/Eastern", "./tmp/workspace", "./tmp — bot loads `./tmp/.env`");
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "US/Eastern",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+        );
         assert!(prompt.contains("Time and timezone"));
         assert!(prompt.contains("US/Eastern"));
     }

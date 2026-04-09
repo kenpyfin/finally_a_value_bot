@@ -38,9 +38,10 @@ pub enum HeartbeatSignal {
 
 pub fn signal_from_agent_event(evt: &AgentEvent) -> Option<HeartbeatSignal> {
     match evt {
-        AgentEvent::Iteration { iteration } => {
-            Some(HeartbeatSignal::Progress(format!("iteration {}", iteration)))
-        }
+        AgentEvent::Iteration { iteration } => Some(HeartbeatSignal::Progress(format!(
+            "iteration {}",
+            iteration
+        ))),
         AgentEvent::WorkflowSelected {
             workflow_id,
             confidence,
@@ -81,13 +82,29 @@ pub fn spawn_shared_heartbeat(
             let stage = stage.clone();
             let message = message.clone();
             let job_type = job_type.as_str().to_string();
-            move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, true)
+            move |db| {
+                db.upsert_job_heartbeat(
+                    &run_key, chat_id, persona_id, &job_type, &stage, &message, true,
+                )
+            }
         })
         .await;
         let _ = call_blocking(state.db.clone(), {
             let run_key = run_key.clone();
-            let payload = format!(r#"{{"stage":"{}","message":"{}"}}"#, stage, message.replace('"', "'"));
-            move |db| db.append_run_timeline_event(&run_key, chat_id, persona_id, "heartbeat", Some(&payload))
+            let payload = format!(
+                r#"{{"stage":"{}","message":"{}"}}"#,
+                stage,
+                message.replace('"', "'")
+            );
+            move |db| {
+                db.append_run_timeline_event(
+                    &run_key,
+                    chat_id,
+                    persona_id,
+                    "heartbeat",
+                    Some(&payload),
+                )
+            }
         })
         .await;
 

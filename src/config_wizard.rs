@@ -362,11 +362,20 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Fina
     lines.push("# FinallyAValueBot configuration".into());
     lines.push("".into());
     lines.push("# Telegram".into());
-    lines.push(format!("TELEGRAM_BOT_TOKEN={}", escape_env_val(&config.telegram_bot_token)));
-    lines.push(format!("BOT_USERNAME={}", escape_env_val(&config.bot_username)));
+    lines.push(format!(
+        "TELEGRAM_BOT_TOKEN={}",
+        escape_env_val(&config.telegram_bot_token)
+    ));
+    lines.push(format!(
+        "BOT_USERNAME={}",
+        escape_env_val(&config.bot_username)
+    ));
     lines.push("".into());
     lines.push("# LLM".into());
-    lines.push(format!("LLM_PROVIDER={}", escape_env_val(&config.llm_provider)));
+    lines.push(format!(
+        "LLM_PROVIDER={}",
+        escape_env_val(&config.llm_provider)
+    ));
     lines.push(format!("LLM_API_KEY={}", escape_env_val(&config.api_key)));
     if !config.model.is_empty() {
         lines.push(format!("LLM_MODEL={}", escape_env_val(&config.model)));
@@ -378,7 +387,10 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Fina
     }
     lines.push("".into());
     lines.push("# Workspace".into());
-    lines.push(format!("WORKSPACE_DIR={}", escape_env_val(&config.workspace_dir)));
+    lines.push(format!(
+        "WORKSPACE_DIR={}",
+        escape_env_val(&config.workspace_dir)
+    ));
     lines.push(format!("TIMEZONE={}", escape_env_val(&config.timezone)));
     if let Some(ref v) = config.vault {
         lines.push("".into());
@@ -576,7 +588,11 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
         None => return Ok(false),
     };
 
-    let workspace_dir = match prompt_line("Workspace directory (root for runtime, skills, shared)", Some(&existing.workspace_dir), false)? {
+    let workspace_dir = match prompt_line(
+        "Workspace directory (root for runtime, skills, shared)",
+        Some(&existing.workspace_dir),
+        false,
+    )? {
         Some(v) => {
             if v.trim().is_empty() {
                 "./workspace".to_string()
