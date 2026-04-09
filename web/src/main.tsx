@@ -2,12 +2,18 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   AssistantRuntimeProvider,
+  CompositeAttachmentAdapter,
   MessagePrimitive,
+  SimpleImageAttachmentAdapter,
+  SimpleTextAttachmentAdapter,
   useMessage,
   useLocalRuntime,
+  type AttachmentAdapter,
   type ChatModelAdapter,
   type ChatModelRunOptions,
   type ChatModelRunResult,
+  type CompleteAttachment,
+  type PendingAttachment,
   type ThreadMessageLike,
   type ToolCallMessagePartProps,
 } from '@assistant-ui/react'
@@ -36,7 +42,7 @@ import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
-import type { Persona, ScheduleTask, ChannelBinding, BackgroundJob } from './types'
+import type { Persona, ScheduleTask, ChannelBinding } from './types'
 
 type BackendMessage = {
   id?: string
@@ -44,6 +50,16 @@ type BackendMessage = {
   content?: string
   is_from_bot?: boolean
   timestamp?: string
+}
+
+type QueueLane = {
+  chat_id: number
+  pending: number
+  active_for_ms: number
+  oldest_wait_ms: number
+  last_error?: string | null
+  project_id?: number | null
+  workflow_id?: number | null
 }
 
 type Appearance = 'dark' | 'light'
@@ -105,6 +121,7 @@ function saveUiTheme(value: UiTheme): void {
 }
 
 const PERSONA_STORAGE_KEY = 'finally-a-value-bot_selected_persona_id'
+const PERSONA_LAST_READ_STORAGE_KEY = 'finally-a-value-bot_persona_last_read_v1'
 
 function readStoredPersonaId(): number | null {
   if (typeof window === 'undefined') return null
@@ -125,6 +142,38 @@ function writeStoredPersonaId(id: number): void {
   } catch {
     // ignore
   }
+}
+
+function readPersonaLastReadAt(chatId: number, personaId: number): string | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(PERSONA_LAST_READ_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const key = `${chatId}:${personaId}`
+    const v = parsed[key]
+    return typeof v === 'string' ? v : null
+  } catch {
+    return null
+  }
+}
+
+function writePersonaLastReadAt(chatId: number, personaId: number, isoTimestamp: string): void {
+  if (typeof window === 'undefined') return
+  try {
+    const raw = localStorage.getItem(PERSONA_LAST_READ_STORAGE_KEY)
+    const parsed: Record<string, unknown> = raw ? JSON.parse(raw) : {}
+    parsed[`${chatId}:${personaId}`] = isoTimestamp
+    localStorage.setItem(PERSONA_LAST_READ_STORAGE_KEY, JSON.stringify(parsed))
+  } catch {
+    // ignore
+  }
+}
+
+function toMs(iso: string | null | undefined): number | null {
+  if (!iso) return null
+  const ms = Date.parse(iso)
+  return Number.isFinite(ms) ? ms : null
 }
 
 if (typeof document !== 'undefined') {
@@ -349,6 +398,40 @@ async function extractLatestUserInput(
   return { text: '', attachments: [] }
 }
 
+/** Catch-all for PDFs, archives, and other types not covered by image/text adapters. Keeps `file` on the attachment for upload extraction. */
+class WebWildcardAttachmentAdapter implements AttachmentAdapter {
+  readonly accept = '*'
+
+  async add(state: { file: File }): Promise<PendingAttachment> {
+    return {
+      id: `${state.file.name}-${state.file.size}-${state.file.lastModified}`,
+      type: 'document',
+      name: state.file.name,
+      contentType: state.file.type,
+      file: state.file,
+      status: { type: 'requires-action', reason: 'composer-send' },
+    }
+  }
+
+  async send(attachment: PendingAttachment): Promise<CompleteAttachment> {
+    return {
+      ...attachment,
+      status: { type: 'complete' },
+      content: [{ type: 'text', text: '' }],
+    }
+  }
+
+  async remove(): Promise<void> {
+    // noop
+  }
+}
+
+const webAttachmentAdapter = new CompositeAttachmentAdapter([
+  new SimpleImageAttachmentAdapter(),
+  new SimpleTextAttachmentAdapter(),
+  new WebWildcardAttachmentAdapter(),
+])
+
 function mapBackendHistory(messages: BackendMessage[]): ThreadMessageLike[] {
   return messages.map((item, index) => ({
     id: item.id || `history-${index}`,
@@ -421,9 +504,9 @@ function CustomAssistantMessage() {
   const hasRenderableContent = useMessage((m) =>
     Array.isArray(m.content)
       ? m.content.some((part) => {
-          if (part.type === 'text') return Boolean(part.text?.trim())
-          return part.type === 'tool-call'
-        })
+        if (part.type === 'text') return Boolean(part.text?.trim())
+        return part.type === 'tool-call'
+      })
       : false,
   )
 
@@ -483,6 +566,9 @@ function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
   const runtime = useLocalRuntime(adapter, {
     initialMessages,
     maxSteps: 100,
+    adapters: {
+      attachments: webAttachmentAdapter,
+    },
   })
 
   return (
@@ -534,15 +620,47 @@ function App() {
   const [personas, setPersonas] = useState<Persona[]>([])
   const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
-  const [schedulesOpen, setSchedulesOpen] = useState<boolean>(false)
+  const [schedulesDialogOpen, setSchedulesDialogOpen] = useState<boolean>(false)
+  const [memoryDialogOpen, setMemoryDialogOpen] = useState<boolean>(false)
+  const [memoryContent, setMemoryContent] = useState<string>('')
+  const [memoryMtimeMs, setMemoryMtimeMs] = useState<number | null>(null)
+  const [memoryPathHint, setMemoryPathHint] = useState<string>('')
+  const [memoryBusy, setMemoryBusy] = useState<boolean>(false)
+  const [memoryError, setMemoryError] = useState<string>('')
   const [newSchedulePrompt, setNewSchedulePrompt] = useState('')
   const [newScheduleType, setNewScheduleType] = useState<'cron' | 'once'>('cron')
   const [newScheduleValue, setNewScheduleValue] = useState('0 9 * * *')
   const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
-  const [bgJobs, setBgJobs] = useState<BackgroundJob[]>([])
-  const [bgJobsOpen, setBgJobsOpen] = useState<boolean>(false)
   const [pendingRunIds, setPendingRunIds] = useState<string[]>([])
+  const [queueLane, setQueueLane] = useState<QueueLane | null>(null)
+  const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
+  const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
+
+  const personaHasNew = useMemo<Record<number, boolean>>(() => {
+    if (chatId == null) return {}
+    const out: Record<number, boolean> = {}
+    for (const p of personas) {
+      if (p.id === activePersonaId) {
+        out[p.id] = false
+        continue
+      }
+      const lastBotMs = toMs(p.last_bot_message_at ?? null)
+      if (lastBotMs == null) {
+        out[p.id] = false
+        continue
+      }
+      const lastReadMs = toMs(readPersonaLastReadAt(chatId, p.id))
+      out[p.id] = lastReadMs == null ? true : lastBotMs > lastReadMs
+    }
+    return out
+  }, [chatId, personas, activePersonaId, personaReadNonce])
+
+  function markPersonaRead(personaId: number): void {
+    if (chatId == null) return
+    writePersonaLastReadAt(chatId, personaId, new Date().toISOString())
+    setPersonaReadNonce((x) => x + 1)
+  }
 
   React.useEffect(() => {
     const onAuthRequired = () => setAuthRequired(true)
@@ -550,7 +668,8 @@ function App() {
     return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
   }, [])
 
-  const selectedSessionLabel = 'Chat'
+  const activePersonaName = personas.find((p) => p.id === activePersonaId)?.name ?? null
+  const selectedSessionLabel = activePersonaName ? `Chat · ${activePersonaName}` : 'Chat'
   const selectedSessionReadOnly = false
 
   /** Loads personas and applies stored preference; returns the chosen persona id and name for history/switch. */
@@ -558,9 +677,9 @@ function App() {
     if (cid == null) return null
     try {
       const query = new URLSearchParams({ chat_id: String(cid) })
-      const data = await api<{ personas?: { id: number; name: string; is_active: boolean }[] }>(`/api/personas?${query.toString()}`)
+      const data = await api<{ personas?: { id: number; name: string; is_active: boolean; last_bot_message_at?: string | null }[] }>(`/api/personas?${query.toString()}`)
       const list = Array.isArray(data.personas) ? data.personas : []
-      const personaList = list.map((p) => ({ id: p.id, name: p.name, is_active: p.is_active }))
+      const personaList = list.map((p) => ({ id: p.id, name: p.name, is_active: p.is_active, last_bot_message_at: p.last_bot_message_at ?? null }))
       setPersonas(personaList)
       const active = list.find((p) => p.is_active)
       const defaultChoice = active ?? list[0]
@@ -569,8 +688,8 @@ function App() {
       const chosen = storedInList && list.find((p) => p.id === storedId)
         ? { id: list.find((p) => p.id === storedId)!.id, name: list.find((p) => p.id === storedId)!.name }
         : defaultChoice
-            ? { id: defaultChoice.id, name: defaultChoice.name }
-            : null
+          ? { id: defaultChoice.id, name: defaultChoice.name }
+          : null
       if (chosen) {
         setActivePersonaId(chosen.id)
         if (newSchedulePersonaId == null) {
@@ -591,6 +710,18 @@ function App() {
     }
   }
 
+  async function refreshPersonas(cid: number | null = chatId): Promise<void> {
+    if (cid == null) return
+    try {
+      const query = new URLSearchParams({ chat_id: String(cid) })
+      const data = await api<{ personas?: { id: number; name: string; is_active: boolean; last_bot_message_at?: string | null }[] }>(`/api/personas?${query.toString()}`)
+      const list = Array.isArray(data.personas) ? data.personas : []
+      setPersonas(list.map((p) => ({ id: p.id, name: p.name, is_active: p.is_active, last_bot_message_at: p.last_bot_message_at ?? null })))
+    } catch {
+      // ignore refresh errors
+    }
+  }
+
   async function switchPersona(personaName: string): Promise<void> {
     if (chatId == null) return
     await api('/api/personas/switch', {
@@ -601,6 +732,7 @@ function App() {
     if (p) writeStoredPersonaId(p.id)
     await loadPersonas(chatId)
     await loadHistory(chatId, p?.id ?? undefined)
+    if (p) markPersonaRead(p.id)
     setRuntimeNonce((x) => x + 1)
   }
 
@@ -628,6 +760,43 @@ function App() {
     setRuntimeNonce((x) => x + 1)
   }
 
+  async function loadPersonaMemory(pid: number): Promise<void> {
+    setMemoryBusy(true)
+    setMemoryError('')
+    try {
+      const data = await api<{ content?: string; mtime_ms?: number; path?: string }>(`/api/personas/${pid}/memory`)
+      setMemoryContent(typeof data.content === 'string' ? data.content : '')
+      setMemoryMtimeMs(typeof data.mtime_ms === 'number' ? data.mtime_ms : null)
+      setMemoryPathHint(typeof data.path === 'string' ? data.path : '')
+    } catch (e) {
+      setMemoryError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMemoryBusy(false)
+    }
+  }
+
+  async function savePersonaMemory(pid: number): Promise<void> {
+    setMemoryBusy(true)
+    setMemoryError('')
+    try {
+      const res = await api<{ mtime_ms?: number }>(`/api/personas/${pid}/memory`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          content: memoryContent,
+          if_match_mtime_ms: memoryMtimeMs ?? undefined,
+        }),
+      })
+      if (typeof res.mtime_ms === 'number') {
+        setMemoryMtimeMs(res.mtime_ms)
+      }
+      setStatusText('Memory saved')
+    } catch (e) {
+      setMemoryError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMemoryBusy(false)
+    }
+  }
+
   async function loadOlderDay(): Promise<void> {
     if (chatId == null || loadingOlder) return
     setLoadingOlder(true)
@@ -639,12 +808,12 @@ function App() {
       const oldestLoaded = loadedDays.length > 0
         ? loadedDays[0]
         : (() => {
-            const first = historySeed[0] as { createdAt?: Date } | undefined
-            if (first?.createdAt) {
-              return new Date(first.createdAt).toISOString().slice(0, 10)
-            }
-            return allDays[0]
-          })()
+          const first = historySeed[0] as { createdAt?: Date } | undefined
+          if (first?.createdAt) {
+            return new Date(first.createdAt).toISOString().slice(0, 10)
+          }
+          return allDays[0]
+        })()
       const idx = allDays.indexOf(oldestLoaded)
       const nextOlder = idx >= 0 && idx < allDays.length - 1 ? allDays[idx + 1] : null
       if (nextOlder) await loadHistory(chatId, activePersonaId ?? undefined, nextOlder)
@@ -694,6 +863,9 @@ function App() {
           }
           setPendingRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId]))
           setStatusText('Queued')
+          // A background-handoff run can finish quickly while its final reply arrives later.
+          // Keep history fresh for a short window after sending.
+          setHistoryPollUntilMs(Date.now() + 2 * 60 * 1000)
           yield {
             content: [
               {
@@ -756,7 +928,7 @@ function App() {
   }, [uiTheme])
 
   useEffect(() => {
-    ;(async () => {
+    ; (async () => {
       try {
         setError('')
         const data = await api<{ chat_id?: number; persona_id?: number }>('/api/chat')
@@ -766,10 +938,12 @@ function App() {
         if (pid != null) setActivePersonaId(pid)
         if (cid != null) {
           const chosen = await loadPersonas(cid)
-          loadBindings(cid).catch(() => {})
-          loadSchedules(cid).catch(() => {})
-          loadBackgroundJobs(cid).catch(() => {})
+          loadBindings(cid).catch(() => { })
+          loadSchedules(cid).catch(() => { })
+          loadQueueDiagnostics(cid).catch(() => { })
           await loadHistory(cid, chosen?.id ?? pid)
+          const readId = chosen?.id ?? pid ?? null
+          if (readId != null) markPersonaRead(readId)
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
@@ -789,18 +963,35 @@ function App() {
     }
   }
 
-  async function loadBackgroundJobs(cid: number | null = chatId): Promise<void> {
-    if (cid == null) return
-    try {
-      const query = new URLSearchParams({ chat_id: String(cid) })
-      const data = await api<{ jobs?: BackgroundJob[] }>(`/api/background_jobs?${query.toString()}`)
-      const jobs = Array.isArray(data.jobs) ? data.jobs : []
-      setBgJobs(jobs)
-      return
-    } catch {
-      setBgJobs([])
+  useEffect(() => {
+    if (!schedulesDialogOpen) return
+    void loadSchedules(chatId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schedulesDialogOpen])
+
+  useEffect(() => {
+    if (!memoryDialogOpen) return
+    if (activePersonaId == null) return
+    void loadPersonaMemory(activePersonaId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [memoryDialogOpen, activePersonaId])
+
+  useEffect(() => {
+    if (chatId == null) return
+    let cancelled = false
+    const activePending = (queueLane?.pending ?? 0) > 0 || pendingRunIds.length > 0
+    const intervalMs = activePending ? 2500 : 10000
+    const interval = setInterval(() => {
+      if (cancelled) return
+      loadQueueDiagnostics(chatId).catch(() => { })
+      refreshPersonas(chatId).catch(() => { })
+    }, intervalMs)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
     }
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId, pendingRunIds.length, queueLane?.pending])
 
   async function loadBindings(cid: number | null = chatId): Promise<void> {
     if (cid == null) return
@@ -810,6 +1001,18 @@ function App() {
       setBindings(Array.isArray(data.bindings) ? data.bindings : [])
     } catch {
       setBindings([])
+    }
+  }
+
+  async function loadQueueDiagnostics(cid: number | null = chatId): Promise<void> {
+    if (cid == null) return
+    try {
+      const data = await api<{ lanes?: QueueLane[] }>('/api/queue_diagnostics')
+      const lanes = Array.isArray(data.lanes) ? data.lanes : []
+      const lane = lanes.find((l) => l.chat_id === cid) ?? null
+      setQueueLane(lane)
+    } catch {
+      setQueueLane(null)
     }
   }
 
@@ -867,9 +1070,8 @@ function App() {
     async function init() {
       const chosen = await loadPersonas(chatId)
       if (cancelled) return
-      loadBindings(chatId).catch(() => {})
-      loadSchedules(chatId).catch(() => {})
-      loadBackgroundJobs(chatId).catch(() => {})
+      loadBindings(chatId).catch(() => { })
+      loadSchedules(chatId).catch(() => { })
       if (chosen) {
         try {
           await api('/api/personas/switch', {
@@ -901,7 +1103,7 @@ function App() {
     if (pendingRunIds.length === 0) return
     let cancelled = false
     const interval = setInterval(() => {
-      ;(async () => {
+      ; (async () => {
         const completed: string[] = []
         for (const runId of pendingRunIds) {
           try {
@@ -917,6 +1119,7 @@ function App() {
         setPendingRunIds((prev) => prev.filter((id) => !completed.includes(id)))
         setStatusText('Done')
         void loadHistory(chatId, activePersonaId ?? undefined)
+        setHistoryPollUntilMs(Date.now() + 2 * 60 * 1000)
       })()
     }, 2500)
     return () => {
@@ -926,45 +1129,21 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingRunIds, chatId, activePersonaId])
 
-  // Poll background jobs while any are still in active subagent lifecycle states.
   useEffect(() => {
-    const hasActive = bgJobs.some((j) =>
-      j.status === 'pending' ||
-      j.status === 'running' ||
-      j.status === 'completed_raw' ||
-      j.status === 'main_agent_processing',
-    )
-    if (!hasActive || chatId == null) return
+    if (chatId == null) return
+    if (historyPollUntilMs <= Date.now()) return
+    let cancelled = false
     const interval = setInterval(() => {
-      loadBackgroundJobs(chatId).catch(() => {})
-    }, 5000)
-    return () => clearInterval(interval)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bgJobs, chatId])
-
-  // When a background job reaches its terminal state, refresh history once.
-  const prevBgJobsRef = React.useRef<BackgroundJob[]>([])
-  useEffect(() => {
-    const prev = prevBgJobsRef.current
-    for (const job of bgJobs) {
-      if (job.status === 'done' || job.status === 'failed') {
-        const was = prev.find((p) => p.id === job.id)
-        if (
-          was && (
-            was.status === 'pending' ||
-            was.status === 'running' ||
-            was.status === 'completed_raw' ||
-            was.status === 'main_agent_processing'
-          )
-        ) {
-          loadHistory(chatId, activePersonaId ?? undefined).catch(() => {})
-          break
-        }
-      }
+      if (cancelled) return
+      if (historyPollUntilMs <= Date.now()) return
+      loadHistory(chatId, activePersonaId ?? undefined).catch(() => { })
+    }, 10000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
     }
-    prevBgJobsRef.current = bgJobs
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bgJobs])
+  }, [chatId, activePersonaId, historyPollUntilMs])
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
@@ -1018,6 +1197,7 @@ function App() {
             onUiThemeChange={(theme) => setUiTheme(theme as UiTheme)}
             uiThemeOptions={UI_THEME_OPTIONS}
             personas={personas}
+            personaHasNew={personaHasNew}
             selectedPersonaId={activePersonaId}
             onPersonaSelect={(name) => void switchPersona(name)}
             onCreatePersona={() => void onCreatePersona()}
@@ -1038,171 +1218,211 @@ function App() {
                   : 'sticky top-0 z-10 border-b border-slate-200 bg-white/92 px-4 py-3 backdrop-blur-sm'
               }
             >
-              <Heading size="6">
-                {selectedSessionLabel}
-              </Heading>
-            </header>
+              <Flex justify="between" align="center" gap="3" wrap="wrap">
+                <Heading size="6">
+                  {selectedSessionLabel}
+                </Heading>
+                <Flex align="center" gap="3" wrap="wrap" justify="end">
+                  <Text size="2" color="gray">
+                    {statusText}
+                  </Text>
+                  <Text
+                    size="2"
+                    color={(queueLane?.last_error ? 'red' : 'gray') as never}
+                    title={queueLane?.last_error ?? undefined}
+                  >
+                    Queue: {(queueLane?.pending ?? 0) > 0 ? String(queueLane?.pending ?? 0) : 'idle'}
+                    {(queueLane?.pending ?? 0) > 0 && (queueLane?.oldest_wait_ms ?? 0) > 0
+                      ? ` · ${Math.round((queueLane?.oldest_wait_ms ?? 0) / 1000)}s`
+                      : ''}
+                  </Text>
 
-            <div className="mx-3 mt-2">
-              <Button size="1" variant="soft" onClick={() => setSchedulesOpen((o) => !o)}>
-                {schedulesOpen ? 'Hide' : 'Show'} Schedules
-              </Button>
-              {schedulesOpen ? (
-                <div className="mt-2 rounded-md border p-3" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' } : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}>
-                  <Text size="2" weight="bold" className="mb-2 block">Schedules</Text>
-                  <ul className="mb-3 list-none space-y-2">
-                    {schedules.map((t) => (
-                      <li key={t.id} className="flex flex-wrap items-center gap-2 rounded border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
-                        <span className="min-w-0 flex-1 truncate" title={t.prompt}>{t.prompt}</span>
-                        <Select.Root
-                          value={String(t.persona_id)}
-                          onValueChange={(v) => void updateSchedule(t.id, { persona_id: Number(v) })}
-                        >
-                          <Select.Trigger className="w-[120px]" />
-                          <Select.Content>
-                            {personas.map((p) => (
-                              <Select.Item key={p.id} value={String(p.id)}>
-                                {p.name}
-                              </Select.Item>
-                            ))}
-                          </Select.Content>
-                        </Select.Root>
-                        <Text size="1" color="gray">{t.schedule_type} · {t.next_run ?? '—'}</Text>
-                        <Text size="1" color={
-                          t.status === 'active' || t.status === 'running' ? 'green' :
-                          t.status === 'paused' ? 'orange' :
-                          t.status === 'completed' ? 'gray' :
-                          t.status === 'cancelled' ? 'red' : 'gray'
-                        }>
-                          {t.status === 'running' ? 'active' : t.status}
+                  <Dialog.Root
+                    open={schedulesDialogOpen}
+                    onOpenChange={(open) => setSchedulesDialogOpen(open)}
+                  >
+                    <Dialog.Trigger>
+                      <Button size="1" variant="soft">Schedules</Button>
+                    </Dialog.Trigger>
+                    <Dialog.Content style={{ maxWidth: 820 }}>
+                      <Dialog.Title>Schedules</Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        Create and manage scheduled prompts for this chat.
+                      </Dialog.Description>
+
+                      <div className="rounded-md border p-3" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' } : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}>
+                        <ul className="mb-3 list-none space-y-2">
+                          {schedules.map((t) => (
+                            <li key={t.id} className="flex flex-wrap items-center gap-2 rounded border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
+                              <span className="min-w-0 flex-1 truncate" title={t.prompt}>{t.prompt}</span>
+                              <Select.Root
+                                value={String(t.persona_id)}
+                                onValueChange={(v) => void updateSchedule(t.id, { persona_id: Number(v) })}
+                              >
+                                <Select.Trigger className="w-[120px]" />
+                                <Select.Content>
+                                  {personas.map((p) => (
+                                    <Select.Item key={p.id} value={String(p.id)}>
+                                      {p.name}
+                                    </Select.Item>
+                                  ))}
+                                </Select.Content>
+                              </Select.Root>
+                              <Text size="1" color="gray">{t.schedule_type} · {t.next_run ?? '—'}</Text>
+                              <Text size="1" color={
+                                t.status === 'active' || t.status === 'running' ? 'green' :
+                                  t.status === 'paused' ? 'orange' :
+                                    t.status === 'completed' ? 'gray' :
+                                      t.status === 'cancelled' ? 'red' : 'gray'
+                              }>
+                                {t.status === 'running' ? 'active' : t.status}
+                              </Text>
+                              {t.status === 'active' ? (
+                                <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'paused' })}>Pause</Button>
+                              ) : t.status === 'paused' ? (
+                                <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'active' })}>Resume</Button>
+                              ) : null}
+                              {t.status !== 'cancelled' ? (
+                                <Button size="1" variant="soft" color="red" onClick={() => void updateSchedule(t.id, { status: 'cancelled' })}>Cancel</Button>
+                              ) : null}
+                            </li>
+                          ))}
+                        </ul>
+
+                        <Flex gap="2" align="end" wrap="wrap">
+                          <TextField.Root
+                            placeholder="Prompt"
+                            value={newSchedulePrompt}
+                            onChange={(e) => setNewSchedulePrompt(e.target.value)}
+                            className="min-w-[220px]"
+                          />
+                          <Select.Root value={newScheduleType} onValueChange={(v) => setNewScheduleType(v as 'cron' | 'once')}>
+                            <Select.Trigger className="w-[100px]" />
+                            <Select.Content>
+                              <Select.Item value="cron">Cron</Select.Item>
+                              <Select.Item value="once">Once</Select.Item>
+                            </Select.Content>
+                          </Select.Root>
+                          <TextField.Root
+                            placeholder={newScheduleType === 'cron' ? '0 9 * * *' : '2025-12-31T09:00:00Z'}
+                            value={newScheduleValue}
+                            onChange={(e) => setNewScheduleValue(e.target.value)}
+                            className="min-w-[200px]"
+                          />
+                          <Select.Root
+                            value={newSchedulePersonaId != null ? String(newSchedulePersonaId) : ''}
+                            onValueChange={(v) => setNewSchedulePersonaId(Number(v))}
+                          >
+                            <Select.Trigger className="w-[140px]" placeholder="Persona" />
+                            <Select.Content>
+                              {personas.map((p) => (
+                                <Select.Item key={p.id} value={String(p.id)}>
+                                  {p.name}
+                                </Select.Item>
+                              ))}
+                            </Select.Content>
+                          </Select.Root>
+                          <Button
+                            size="1"
+                            onClick={() => {
+                              if (newSchedulePrompt.trim()) {
+                                void createSchedule(
+                                  newSchedulePrompt.trim(),
+                                  newScheduleType,
+                                  newScheduleValue,
+                                  newSchedulePersonaId ?? activePersonaId,
+                                )
+                                setNewSchedulePrompt('')
+                              }
+                            }}
+                          >
+                            Add
+                          </Button>
+                        </Flex>
+                      </div>
+
+                      <Flex justify="end" mt="4" gap="2">
+                        <Dialog.Close>
+                          <Button variant="soft">Close</Button>
+                        </Dialog.Close>
+                      </Flex>
+                    </Dialog.Content>
+                  </Dialog.Root>
+
+                  <Dialog.Root
+                    open={memoryDialogOpen}
+                    onOpenChange={(open) => {
+                      setMemoryDialogOpen(open)
+                      if (!open) {
+                        setMemoryError('')
+                        setMemoryBusy(false)
+                      }
+                    }}
+                  >
+                    <Dialog.Trigger>
+                      <Button size="1" variant="soft">Memory</Button>
+                    </Dialog.Trigger>
+                    <Dialog.Content style={{ maxWidth: 900 }}>
+                      <Dialog.Title>Persona memory</Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        Edit this persona’s tiered memory file. Memory is context, not a task queue.
+                      </Dialog.Description>
+
+                      {memoryPathHint ? (
+                        <Text size="1" color="gray" className="mb-2 block">
+                          {memoryPathHint}
                         </Text>
-                        {t.status === 'active' ? (
-                          <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'paused' })}>Pause</Button>
-                        ) : t.status === 'paused' ? (
-                          <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'active' })}>Resume</Button>
-                        ) : null}
-                        {t.status !== 'cancelled' ? (
-                          <Button size="1" variant="soft" color="red" onClick={() => void updateSchedule(t.id, { status: 'cancelled' })}>Cancel</Button>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ul>
-                  <Flex gap="2" align="end" wrap="wrap">
-                    <TextField.Root
-                      placeholder="Prompt"
-                      value={newSchedulePrompt}
-                      onChange={(e) => setNewSchedulePrompt(e.target.value)}
-                      className="min-w-[180px]"
-                    />
-                    <Select.Root value={newScheduleType} onValueChange={(v) => setNewScheduleType(v as 'cron' | 'once')}>
-                      <Select.Trigger className="w-[100px]" />
-                      <Select.Content>
-                        <Select.Item value="cron">Cron</Select.Item>
-                        <Select.Item value="once">Once</Select.Item>
-                      </Select.Content>
-                    </Select.Root>
-                    <TextField.Root
-                      placeholder={newScheduleType === 'cron' ? '0 9 * * *' : '2025-12-31T09:00:00Z'}
-                      value={newScheduleValue}
-                      onChange={(e) => setNewScheduleValue(e.target.value)}
-                      className="min-w-[160px]"
-                    />
-                    <Select.Root
-                      value={newSchedulePersonaId != null ? String(newSchedulePersonaId) : ''}
-                      onValueChange={(v) => setNewSchedulePersonaId(Number(v))}
-                    >
-                      <Select.Trigger className="w-[140px]" placeholder="Persona" />
-                      <Select.Content>
-                        {personas.map((p) => (
-                          <Select.Item key={p.id} value={String(p.id)}>
-                            {p.name}
-                          </Select.Item>
-                        ))}
-                      </Select.Content>
-                    </Select.Root>
-                    <Button
-                      size="1"
-                      onClick={() => {
-                        if (newSchedulePrompt.trim()) {
-                          void createSchedule(
-                            newSchedulePrompt.trim(),
-                            newScheduleType,
-                            newScheduleValue,
-                            newSchedulePersonaId ?? activePersonaId,
-                          )
-                          setNewSchedulePrompt('')
-                        }
-                      }}
-                    >
-                      Add
-                    </Button>
-                  </Flex>
-                </div>
-              ) : null}
-            </div>
+                      ) : null}
 
-            {bgJobs.length > 0 ? (
-              <div className="mx-3 mt-2">
-                <Button size="1" variant="soft" onClick={() => setBgJobsOpen((o) => !o)}>
-                  {bgJobsOpen ? 'Hide' : 'Show'} Background Jobs
-                  {bgJobs.some((j) =>
-                    j.status === 'pending' ||
-                    j.status === 'running' ||
-                    j.status === 'completed_raw' ||
-                    j.status === 'main_agent_processing',
-                  )
-                    ? ` (${bgJobs.filter((j) =>
-                      j.status === 'pending' ||
-                      j.status === 'running' ||
-                      j.status === 'completed_raw' ||
-                      j.status === 'main_agent_processing',
-                    ).length} active)`
-                    : ''}
-                </Button>
-                {bgJobsOpen ? (
-                  <div className="mt-2 rounded-md border p-3" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' } : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}>
-                    <Text size="2" weight="bold" className="mb-2 block">Background Jobs</Text>
-                    <ul className="list-none space-y-2">
-                      {bgJobs.map((j) => (
-                        <li key={j.id} className="flex flex-wrap items-center gap-2 rounded border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
-                          <span className="min-w-0 flex-1 truncate" title={j.prompt}>{j.prompt}</span>
-                          <Text size="1" color={
-                            j.status === 'running' ? 'blue' :
-                            j.status === 'completed_raw' ? 'orange' :
-                            j.status === 'main_agent_processing' ? 'blue' :
-                            j.status === 'done' ? 'green' :
-                            j.status === 'failed' ? 'red' : 'gray'
-                          }>
-                            {j.status === 'running' ? 'Running...' :
-                             j.status === 'completed_raw' ? 'Raw result ready' :
-                             j.status === 'main_agent_processing' ? 'Main agent summarizing...' :
-                             j.status === 'done' ? 'Completed' :
-                             j.status === 'failed' ? 'Failed' :
-                             j.status === 'pending' ? 'Pending' : j.status}
-                          </Text>
-                          {j.created_at ? (
-                            <Text size="1" color="gray" title={j.created_at}>
-                              {new Date(j.created_at).toLocaleTimeString()}
-                            </Text>
-                          ) : null}
-                          {j.finished_at ? (
-                            <Text size="1" color="gray" title={j.finished_at}>
-                              done {new Date(j.finished_at).toLocaleTimeString()}
-                            </Text>
-                          ) : null}
-                          {j.error_text ? (
-                            <Text size="1" color="red" className="w-full truncate" title={j.error_text}>{j.error_text}</Text>
-                          ) : null}
-                          {j.result_preview ? (
-                            <Text size="1" color="gray" className="w-full truncate" title={j.result_preview}>{j.result_preview}</Text>
-                          ) : null}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
+                      {memoryError ? (
+                        <Callout.Root color="red" size="1" variant="soft" className="mb-2">
+                          <Callout.Text>{memoryError}</Callout.Text>
+                        </Callout.Root>
+                      ) : null}
+
+                      <textarea
+                        value={memoryContent}
+                        onChange={(e) => setMemoryContent(e.target.value)}
+                        spellCheck={false}
+                        className={appearance === 'dark'
+                          ? 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-slate-100'
+                          : 'h-[420px] w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-xs text-slate-900'}
+                      />
+
+                      <Flex justify="between" align="center" mt="3" wrap="wrap" gap="2">
+                        <Text size="1" color="gray">
+                          {memoryMtimeMs != null ? `mtime: ${memoryMtimeMs}` : ''}
+                        </Text>
+                        <Flex gap="2">
+                          <Button
+                            size="1"
+                            variant="soft"
+                            onClick={() => {
+                              if (activePersonaId != null) void loadPersonaMemory(activePersonaId)
+                            }}
+                            disabled={memoryBusy || activePersonaId == null}
+                          >
+                            Reload
+                          </Button>
+                          <Button
+                            size="1"
+                            onClick={() => {
+                              if (activePersonaId != null) void savePersonaMemory(activePersonaId)
+                            }}
+                            disabled={memoryBusy || activePersonaId == null}
+                          >
+                            {memoryBusy ? 'Saving…' : 'Save'}
+                          </Button>
+                          <Dialog.Close>
+                            <Button size="1" variant="soft">Close</Button>
+                          </Dialog.Close>
+                        </Flex>
+                      </Flex>
+                    </Dialog.Content>
+                  </Dialog.Root>
+                </Flex>
+              </Flex>
+            </header>
 
             <div
               className={

@@ -27,6 +27,7 @@ use crate::telegram::{
     process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
     BACKGROUND_JOB_HANDOFF_PREFIX,
 };
+use std::time::SystemTime;
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
 
@@ -1377,8 +1378,12 @@ async fn process_web_attachments(
         .max_document_size_mb
         .saturating_mul(1024)
         .saturating_mul(1024);
-    let dir = FsPath::new(state.app_state.config.working_dir())
-        .join("uploads")
+    let dir = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
         .join("web")
         .join(chat_id.to_string());
     tokio::fs::create_dir_all(&dir)
@@ -1415,16 +1420,23 @@ async fn process_web_attachments(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+        let saved_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
+
         if image_data.is_none() && mime.starts_with("image/") {
             let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
             *image_data = Some((b64, mime.clone()));
         }
 
         notes.push(format!(
-            "[document] filename={} bytes={} mime={} saved_path={}",
+            "[document] filename={} bytes={} mime={} tool_path={} saved_path={}",
             filename,
             bytes.len(),
             mime,
+            tool_path,
             path.display()
         ));
     }
@@ -1528,6 +1540,14 @@ async fn api_personas(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let cid3 = chat_id;
+    let last_bot_rows = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_last_bot_message_at(cid3)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let last_bot_by_persona: HashMap<i64, String> = last_bot_rows.into_iter().collect();
+
     let items: Vec<serde_json::Value> = personas
         .iter()
         .map(|p| {
@@ -1536,6 +1556,7 @@ async fn api_personas(
                 "name": p.name,
                 "model_override": p.model_override,
                 "is_active": active_id == Some(p.id),
+                "last_bot_message_at": last_bot_by_persona.get(&p.id).cloned(),
             })
         })
         .collect();
@@ -1588,6 +1609,110 @@ async fn api_personas_switch(
     Ok(Json(json!({
         "ok": true,
         "message": format!("Switched to {}", persona_name_for_msg),
+    })))
+}
+
+#[derive(Deserialize)]
+struct PersonaMemoryPathParams {
+    persona_id: i64,
+}
+
+fn ensure_persona_memory_file_exists_for_web(state: &AppState, chat_id: i64, persona_id: i64) {
+    let path = state.memory.persona_memory_path(chat_id, persona_id);
+    if path.exists() {
+        return;
+    }
+    let template = "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, template);
+}
+
+fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    Some(dur.as_millis() as i64)
+}
+
+async fn api_persona_memory_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMemoryPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| db.persona_exists(chat_id, pid))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    ensure_persona_memory_file_exists_for_web(&state.app_state, chat_id, pid);
+    let mem_path = state.app_state.memory.persona_memory_path(chat_id, pid);
+    let content = std::fs::read_to_string(&mem_path).unwrap_or_default();
+    let mtime_ms = file_mtime_ms(&mem_path).unwrap_or(0);
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": pid,
+        "content": content,
+        "mtime_ms": mtime_ms,
+        "path": mem_path.to_string_lossy(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct PersonaMemoryPutBody {
+    content: String,
+    if_match_mtime_ms: Option<i64>,
+}
+
+async fn api_persona_memory_put(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMemoryPathParams>,
+    Json(body): Json<PersonaMemoryPutBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    if body.content.len() > 256 * 1024 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "memory content too large".into()));
+    }
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| db.persona_exists(chat_id, pid))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    ensure_persona_memory_file_exists_for_web(&state.app_state, chat_id, pid);
+    let mem_path = state.app_state.memory.persona_memory_path(chat_id, pid);
+    let current_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
+    if let Some(expected) = body.if_match_mtime_ms {
+        if expected != current_mtime {
+            return Err((StatusCode::CONFLICT, "memory was modified; reload and retry".into()));
+        }
+    }
+
+    if let Some(parent) = mem_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    std::fs::write(&mem_path, body.content).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let new_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": pid,
+        "mtime_ms": new_mtime,
     })))
 }
 
@@ -2260,6 +2385,10 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/personas/switch", post(api_personas_switch))
         .route("/api/personas/create", post(api_personas_create))
         .route("/api/personas/delete", post(api_personas_delete))
+        .route(
+            "/api/personas/:persona_id/memory",
+            get(api_persona_memory_get).put(api_persona_memory_put),
+        )
         .route("/api/oauth/authorize/:platform", get(api_oauth_authorize))
         .route("/api/oauth/callback/:platform", get(api_oauth_callback))
         .with_state(web_state)

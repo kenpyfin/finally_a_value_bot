@@ -20,6 +20,31 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 <!-- Add entries below this line, newest first. -->
 
+### 2026-04-09 — Web chat file uploads (UI + `shared/upload` storage)
+
+- **Area:** web / api / agent workspace
+- **Summary:** Enabled the composer attachment flow by registering an `AttachmentAdapter` on `useLocalRuntime`, and moved persisted web uploads from `workspace_dir/uploads/web/` to `workspace_dir/shared/upload/web/<chat_id>/`. Injected `[document]` lines now include `tool_path=upload/web/...` (relative to the tool workspace `shared/`) alongside `saved_path`.
+- **Rationale:** Local runtime only exposes `capabilities.attachments` when `adapters.attachments` is set, so the UI never offered uploads before. Saving under `shared/upload` aligns with `resolve_tool_working_dir` (`workspace_dir/shared`) so `read_file` and other tools can use normal relative paths.
+- **Key files / symbols:**
+  - `web/src/main.tsx` — `CompositeAttachmentAdapter` with `SimpleImageAttachmentAdapter`, `SimpleTextAttachmentAdapter`, `WebWildcardAttachmentAdapter` (`accept: "*"`), passed as `adapters.attachments` to `useLocalRuntime`.
+  - `src/web.rs` — `process_web_attachments` directory `workspace_root_absolute().join("shared/upload/web/...")`; note format `tool_path=...`.
+  - `web/dist/*` — rebuilt production bundle (`npm run build`).
+- **Follow-ups:** Optional migration of files left in legacy `uploads/web/`; consider size limits for very large JSON bodies on `/api/send_stream`.
+
+### 2026-04-08 — Web chat “master view” (queue, schedules modal, persona indicators, memory editor)
+
+- **Area:** web / api / db
+- **Summary:** Refocused the web chat into a master control view: removed background-jobs UI, moved schedules into a standalone modal, added a live queue indicator, added per-persona “new message” dots, and added a per-persona memory file viewer/editor.
+- **Rationale:** Keep the main thread as the primary surface while still exposing the key operational signals and controls (queue + schedules + memory) without clutter. The persona indicator reduces missed activity across personas.
+- **Key files / symbols:**
+  - `web/src/main.tsx` — header control strip (status + queue), schedules modal, memory modal, time-bounded history refresh after sends.
+  - `web/src/components/session-sidebar.tsx` — persona new-message dot rendering.
+  - `web/src/types.ts` — `Persona.last_bot_message_at`.
+  - `src/db.rs` — `list_persona_last_bot_message_at`.
+  - `src/web.rs` — `api_personas` includes `last_bot_message_at`; new routes `GET/PUT /api/personas/:persona_id/memory`.
+  - `web/dist/*` — rebuilt production bundle.
+- **Follow-ups:** Consider tier-aware memory editing (Tier 1/2/3) in the UI; consider SSE-driven history refresh to avoid periodic polling.
+
 ### 2026-04-01 — Global projects/workflows and unified runtime timeline
 
 - **Area:** agent / runtime / db / queue / web / config

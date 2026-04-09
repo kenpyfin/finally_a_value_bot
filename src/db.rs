@@ -2597,6 +2597,25 @@ impl Database {
         Ok(personas)
     }
 
+    /// Returns a `(persona_id, last_bot_message_at)` row for each persona that has at least one bot message.
+    /// `last_bot_message_at` is the max `messages.timestamp` for rows where `is_from_bot = 1`.
+    pub fn list_persona_last_bot_message_at(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<(i64, String)>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT persona_id, MAX(timestamp) AS last_at
+             FROM messages
+             WHERE chat_id = ?1 AND is_from_bot = 1
+             GROUP BY persona_id",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn create_persona(
         &self,
         chat_id: i64,

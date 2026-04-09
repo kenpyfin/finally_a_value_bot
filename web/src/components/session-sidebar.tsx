@@ -9,6 +9,7 @@ type SessionSidebarProps = {
   onUiThemeChange: (theme: string) => void
   uiThemeOptions: Array<{ key: string; label: string; color: string }>
   personas: Persona[]
+  personaHasNew?: Record<number, boolean>
   selectedPersonaId: number | null
   onPersonaSelect: (personaName: string) => void
   onCreatePersona: () => void
@@ -22,6 +23,7 @@ export function SessionSidebar({
   onUiThemeChange,
   uiThemeOptions,
   personas,
+  personaHasNew,
   selectedPersonaId,
   onPersonaSelect,
   onCreatePersona,
@@ -194,7 +196,16 @@ export function SessionSidebar({
                     className="min-w-0 flex-1 text-left text-sm font-medium"
                     onClick={() => onPersonaSelect(p.name)}
                   >
-                    {p.name}
+                    <span className="inline-flex items-center gap-2">
+                      <span className="truncate">{p.name}</span>
+                      {personaHasNew?.[p.id] ? (
+                        <span
+                          className={isDark ? 'h-2 w-2 rounded-full bg-[color:var(--mc-accent)]' : 'h-2 w-2 rounded-full bg-[color:var(--mc-accent)]'}
+                          aria-label="New messages"
+                          title="New messages"
+                        />
+                      ) : null}
+                    </span>
                   </button>
                   {p.is_active ? <Badge size="1" variant="soft">active</Badge> : null}
                   {p.name !== 'default' ? (

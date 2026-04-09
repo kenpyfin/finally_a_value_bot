@@ -14,6 +14,7 @@ export type Persona = {
   id: number
   name: string
   is_active: boolean
+  last_bot_message_at?: string | null
 }
 
 export type ChannelBinding = {
@@ -32,20 +33,6 @@ export type ScheduleTask = {
   last_run: string | null
   status: string
   created_at: string | null
-}
-
-export type BackgroundJob = {
-  id: string
-  chat_id: number
-  persona_id: number
-  prompt: string
-  status: string // "pending" | "running" | "completed_raw" | "main_agent_processing" | "done" | "failed"
-  trigger_reason: string
-  created_at: string
-  started_at: string | null
-  finished_at: string | null
-  result_preview: string | null
-  error_text: string | null
 }
 
 export type MessageItem = {
