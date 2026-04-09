@@ -1,26 +1,25 @@
 # Docker Deployment
 
+**Not recommended for new deployments.** Prefer the native binary from [README.md](README.md) (install script, Homebrew, or build from source) and `finally-a-value-bot gateway install` for a persistent service. This page is for operators who maintain or require a container-based setup.
+
 FinallyAValueBot can run in Docker with agent-browser (headless Chromium) support.
 
 ## Quick Start
 
-1. Copy and edit config:
-   ```bash
+1. **Config:** The bot has no TTY inside the default container, so interactive `finally-a-value-bot config` will not run there. Prepare `.env` on the host (copy [.env.example](.env.example) and edit, or run `config` / `setup` on your machine first), then mount it as below.
+  ```bash
    cp .env.example .env
-   # Edit .env with your tokens, API keys, etc. (or run finally-a-value-bot setup)
-   ```
-
+   # Edit .env with your tokens, API keys, etc.
+  ```
 2. Ensure the workspace directory exists (default `./workspace`). The container entrypoint creates `workspace/shared/vault_db` for the vector DB on first run:
-   ```bash
+  ```bash
    mkdir -p workspace
-   ```
-
+  ```
 3. Deploy:
-   ```bash
+  ```bash
    ./deploy.sh
-   ```
-
-4. Open Web UI: http://localhost:10961
+  ```
+4. Open Web UI: [http://localhost:10961](http://localhost:10961)
 
 ## Config for Docker
 
@@ -77,4 +76,3 @@ For development, use `deploy-dev.sh` to rebuild incrementally (uses Docker cache
 ```
 
 This skips `git pull` and `--no-cache`, so builds are much faster when only some layers changed. Use `./deploy.sh` for production or when you want a clean rebuild.
-

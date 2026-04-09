@@ -314,11 +314,11 @@ main() {
 
   printf "\n"
   log_info "Next steps:"
-  log_info "  1) Navigate to your project directory if not already there"
-  log_info "  2) Edit your .env file to configure Telegram, LLM keys, and workspace"
-  log_info "  3) Start the bot: ${BIN_NAME} start"
+  log_info "  1) cd to a project directory (with .env or copy .env.example from the repo)"
+  log_info "  2) Run: ${BIN_NAME} config   (or: ${BIN_NAME} setup   for full-screen setup)"
+  log_info "  3) Or edit .env, then: ${BIN_NAME} start"
   printf "\n"
-  log_info "Run: ${BIN_NAME} help for more options."
+  log_info "Run: ${BIN_NAME} help for more options (${BIN_NAME} doctor for preflight checks)."
 }
 
 main "$@"

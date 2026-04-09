@@ -391,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
         Some("setup") => {
             let saved = setup::run_setup_wizard()?;
             if saved {
-                println!("Setup saved to finally_a_value_bot.config.yaml");
+                println!("Setup saved to .env");
             } else {
                 println!("Setup canceled");
             }

@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-09 — README, install scripts, `.env.example`, Docker doc posture
+
+- **Area:** docs / onboarding / config
+- **Summary:** Rebuilt [.env.example](.env.example) from `Config::load_from_env` (sections for channels, LLM, web, scheduler, agent stack, runtime/workflow, cursor-agent, browser, safety, optional vault/social/git); removed obsolete `DELEGATE_*`; vault block commented so a copy does not enable vault by default. Refreshed [README.md](README.md) for native install, `config` / `setup`, `doctor`, minimum Telegram-or-Discord + LLM rules, web URL, vault pointer; Docker no longer recommended (legacy pointer to [DOCKER.md](DOCKER.md)). [install.sh](install.sh) / [install.ps1](install.ps1) next steps now emphasize `config`/`setup`. [DOCKER.md](DOCKER.md) opens with a non-recommended banner and clarifies host-prepared `.env`. Fixed misleading `setup` success message in [src/main.rs](src/main.rs) (saves `.env`, not YAML).
+- **Rationale:** Onboarding docs and the example env had drifted from the actual config surface and implied Docker as a first-class path; operators need one accurate reference aligned with `src/config.rs`.
+- **Key files / symbols:** `.env.example`; `README.md`; `install.sh`, `install.ps1`; `DOCKER.md`; `main.rs` — `Some("setup")` branch `println!`.
+
 ### 2026-04-09 — System prompt: repository layout and `.env` resolution
 
 - **Area:** agent / channels / workspace principles
