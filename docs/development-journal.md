@@ -47,7 +47,6 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Rationale:** Users can address a non-active persona per message while keeping UI “active” unchanged; agentic tool calls must stay on the run’s persona.
 - **Key files / symbols:** `persona::resolve_incoming_run_persona`; `tools::default_persona_id_for_chat`; `send_message` / `export_chat`; `channels/telegram.rs`, `discord.rs`, `whatsapp.rs` ingress.
 - **Follow-ups:** Optional same prefix convention on web; optional DRY with `schedule_task` persona resolution.
-
 ### 2026-04-09 — README, install scripts, `.env.example`, Docker doc posture
 
 - **Area:** docs / onboarding / config

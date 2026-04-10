@@ -59,11 +59,14 @@ impl Tool for ExportChatTool {
         let cid = chat_id;
         let persona_id = match default_persona_id_for_chat(&input, chat_id) {
             Some(pid) => pid,
-            None => match call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(cid)).await
-            {
-                Ok(pid) => pid,
-                Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
-            },
+            None => {
+                match call_blocking(self.db.clone(), move |db| db.get_or_create_default_persona(cid))
+                    .await
+                {
+                    Ok(pid) => pid,
+                    Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
+                }
+            }
         };
         let cid2 = chat_id;
         let pid = persona_id;
