@@ -18,6 +18,21 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-10 — Web chat: `React.memo(ThreadPane)` vs parent polling
+
+- **Area:** web / UX
+- **Summary:** Wrapped the chat thread in `React.memo` so it does not re-render when unrelated App state updates (persona list refresh every ~2.5–10s, queue diagnostics, schedules, etc.). `@assistant-ui/react`’s `useLocalRuntime` runs a `useEffect` with no dependency array each render, updating options and calling `__internal_load`; those extra passes correlated with composer text loss and scroll jumping.
+- **Rationale:** Isolate the assistant runtime from header/sidebar polling re-renders; defer/history equality alone was not sufficient.
+- **Key files / symbols:** `web/src/main.tsx` — `ThreadPane` (`React.memo`).
+
+### 2026-04-09 — Web UI: “Last agent run” modal (latest trace per persona)
+
+- **Area:** web / API / agent
+- **Summary:** Added `GET /api/personas/:persona_id/agent_history/latest` (same auth/binding/persona guards as memory) returning the newest `YYYYMMDD-HHMMSS.md` under `runtime_data_dir/groups/{chat_id}/{persona_id}/agent_history/`. Helpers in `agent_history` list/validate basenames, enforce a 4 MiB read cap, and `read_latest_agent_history`. Web header opens a **Last agent run** dialog that parses `## Iteration N` sections and renders Markdown with Prev/Next and ←/→.
+- **Rationale:** Operators can review the latest agentic loop (iterations and tool lines) without opening files on disk.
+- **Key files / symbols:** `agent_history::{list_agent_history_md_basenames_sorted, read_latest_agent_history, is_valid_agent_history_filename, ReadLatestAgentHistoryError}`; `web.rs` — `api_persona_agent_history_latest`; `web/src/main.tsx` — dialog, `AgentHistoryMarkdownBody`; `web/src/parse-agent-history.ts` — `parseAgentHistoryMarkdown`; `tools/agent_history.rs` — reuses shared listing.
+- **Follow-ups:** Optional API to list or fetch older runs; optional persisted per-iteration notes.
+
 ### 2026-04-09 — Web chat: avoid composer reset while typing / reading history
 
 - **Area:** web / UX

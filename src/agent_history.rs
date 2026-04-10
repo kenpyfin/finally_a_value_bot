@@ -2,8 +2,115 @@
 //! can later read them for self-improvement and workflow optimization.
 
 use chrono::{DateTime, Utc};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::info;
+
+/// Max bytes read for a single agent history file (web UI / API).
+pub const MAX_AGENT_HISTORY_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Basename must be `YYYYMMDD-HHMMSS.md` (same as `write_agent_history_run`).
+pub fn is_valid_agent_history_filename(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.len() != 18 {
+        return false;
+    }
+    for i in 0..8 {
+        if !b[i].is_ascii_digit() {
+            return false;
+        }
+    }
+    if b[8] != b'-' {
+        return false;
+    }
+    for i in 9..15 {
+        if !b[i].is_ascii_digit() {
+            return false;
+        }
+    }
+    b[15..] == *b".md"
+}
+
+/// Lists `YYYYMMDD-HHMMSS.md` basenames under `dir`, sorted ascending (oldest first).
+pub fn list_agent_history_md_basenames_sorted(dir: &Path) -> std::io::Result<Vec<String>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.extension().map_or(false, |e| e == "md") {
+            continue;
+        }
+        let os_name = entry.file_name();
+        let Some(name) = os_name.to_str() else {
+            continue;
+        };
+        if is_valid_agent_history_filename(name) {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+pub struct LatestAgentHistoryRead {
+    pub filename: String,
+    pub path: PathBuf,
+    pub content: String,
+    pub mtime_ms: i64,
+}
+
+#[derive(Debug)]
+pub enum ReadLatestAgentHistoryError {
+    Io(std::io::Error),
+    FileTooLarge(u64),
+}
+
+impl std::fmt::Display for ReadLatestAgentHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadLatestAgentHistoryError::Io(e) => write!(f, "{e}"),
+            ReadLatestAgentHistoryError::FileTooLarge(n) => {
+                write!(f, "agent history file too large ({n} bytes)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadLatestAgentHistoryError {}
+
+/// Reads the newest valid `.md` run file for this persona, if any.
+pub fn read_latest_agent_history(
+    data_dir: &str,
+    chat_id: i64,
+    persona_id: i64,
+) -> Result<Option<LatestAgentHistoryRead>, ReadLatestAgentHistoryError> {
+    let dir = history_dir(data_dir, chat_id, persona_id);
+    let basenames = list_agent_history_md_basenames_sorted(&dir).map_err(ReadLatestAgentHistoryError::Io)?;
+    let Some(newest) = basenames.last() else {
+        return Ok(None);
+    };
+    let full_path = dir.join(newest);
+    let meta = std::fs::metadata(&full_path).map_err(ReadLatestAgentHistoryError::Io)?;
+    let len = meta.len();
+    if len > MAX_AGENT_HISTORY_READ_BYTES {
+        return Err(ReadLatestAgentHistoryError::FileTooLarge(len));
+    }
+    let content = std::fs::read_to_string(&full_path).map_err(ReadLatestAgentHistoryError::Io)?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(Some(LatestAgentHistoryRead {
+        filename: newest.clone(),
+        path: full_path,
+        content,
+        mtime_ms,
+    }))
+}
 
 const MAX_HISTORY_FILES: usize = 50;
 

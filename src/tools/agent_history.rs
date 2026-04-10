@@ -3,7 +3,6 @@
 
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
 
 use crate::claude::ToolDefinition;
 
@@ -93,21 +92,20 @@ impl Tool for ReadAgentHistoryTool {
             return ToolResult::success("No agent history found for this persona.".into());
         }
 
-        let mut files = match collect_history_files(&dir) {
+        let mut files = match crate::agent_history::list_agent_history_md_basenames_sorted(&dir) {
             Ok(f) => f,
             Err(e) => return ToolResult::error(format!("Failed to read agent history dir: {e}")),
         };
 
         if let Some(ref since) = since_filter {
             files.retain(|name| {
-                let stem = name.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let stem = name.strip_suffix(".md").unwrap_or(name);
                 let date_part: String = stem.chars().take(8).collect();
                 date_part >= *since
             });
         }
 
         // Most recent first
-        files.sort();
         files.reverse();
         files.truncate(limit);
 
@@ -121,8 +119,8 @@ impl Tool for ReadAgentHistoryTool {
             files.len()
         ));
 
-        for path in &files {
-            let full_path = dir.join(path);
+        for basename in &files {
+            let full_path = dir.join(basename);
             match std::fs::read_to_string(&full_path) {
                 Ok(content) => {
                     output.push_str(&content);
@@ -131,7 +129,7 @@ impl Tool for ReadAgentHistoryTool {
                 Err(e) => {
                     output.push_str(&format!(
                         "[Error reading {}]: {}\n\n---\n\n",
-                        path.display(),
+                        basename,
                         e
                     ));
                 }
@@ -147,16 +145,4 @@ impl Tool for ReadAgentHistoryTool {
 
         ToolResult::success(output)
     }
-}
-
-fn collect_history_files(dir: &PathBuf) -> Result<Vec<PathBuf>, std::io::Error> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "md") {
-            files.push(PathBuf::from(entry.file_name()));
-        }
-    }
-    Ok(files)
 }
