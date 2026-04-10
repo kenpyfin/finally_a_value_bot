@@ -1,11 +1,57 @@
 //! Persona system: per-chat identity that selects which session and message history to use.
 //! Operations (list, switch, new, delete, model) are internal; use the HTTP API or this module.
-//! Chat flow only resolves persona_id via db.get_or_create_default_persona(chat_id).
+//! Inbound messages resolve run persona via [`resolve_incoming_run_persona`] (optional `[Name]` prefix)
+//! or `get_current_persona_id`; explicit switch commands still use `set_active_persona`.
 
 use std::sync::Arc;
 
 use crate::config::Config;
 use crate::db::{call_blocking, Database};
+use crate::error::FinallyAValueBotError;
+
+/// Leading `[token]` values that are transport/system tags, not persona names.
+const RESERVED_INBOUND_PERSONA_TOKENS: &[&str] = &["image", "document", "location", "voice"];
+
+/// Resolve which persona owns this inbound turn and optional body text after stripping a leading
+/// `[PersonaName]` tag. Does **not** call `set_active_persona` — DB active is unchanged.
+///
+/// - If the trimmed text starts with `[token]` and `token` matches a persona name for `chat_id`
+///   (ASCII case-insensitive), returns that persona's id and the remainder (trimmed) as the stored
+///   body.
+/// - Reserved tokens (`image`, `document`, `location`, `voice`) never select a persona.
+/// - Otherwise returns [`Database::get_current_persona_id`] and the original `text`.
+pub fn resolve_incoming_run_persona(
+    db: &Database,
+    chat_id: i64,
+    text: &str,
+) -> Result<(i64, String), FinallyAValueBotError> {
+    let fallback_pid = db.get_current_persona_id(chat_id)?;
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('[') {
+        return Ok((fallback_pid, text.to_string()));
+    }
+    let Some(close_idx) = trimmed.find(']') else {
+        return Ok((fallback_pid, text.to_string()));
+    };
+    let token = &trimmed[1..close_idx];
+    if token.is_empty() || token.len() > 64 || token.contains('\n') {
+        return Ok((fallback_pid, text.to_string()));
+    }
+    let token_lower = token.to_lowercase();
+    if RESERVED_INBOUND_PERSONA_TOKENS
+        .iter()
+        .any(|r| *r == token_lower.as_str())
+    {
+        return Ok((fallback_pid, text.to_string()));
+    }
+    let personas = db.list_personas(chat_id)?;
+    let Some(persona) = personas.iter().find(|p| p.name.eq_ignore_ascii_case(token)) else {
+        return Ok((fallback_pid, text.to_string()));
+    };
+    let body = trimmed[close_idx + 1..].trim_start();
+    let stored = body.to_string();
+    Ok((persona.id, stored))
+}
 
 /// Handle a persona command payload (e.g. from API or internal call).
 /// `text` is the full message; the first token is typically "/persona" or "/personas", rest are subcommand and args.
@@ -177,5 +223,80 @@ pub async fn handle_persona_command(
         }
     } else {
         "Usage: /persona [list|switch|new|delete|model]".into()
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_incoming_run_persona;
+    use crate::db::Database;
+
+    fn db_with_personas(dir: &std::path::Path) -> Database {
+        let db = Database::new(dir.to_str().unwrap()).unwrap();
+        let chat_id = 42_i64;
+        db.upsert_chat(chat_id, None, "private").unwrap();
+        let _ = db.create_persona(chat_id, "Alpha", None).unwrap();
+        let _ = db.create_persona(chat_id, "Beta", None).unwrap();
+        db.set_active_persona(
+            chat_id,
+            db.get_persona_by_name(chat_id, "Alpha")
+                .unwrap()
+                .unwrap()
+                .id,
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn prefix_routes_to_named_persona_without_changing_active() {
+        let dir = std::env::temp_dir().join(format!("persona_resolve_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = db_with_personas(&dir);
+        let chat_id = 42_i64;
+        let active_before = db.get_active_persona_id(chat_id).unwrap().unwrap();
+        let beta_id = db.get_persona_by_name(chat_id, "Beta").unwrap().unwrap().id;
+        let (pid, body) =
+            resolve_incoming_run_persona(&db, chat_id, "[Beta] hello").expect("resolve");
+        assert_eq!(pid, beta_id);
+        assert_eq!(body, "hello");
+        let active_after = db.get_active_persona_id(chat_id).unwrap().unwrap();
+        assert_eq!(active_before, active_after);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_prefix_uses_current_persona() {
+        let dir = std::env::temp_dir().join(format!("persona_resolve2_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = db_with_personas(&dir);
+        let chat_id = 42_i64;
+        let alpha_id = db
+            .get_persona_by_name(chat_id, "Alpha")
+            .unwrap()
+            .unwrap()
+            .id;
+        let (pid, body) = resolve_incoming_run_persona(&db, chat_id, "plain").expect("resolve");
+        assert_eq!(pid, alpha_id);
+        assert_eq!(body, "plain");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserved_document_prefix_does_not_match_persona() {
+        let dir = std::env::temp_dir().join(format!("persona_resolve3_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = db_with_personas(&dir);
+        let chat_id = 42_i64;
+        let alpha_id = db
+            .get_persona_by_name(chat_id, "Alpha")
+            .unwrap()
+            .unwrap()
+            .id;
+        let raw = "[document] saved_path=/tmp/x.txt note";
+        let (pid, body) = resolve_incoming_run_persona(&db, chat_id, raw).expect("resolve");
+        assert_eq!(pid, alpha_id);
+        assert_eq!(body, raw);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

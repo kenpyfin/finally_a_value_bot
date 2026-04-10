@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::{authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{authorize_chat_access, default_persona_id_for_chat, schema_object, Tool, ToolResult};
 use crate::claude::ToolDefinition;
 use crate::db::{call_blocking, Database};
 
@@ -57,13 +57,18 @@ impl Tool for ExportChatTool {
         }
 
         let cid = chat_id;
-        let persona_id = match call_blocking(self.db.clone(), move |db| {
-            db.get_or_create_default_persona(cid)
-        })
-        .await
-        {
-            Ok(pid) => pid,
-            Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
+        let persona_id = match default_persona_id_for_chat(&input, chat_id) {
+            Some(pid) => pid,
+            None => {
+                match call_blocking(self.db.clone(), move |db| {
+                    db.get_or_create_default_persona(cid)
+                })
+                .await
+                {
+                    Ok(pid) => pid,
+                    Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
+                }
+            }
         };
         let cid2 = chat_id;
         let pid = persona_id;

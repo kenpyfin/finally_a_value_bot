@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   AssistantRuntimeProvider,
@@ -38,10 +38,12 @@ import {
   Theme,
 } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
+import ReactMarkdown from 'react-markdown'
 import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
+import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
 import type { Persona, ScheduleTask, ChannelBinding } from './types'
 
 type BackendMessage = {
@@ -441,6 +443,7 @@ function mapBackendHistory(messages: BackendMessage[]): ThreadMessageLike[] {
   }))
 }
 
+/** Compare history for sync/remount decisions: id, role, content only — ignore `createdAt` (server timestamps can jitter between polls). */
 function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): boolean {
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i += 1) {
@@ -449,11 +452,19 @@ function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): boolean
     if (x.id !== y.id) return false
     if (x.role !== y.role) return false
     if (x.content !== y.content) return false
-    const xMs = x.createdAt instanceof Date ? x.createdAt.getTime() : Date.parse(String(x.createdAt ?? ''))
-    const yMs = y.createdAt instanceof Date ? y.createdAt.getTime() : Date.parse(String(y.createdAt ?? ''))
-    if (xMs !== yMs) return false
   }
   return true
+}
+
+function shouldDeferHistoryRemount(): boolean {
+  if (typeof document === 'undefined') return false
+  const inComposer = Boolean(document.activeElement?.closest?.('.aui-composer-root'))
+  const vp = document.querySelector('.aui-thread-viewport')
+  if (!vp) return inComposer
+  const el = vp as HTMLElement
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  const scrolledAwayFromBottom = gap > 100
+  return inComposer || scrolledAwayFromBottom
 }
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -567,7 +578,8 @@ type ThreadPaneProps = {
   runtimeKey: string
 }
 
-function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
+/** Isolated from App re-renders (persona poll, queue lane, schedules, etc.). `useLocalRuntime` runs an effect after every render that touches options/load; re-rendering on unrelated parent state was resetting the composer and scroll. */
+const ThreadPane = React.memo(function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
   const MarkdownText = makeMarkdownText({
     remarkPlugins: [remarkGfm],
     components: {
@@ -617,6 +629,25 @@ function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
       </div>
     </AssistantRuntimeProvider>
   )
+})
+
+function AgentHistoryMarkdownBody({ markdown }: { markdown: string }) {
+  return (
+    <div className="aui-md-root text-sm leading-relaxed">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          table: ({ className, ...props }) => (
+            <div className="mc-md-table-scroll">
+              <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
+            </div>
+          ),
+        }}
+      >
+        {markdown}
+      </ReactMarkdown>
+    </div>
+  )
 }
 
 function App() {
@@ -642,6 +673,15 @@ function App() {
   const [memoryPathHint, setMemoryPathHint] = useState<string>('')
   const [memoryBusy, setMemoryBusy] = useState<boolean>(false)
   const [memoryError, setMemoryError] = useState<string>('')
+  const [agentHistoryDialogOpen, setAgentHistoryDialogOpen] = useState(false)
+  const [agentHistoryBusy, setAgentHistoryBusy] = useState(false)
+  const [agentHistoryError, setAgentHistoryError] = useState('')
+  const [agentHistoryRaw, setAgentHistoryRaw] = useState('')
+  const [agentHistoryParsed, setAgentHistoryParsed] = useState<ParsedAgentHistory | null>(null)
+  const [agentHistoryPathHint, setAgentHistoryPathHint] = useState('')
+  const [agentHistoryFilename, setAgentHistoryFilename] = useState('')
+  const [agentHistoryMtimeMs, setAgentHistoryMtimeMs] = useState<number | null>(null)
+  const [agentHistoryIterationIdx, setAgentHistoryIterationIdx] = useState(0)
   const [newSchedulePrompt, setNewSchedulePrompt] = useState('')
   const [newScheduleType, setNewScheduleType] = useState<'cron' | 'once'>('cron')
   const [newScheduleValue, setNewScheduleValue] = useState('0 9 * * *')
@@ -651,6 +691,22 @@ function App() {
   const [queueLane, setQueueLane] = useState<QueueLane | null>(null)
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
+
+  const historySeedRef = useRef<ThreadMessageLike[]>([])
+  const deferredHistoryRef = useRef<ThreadMessageLike[] | null>(null)
+
+  useEffect(() => {
+    historySeedRef.current = historySeed
+  }, [historySeed])
+
+  const flushDeferredHistory = useCallback(() => {
+    const pending = deferredHistoryRef.current
+    if (!pending) return
+    deferredHistoryRef.current = null
+    if (historiesEqual(historySeedRef.current, pending)) return
+    setHistorySeed(pending)
+    setRuntimeNonce((x) => x + 1)
+  }, [])
 
   const personaHasNew = useMemo<Record<number, boolean>>(() => {
     if (chatId == null) return {}
@@ -746,13 +802,19 @@ function App() {
     const p = personas.find((x) => x.name === personaName)
     if (p) writeStoredPersonaId(p.id)
     await loadPersonas(chatId)
-    await loadHistory(chatId, p?.id ?? undefined)
+    await loadHistory(chatId, p?.id ?? undefined, null, { force: true })
     if (p) markPersonaRead(p.id)
     setRuntimeNonce((x) => x + 1)
   }
 
-  async function loadHistory(cid: number | null = chatId, personaId?: number | null, day?: string | null): Promise<void> {
+  async function loadHistory(
+    cid: number | null = chatId,
+    personaId?: number | null,
+    day?: string | null,
+    opts?: { force?: boolean },
+  ): Promise<void> {
     if (cid == null) return
+    const force = opts?.force === true
     const query = new URLSearchParams({ chat_id: String(cid) })
     if (personaId != null && personaId > 0) query.set('persona_id', String(personaId))
     if (day) query.set('day', day)
@@ -765,13 +827,19 @@ function App() {
       const allDays = Object.keys(nextByDay).sort()
       const combined = allDays.flatMap((d) => (nextByDay[d] ?? []))
       setHistoryByDay(nextByDay)
-      if (!historiesEqual(historySeed, combined)) {
+      if (!historiesEqual(historySeedRef.current, combined)) {
+        deferredHistoryRef.current = null
         setHistorySeed(combined)
         setRuntimeNonce((x) => x + 1)
       }
     } else {
       setHistoryByDay({})
-      if (!historiesEqual(historySeed, mapped)) {
+      if (!historiesEqual(historySeedRef.current, mapped)) {
+        if (!force && shouldDeferHistoryRemount()) {
+          deferredHistoryRef.current = mapped
+          return
+        }
+        deferredHistoryRef.current = null
         setHistorySeed(mapped)
         setRuntimeNonce((x) => x + 1)
       }
@@ -815,6 +883,39 @@ function App() {
     }
   }
 
+  async function loadAgentHistoryLatest(pid: number): Promise<void> {
+    setAgentHistoryBusy(true)
+    setAgentHistoryError('')
+    try {
+      const data = await api<{
+        content?: string
+        path?: string
+        filename?: string
+        mtime_ms?: number
+      }>(`/api/personas/${pid}/agent_history/latest`)
+      const raw = typeof data.content === 'string' ? data.content : ''
+      setAgentHistoryPathHint(typeof data.path === 'string' ? data.path : '')
+      setAgentHistoryFilename(typeof data.filename === 'string' ? data.filename : '')
+      setAgentHistoryMtimeMs(typeof data.mtime_ms === 'number' ? data.mtime_ms : null)
+      setAgentHistoryRaw(raw)
+      setAgentHistoryParsed(parseAgentHistoryMarkdown(raw))
+      setAgentHistoryIterationIdx(0)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      const isEmpty = /no agent history for this persona/i.test(msg)
+      setAgentHistoryError(
+        isEmpty ? 'No saved agent run history for this persona yet.' : msg,
+      )
+      setAgentHistoryRaw('')
+      setAgentHistoryParsed(null)
+      setAgentHistoryPathHint('')
+      setAgentHistoryFilename('')
+      setAgentHistoryMtimeMs(null)
+    } finally {
+      setAgentHistoryBusy(false)
+    }
+  }
+
   async function loadOlderDay(): Promise<void> {
     if (chatId == null || loadingOlder) return
     setLoadingOlder(true)
@@ -834,7 +935,7 @@ function App() {
         })()
       const idx = allDays.indexOf(oldestLoaded)
       const nextOlder = idx >= 0 && idx < allDays.length - 1 ? allDays[idx + 1] : null
-      if (nextOlder) await loadHistory(chatId, activePersonaId ?? undefined, nextOlder)
+      if (nextOlder) await loadHistory(chatId, activePersonaId ?? undefined, nextOlder, { force: true })
     } finally {
       setLoadingOlder(false)
     }
@@ -928,7 +1029,7 @@ function App() {
         body: JSON.stringify({ chat_id: chatId, persona_id: personaId }),
       })
       await loadPersonas(chatId)
-      if (activePersonaId === personaId) await loadHistory(chatId)
+      if (activePersonaId === personaId) await loadHistory(chatId, undefined, null, { force: true })
       setStatusText('Persona deleted')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -959,7 +1060,7 @@ function App() {
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
           loadQueueDiagnostics(cid).catch(() => { })
-          await loadHistory(cid, chosen?.id ?? pid)
+          await loadHistory(cid, chosen?.id ?? pid, null, { force: true })
           const readId = chosen?.id ?? pid ?? null
           if (readId != null) markPersonaRead(readId)
         }
@@ -993,6 +1094,30 @@ function App() {
     void loadPersonaMemory(activePersonaId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [memoryDialogOpen, activePersonaId])
+
+  useEffect(() => {
+    if (!agentHistoryDialogOpen) return
+    if (activePersonaId == null) return
+    void loadAgentHistoryLatest(activePersonaId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentHistoryDialogOpen, activePersonaId])
+
+  useEffect(() => {
+    if (!agentHistoryDialogOpen) return
+    const n = agentHistoryParsed?.iterations.length ?? 0
+    if (n === 0) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault()
+        setAgentHistoryIterationIdx((i) => Math.max(0, i - 1))
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault()
+        setAgentHistoryIterationIdx((i) => Math.min(n - 1, i + 1))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [agentHistoryDialogOpen, agentHistoryParsed?.iterations.length])
 
   useEffect(() => {
     if (chatId == null) return
@@ -1040,7 +1165,7 @@ function App() {
       body: JSON.stringify({ contact_chat_id: contactChatId }),
     })
     await loadBindings(chatId)
-    await loadHistory(chatId)
+    await loadHistory(chatId, undefined, null, { force: true })
     setRuntimeNonce((x) => x + 1)
   }
 
@@ -1100,7 +1225,9 @@ function App() {
           // ignore; we still load history for the chosen persona
         }
       }
-      loadHistory(chatId, chosen?.id).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      loadHistory(chatId, chosen?.id, null, { force: true }).catch((e) =>
+        setError(e instanceof Error ? e.message : String(e)),
+      )
     }
     init()
     return () => { cancelled = true }
@@ -1165,6 +1292,32 @@ function App() {
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
+
+  useEffect(() => {
+    const onFocusOut = (e: FocusEvent) => {
+      const t = e.target as HTMLElement | null
+      if (!t?.closest?.('.aui-composer-root')) return
+      const rt = e.relatedTarget as HTMLElement | null
+      if (!rt?.closest?.('.aui-composer-root')) {
+        flushDeferredHistory()
+      }
+    }
+    document.addEventListener('focusout', onFocusOut, true)
+    return () => document.removeEventListener('focusout', onFocusOut, true)
+  }, [flushDeferredHistory])
+
+  useEffect(() => {
+    const vp = document.querySelector('.aui-thread-viewport')
+    if (!vp) return
+    const onScroll = () => {
+      const el = vp as HTMLElement
+      if (el.scrollHeight - el.scrollTop - el.clientHeight <= 100) {
+        flushDeferredHistory()
+      }
+    }
+    vp.addEventListener('scroll', onScroll, { passive: true })
+    return () => vp.removeEventListener('scroll', onScroll)
+  }, [flushDeferredHistory, runtimeNonce])
 
   function submitAuthToken() {
     const token = sanitizeHttpHeaderValue(authTokenInput)
@@ -1435,6 +1588,147 @@ function App() {
                             <Button size="1" variant="soft">Close</Button>
                           </Dialog.Close>
                         </Flex>
+                      </Flex>
+                    </Dialog.Content>
+                  </Dialog.Root>
+
+                  <Dialog.Root
+                    open={agentHistoryDialogOpen}
+                    onOpenChange={(open) => {
+                      setAgentHistoryDialogOpen(open)
+                      if (!open) {
+                        setAgentHistoryError('')
+                        setAgentHistoryBusy(false)
+                      }
+                    }}
+                  >
+                    <Dialog.Trigger>
+                      <Button size="1" variant="soft" disabled={activePersonaId == null}>
+                        Last agent run
+                      </Button>
+                    </Dialog.Trigger>
+                    <Dialog.Content style={{ maxWidth: 900 }}>
+                      <Dialog.Title>Last agent run</Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        Latest saved trace for this persona (iterations and tool calls). Use Prev/Next or arrow keys to step through iterations.
+                      </Dialog.Description>
+
+                      {agentHistoryPathHint ? (
+                        <Text size="1" color="gray" className="mb-1 block">
+                          {agentHistoryPathHint}
+                        </Text>
+                      ) : null}
+                      {agentHistoryFilename ? (
+                        <Text size="1" color="gray" className="mb-2 block">
+                          File: {agentHistoryFilename}
+                          {agentHistoryMtimeMs != null ? ` · mtime: ${agentHistoryMtimeMs}` : ''}
+                        </Text>
+                      ) : null}
+
+                      {agentHistoryBusy ? (
+                        <Text size="2" color="gray" mb="2">
+                          Loading…
+                        </Text>
+                      ) : null}
+
+                      {agentHistoryError ? (
+                        <Callout.Root color="orange" size="1" variant="soft" className="mb-2">
+                          <Callout.Text>{agentHistoryError}</Callout.Text>
+                        </Callout.Root>
+                      ) : null}
+
+                      {!agentHistoryBusy && !agentHistoryError && agentHistoryParsed != null ? (
+                        <>
+                          {agentHistoryParsed.runHeader.trim() ? (
+                            <div
+                              className={
+                                appearance === 'dark'
+                                  ? 'mb-3 max-h-32 overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-2'
+                                  : 'mb-3 max-h-32 overflow-auto rounded-md border border-slate-300 bg-slate-50 p-2'
+                              }
+                            >
+                              <AgentHistoryMarkdownBody markdown={agentHistoryParsed.runHeader} />
+                            </div>
+                          ) : null}
+
+                          {agentHistoryParsed.iterations.length > 0 ? (
+                            <>
+                              <Flex justify="between" align="center" mb="2" wrap="wrap" gap="2">
+                                <Text size="2">
+                                  Iteration {agentHistoryIterationIdx + 1} of {agentHistoryParsed.iterations.length}
+                                </Text>
+                                <Flex gap="2">
+                                  <Button
+                                    size="1"
+                                    variant="soft"
+                                    disabled={agentHistoryIterationIdx <= 0}
+                                    onClick={() =>
+                                      setAgentHistoryIterationIdx((i) => Math.max(0, i - 1))
+                                    }
+                                  >
+                                    Prev
+                                  </Button>
+                                  <Button
+                                    size="1"
+                                    variant="soft"
+                                    disabled={
+                                      agentHistoryIterationIdx >= agentHistoryParsed.iterations.length - 1
+                                    }
+                                    onClick={() =>
+                                      setAgentHistoryIterationIdx((i) =>
+                                        Math.min(agentHistoryParsed.iterations.length - 1, i + 1),
+                                      )
+                                    }
+                                  >
+                                    Next
+                                  </Button>
+                                </Flex>
+                              </Flex>
+                              <Text size="1" color="gray" mb="2" className="block">
+                                Keyboard: ← →
+                              </Text>
+                              <div
+                                className={
+                                  appearance === 'dark'
+                                    ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
+                                    : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
+                                }
+                              >
+                                <AgentHistoryMarkdownBody
+                                  markdown={
+                                    agentHistoryParsed.iterations[agentHistoryIterationIdx]?.body ?? ''
+                                  }
+                                />
+                              </div>
+                            </>
+                          ) : (
+                            <div
+                              className={
+                                appearance === 'dark'
+                                  ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
+                                  : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
+                              }
+                            >
+                              <AgentHistoryMarkdownBody markdown={agentHistoryRaw} />
+                            </div>
+                          )}
+                        </>
+                      ) : null}
+
+                      <Flex justify="end" mt="3" gap="2">
+                        <Button
+                          size="1"
+                          variant="soft"
+                          onClick={() => {
+                            if (activePersonaId != null) void loadAgentHistoryLatest(activePersonaId)
+                          }}
+                          disabled={agentHistoryBusy || activePersonaId == null}
+                        >
+                          Reload
+                        </Button>
+                        <Dialog.Close>
+                          <Button size="1" variant="soft">Close</Button>
+                        </Dialog.Close>
                       </Flex>
                     </Dialog.Content>
                   </Dialog.Root>

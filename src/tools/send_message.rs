@@ -6,7 +6,10 @@ use serde_json::json;
 use teloxide::prelude::*;
 use teloxide::types::InputFile;
 
-use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{
+    auth_context_from_input, authorize_chat_access, default_persona_id_for_chat, schema_object,
+    Tool, ToolResult,
+};
 use crate::channel::{deliver_and_store_bot_message, enforce_channel_policy};
 use crate::claude::ToolDefinition;
 use crate::config::Config;
@@ -476,10 +479,14 @@ impl Tool for SendMessageTool {
                     let pid_result = match persona_id_override {
                         Some(id) => Ok(id),
                         None => {
-                            call_blocking(db.clone(), move |db| {
-                                db.get_or_create_default_persona(chat_id)
-                            })
-                            .await
+                            if let Some(pid) = default_persona_id_for_chat(&input, chat_id) {
+                                Ok(pid)
+                            } else {
+                                call_blocking(db.clone(), move |db| {
+                                    db.get_or_create_default_persona(chat_id)
+                                })
+                                .await
+                            }
                         }
                     };
                     let pid = match pid_result {
@@ -510,10 +517,14 @@ impl Tool for SendMessageTool {
             let persona_id_result = match persona_id_override {
                 Some(id) => Ok(id),
                 None => {
-                    call_blocking(self.db.clone(), move |db| {
-                        db.get_or_create_default_persona(cid)
-                    })
-                    .await
+                    if let Some(pid) = default_persona_id_for_chat(&input, chat_id) {
+                        Ok(pid)
+                    } else {
+                        call_blocking(self.db.clone(), move |db| {
+                            db.get_or_create_default_persona(cid)
+                        })
+                        .await
+                    }
                 }
             };
             let persona_id = match persona_id_result {
@@ -574,6 +585,40 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("Permission denied"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_prefers_auth_caller_persona_over_db_active() {
+        let (db, dir) = test_db();
+        let chat_id = 777_i64;
+        db.upsert_chat(chat_id, Some("web-main"), "web").unwrap();
+        let alpha_id = db.create_persona(chat_id, "Alpha", None).unwrap();
+        let beta_id = db.create_persona(chat_id, "Beta", None).unwrap();
+        db.set_active_persona(chat_id, alpha_id).unwrap();
+
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db.clone(), "bot".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": chat_id,
+                "text": "from beta run",
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": chat_id,
+                    "caller_persona_id": beta_id,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let beta_msgs = db.get_all_messages(chat_id, beta_id).unwrap();
+        assert_eq!(beta_msgs.len(), 1);
+        assert!(beta_msgs[0].is_from_bot);
+        let alpha_msgs = db.get_all_messages(chat_id, alpha_id).unwrap();
+        assert!(
+            alpha_msgs.is_empty(),
+            "message should be stored under auth persona, not active"
+        );
         cleanup(&dir);
     }
 

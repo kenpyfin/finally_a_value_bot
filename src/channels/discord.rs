@@ -259,12 +259,28 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Resolve persona for this contact
-        let persona_id = call_blocking(self.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(canonical_chat_id)
+        // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
+        let text_for_resolve = text.clone();
+        let (persona_id, text) = match call_blocking(self.app_state.db.clone(), move |db| {
+            crate::persona::resolve_incoming_run_persona(&db, canonical_chat_id, &text_for_resolve)
         })
         .await
-        .unwrap_or(0);
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    target: "persona",
+                    error = %e,
+                    "resolve_incoming_run_persona failed; falling back to active persona"
+                );
+                let pid = call_blocking(self.app_state.db.clone(), move |db| {
+                    db.get_current_persona_id(canonical_chat_id)
+                })
+                .await
+                .unwrap_or(0);
+                (pid, text)
+            }
+        };
         if persona_id == 0 {
             return;
         }

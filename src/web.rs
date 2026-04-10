@@ -1760,6 +1760,48 @@ async fn api_persona_memory_put(
     })))
 }
 
+async fn api_persona_agent_history_latest(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMemoryPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let data_dir = state.app_state.config.runtime_data_dir();
+    match crate::agent_history::read_latest_agent_history(&data_dir, chat_id, pid) {
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            "no agent history for this persona".into(),
+        )),
+        Ok(Some(r)) => Ok(Json(json!({
+            "ok": true,
+            "persona_id": pid,
+            "filename": r.filename,
+            "content": r.content,
+            "mtime_ms": r.mtime_ms,
+            "path": r.path.to_string_lossy(),
+        }))),
+        Err(crate::agent_history::ReadLatestAgentHistoryError::FileTooLarge(_)) => Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "agent history file too large".into(),
+        )),
+        Err(crate::agent_history::ReadLatestAgentHistoryError::Io(e)) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
 async fn api_personas_create(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -2460,6 +2502,10 @@ fn build_router(web_state: WebState) -> Router {
         .route(
             "/api/personas/:persona_id/memory",
             get(api_persona_memory_get).put(api_persona_memory_put),
+        )
+        .route(
+            "/api/personas/:persona_id/agent_history/latest",
+            get(api_persona_agent_history_latest),
         )
         .route("/api/oauth/authorize/:platform", get(api_oauth_authorize))
         .route("/api/oauth/callback/:platform", get(api_oauth_callback))

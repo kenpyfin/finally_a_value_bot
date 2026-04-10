@@ -18,6 +18,35 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-10 — Web chat: `React.memo(ThreadPane)` vs parent polling
+
+- **Area:** web / UX
+- **Summary:** Wrapped the chat thread in `React.memo` so it does not re-render when unrelated App state updates (persona list refresh every ~2.5–10s, queue diagnostics, schedules, etc.). `@assistant-ui/react`’s `useLocalRuntime` runs a `useEffect` with no dependency array each render, updating options and calling `__internal_load`; those extra passes correlated with composer text loss and scroll jumping.
+- **Rationale:** Isolate the assistant runtime from header/sidebar polling re-renders; defer/history equality alone was not sufficient.
+- **Key files / symbols:** `web/src/main.tsx` — `ThreadPane` (`React.memo`).
+
+### 2026-04-09 — Web UI: “Last agent run” modal (latest trace per persona)
+
+- **Area:** web / API / agent
+- **Summary:** Added `GET /api/personas/:persona_id/agent_history/latest` (same auth/binding/persona guards as memory) returning the newest `YYYYMMDD-HHMMSS.md` under `runtime_data_dir/groups/{chat_id}/{persona_id}/agent_history/`. Helpers in `agent_history` list/validate basenames, enforce a 4 MiB read cap, and `read_latest_agent_history`. Web header opens a **Last agent run** dialog that parses `## Iteration N` sections and renders Markdown with Prev/Next and ←/→.
+- **Rationale:** Operators can review the latest agentic loop (iterations and tool lines) without opening files on disk.
+- **Key files / symbols:** `agent_history::{list_agent_history_md_basenames_sorted, read_latest_agent_history, is_valid_agent_history_filename, ReadLatestAgentHistoryError}`; `web.rs` — `api_persona_agent_history_latest`; `web/src/main.tsx` — dialog, `AgentHistoryMarkdownBody`; `web/src/parse-agent-history.ts` — `parseAgentHistoryMarkdown`; `tools/agent_history.rs` — reuses shared listing.
+- **Follow-ups:** Optional API to list or fetch older runs; optional persisted per-iteration notes.
+
+### 2026-04-09 — Web chat: avoid composer reset while typing / reading history
+
+- **Area:** web / UX
+- **Summary:** History sync compared messages including `createdAt`, so polling could remount the thread when timestamps jittered. Remounting bumped `runtimeNonce` and wiped the composer + scrolled to bottom. Equality now uses id/role/content only; background `loadHistory` defers applying updates (and the remount) while the composer is focused or the thread viewport is scrolled away from the bottom, then flushes on focus-out or scroll-to-bottom. Explicit actions (initial load, persona switch, bind, load older, delete persona) use `force: true`.
+- **Rationale:** Polling and post-send history refresh must not disrupt typing or reading older messages.
+- **Key files / symbols:** `web/src/main.tsx` — `historiesEqual`, `shouldDeferHistoryRemount`, `deferredHistoryRef`, `flushDeferredHistory`, `loadHistory(..., { force })`.
+
+### 2026-04-09 — Persona routing: requester prefix + run-scoped tool defaults
+
+- **Area:** channels / agent / tools / persona
+- **Summary:** Inbound Telegram, Discord, and WhatsApp messages resolve **run persona** via optional leading `[PersonaName]` (case-insensitive match to a persona in that chat; reserved `image`/`document`/`location`/`voice`); storage and `process_with_agent` use that id **without** calling `set_active_persona`. Added `default_persona_id_for_chat` so `send_message` and `export_chat` default to `ToolAuthContext.caller_persona_id` for the same chat instead of DB active at tool time (mid-run active switch no longer mis-attributes).
+- **Rationale:** Users can address a non-active persona per message while keeping UI “active” unchanged; agentic tool calls must stay on the run’s persona.
+- **Key files / symbols:** `persona::resolve_incoming_run_persona`; `tools::default_persona_id_for_chat`; `send_message` / `export_chat`; `channels/telegram.rs`, `discord.rs`, `whatsapp.rs` ingress.
+- **Follow-ups:** Optional same prefix convention on web; optional DRY with `schedule_task` persona resolution.
 ### 2026-04-09 — README, install scripts, `.env.example`, Docker doc posture
 
 - **Area:** docs / onboarding / config
