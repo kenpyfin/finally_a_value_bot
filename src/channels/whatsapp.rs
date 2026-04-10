@@ -450,9 +450,16 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
 
                 // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
                 let text_for_resolve = text.clone();
-                let (persona_id, text) = match call_blocking(state.app_state.db.clone(), move |db| {
-                    crate::persona::resolve_incoming_run_persona(&db, chat_id, &text_for_resolve)
-                })
+                let (persona_id, text) = match call_blocking(
+                    state.app_state.db.clone(),
+                    move |db| {
+                        crate::persona::resolve_incoming_run_persona(
+                            &db,
+                            chat_id,
+                            &text_for_resolve,
+                        )
+                    },
+                )
                 .await
                 {
                     Ok(pair) => pair,

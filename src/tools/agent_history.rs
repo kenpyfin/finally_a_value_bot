@@ -127,11 +127,7 @@ impl Tool for ReadAgentHistoryTool {
                     output.push_str("\n---\n\n");
                 }
                 Err(e) => {
-                    output.push_str(&format!(
-                        "[Error reading {}]: {}\n\n---\n\n",
-                        basename,
-                        e
-                    ));
+                    output.push_str(&format!("[Error reading {}]: {}\n\n---\n\n", basename, e));
                 }
             }
         }

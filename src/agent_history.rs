@@ -87,7 +87,8 @@ pub fn read_latest_agent_history(
     persona_id: i64,
 ) -> Result<Option<LatestAgentHistoryRead>, ReadLatestAgentHistoryError> {
     let dir = history_dir(data_dir, chat_id, persona_id);
-    let basenames = list_agent_history_md_basenames_sorted(&dir).map_err(ReadLatestAgentHistoryError::Io)?;
+    let basenames =
+        list_agent_history_md_basenames_sorted(&dir).map_err(ReadLatestAgentHistoryError::Io)?;
     let Some(newest) = basenames.last() else {
         return Ok(None);
     };

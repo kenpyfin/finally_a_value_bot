@@ -1797,10 +1797,9 @@ async fn api_persona_agent_history_latest(
             StatusCode::PAYLOAD_TOO_LARGE,
             "agent history file too large".into(),
         )),
-        Err(crate::agent_history::ReadLatestAgentHistoryError::Io(e)) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            e.to_string(),
-        )),
+        Err(crate::agent_history::ReadLatestAgentHistoryError::Io(e)) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
     }
 }
 async fn api_personas_create(

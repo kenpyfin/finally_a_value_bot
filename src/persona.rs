@@ -10,8 +10,7 @@ use crate::db::{call_blocking, Database};
 use crate::error::FinallyAValueBotError;
 
 /// Leading `[token]` values that are transport/system tags, not persona names.
-const RESERVED_INBOUND_PERSONA_TOKENS: &[&str] =
-    &["image", "document", "location", "voice"];
+const RESERVED_INBOUND_PERSONA_TOKENS: &[&str] = &["image", "document", "location", "voice"];
 
 /// Resolve which persona owns this inbound turn and optional body text after stripping a leading
 /// `[PersonaName]` tag. Does **not** call `set_active_persona` — DB active is unchanged.
@@ -46,10 +45,7 @@ pub fn resolve_incoming_run_persona(
         return Ok((fallback_pid, text.to_string()));
     }
     let personas = db.list_personas(chat_id)?;
-    let Some(persona) = personas
-        .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(token))
-    else {
+    let Some(persona) = personas.iter().find(|p| p.name.eq_ignore_ascii_case(token)) else {
         return Ok((fallback_pid, text.to_string()));
     };
     let body = trimmed[close_idx + 1..].trim_start();
@@ -259,11 +255,7 @@ mod resolve_tests {
         let db = db_with_personas(&dir);
         let chat_id = 42_i64;
         let active_before = db.get_active_persona_id(chat_id).unwrap().unwrap();
-        let beta_id = db
-            .get_persona_by_name(chat_id, "Beta")
-            .unwrap()
-            .unwrap()
-            .id;
+        let beta_id = db.get_persona_by_name(chat_id, "Beta").unwrap().unwrap().id;
         let (pid, body) =
             resolve_incoming_run_persona(&db, chat_id, "[Beta] hello").expect("resolve");
         assert_eq!(pid, beta_id);
