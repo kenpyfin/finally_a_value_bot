@@ -83,6 +83,40 @@ async fn run_due_tasks(
         _ => {}
     }
 
+    match call_blocking(state.db.clone(), {
+        let now = now.clone();
+        move |db| db.reconcile_stale_active_job_heartbeats(&now, stale_reclaim_secs)
+    })
+    .await
+    {
+        Ok(keys) if !keys.is_empty() => {
+            info!(
+                "Scheduler: reconciled {} stale active job heartbeat(s): {:?}",
+                keys.len(),
+                keys
+            );
+        }
+        Err(e) => error!("Scheduler: failed to reconcile stale job heartbeats: {e}"),
+        _ => {}
+    }
+
+    match call_blocking(state.db.clone(), {
+        let now = now.clone();
+        move |db| db.reconcile_orphan_stale_background_jobs(&now, stale_reclaim_secs)
+    })
+    .await
+    {
+        Ok(ids) if !ids.is_empty() => {
+            info!(
+                "Scheduler: reconciled {} orphan stale background job(s): {:?}",
+                ids.len(),
+                ids
+            );
+        }
+        Err(e) => error!("Scheduler: failed to reconcile orphan background jobs: {e}"),
+        _ => {}
+    }
+
     let tasks = match call_blocking(state.db.clone(), {
         let now_for_due = now.clone();
         move |db| db.get_due_tasks(&now_for_due)
@@ -412,6 +446,10 @@ async fn run_scheduled_agent_and_finalize(
                     chat_id = chat_id,
                     "Skipping duplicate scheduled delivery: latest stored message already matches"
                 );
+                let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
+                    "scheduled task #{} completed (duplicate delivery skipped)",
+                    task_id
+                )));
                 (true, Some("Skipped duplicate final delivery".to_string()))
             } else {
                 match deliver_to_contact(

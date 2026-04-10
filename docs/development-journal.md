@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-10 — Background jobs: visibility, terminal heartbeats, stale reconciliation
+
+- **Area:** web / API / scheduler / db / job heartbeat
+- **Summary:** Closed gaps where job heartbeats could stay `active` after worker disconnect; scheduled duplicate-delivery skip now sends `Finished` to the shared heartbeat. `/api/run_status` merges optional DB heartbeat + background job snapshot (and falls back to DB-only when the in-memory run hub has no channel, e.g. polling by background `job_id`). `GET /api/background_jobs` returns per-job `heartbeat`, `active_heartbeats`, and `GET /api/background_jobs/:job_id` returns merged job + heartbeat + recent timeline rows. Scheduler tick calls `reconcile_stale_active_job_heartbeats` and `reconcile_orphan_stale_background_jobs` using the same threshold as `scheduler_stale_running_reclaim_secs`. Web header shows **Background: N active** and polls background visibility when the queue is busy or background work is active.
+- **Rationale:** Operators need a single place to see liveness and stage; dangling `active` rows after crashes or dropped senders misrepresented system state; process-kill leaves DB stale until a reconciler runs.
+- **Key files / symbols:** `job_heartbeat::spawn_shared_heartbeat` (disconnect → `aborted` + timeline); `scheduler::run_scheduled_agent_and_finalize` (skip_dup → `Finished`); `scheduler::run_due_tasks` (reconcile calls); `db::{list_active_job_heartbeats_for_chat, list_job_heartbeats_for_chat, reconcile_stale_active_job_heartbeats, reconcile_orphan_stale_background_jobs}`; `web::{json_job_heartbeat, api_run_status, api_background_jobs_list, api_background_job_get}`; `web/src/main.tsx` — `loadBackgroundVisibility`, header indicator.
+
 ### 2026-04-10 — Web chat: `React.memo(ThreadPane)` vs parent polling
 
 - **Area:** web / UX

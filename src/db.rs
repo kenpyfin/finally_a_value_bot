@@ -2330,6 +2330,210 @@ impl Database {
         }
     }
 
+    /// Active heartbeats for a chat (e.g. operator visibility, dashboards).
+    pub fn list_active_job_heartbeats_for_chat(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<JobHeartbeat>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let lim = limit.max(1).min(100) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT run_key, chat_id, persona_id, job_type, stage, message, active, updated_at
+             FROM job_heartbeats
+             WHERE chat_id = ?1 AND active = 1
+             ORDER BY updated_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id, lim], |row| {
+                Ok(JobHeartbeat {
+                    run_key: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    job_type: row.get(3)?,
+                    stage: row.get(4)?,
+                    message: row.get(5)?,
+                    active: row.get::<_, i32>(6)? != 0,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Recent heartbeats for a chat (including completed), for merging into job lists.
+    pub fn list_job_heartbeats_for_chat(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<JobHeartbeat>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let lim = limit.max(1).min(200) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT run_key, chat_id, persona_id, job_type, stage, message, active, updated_at
+             FROM job_heartbeats
+             WHERE chat_id = ?1
+             ORDER BY updated_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id, lim], |row| {
+                Ok(JobHeartbeat {
+                    run_key: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    job_type: row.get(3)?,
+                    stage: row.get(4)?,
+                    message: row.get(5)?,
+                    active: row.get::<_, i32>(6)? != 0,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Mark active heartbeats stale if `updated_at` is older than `max_age_secs`, append timeline
+    /// events, and fail matching `manual_background` rows in `background_jobs`.
+    pub fn reconcile_stale_active_job_heartbeats(
+        &self,
+        now_rfc3339: &str,
+        max_age_secs: i64,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "reconcile_stale_active_job_heartbeats: invalid now timestamp: {e}"
+                ))
+            })?;
+
+        let stale_msg = "stale — no recent heartbeat (process may have exited)";
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT run_key, chat_id, persona_id, job_type, updated_at
+             FROM job_heartbeats
+             WHERE active = 1",
+        )?;
+        let rows: Vec<(String, i64, i64, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut reconciled = Vec::new();
+        let now_str = now.to_rfc3339();
+
+        for (run_key, chat_id, persona_id, job_type, updated_at) in rows {
+            let Ok(updated) = DateTime::parse_from_rfc3339(&updated_at) else {
+                continue;
+            };
+            let updated = updated.with_timezone(&Utc);
+            if now.signed_duration_since(updated).num_seconds() <= max_age_secs {
+                continue;
+            }
+
+            conn.execute(
+                "UPDATE job_heartbeats
+                 SET stage = 'failed', message = ?1, active = 0, updated_at = ?2
+                 WHERE run_key = ?3 AND active = 1",
+                params![stale_msg, now_str, run_key],
+            )?;
+
+            let payload = format!(
+                r#"{{"stage":"failed","message":"{}","reason":"stale_reconcile"}}"#,
+                stale_msg.replace('"', "'")
+            );
+            conn.execute(
+                "INSERT INTO run_timeline_events (run_key, chat_id, persona_id, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, 'heartbeat', ?4, ?5)",
+                params![run_key, chat_id, persona_id, payload, now_str],
+            )?;
+
+            if job_type == "manual_background" {
+                let _ = conn.execute(
+                    "UPDATE background_jobs
+                     SET status = 'failed', finished_at = ?1, error_text = ?2
+                     WHERE id = ?3
+                       AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
+                    params![now_str, stale_msg, run_key],
+                );
+            }
+            reconciled.push(run_key);
+        }
+
+        Ok(reconciled)
+    }
+
+    /// Fail web `background_jobs` rows that never got a heartbeat row but stayed active too long.
+    pub fn reconcile_orphan_stale_background_jobs(
+        &self,
+        now_rfc3339: &str,
+        max_age_secs: i64,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "reconcile_orphan_stale_background_jobs: invalid now timestamp: {e}"
+                ))
+            })?;
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT b.id, b.chat_id, b.persona_id, b.started_at
+             FROM background_jobs b
+             LEFT JOIN job_heartbeats h ON h.run_key = b.id
+             WHERE b.status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')
+               AND b.started_at IS NOT NULL
+               AND h.run_key IS NULL",
+        )?;
+        let rows: Vec<(String, i64, i64, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let stale_msg = "stale — no heartbeat record (worker may have crashed before registration)";
+        let mut out = Vec::new();
+        let now_str = now.to_rfc3339();
+
+        for (id, _chat_id, _persona_id, started_at) in rows {
+            let Ok(started) = DateTime::parse_from_rfc3339(&started_at) else {
+                continue;
+            };
+            let started = started.with_timezone(&Utc);
+            if now.signed_duration_since(started).num_seconds() <= max_age_secs {
+                continue;
+            }
+            let n = conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'failed', finished_at = ?1, error_text = ?2
+                 WHERE id = ?3
+                   AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
+                params![now_str, stale_msg, id],
+            )?;
+            if n > 0 {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     #[allow(dead_code)]
     pub fn delete_task(&self, task_id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
