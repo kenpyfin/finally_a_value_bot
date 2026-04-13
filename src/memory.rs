@@ -228,11 +228,7 @@ mod tests {
     fn test_persona_memory_path() {
         let (mm, dir) = test_memory_manager();
         let path = mm.persona_memory_path(997894126, 1);
-        assert!(path.ends_with(
-            Path::new("997894126")
-                .join("1")
-                .join("MEMORY.md")
-        ));
+        assert!(path.ends_with(Path::new("997894126").join("1").join("MEMORY.md")));
         cleanup(&dir);
     }
 
