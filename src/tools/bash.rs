@@ -268,7 +268,13 @@ mod tests {
     #[tokio::test]
     async fn test_bash_stderr() {
         let tool = BashTool::new(".");
-        let result = tool.execute(json!({"command": "echo err >&2"})).await;
+        // Unix: sh -c; Windows: PowerShell (see shell_command) — use shell-appropriate stderr.
+        let cmd = if cfg!(windows) {
+            "[Console]::Error.WriteLine('err')"
+        } else {
+            "echo err >&2"
+        };
+        let result = tool.execute(json!({"command": cmd})).await;
         assert!(!result.is_error); // exit code is 0
         assert!(result.content.contains("STDERR"));
         assert!(result.content.contains("err"));
@@ -310,9 +316,17 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
 
         let tool = BashTool::new(work.to_str().unwrap());
-        let result = tool.execute(json!({"command": "pwd"})).await;
+        // PowerShell's `pwd` can format as a table; use a plain path string on Windows.
+        let cmd = if cfg!(windows) {
+            "(Get-Location).Path"
+        } else {
+            "pwd"
+        };
+        let result = tool.execute(json!({"command": cmd})).await;
         assert!(!result.is_error);
-        assert!(result.content.contains(work.to_str().unwrap()));
+        let work_norm = work.to_string_lossy().replace('\\', "/");
+        let out_norm = result.content.replace('\\', "/");
+        assert!(out_norm.contains(&work_norm));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -331,11 +345,13 @@ mod tests {
     async fn test_bash_warn_confirm_allows_risky_command_with_prefix() {
         let tool =
             BashTool::new_with_safety(".", "warn_confirm".into(), vec!["destructive".into()]);
-        let result = tool
-            .execute(
-                json!({"command": "CONFIRM_EXECUTE rm -rf /tmp/finally_a_value_bot_test_confirm"}),
-            )
-            .await;
+        // Unix: real rm; Windows (PowerShell): keep `rm -rf` substring for destructive match but run a no-op.
+        let cmd = if cfg!(windows) {
+            "CONFIRM_EXECUTE Write-Output 'rm -rf noop'"
+        } else {
+            "CONFIRM_EXECUTE rm -rf /tmp/finally_a_value_bot_test_confirm"
+        };
+        let result = tool.execute(json!({"command": cmd})).await;
         assert!(!result.is_error);
     }
 
