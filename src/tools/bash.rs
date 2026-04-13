@@ -249,6 +249,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Windows `canonicalize()` returns `\\?\`-prefixed paths; PowerShell prints normal `C:\...`.
+    /// Normalize both for substring comparison.
+    fn normalize_path_for_shell_assert(path: &str) -> String {
+        let mut s = path.replace('\\', "/").to_lowercase();
+        if cfg!(windows) {
+            if let Some(rest) = s.strip_prefix("//?/") {
+                s = rest.to_string();
+            }
+        }
+        s
+    }
+
     #[tokio::test]
     async fn test_bash_echo() {
         let tool = BashTool::new(".");
@@ -327,13 +339,9 @@ mod tests {
         // Actual cwd is workspace/shared (see resolve_tool_working_dir). Compare canonical paths so
         // Windows matches long paths (Get-Location) vs short temp segments (RUNNER~1).
         let expected = crate::tools::resolve_tool_working_dir(&work);
-        let expected_norm = expected
-            .canonicalize()
-            .unwrap_or_else(|_| expected.clone())
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_lowercase();
-        let out_norm = result.content.replace('\\', "/").to_lowercase();
+        let expected_path = expected.canonicalize().unwrap_or_else(|_| expected.clone());
+        let expected_norm = normalize_path_for_shell_assert(&expected_path.to_string_lossy());
+        let out_norm = normalize_path_for_shell_assert(result.content.trim());
         assert!(
             out_norm.contains(&expected_norm),
             "expected cwd in output.\nexpected: {expected_norm}\noutput:\n{}",
