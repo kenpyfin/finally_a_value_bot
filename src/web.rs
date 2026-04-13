@@ -19,7 +19,7 @@ use tracing::{error, info};
 use crate::channel::deliver_to_contact;
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
-use crate::db::{call_blocking, Persona, StoredMessage};
+use crate::db::{call_blocking, JobHeartbeat, Persona, StoredMessage};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
@@ -1111,28 +1111,100 @@ async fn api_stream(
     ))
 }
 
+fn json_job_heartbeat(h: &JobHeartbeat) -> serde_json::Value {
+    json!({
+        "run_key": h.run_key,
+        "chat_id": h.chat_id,
+        "persona_id": h.persona_id,
+        "job_type": h.job_type,
+        "stage": h.stage,
+        "message": h.message,
+        "active": h.active,
+        "updated_at": h.updated_at,
+    })
+}
+
 async fn api_run_status(
     headers: HeaderMap,
     State(state): State<WebState>,
     Query(query): Query<RunStatusQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let Some((done, last_event_id)) = state.run_hub.status(&query.run_id).await else {
-        return Err((StatusCode::NOT_FOUND, "run not found".into()));
-    };
+    let run_key = query.run_id.clone();
     let timeline_count = call_blocking(state.app_state.db.clone(), {
-        let run_key = query.run_id.clone();
+        let run_key = run_key.clone();
         move |db| Ok(db.get_run_timeline_events(&run_key, 500)?.len() as i64)
     })
     .await
     .unwrap_or(0);
-    Ok(Json(json!({
-        "ok": true,
-        "run_id": query.run_id,
-        "done": done,
-        "last_event_id": last_event_id,
-        "timeline_events": timeline_count,
-    })))
+
+    let hb_opt = call_blocking(state.app_state.db.clone(), {
+        let run_key = run_key.clone();
+        move |db| db.get_job_heartbeat(&run_key)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let bg_json = if hb_opt
+        .as_ref()
+        .map(|h| h.job_type.as_str() == "manual_background")
+        .unwrap_or(false)
+    {
+        call_blocking(state.app_state.db.clone(), {
+            let run_key = run_key.clone();
+            move |db| db.get_background_job(&run_key)
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|j| {
+            json!({
+                "id": j.id,
+                "chat_id": j.chat_id,
+                "persona_id": j.persona_id,
+                "prompt": j.prompt,
+                "status": j.status,
+                "trigger_reason": j.trigger_reason,
+                "created_at": j.created_at,
+                "started_at": j.started_at,
+                "finished_at": j.finished_at,
+                "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
+                "error_text": j.error_text,
+            })
+        })
+    } else {
+        None
+    };
+
+    if let Some((done, last_event_id)) = state.run_hub.status(&query.run_id).await {
+        return Ok(Json(json!({
+            "ok": true,
+            "run_id": query.run_id,
+            "done": done,
+            "last_event_id": last_event_id,
+            "timeline_events": timeline_count,
+            "heartbeat": hb_opt.as_ref().map(json_job_heartbeat),
+            "background_job": bg_json,
+            "source": "run_hub",
+        })));
+    }
+
+    if let Some(ref hb) = hb_opt {
+        let done = !hb.active;
+        return Ok(Json(json!({
+            "ok": true,
+            "run_id": query.run_id,
+            "done": done,
+            "last_event_id": 0u64,
+            "timeline_events": timeline_count,
+            "heartbeat": json_job_heartbeat(hb),
+            "background_job": bg_json,
+            "source": "database",
+        })));
+    }
+
+    Err((StatusCode::NOT_FOUND, "run not found".into()))
 }
 
 async fn api_queue_diagnostics(
@@ -2117,9 +2189,26 @@ async fn api_background_jobs_list(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let heartbeats = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_job_heartbeats_for_chat(chat_id, 200)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let hb_by_key: HashMap<String, JobHeartbeat> = heartbeats
+        .into_iter()
+        .map(|h| (h.run_key.clone(), h))
+        .collect();
+
+    let active_heartbeats = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_active_job_heartbeats_for_chat(chat_id, 20)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     let items: Vec<serde_json::Value> = jobs
         .into_iter()
         .map(|j| {
+            let hb = hb_by_key.get(&j.id);
             json!({
                 "id": j.id,
                 "chat_id": j.chat_id,
@@ -2132,14 +2221,88 @@ async fn api_background_jobs_list(
                 "finished_at": j.finished_at,
                 "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
                 "error_text": j.error_text,
+                "heartbeat": hb.map(json_job_heartbeat),
+            })
+        })
+        .collect();
+
+    let active_hb_json: Vec<serde_json::Value> =
+        active_heartbeats.iter().map(json_job_heartbeat).collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "jobs": items,
+        "active_heartbeats": active_hb_json,
+    })))
+}
+
+async fn api_background_job_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(job_id): Path<String>,
+    Query(query): Query<BackgroundJobsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    let job = call_blocking(state.app_state.db.clone(), {
+        let job_id = job_id.clone();
+        move |db| db.get_background_job(&job_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(job) = job else {
+        return Err((StatusCode::NOT_FOUND, "background job not found".into()));
+    };
+    if job.chat_id != chat_id {
+        return Err((StatusCode::NOT_FOUND, "background job not found".into()));
+    }
+
+    let hb = call_blocking(state.app_state.db.clone(), {
+        let job_id = job_id.clone();
+        move |db| db.get_job_heartbeat(&job_id)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let timeline = call_blocking(state.app_state.db.clone(), {
+        let job_id = job_id.clone();
+        move |db| db.get_run_timeline_events(&job_id, 50)
+    })
+    .await
+    .unwrap_or_default();
+
+    let timeline_json: Vec<serde_json::Value> = timeline
+        .into_iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "event_type": e.event_type,
+                "payload_json": e.payload_json,
+                "created_at": e.created_at,
             })
         })
         .collect();
 
     Ok(Json(json!({
         "ok": true,
-        "chat_id": chat_id,
-        "jobs": items,
+        "job": {
+            "id": job.id,
+            "chat_id": job.chat_id,
+            "persona_id": job.persona_id,
+            "prompt": job.prompt,
+            "status": job.status,
+            "trigger_reason": job.trigger_reason,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "result_text": job.result_text,
+            "error_text": job.error_text,
+        },
+        "heartbeat": hb.as_ref().map(json_job_heartbeat),
+        "timeline_events_recent": timeline_json,
     })))
 }
 
@@ -2486,6 +2649,7 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route("/api/schedules/:id", patch(api_schedules_update))
         .route("/api/background_jobs", get(api_background_jobs_list))
+        .route("/api/background_jobs/:job_id", get(api_background_job_get))
         .route("/api/history", get(api_history))
         .route("/api/history/days", get(api_history_days))
         .route("/api/send", post(api_send))

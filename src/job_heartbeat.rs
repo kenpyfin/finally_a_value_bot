@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tracing::warn;
 
 use crate::channel::deliver_to_contact;
 use crate::db::call_blocking;
@@ -112,6 +113,53 @@ pub fn spawn_shared_heartbeat(
             tokio::select! {
                 maybe_sig = rx.recv() => {
                     let Some(sig) = maybe_sig else {
+                        if active {
+                            warn!(
+                                run_key = %run_key,
+                                chat_id,
+                                "heartbeat channel closed without Finished/Failed; marking inactive"
+                            );
+                            stage = "aborted".to_string();
+                            message = "heartbeat channel closed (worker ended unexpectedly)".to_string();
+                            let _ = call_blocking(state.db.clone(), {
+                                let run_key = run_key.clone();
+                                let stage = stage.clone();
+                                let message = message.clone();
+                                let job_type = job_type.as_str().to_string();
+                                move |db| {
+                                    db.upsert_job_heartbeat(
+                                        &run_key,
+                                        chat_id,
+                                        persona_id,
+                                        &job_type,
+                                        &stage,
+                                        &message,
+                                        false,
+                                    )
+                                }
+                            })
+                            .await;
+                            let _ = call_blocking(state.db.clone(), {
+                                let run_key = run_key.clone();
+                                let stage = stage.clone();
+                                let message = message.clone();
+                                let payload = format!(
+                                    r#"{{"stage":"{}","message":"{}"}}"#,
+                                    stage,
+                                    message.replace('"', "'")
+                                );
+                                move |db| {
+                                    db.append_run_timeline_event(
+                                        &run_key,
+                                        chat_id,
+                                        persona_id,
+                                        "heartbeat",
+                                        Some(&payload),
+                                    )
+                                }
+                            })
+                            .await;
+                        }
                         break;
                     };
                     match sig {

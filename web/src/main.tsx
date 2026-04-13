@@ -688,6 +688,7 @@ function App() {
   const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
   const [pendingRunIds, setPendingRunIds] = useState<string[]>([])
+  const [backgroundActiveCount, setBackgroundActiveCount] = useState(0)
   const [queueLane, setQueueLane] = useState<QueueLane | null>(null)
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
@@ -1060,6 +1061,7 @@ function App() {
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
           loadQueueDiagnostics(cid).catch(() => { })
+          loadBackgroundVisibility(cid).catch(() => { })
           await loadHistory(cid, chosen?.id ?? pid, null, { force: true })
           const readId = chosen?.id ?? pid ?? null
           if (readId != null) markPersonaRead(readId)
@@ -1122,11 +1124,12 @@ function App() {
   useEffect(() => {
     if (chatId == null) return
     let cancelled = false
-    const activePending = (queueLane?.pending ?? 0) > 0 || pendingRunIds.length > 0
+    const activePending = (queueLane?.pending ?? 0) > 0 || pendingRunIds.length > 0 || backgroundActiveCount > 0
     const intervalMs = activePending ? 2500 : 10000
     const interval = setInterval(() => {
       if (cancelled) return
       loadQueueDiagnostics(chatId).catch(() => { })
+      loadBackgroundVisibility(chatId).catch(() => { })
       refreshPersonas(chatId).catch(() => { })
     }, intervalMs)
     return () => {
@@ -1134,7 +1137,7 @@ function App() {
       clearInterval(interval)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatId, pendingRunIds.length, queueLane?.pending])
+  }, [chatId, pendingRunIds.length, queueLane?.pending, backgroundActiveCount])
 
   async function loadBindings(cid: number | null = chatId): Promise<void> {
     if (cid == null) return
@@ -1156,6 +1159,18 @@ function App() {
       setQueueLane(lane)
     } catch {
       setQueueLane(null)
+    }
+  }
+
+  async function loadBackgroundVisibility(cid: number | null = chatId): Promise<void> {
+    if (cid == null) return
+    try {
+      const q = new URLSearchParams({ chat_id: String(cid) })
+      const data = await api<{ active_heartbeats?: unknown[] }>(`/api/background_jobs?${q.toString()}`)
+      const arr = Array.isArray(data.active_heartbeats) ? data.active_heartbeats : []
+      setBackgroundActiveCount(arr.length)
+    } catch {
+      setBackgroundActiveCount(0)
     }
   }
 
@@ -1215,6 +1230,7 @@ function App() {
       if (cancelled) return
       loadBindings(chatId).catch(() => { })
       loadSchedules(chatId).catch(() => { })
+      loadBackgroundVisibility(chatId).catch(() => { })
       if (chosen) {
         try {
           await api('/api/personas/switch', {
@@ -1406,6 +1422,13 @@ function App() {
                     {(queueLane?.pending ?? 0) > 0 && (queueLane?.oldest_wait_ms ?? 0) > 0
                       ? ` · ${Math.round((queueLane?.oldest_wait_ms ?? 0) / 1000)}s`
                       : ''}
+                  </Text>
+                  <Text
+                    size="2"
+                    color={(backgroundActiveCount > 0 ? 'blue' : 'gray') as never}
+                    title="Long-running web background jobs (heartbeat active)"
+                  >
+                    Background: {backgroundActiveCount > 0 ? `${backgroundActiveCount} active` : 'none'}
                   </Text>
 
                   <Dialog.Root
