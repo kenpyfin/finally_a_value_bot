@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-13 — GitHub Actions: action bumps, Dependabot, CI polish
+
+- **Area:** infra / CI
+- **Summary:** Pinned first-party actions to current majors (`actions/checkout@v6`, `actions/setup-node@v6`, `actions/upload-artifact@v6`, `actions/download-artifact@v6`) in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/release-assets.yml`](.github/workflows/release-assets.yml). Added [`.github/dependabot.yml`](.github/dependabot.yml) (weekly) for `github-actions`, `cargo`, and `npm` under `web/`. CI now uses `concurrency` (cancel in-progress on same ref), `workflow_dispatch`, and passes `web/dist` from the web job to the release build job via artifacts so `npm ci` + web build run once per run.
+- **Rationale:** Stay on supported action runtimes; reduce duplicate web builds; automated dependency PRs for workflows and lockfiles.
+- **Key files / symbols:** `.github/workflows/ci.yml` — `web-dist` artifact; `.github/workflows/release-assets.yml`; `.github/dependabot.yml`.
+
 ### 2026-04-10 — Background jobs: visibility, terminal heartbeats, stale reconciliation
 
 - **Area:** web / API / scheduler / db / job heartbeat
