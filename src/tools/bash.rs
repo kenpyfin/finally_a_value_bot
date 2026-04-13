@@ -324,9 +324,21 @@ mod tests {
         };
         let result = tool.execute(json!({"command": cmd})).await;
         assert!(!result.is_error);
-        let work_norm = work.to_string_lossy().replace('\\', "/");
-        let out_norm = result.content.replace('\\', "/");
-        assert!(out_norm.contains(&work_norm));
+        // Actual cwd is workspace/shared (see resolve_tool_working_dir). Compare canonical paths so
+        // Windows matches long paths (Get-Location) vs short temp segments (RUNNER~1).
+        let expected = crate::tools::resolve_tool_working_dir(&work);
+        let expected_norm = expected
+            .canonicalize()
+            .unwrap_or_else(|_| expected.clone())
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        let out_norm = result.content.replace('\\', "/").to_lowercase();
+        assert!(
+            out_norm.contains(&expected_norm),
+            "expected cwd in output.\nexpected: {expected_norm}\noutput:\n{}",
+            result.content
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
