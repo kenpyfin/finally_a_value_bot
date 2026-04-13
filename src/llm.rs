@@ -551,9 +551,11 @@ fn process_openai_stream_event(
 
 fn normalize_stop_reason(reason: Option<String>) -> Option<String> {
     match reason.as_deref() {
+        None => Some("end_turn".into()),
         Some("tool_use") | Some("tool_calls") => Some("tool_use".into()),
         Some("max_tokens") | Some("length") => Some("max_tokens".into()),
-        Some("stop") | Some("end_turn") | None => Some("end_turn".into()),
+        Some("end_turn") => Some("end_turn".into()),
+        Some(r) if r.eq_ignore_ascii_case("stop") => Some("end_turn".into()),
         Some(other) => Some(other.to_string()),
     }
 }

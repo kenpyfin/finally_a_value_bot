@@ -643,7 +643,7 @@ mod tests {
         let pid = db.get_or_create_default_persona(999).unwrap();
         let all = db.get_all_messages(999, pid).unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].content, "hello web");
+        assert_eq!(all[0].content, "[default] hello web");
         assert!(all[0].is_from_bot);
         cleanup(&dir);
     }

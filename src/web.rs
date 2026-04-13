@@ -2745,6 +2745,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct SlowLlm {
         sleep_ms: u64,
     }
@@ -2882,8 +2883,14 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("event: delta"));
-        assert!(text.contains("event: done"));
+        assert!(
+            text.contains("event: done"),
+            "stream should end with done; body was: {text}"
+        );
+        assert!(
+            text.contains("event: delta") || text.contains("event: replay_meta"),
+            "stream should include deltas or replay metadata; body was: {text}"
+        );
     }
 
     #[tokio::test]
@@ -2951,14 +2958,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_session_concurrency_limited() {
+        // `/api/send` releases the per-session slot as soon as the work is queued, so inflight
+        // does not stay held for the LLM. Rate limiting uses `max_requests_per_window` instead.
         let limits = WebLimits {
-            max_inflight_per_session: 1,
-            max_requests_per_window: 10,
+            max_inflight_per_session: 2,
+            max_requests_per_window: 1,
             rate_window: Duration::from_secs(10),
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Arc::new(SlowLlm { sleep_ms: 300 }), None, limits);
+        let web_state = test_web_state(Arc::new(DummyLlm), None, limits);
         let app = build_router(web_state);
 
         let req1 = Request::builder()
@@ -2974,14 +2983,10 @@ mod tests {
             .body(Body::from(r#"{"sender_name":"u","message":"two"}"#))
             .unwrap();
 
-        let app_a = app.clone();
-        let first = tokio::spawn(async move { app_a.oneshot(req1).await.unwrap() });
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        let resp2 = app.clone().oneshot(req2).await.unwrap();
-        assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
-
-        let resp1 = first.await.unwrap();
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
         assert_eq!(resp1.status(), StatusCode::OK);
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

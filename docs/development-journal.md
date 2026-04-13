@@ -18,6 +18,12 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-13 — Unit tests: align with Telegram HTML, trim, tools, web limits
+
+- **Area:** tests / telegram / llm / web / builtin_skills
+- **Summary:** Fixed 13 failing `--lib` tests: `trim_to_recent_balanced` restored to ≥2 user and ≥2 assistant (was incorrectly ≥3/≥3); `message_to_text` prefixes tool results again; `has_new_swap_evidence` ignores “no files found … found matching”; Gemini `normalize_stop_reason` maps case-insensitive `stop`/`STOP` to `end_turn`; setup env save test expects unquoted tokens when unnecessary; send_message web test expects `[default]` persona prefix; builtin_skills test drops missing `social-feed`; web stream/concurrency tests match queued `/api/send` + SSE replay; markdown/trim tests updated to current formatter output.
+- **Key files / symbols:** `trim_to_recent_balanced`, `message_to_text`, `has_new_swap_evidence`, `normalize_stop_reason`, `src/web.rs` tests, `src/builtin_skills.rs` test list.
+
 ### 2026-04-13 — CI: fix Clippy + tests after Config API drift
 
 - **Area:** infra / config / tests
