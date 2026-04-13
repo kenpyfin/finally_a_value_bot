@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-13 — CI: fix Clippy + tests after Config API drift
+
+- **Area:** infra / config / tests
+- **Summary:** Aligned `test_config` and test-only `Config` literals with the current [`Config`](src/config.rs) struct (removed obsolete `max_session_messages` / `compact_keep_recent` / delegate fields). Exposed `pub fn test_config()` at the `config` module root under `cfg(test)` for unit tests; integration tests use YAML-based minimal config. Updated `history_to_claude_messages` unit tests for the `keep_trailing_assistant` parameter. Resolved Clippy 1.94 (`is_some_and` / `is_none_or`, `cursor_agent` init, `channel` test module placement, `[lints.clippy]` allows for noisy lints, `DummyTool` dead_code).
+- **Rationale:** `cargo clippy -- -D warnings` on CI was failing on private `config::tests`, stale struct fields, and new Clippy suggestions.
+- **Key files / symbols:** `src/config.rs` — `test_config`; `src/channels/telegram.rs`; `src/llm.rs` / `src/web.rs` tests use `crate::config::test_config()`; `tests/config_validation.rs`; `Cargo.toml` `[lints.clippy]`; `src/channel.rs` — `mod tests` at EOF; `src/tools/cursor_agent.rs`.
+
 ### 2026-04-13 — GitHub Actions: action bumps, Dependabot, CI polish
 
 - **Area:** infra / CI

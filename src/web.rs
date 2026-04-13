@@ -2459,7 +2459,7 @@ async fn api_oauth_authorize(
         .config
         .social
         .as_ref()
-        .map_or(true, |s| !s.is_platform_enabled(&platform))
+        .is_none_or(|s| !s.is_platform_enabled(&platform))
     {
         return Err((StatusCode::BAD_REQUEST, "Platform not configured".into()));
     }
@@ -2605,7 +2605,7 @@ async fn api_oauth_callback(
             Html(format!(
                 r#"<!DOCTYPE html><html><head><title>OAuth Error</title></head><body>
                 <h1>Failed to store token</h1><p>{}</p></body></html>"#,
-                html_escape::encode_text(&e.to_string()).to_string()
+                html_escape::encode_text(&e.to_string())
             )),
         )
             .into_response();
@@ -2679,7 +2679,6 @@ fn build_router(web_state: WebState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::db::call_blocking;
     use crate::llm::LlmProvider;
     use crate::{claude::ResponseContentBlock, error::FinallyAValueBotError};
@@ -2805,80 +2804,9 @@ mod tests {
     }
 
     fn test_state(llm: Arc<dyn LlmProvider>) -> Arc<AppState> {
-        let mut cfg = Config {
-            telegram_bot_token: "tok".into(),
-            bot_username: "bot".into(),
-            llm_provider: "anthropic".into(),
-            api_key: "key".into(),
-            model: "claude-sonnet-4-5-20250929".into(),
-            llm_base_url: None,
-            max_tokens: 8192,
-            max_tool_iterations: 100,
-            max_history_messages: 50,
-            max_document_size_mb: 100,
-            workspace_dir: "./workspace".into(),
-            openai_api_key: None,
-            timezone: "UTC".into(),
-            allowed_groups: vec![],
-            control_chat_ids: vec![],
-            max_session_messages: 40,
-            compact_keep_recent: 20,
-            whatsapp_access_token: None,
-            whatsapp_phone_number_id: None,
-            whatsapp_verify_token: None,
-            whatsapp_webhook_port: 8080,
-            discord_bot_token: None,
-            discord_allowed_channels: vec![],
-            show_thinking: false,
-            web_enabled: true,
-            web_host: "127.0.0.1".into(),
-            web_port: 3900,
-            web_auth_token: None,
-            web_max_inflight_per_session: 2,
-            web_max_requests_per_window: 8,
-            web_rate_window_seconds: 10,
-            web_run_history_limit: 512,
-            web_session_idle_ttl_seconds: 300,
-            universal_chat_id: Some(997894126),
-            browser_managed: false,
-            browser_executable_path: None,
-            browser_cdp_port_base: 9222,
-            browser_idle_timeout_secs: None,
-            browser_headless: false,
-            safety_output_guard_mode: "moderate".into(),
-            safety_max_emojis_per_response: 12,
-            safety_tail_repeat_limit: 8,
-            safety_execution_mode: "warn_confirm".into(),
-            safety_risky_categories: vec![
-                "destructive".into(),
-                "system".into(),
-                "network".into(),
-                "package".into(),
-            ],
-            agent_browser_path: None,
-            web_search_searxng_url: None,
-            cursor_agent_cli_path: "cursor-agent".into(),
-            cursor_agent_model: String::new(),
-            cursor_agent_timeout_secs: 1500,
-            social: None,
-            vault: None,
-            orchestrator_enabled: true,
-            orchestrator_model: String::new(),
-            tool_skill_agent_enabled: true,
-            tool_skill_agent_model: String::new(),
-            post_tool_evaluator_enabled: false,
-            post_tool_evaluator_model: String::new(),
-            delegate_tool_enabled: true,
-            delegate_max_iterations: 10,
-            delegate_model: String::new(),
-            cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
-            cursor_agent_tmux_enabled: true,
-            cursor_agent_runner_url: None,
-            scheduler_task_timeout_secs: 3600,
-            scheduler_stale_running_reclaim_secs: 7200,
-            scheduler_max_concurrent_tasks: 2,
-            scheduler_poll_interval_secs: 60,
-        };
+        let mut cfg = crate::config::test_config();
+        cfg.web_port = 3900;
+        cfg.universal_chat_id = Some(997894126);
         let dir = std::env::temp_dir().join(format!(
             "finally_a_value_bot_webtest_{}",
             uuid::Uuid::new_v4()

@@ -3,71 +3,20 @@
 use finally_a_value_bot::config::Config;
 
 /// Helper to create a minimal valid config for testing.
+/// Built from YAML so we do not depend on `cfg(test)` helpers from the library crate.
 fn minimal_config() -> Config {
-    Config {
-        telegram_bot_token: "tok".into(),
-        bot_username: "testbot".into(),
-        llm_provider: "anthropic".into(),
-        api_key: "test-key".into(),
-        model: String::new(),
-        llm_base_url: None,
-        max_tokens: 8192,
-        max_tool_iterations: 25,
-        max_history_messages: 50,
-        max_document_size_mb: 100,
-        workspace_dir: "./workspace".into(),
-        openai_api_key: None,
-        timezone: "UTC".into(),
-        allowed_groups: vec![],
-        control_chat_ids: vec![],
-        max_session_messages: 40,
-        compact_keep_recent: 20,
-        whatsapp_access_token: None,
-        whatsapp_phone_number_id: None,
-        whatsapp_verify_token: None,
-        whatsapp_webhook_port: 8080,
-        discord_bot_token: None,
-        discord_allowed_channels: vec![],
-        show_thinking: false,
-        web_enabled: false,
-        web_host: "127.0.0.1".into(),
-        web_port: 3900,
-        web_auth_token: None,
-        web_max_inflight_per_session: 2,
-        web_max_requests_per_window: 8,
-        web_rate_window_seconds: 10,
-        web_run_history_limit: 512,
-        web_session_idle_ttl_seconds: 300,
-        browser_managed: false,
-        browser_executable_path: None,
-        browser_cdp_port_base: 9222,
-        browser_idle_timeout_secs: None,
-        browser_headless: false,
-        agent_browser_path: None,
-        web_search_searxng_url: None,
-        cursor_agent_cli_path: "cursor-agent".into(),
-        cursor_agent_model: String::new(),
-        cursor_agent_timeout_secs: 600,
-        social: None,
-        vault: None,
-        universal_chat_id: None,
-        orchestrator_enabled: true,
-        orchestrator_model: String::new(),
-        tool_skill_agent_enabled: true,
-        tool_skill_agent_model: String::new(),
-        post_tool_evaluator_enabled: false,
-        post_tool_evaluator_model: String::new(),
-        delegate_tool_enabled: true,
-        delegate_max_iterations: 10,
-        delegate_model: String::new(),
-        cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
-        cursor_agent_tmux_enabled: true,
-        cursor_agent_runner_url: None,
-        scheduler_task_timeout_secs: 3600,
-        scheduler_stale_running_reclaim_secs: 7200,
-        scheduler_max_concurrent_tasks: 2,
-        scheduler_poll_interval_secs: 60,
-    }
+    let mut c: Config = serde_yaml::from_str(
+        r#"
+telegram_bot_token: tok
+bot_username: testbot
+api_key: test-key
+"#,
+    )
+    .unwrap();
+    c.web_enabled = false;
+    c.web_port = 3900;
+    c.max_tool_iterations = 25;
+    c
 }
 
 #[test]
@@ -84,8 +33,6 @@ fn test_yaml_parse_minimal() {
     assert_eq!(config.max_document_size_mb, 100);
     assert_eq!(config.max_history_messages, 50);
     assert_eq!(config.timezone, "UTC");
-    assert_eq!(config.max_session_messages, 40);
-    assert_eq!(config.compact_keep_recent, 20);
     assert_eq!(config.whatsapp_webhook_port, 8080);
 }
 
@@ -109,8 +56,6 @@ allowed_groups:
   - 222
 control_chat_ids:
   - 999
-max_session_messages: 60
-compact_keep_recent: 30
 whatsapp_access_token: wa_tok
 whatsapp_phone_number_id: phone123
 whatsapp_verify_token: verify_tok
@@ -136,8 +81,6 @@ discord_allowed_channels:
     assert_eq!(config.timezone, "Asia/Shanghai");
     assert_eq!(config.allowed_groups, vec![111, 222]);
     assert_eq!(config.control_chat_ids, vec![999]);
-    assert_eq!(config.max_session_messages, 60);
-    assert_eq!(config.compact_keep_recent, 30);
     assert_eq!(config.whatsapp_webhook_port, 9090);
     assert_eq!(config.discord_allowed_channels, vec![333, 444]);
 }

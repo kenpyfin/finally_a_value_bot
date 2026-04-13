@@ -4093,7 +4093,7 @@ mod tests {
             make_msg("2", "bot", "hi there!", true, "2024-01-01T00:00:02Z"),
             make_msg("3", "alice", "how are you?", false, "2024-01-01T00:00:03Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
@@ -4119,7 +4119,7 @@ mod tests {
             make_msg("3", "bot", "hey all!", true, "2024-01-01T00:00:03Z"),
             make_msg("4", "alice", "thanks", false, "2024-01-01T00:00:04Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Two user msgs merged, then assistant, then user -> 3 messages
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
@@ -4139,7 +4139,7 @@ mod tests {
             make_msg("1", "alice", "hello", false, "2024-01-01T00:00:01Z"),
             make_msg("2", "bot", "response", true, "2024-01-01T00:00:02Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Trailing assistant message should be removed (Claude API requires last msg to be user)
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
@@ -4151,21 +4151,21 @@ mod tests {
             make_msg("1", "bot", "I said something", true, "2024-01-01T00:00:01Z"),
             make_msg("2", "alice", "hello", false, "2024-01-01T00:00:02Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
     }
 
     #[test]
     fn test_history_to_claude_messages_empty() {
-        let messages = history_to_claude_messages(&[], "bot");
+        let messages = history_to_claude_messages(&[], "bot", false);
         assert!(messages.is_empty());
     }
 
     #[test]
     fn test_history_to_claude_messages_only_assistant() {
         let history = vec![make_msg("1", "bot", "hello", true, "2024-01-01T00:00:01Z")];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Should be empty (leading + trailing assistant removed)
         assert!(messages.is_empty());
     }
@@ -4778,7 +4778,7 @@ mod tests {
             make_msg("1", "bot", "msg1", true, "2024-01-01T00:00:01Z"),
             make_msg("2", "bot", "msg2", true, "2024-01-01T00:00:02Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Both should be removed (leading + trailing assistant)
         assert!(messages.is_empty());
     }
@@ -4792,7 +4792,7 @@ mod tests {
             make_msg("4", "bot", "a2", true, "2024-01-01T00:00:04Z"),
             make_msg("5", "alice", "q3", false, "2024-01-01T00:00:05Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
@@ -4923,7 +4923,7 @@ mod tests {
 
     #[test]
     fn test_output_safeguards_trim_repeated_tail() {
-        let mut cfg = crate::config::tests::test_config();
+        let mut cfg = crate::config::test_config();
         cfg.safety_output_guard_mode = "moderate".into();
         cfg.safety_tail_repeat_limit = 3;
         let input = "ready A A A A A A";
@@ -4933,7 +4933,7 @@ mod tests {
 
     #[test]
     fn test_output_safeguards_trim_excess_emojis() {
-        let mut cfg = crate::config::tests::test_config();
+        let mut cfg = crate::config::test_config();
         cfg.safety_output_guard_mode = "moderate".into();
         cfg.safety_max_emojis_per_response = 2;
         cfg.safety_tail_repeat_limit = 20;

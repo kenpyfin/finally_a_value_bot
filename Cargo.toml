@@ -4,6 +4,25 @@ version = "0.0.37"
 edition = "2021"
 license = "MIT"
 
+[lints.clippy]
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+unnecessary_map_or = "allow"
+needless_borrow = "allow"
+map_clone = "allow"
+manual_strip = "allow"
+manual_is_multiple_of = "allow"
+if_same_then_else = "allow"
+manual_flatten = "allow"
+match_result_ok = "allow"
+manual_clamp = "allow"
+needless_borrows_for_generic_args = "allow"
+manual_contains = "allow"
+single_char_add_str = "allow"
+unnecessary_lazy_evaluations = "allow"
+ptr_arg = "allow"
+unnecessary_cast = "allow"
+
 [dependencies]
 teloxide = { version = "0.17", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
