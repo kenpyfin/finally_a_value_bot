@@ -3938,9 +3938,7 @@ fn message_to_text(msg: &Message) -> String {
                     format!("[tool_use: {name}({})]", input)
                 }
                 ContentBlock::ToolResult {
-                    content,
-                    is_error,
-                    ..
+                    content, is_error, ..
                 } => {
                     let body = if content.len() > 200 {
                         format!("{}...", &content[..content.floor_char_boundary(200)])
