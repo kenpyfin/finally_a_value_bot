@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, patch, post};
@@ -17,16 +17,16 @@ use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info};
 
-use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::channel::deliver_to_contact;
+use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
 use crate::db::{call_blocking, JobHeartbeat, Persona, StoredMessage};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
-    BACKGROUND_JOB_HANDOFF_PREFIX,
+    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext,
+    AppState, BACKGROUND_JOB_HANDOFF_PREFIX,
 };
 use std::time::SystemTime;
 
@@ -403,6 +403,73 @@ struct RunStatusQuery {
     run_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArtifactQuery {
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+    kind: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ArtifactItem {
+    id: String,
+    name: String,
+    kind: String,
+    size_bytes: Option<u64>,
+    created_at: Option<String>,
+    source: String,
+    url: String,
+    preview_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadQuery {
+    preview: Option<bool>,
+    download: Option<bool>,
+}
+
+fn artifact_kind_from_filename(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".svg")
+    {
+        "image".to_string()
+    } else if lower.ends_with(".md") || lower.ends_with(".markdown") {
+        "markdown".to_string()
+    } else if lower.ends_with(".html") || lower.ends_with(".htm") {
+        "html".to_string()
+    } else if lower.ends_with(".txt")
+        || lower.ends_with(".json")
+        || lower.ends_with(".log")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".xml")
+    {
+        "text".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn extract_upload_urls_from_text(text: &str) -> Vec<String> {
+    let Some(re) = regex::Regex::new(r#"/api/uploads/[^\s\)>"]+"#).ok() else {
+        return Vec::new();
+    };
+    re.find_iter(text).map(|m| m.as_str().to_string()).collect()
+}
+
+fn system_time_to_rfc3339(value: std::time::SystemTime) -> Option<String> {
+    let datetime: chrono::DateTime<chrono::Utc> = value.into();
+    Some(datetime.to_rfc3339())
+}
+
 async fn index() -> impl IntoResponse {
     match WEB_ASSETS.get_file("index.html") {
         Some(file) => Html(String::from_utf8_lossy(file.contents()).to_string()).into_response(),
@@ -597,6 +664,157 @@ async fn api_history_days(
     })))
 }
 
+async fn list_chat_artifacts(
+    state: &WebState,
+    chat_id: i64,
+    persona_id: i64,
+    kind_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ArtifactItem>, (StatusCode, String)> {
+    let shared_dir = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
+        .join("web")
+        .join(chat_id.to_string());
+    let legacy_dir = FsPath::new(state.app_state.config.working_dir())
+        .join("uploads")
+        .join("web")
+        .join(chat_id.to_string());
+
+    let mut by_url: HashMap<String, ArtifactItem> = HashMap::new();
+
+    let mut scan_dir = |dir: &std::path::Path, source: &str| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+            else {
+                continue;
+            };
+            let kind = artifact_kind_from_filename(&name);
+            if let Some(filter) = kind_filter {
+                if filter != "all" && filter != kind {
+                    continue;
+                }
+            }
+            let url = format!("/api/uploads/web/{chat_id}/{name}");
+            let preview_url = format!("{url}?preview=1");
+            let meta = std::fs::metadata(&path).ok();
+            let created_at = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(system_time_to_rfc3339);
+            let item = ArtifactItem {
+                id: format!("{}:{name}", source),
+                name: name.clone(),
+                kind,
+                size_bytes: meta.as_ref().map(|m| m.len()),
+                created_at,
+                source: source.to_string(),
+                url: url.clone(),
+                preview_url,
+            };
+            by_url.entry(url).or_insert(item);
+        }
+    };
+
+    scan_dir(&shared_dir, "web_upload");
+    scan_dir(&legacy_dir, "legacy_upload");
+
+    let cid = chat_id;
+    let pid = persona_id;
+    let history = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_all_messages(cid, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    for msg in &history {
+        for url in extract_upload_urls_from_text(&msg.content) {
+            if by_url.contains_key(&url) {
+                continue;
+            }
+            let name = url.rsplit('/').next().unwrap_or("artifact.bin").to_string();
+            let kind = artifact_kind_from_filename(&name);
+            if let Some(filter) = kind_filter {
+                if filter != "all" && filter != kind {
+                    continue;
+                }
+            }
+            by_url.insert(
+                url.clone(),
+                ArtifactItem {
+                    id: format!("message:{}:{}", msg.id, url),
+                    name,
+                    kind,
+                    size_bytes: None,
+                    created_at: Some(msg.timestamp.clone()),
+                    source: "message_link".to_string(),
+                    preview_url: format!("{url}?preview=1"),
+                    url,
+                },
+            );
+        }
+    }
+
+    let mut items: Vec<ArtifactItem> = by_url.into_values().collect();
+    items.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+    Ok(items)
+}
+
+async fn api_artifacts(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<ArtifactQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = query.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let kind_filter = query.kind.as_deref().map(|k| k.trim().to_ascii_lowercase());
+    let artifacts =
+        list_chat_artifacts(&state, chat_id, persona_id, kind_filter.as_deref(), limit).await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "persona_id": persona_id,
+        "artifacts": artifacts,
+    })))
+}
+
 async fn api_send(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -623,9 +841,11 @@ async fn api_send(
     let persona_id_queue = if let Some(pid) = body.persona_id {
         pid
     } else {
-        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     let queue_label = body.message.chars().take(120).collect::<String>();
     let queue_meta = QueueEnqueueMeta {
@@ -764,9 +984,11 @@ async fn api_send_stream(
     let persona_id_queue = if let Some(pid) = body.persona_id {
         pid
     } else {
-        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     let queue_label = text.chars().take(120).collect::<String>();
     let queue_meta = QueueEnqueueMeta {
@@ -1596,6 +1818,7 @@ async fn process_web_attachments(
 
         let saved_file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
         let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
+        let rel_url = format!("/api/uploads/web/{chat_id}/{saved_file}");
 
         if image_data.is_none() && mime.starts_with("image/") {
             let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
@@ -1603,13 +1826,21 @@ async fn process_web_attachments(
         }
 
         notes.push(format!(
-            "[document] filename={} bytes={} mime={} tool_path={} saved_path={}",
+            "[document] filename={} bytes={} mime={} tool_path={} saved_path={} url={}",
             filename,
             bytes.len(),
             mime,
             tool_path,
-            path.display()
+            path.display(),
+            rel_url
         ));
+
+        if mime.starts_with("image/") {
+            let alt = filename.replace(']', "_");
+            notes.push(format!("![{alt}]({rel_url})"));
+        } else {
+            notes.push(format!("[{filename}]({rel_url})"));
+        }
     }
 
     Ok(notes)
@@ -2543,22 +2774,73 @@ async fn asset_file(Path(file): Path<String>) -> impl IntoResponse {
     }
 }
 
-async fn upload_file(State(state): State<WebState>, Path(path): Path<String>) -> impl IntoResponse {
+async fn upload_file(
+    State(state): State<WebState>,
+    Path(path): Path<String>,
+    Query(query): Query<UploadQuery>,
+) -> impl IntoResponse {
     let clean = path.replace("..", "");
     if clean.is_empty() {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
-    let full_path = FsPath::new(state.app_state.config.working_dir())
+    let legacy_path = FsPath::new(state.app_state.config.working_dir())
         .join("uploads")
         .join(clean);
-    if !full_path.is_file() {
+    let shared_path = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
+        .join(path.replace("..", ""));
+
+    let full_path = if shared_path.is_file() {
+        shared_path
+    } else if legacy_path.is_file() {
+        legacy_path
+    } else {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    }
+    };
 
     match tokio::fs::read(&full_path).await {
         Ok(bytes) => {
             let content_type = guess_upload_content_type(&full_path);
-            ([("content-type", content_type)], bytes).into_response()
+            let mut headers = HeaderMap::new();
+            let _ = headers.insert("content-type", HeaderValue::from_static(content_type));
+            let _ = headers.insert(
+                "x-content-type-options",
+                HeaderValue::from_static("nosniff"),
+            );
+
+            let force_download = query.download.unwrap_or(false);
+            let is_html = content_type == "text/html; charset=utf-8";
+            let allow_inline = content_type.starts_with("image/")
+                || content_type.starts_with("text/")
+                || content_type == "application/json"
+                || content_type == "application/pdf";
+
+            if is_html {
+                if query.preview.unwrap_or(false) {
+                    let _ = headers.insert(
+                        "content-security-policy",
+                        HeaderValue::from_static(
+                            "default-src 'none'; img-src data: blob: https: http:; style-src 'unsafe-inline'; sandbox",
+                        ),
+                    );
+                } else {
+                    let _ = headers.insert(
+                        "content-disposition",
+                        HeaderValue::from_static("attachment"),
+                    );
+                }
+            } else if force_download || !allow_inline {
+                let _ = headers.insert(
+                    "content-disposition",
+                    HeaderValue::from_static("attachment"),
+                );
+            }
+
+            (headers, bytes).into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
@@ -2577,6 +2859,8 @@ fn guess_upload_content_type(path: &FsPath) -> &'static str {
         Some("webp") => "image/webp",
         Some("svg") => "image/svg+xml",
         Some("bmp") => "image/bmp",
+        Some("md") | Some("markdown") => "text/markdown; charset=utf-8",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
         Some("txt") => "text/plain; charset=utf-8",
         Some("json") => "application/json",
         Some("pdf") => "application/pdf",
@@ -2813,6 +3097,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/background_jobs/:job_id", get(api_background_job_get))
         .route("/api/history", get(api_history))
         .route("/api/history/days", get(api_history_days))
+        .route("/api/artifacts", get(api_artifacts))
         .route("/api/send", post(api_send))
         .route("/api/send_stream", post(api_send_stream))
         .route("/api/stream", get(api_stream))
@@ -2875,6 +3160,23 @@ mod tests {
             assets_dir.unwrap().files().next().is_some(),
             "embedded web asset dir is empty: assets"
         );
+    }
+
+    #[test]
+    fn test_artifact_kind_from_filename() {
+        assert_eq!(artifact_kind_from_filename("report.md"), "markdown");
+        assert_eq!(artifact_kind_from_filename("image.png"), "image");
+        assert_eq!(artifact_kind_from_filename("index.html"), "html");
+        assert_eq!(artifact_kind_from_filename("notes.txt"), "text");
+        assert_eq!(artifact_kind_from_filename("archive.zip"), "other");
+    }
+
+    #[test]
+    fn test_extract_upload_urls_from_text() {
+        let text = "See [/api/uploads/web/1/file.md](/api/uploads/web/1/file.md) and ![](/api/uploads/web/1/img.png)";
+        let urls = extract_upload_urls_from_text(text);
+        assert!(urls.iter().any(|u| u == "/api/uploads/web/1/file.md"));
+        assert!(urls.iter().any(|u| u == "/api/uploads/web/1/img.png"));
     }
 
     struct DummyLlm;

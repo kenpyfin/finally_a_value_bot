@@ -14,7 +14,9 @@ use crate::claude::Message as ClaudeMessage;
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
-use crate::telegram::{archive_conversation, process_with_agent_with_events, AgentRequestContext, AppState};
+use crate::telegram::{
+    archive_conversation, process_with_agent_with_events, AgentRequestContext, AppState,
+};
 
 struct Handler {
     app_state: Arc<AppState>,

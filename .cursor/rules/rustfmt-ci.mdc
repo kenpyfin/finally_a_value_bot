@@ -1,0 +1,22 @@
+---
+description: Run rustfmt on Rust changes; CI fails if cargo fmt --check fails
+alwaysApply: true
+---
+
+# Rust formatting (CI)
+
+GitHub Actions runs `cargo fmt --all --check` and fails if formatting is not up to date.
+
+After editing any `*.rs` file, run:
+
+```sh
+cargo fmt --all
+```
+
+Before pushing or marking Rust work complete, verify:
+
+```sh
+cargo fmt --all --check
+```
+
+This is separate from tests. Keep the existing project rule that avoids long-running test commands.

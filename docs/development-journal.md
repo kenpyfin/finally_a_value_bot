@@ -18,6 +18,21 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-14 — Channel-local attachments + web artifacts viewer
+
+- **Area:** tools / web / channel delivery
+- **Summary:** Changed `send_message` attachment routing to follow `ToolAuthContext.caller_channel` (active channel) rather than `chats.chat_type`, so attachments remain channel-local by default. Added a web artifacts feature: backend `GET /api/artifacts`, safer upload serving with preview/download semantics, and a new **Artifacts** dialog in web UI with list/filter/preview/open/download.
+- **Rationale:** Cross-channel attachment behavior was inconsistent and surprising; channel-local delivery matches user intent and avoids silent fanout mismatches. Web needed a first-class way to inspect generated/uploaded files without forcing re-send from other channels.
+- **Key files / symbols:** `src/tools/send_message.rs` — `resolve_active_attachment_target`, `ActiveAttachmentTarget`; `src/web.rs` — `api_artifacts`, `list_chat_artifacts`, `process_web_attachments` (`url=` + renderable links), `upload_file` (`preview`/`download`, shared+legacy roots), `guess_upload_content_type`; `web/src/main.tsx` — Artifacts dialog and preview UX; `web/src/types.ts` — `ArtifactItem`.
+- **Follow-ups:** Consider adding pagination and server-side search for very large artifact sets; add frontend automated tests for artifact dialog interactions when UI test harness is available.
+
+### 2026-04-14 — Cursor rules: rustfmt CI + cross-platform tests
+
+- **Area:** repo policy / CI / tests
+- **Summary:** Added [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) to enforce `cargo fmt --all` and `cargo fmt --all --check` before completion, and [`.cursor/rules/cross-platform-tests.mdc`](.cursor/rules/cross-platform-tests.mdc) to require OS-agnostic path assertions plus shell-aware test commands (PowerShell vs `/bin/sh`) with Windows path normalization guidance.
+- **Rationale:** Recent CI failures repeated around Windows path separators, PowerShell output differences, and rustfmt drift; explicit always-apply rules reduce regressions and rework.
+- **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc`, `.cursor/rules/cross-platform-tests.mdc`; guidance references `Path::ends_with`, `PathBuf::from`, and Windows `\\?\` prefix handling.
+
 ### 2026-04-14 — Web: queue detail + cancel, schedule prompt edit, AGENTS.md editor
 
 - **Area:** web / API / queue / agent / memory

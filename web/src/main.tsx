@@ -44,7 +44,7 @@ import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
 import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
-import type { Persona, ScheduleTask, ChannelBinding } from './types'
+import type { Persona, ScheduleTask, ChannelBinding, ArtifactItem } from './types'
 
 type BackendMessage = {
   id?: string
@@ -496,6 +496,18 @@ function formatUnknown(value: unknown): string {
   }
 }
 
+function formatBytes(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'unknown size'
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function artifactPreviewUrl(item: ArtifactItem): string {
+  if (item.kind === 'html') return item.preview_url || `${item.url}?preview=1`
+  return item.url
+}
+
 function ToolCallCard(props: ToolCallMessagePartProps) {
   const result = asObject(props.result)
   const hasResult = Object.keys(result).length > 0
@@ -681,6 +693,15 @@ function App() {
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
   const [schedulesDialogOpen, setSchedulesDialogOpen] = useState<boolean>(false)
   const [memoryDialogOpen, setMemoryDialogOpen] = useState<boolean>(false)
+  const [artifactsDialogOpen, setArtifactsDialogOpen] = useState<boolean>(false)
+  const [artifacts, setArtifacts] = useState<ArtifactItem[]>([])
+  const [artifactsBusy, setArtifactsBusy] = useState<boolean>(false)
+  const [artifactsError, setArtifactsError] = useState<string>('')
+  const [artifactKindFilter, setArtifactKindFilter] = useState<string>('all')
+  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null)
+  const [artifactTextPreview, setArtifactTextPreview] = useState<string>('')
+  const [artifactTextBusy, setArtifactTextBusy] = useState<boolean>(false)
+  const [artifactTextError, setArtifactTextError] = useState<string>('')
   const [memoryContent, setMemoryContent] = useState<string>('')
   const [memoryMtimeMs, setMemoryMtimeMs] = useState<number | null>(null)
   const [memoryPathHint, setMemoryPathHint] = useState<string>('')
@@ -814,6 +835,34 @@ function App() {
       setPersonas(list.map((p) => ({ id: p.id, name: p.name, is_active: p.is_active, last_bot_message_at: p.last_bot_message_at ?? null })))
     } catch {
       // ignore refresh errors
+    }
+  }
+
+  const selectedArtifact = useMemo(
+    () => artifacts.find((it) => it.id === selectedArtifactId) ?? null,
+    [artifacts, selectedArtifactId],
+  )
+
+  async function loadArtifacts(cid: number | null = chatId, personaId: number | null = activePersonaId): Promise<void> {
+    if (cid == null) return
+    setArtifactsBusy(true)
+    setArtifactsError('')
+    try {
+      const query = new URLSearchParams({ chat_id: String(cid), kind: artifactKindFilter || 'all' })
+      if (personaId != null) query.set('persona_id', String(personaId))
+      const data = await api<{ artifacts?: ArtifactItem[] }>(`/api/artifacts?${query.toString()}`)
+      const list = Array.isArray(data.artifacts) ? data.artifacts : []
+      setArtifacts(list)
+      setSelectedArtifactId((prev) => {
+        if (prev && list.some((it) => it.id === prev)) return prev
+        return list.length > 0 ? list[0].id : null
+      })
+    } catch (e) {
+      setArtifactsError(e instanceof Error ? e.message : String(e))
+      setArtifacts([])
+      setSelectedArtifactId(null)
+    } finally {
+      setArtifactsBusy(false)
     }
   }
 
@@ -1119,6 +1168,29 @@ function App() {
     void loadPersonaMemory(activePersonaId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [memoryDialogOpen, activePersonaId])
+
+  useEffect(() => {
+    if (!artifactsDialogOpen) return
+    void loadArtifacts(chatId, activePersonaId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artifactsDialogOpen, chatId, activePersonaId, artifactKindFilter])
+
+  useEffect(() => {
+    const item = selectedArtifact
+    setArtifactTextPreview('')
+    setArtifactTextError('')
+    if (!item) return
+    if (!(item.kind === 'markdown' || item.kind === 'text')) return
+    setArtifactTextBusy(true)
+    fetch(artifactPreviewUrl(item), { headers: makeHeaders() })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`Failed to load preview (HTTP ${res.status})`)
+        return res.text()
+      })
+      .then((text) => setArtifactTextPreview(text))
+      .catch((e) => setArtifactTextError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setArtifactTextBusy(false))
+  }, [selectedArtifact])
 
   useEffect(() => {
     if (!agentsMdOpen) return
@@ -1714,14 +1786,23 @@ function App() {
                       </Dialog.Description>
                       {scheduleDetailTask != null ? (
                         <>
-                          <div className="mb-3 space-y-1 text-sm">
-                            <Text size="2"><strong>Persona:</strong> {personas.find((p) => p.id === scheduleDetailTask.persona_id)?.name ?? scheduleDetailTask.persona_id}</Text>
-                            <Text size="2"><strong>Type:</strong> {scheduleDetailTask.schedule_type}</Text>
-                            <Text size="2" className="break-all"><strong>Schedule:</strong> {scheduleDetailTask.schedule_value}</Text>
-                            <Text size="2"><strong>Next run:</strong> {scheduleDetailTask.next_run ?? '—'}</Text>
-                            <Text size="2"><strong>Last run:</strong> {scheduleDetailTask.last_run ?? '—'}</Text>
-                            <Text size="2"><strong>Status:</strong> {scheduleDetailTask.status}</Text>
-                            <Text size="2"><strong>Created:</strong> {scheduleDetailTask.created_at ?? '—'}</Text>
+                          <div className="mb-3 grid grid-cols-[120px_minmax(0,1fr)] gap-x-3 gap-y-1 text-sm">
+                            <Text size="2" color="gray" className="block">Persona</Text>
+                            <Text size="2" className="block">
+                              {personas.find((p) => p.id === scheduleDetailTask.persona_id)?.name ?? scheduleDetailTask.persona_id}
+                            </Text>
+                            <Text size="2" color="gray" className="block">Type</Text>
+                            <Text size="2" className="block">{scheduleDetailTask.schedule_type}</Text>
+                            <Text size="2" color="gray" className="block">Schedule</Text>
+                            <Text size="2" className="block break-all">{scheduleDetailTask.schedule_value}</Text>
+                            <Text size="2" color="gray" className="block">Next run</Text>
+                            <Text size="2" className="block break-all">{scheduleDetailTask.next_run ?? '—'}</Text>
+                            <Text size="2" color="gray" className="block">Last run</Text>
+                            <Text size="2" className="block break-all">{scheduleDetailTask.last_run ?? '—'}</Text>
+                            <Text size="2" color="gray" className="block">Status</Text>
+                            <Text size="2" className="block">{scheduleDetailTask.status}</Text>
+                            <Text size="2" color="gray" className="block">Created</Text>
+                            <Text size="2" className="block break-all">{scheduleDetailTask.created_at ?? '—'}</Text>
                           </div>
                           <Text size="2" weight="bold" mb="1">Prompt</Text>
                           <textarea
@@ -1813,6 +1894,154 @@ function App() {
                             <Button size="1" variant="soft">Close</Button>
                           </Dialog.Close>
                         </Flex>
+                      </Flex>
+                    </Dialog.Content>
+                  </Dialog.Root>
+
+                  <Dialog.Root
+                    open={artifactsDialogOpen}
+                    onOpenChange={(open) => {
+                      setArtifactsDialogOpen(open)
+                      if (!open) {
+                        setArtifactsError('')
+                        setArtifactTextError('')
+                      }
+                    }}
+                  >
+                    <Dialog.Trigger>
+                      <Button size="1" variant="soft">Artifacts</Button>
+                    </Dialog.Trigger>
+                    <Dialog.Content style={{ maxWidth: 980 }}>
+                      <Dialog.Title>Artifacts</Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        View files produced or referenced in this chat persona. Attachments stay channel-local; web can preview them here.
+                      </Dialog.Description>
+                      <Flex gap="3" align="start" wrap="wrap">
+                        <div className="min-w-[250px] flex-1">
+                          <Flex justify="between" align="center" mb="2" gap="2" wrap="wrap">
+                            <Select.Root value={artifactKindFilter} onValueChange={setArtifactKindFilter}>
+                              <Select.Trigger className="w-[150px]" />
+                              <Select.Content>
+                                <Select.Item value="all">All kinds</Select.Item>
+                                <Select.Item value="image">Images</Select.Item>
+                                <Select.Item value="markdown">Markdown</Select.Item>
+                                <Select.Item value="html">HTML</Select.Item>
+                                <Select.Item value="text">Text</Select.Item>
+                                <Select.Item value="other">Other</Select.Item>
+                              </Select.Content>
+                            </Select.Root>
+                            <Button size="1" variant="soft" onClick={() => void loadArtifacts(chatId, activePersonaId)} disabled={artifactsBusy}>
+                              Refresh
+                            </Button>
+                          </Flex>
+                          <div className={appearance === 'dark'
+                            ? 'max-h-[min(440px,65vh)] overflow-auto rounded-md border border-[color:var(--mc-border-soft)]'
+                            : 'max-h-[min(440px,65vh)] overflow-auto rounded-md border border-slate-300'
+                          }>
+                            {artifactsBusy ? (
+                              <Text size="2" color="gray" className="block p-2">Loading artifacts...</Text>
+                            ) : artifactsError ? (
+                              <Callout.Root color="red" size="1" variant="soft" className="m-2">
+                                <Callout.Text>{artifactsError}</Callout.Text>
+                              </Callout.Root>
+                            ) : artifacts.length === 0 ? (
+                              <Text size="2" color="gray" className="block p-2">No artifacts found for this persona.</Text>
+                            ) : (
+                              <ul className="list-none m-0 p-0">
+                                {artifacts.map((it) => (
+                                  <li key={it.id}>
+                                    <button
+                                      type="button"
+                                      onClick={() => setSelectedArtifactId(it.id)}
+                                      className={selectedArtifactId === it.id
+                                        ? 'w-full border-0 border-b text-left p-2 bg-[var(--accent-3)]'
+                                        : 'w-full border-0 border-b text-left p-2'}
+                                      style={appearance === 'dark' ? { borderBottomColor: 'var(--mc-border-soft)' } : { borderBottomColor: 'var(--gray-6)' }}
+                                    >
+                                      <div className="flex items-center justify-between gap-2">
+                                        <Text size="2" className="truncate">{it.name}</Text>
+                                        <Text size="1" color="gray">{it.kind}</Text>
+                                      </div>
+                                      <Text size="1" color="gray">
+                                        {formatBytes(it.size_bytes ?? null)} · {it.source}
+                                      </Text>
+                                    </button>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        </div>
+                        <div className={appearance === 'dark'
+                          ? 'min-w-[320px] flex-[2] rounded-md border border-[color:var(--mc-border-soft)] p-2'
+                          : 'min-w-[320px] flex-[2] rounded-md border border-slate-300 p-2'
+                        }>
+                          {selectedArtifact == null ? (
+                            <Text size="2" color="gray">Select an artifact to preview.</Text>
+                          ) : (
+                            <>
+                              <Flex justify="between" align="center" mb="2" wrap="wrap" gap="2">
+                                <div>
+                                  <Text size="2" weight="bold">{selectedArtifact.name}</Text>
+                                  <Text size="1" color="gray" className="block">
+                                    {selectedArtifact.created_at ?? 'unknown time'} · {selectedArtifact.kind}
+                                  </Text>
+                                </div>
+                                <Flex gap="2">
+                                  <Button size="1" variant="soft" onClick={() => window.open(selectedArtifact.url, '_blank', 'noopener,noreferrer')}>
+                                    Open
+                                  </Button>
+                                  <Button size="1" variant="soft" onClick={() => window.open(`${selectedArtifact.url}${selectedArtifact.url.includes('?') ? '&' : '?'}download=1`, '_blank', 'noopener,noreferrer')}>
+                                    Download
+                                  </Button>
+                                </Flex>
+                              </Flex>
+                              {selectedArtifact.kind === 'image' ? (
+                                <img src={artifactPreviewUrl(selectedArtifact)} alt={selectedArtifact.name} className="max-h-[56vh] w-full object-contain" />
+                              ) : selectedArtifact.kind === 'markdown' ? (
+                                artifactTextBusy ? (
+                                  <Text size="2" color="gray">Loading preview...</Text>
+                                ) : artifactTextError ? (
+                                  <Callout.Root color="red" size="1" variant="soft">
+                                    <Callout.Text>{artifactTextError}</Callout.Text>
+                                  </Callout.Root>
+                                ) : (
+                                  <div className="aui-md-root max-h-[56vh] overflow-auto text-sm leading-relaxed">
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                      {artifactTextPreview}
+                                    </ReactMarkdown>
+                                  </div>
+                                )
+                              ) : selectedArtifact.kind === 'html' ? (
+                                <iframe
+                                  title={selectedArtifact.name}
+                                  src={artifactPreviewUrl(selectedArtifact)}
+                                  sandbox="allow-same-origin"
+                                  className="h-[56vh] w-full rounded border border-[color:var(--gray-6)]"
+                                />
+                              ) : selectedArtifact.kind === 'text' ? (
+                                artifactTextBusy ? (
+                                  <Text size="2" color="gray">Loading preview...</Text>
+                                ) : artifactTextError ? (
+                                  <Callout.Root color="red" size="1" variant="soft">
+                                    <Callout.Text>{artifactTextError}</Callout.Text>
+                                  </Callout.Root>
+                                ) : (
+                                  <pre className="max-h-[56vh] overflow-auto whitespace-pre-wrap text-xs">{artifactTextPreview}</pre>
+                                )
+                              ) : (
+                                <Text size="2" color="gray">
+                                  Preview unavailable for this file type. Use Open or Download.
+                                </Text>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </Flex>
+                      <Flex justify="end" mt="3">
+                        <Dialog.Close>
+                          <Button variant="soft">Close</Button>
+                        </Dialog.Close>
                       </Flex>
                     </Dialog.Content>
                   </Dialog.Root>

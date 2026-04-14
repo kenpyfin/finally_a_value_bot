@@ -84,7 +84,13 @@ pub struct QueueEnqueueMeta {
 
 impl QueueEnqueueMeta {
     /// For callers that only need project/workflow (legacy `QueueTaskMeta` shape).
-    pub fn from_task_meta(run_id: String, persona_id: i64, source: QueueSource, label: String, m: QueueTaskMeta) -> Self {
+    pub fn from_task_meta(
+        run_id: String,
+        persona_id: i64,
+        source: QueueSource,
+        label: String,
+        m: QueueTaskMeta,
+    ) -> Self {
         Self {
             run_id,
             persona_id,

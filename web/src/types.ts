@@ -42,3 +42,14 @@ export type MessageItem = {
   is_from_bot: boolean
   timestamp: string
 }
+
+export type ArtifactItem = {
+  id: string
+  name: string
+  kind: string
+  size_bytes?: number | null
+  created_at?: string | null
+  source: string
+  url: string
+  preview_url: string
+}
