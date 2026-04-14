@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-14 — Cursor rule: prevent behavior-test drift in Rust changes
+
+- **Area:** repo policy / CI / tests
+- **Summary:** Extended [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) with a new behavior-test drift section: when tool contracts change, tests must update in the same change (notably `ToolAuthContext`-dependent attachment tests and parser boundary assertions for URL extraction).
+- **Rationale:** Recent failures came from stale test assumptions after contract updates (`caller_channel` auth requirement and markdown URL token boundaries), not compiler/lint issues.
+- **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc` (`Preventing behavior-test drift`); references `__finally_a_value_bot_auth`, `ToolAuthContext`, URL parser boundary assertions.
+
 ### 2026-04-14 — Cursor rule: require clippy preflight for Rust CI
 
 - **Area:** repo policy / CI / linting
