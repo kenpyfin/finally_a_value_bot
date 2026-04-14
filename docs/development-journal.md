@@ -18,6 +18,26 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-13 — Unit tests: align with Telegram HTML, trim, tools, web limits
+
+- **Area:** tests / telegram / llm / web / builtin_skills
+- **Summary:** Fixed 13 failing `--lib` tests: `trim_to_recent_balanced` restored to ≥2 user and ≥2 assistant (was incorrectly ≥3/≥3); `message_to_text` prefixes tool results again; `has_new_swap_evidence` ignores “no files found … found matching”; Gemini `normalize_stop_reason` maps case-insensitive `stop`/`STOP` to `end_turn`; setup env save test expects unquoted tokens when unnecessary; send_message web test expects `[default]` persona prefix; builtin_skills test drops missing `social-feed`; web stream/concurrency tests match queued `/api/send` + SSE replay; markdown/trim tests updated to current formatter output.
+- **Key files / symbols:** `trim_to_recent_balanced`, `message_to_text`, `has_new_swap_evidence`, `normalize_stop_reason`, `src/web.rs` tests, `src/builtin_skills.rs` test list.
+
+### 2026-04-13 — CI: fix Clippy + tests after Config API drift
+
+- **Area:** infra / config / tests
+- **Summary:** Aligned `test_config` and test-only `Config` literals with the current [`Config`](src/config.rs) struct (removed obsolete `max_session_messages` / `compact_keep_recent` / delegate fields). Exposed `pub fn test_config()` at the `config` module root under `cfg(test)` for unit tests; integration tests use YAML-based minimal config. Updated `history_to_claude_messages` unit tests for the `keep_trailing_assistant` parameter. Resolved Clippy 1.94 (`is_some_and` / `is_none_or`, `cursor_agent` init, `channel` test module placement, `[lints.clippy]` allows for noisy lints, `DummyTool` dead_code).
+- **Rationale:** `cargo clippy -- -D warnings` on CI was failing on private `config::tests`, stale struct fields, and new Clippy suggestions.
+- **Key files / symbols:** `src/config.rs` — `test_config`; `src/channels/telegram.rs`; `src/llm.rs` / `src/web.rs` tests use `crate::config::test_config()`; `tests/config_validation.rs`; `Cargo.toml` `[lints.clippy]`; `src/channel.rs` — `mod tests` at EOF; `src/tools/cursor_agent.rs`.
+
+### 2026-04-13 — GitHub Actions: action bumps, Dependabot, CI polish
+
+- **Area:** infra / CI
+- **Summary:** Pinned first-party actions to current majors (`actions/checkout@v6`, `actions/setup-node@v6`, `actions/upload-artifact@v6`, `actions/download-artifact@v6`) in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/release-assets.yml`](.github/workflows/release-assets.yml). Added [`.github/dependabot.yml`](.github/dependabot.yml) (weekly) for `github-actions`, `cargo`, and `npm` under `web/`. CI now uses `concurrency` (cancel in-progress on same ref), `workflow_dispatch`, and passes `web/dist` from the web job to the release build job via artifacts so `npm ci` + web build run once per run.
+- **Rationale:** Stay on supported action runtimes; reduce duplicate web builds; automated dependency PRs for workflows and lockfiles.
+- **Key files / symbols:** `.github/workflows/ci.yml` — `web-dist` artifact; `.github/workflows/release-assets.yml`; `.github/dependabot.yml`.
+
 ### 2026-04-10 — Background jobs: visibility, terminal heartbeats, stale reconciliation
 
 - **Area:** web / API / scheduler / db / job heartbeat

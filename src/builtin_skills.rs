@@ -86,7 +86,6 @@ mod tests {
             "apple-calendar",
             "weather",
             "find-skills",
-            "social-feed",
             "search-vault",
             "index-vault",
             "create-skill",

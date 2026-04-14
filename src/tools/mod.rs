@@ -376,7 +376,7 @@ impl ToolRegistry {
             let use_command = vault
                 .vault_search_command
                 .as_ref()
-                .map_or(false, |c| !c.trim().is_empty());
+                .is_some_and(|c| !c.trim().is_empty());
 
             if use_native {
                 let embed_url = vault.embedding_server_url.as_ref().unwrap();
@@ -618,6 +618,7 @@ mod tests {
         assert_eq!(dir, std::path::PathBuf::from("/tmp/work/shared"));
     }
 
+    #[allow(dead_code)]
     struct DummyTool {
         tool_name: String,
     }

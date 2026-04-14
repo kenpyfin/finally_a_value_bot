@@ -2498,12 +2498,7 @@ impl Database {
         )?;
         let rows: Vec<(String, i64, i64, String)> = stmt
             .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);

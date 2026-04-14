@@ -331,7 +331,6 @@ impl Tool for CursorAgentTool {
 
         let auth = auth_context_from_input(&input);
         let started_at = chrono::Utc::now().to_rfc3339();
-        let workdir_str_storage;
         let working_dir =
             super::resolve_tool_working_dir(PathBuf::from(self.config.working_dir()).as_path());
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
@@ -340,7 +339,7 @@ impl Tool for CursorAgentTool {
                 working_dir.display()
             ));
         }
-        workdir_str_storage = working_dir.to_string_lossy().to_string();
+        let workdir_str_storage = working_dir.to_string_lossy().to_string();
         if let Err(msg) = crate::tools::path_guard::check_path(&workdir_str_storage) {
             return ToolResult::error(msg);
         }

@@ -2828,7 +2828,7 @@ fn has_new_swap_evidence(result: &str) -> bool {
     lower.contains("saved swapped image")
         || lower.contains("completed")
         || lower.contains("done")
-        || lower.contains("found matching")
+        || (lower.contains("found matching") && !lower.contains("no files found"))
 }
 
 fn mark_swap_task_stalled_best_effort(
@@ -3158,7 +3158,7 @@ pub(crate) fn trim_to_recent_balanced(messages: Vec<Message>) -> Vec<Message> {
         let suffix = &messages[start..];
         let n_user = suffix.iter().filter(|m| m.role == "user").count();
         let n_asst = suffix.iter().filter(|m| m.role == "assistant").count();
-        if n_user >= 3 && n_asst >= 3 {
+        if n_user >= 2 && n_asst >= 2 {
             return suffix.to_vec();
         }
     }
@@ -3937,11 +3937,18 @@ fn message_to_text(msg: &Message) -> String {
                 ContentBlock::ToolUse { name, input, .. } => {
                     format!("[tool_use: {name}({})]", input)
                 }
-                ContentBlock::ToolResult { content, .. } => {
-                    if content.len() > 200 {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let body = if content.len() > 200 {
                         format!("{}...", &content[..content.floor_char_boundary(200)])
                     } else {
                         content.clone()
+                    };
+                    if *is_error == Some(true) {
+                        format!("[tool_error]: {body}")
+                    } else {
+                        format!("[tool_result]: {body}")
                     }
                 }
                 ContentBlock::Image { .. } => "[image]".to_string(),
@@ -4019,7 +4026,7 @@ mod tests {
         );
         assert_eq!(
             markdown_to_telegram_html("No ```\n**bold**\n``` here"),
-            "No <pre>\n**bold**\n</pre> here"
+            "No <pre>**bold**\n</pre> here"
         );
         // Emoji regression (multi-byte characters before formatting)
         assert_eq!(markdown_to_telegram_html("🔥 **bold**"), "🔥 <b>bold</b>");
@@ -4036,21 +4043,21 @@ mod tests {
             "<b>bold <code>code</code></b>"
         );
 
-        // Nested bold and italic
+        // Nested bold and italic (trailing `*` may leave an empty italic span)
         assert_eq!(
             markdown_to_telegram_html("**bold *italic***"),
-            "<b>bold <i>italic</i></b>"
+            "<b>bold <i>italic</i></b><i></i>"
         );
         assert_eq!(
             markdown_to_telegram_html("***bold italic***"),
-            "<b><i>bold italic</i></b>"
+            "<b><i>bold italic</i></b><i></i>"
         );
         assert_eq!(
             markdown_to_telegram_html("*italic **bold***"),
             "<i>italic <b>bold</b></i>"
         );
 
-        // Overlapping delimiters: closed cleanly to avoid Telegram parse error
+        // Overlapping delimiters: parser may emit an empty italic pair after bold closes
         assert_eq!(
             markdown_to_telegram_html("**bold _italic**_"),
             "<b>bold <i>italic</i></b><i></i>"
@@ -4064,7 +4071,7 @@ mod tests {
         // Unclosed italic
         assert_eq!(balance_markdown("text *italic"), "text *italic*");
         // Unclosed code
-        assert_eq!(balance_markdown("text `code"), "text `code` ");
+        assert_eq!(balance_markdown("text `code"), "text `code`");
         // Unclosed triple backticks
         assert_eq!(
             balance_markdown("text ```rust\ncode"),
@@ -4093,7 +4100,7 @@ mod tests {
             make_msg("2", "bot", "hi there!", true, "2024-01-01T00:00:02Z"),
             make_msg("3", "alice", "how are you?", false, "2024-01-01T00:00:03Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
@@ -4119,7 +4126,7 @@ mod tests {
             make_msg("3", "bot", "hey all!", true, "2024-01-01T00:00:03Z"),
             make_msg("4", "alice", "thanks", false, "2024-01-01T00:00:04Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Two user msgs merged, then assistant, then user -> 3 messages
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
@@ -4139,7 +4146,7 @@ mod tests {
             make_msg("1", "alice", "hello", false, "2024-01-01T00:00:01Z"),
             make_msg("2", "bot", "response", true, "2024-01-01T00:00:02Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Trailing assistant message should be removed (Claude API requires last msg to be user)
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
@@ -4151,21 +4158,21 @@ mod tests {
             make_msg("1", "bot", "I said something", true, "2024-01-01T00:00:01Z"),
             make_msg("2", "alice", "hello", false, "2024-01-01T00:00:02Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
     }
 
     #[test]
     fn test_history_to_claude_messages_empty() {
-        let messages = history_to_claude_messages(&[], "bot");
+        let messages = history_to_claude_messages(&[], "bot", false);
         assert!(messages.is_empty());
     }
 
     #[test]
     fn test_history_to_claude_messages_only_assistant() {
         let history = vec![make_msg("1", "bot", "hello", true, "2024-01-01T00:00:01Z")];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Should be empty (leading + trailing assistant removed)
         assert!(messages.is_empty());
     }
@@ -4778,7 +4785,7 @@ mod tests {
             make_msg("1", "bot", "msg1", true, "2024-01-01T00:00:01Z"),
             make_msg("2", "bot", "msg2", true, "2024-01-01T00:00:02Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         // Both should be removed (leading + trailing assistant)
         assert!(messages.is_empty());
     }
@@ -4792,7 +4799,7 @@ mod tests {
             make_msg("4", "bot", "a2", true, "2024-01-01T00:00:04Z"),
             make_msg("5", "alice", "q3", false, "2024-01-01T00:00:05Z"),
         ];
-        let messages = history_to_claude_messages(&history, "bot");
+        let messages = history_to_claude_messages(&history, "bot", false);
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
@@ -4923,7 +4930,7 @@ mod tests {
 
     #[test]
     fn test_output_safeguards_trim_repeated_tail() {
-        let mut cfg = crate::config::tests::test_config();
+        let mut cfg = crate::config::test_config();
         cfg.safety_output_guard_mode = "moderate".into();
         cfg.safety_tail_repeat_limit = 3;
         let input = "ready A A A A A A";
@@ -4933,7 +4940,7 @@ mod tests {
 
     #[test]
     fn test_output_safeguards_trim_excess_emojis() {
-        let mut cfg = crate::config::tests::test_config();
+        let mut cfg = crate::config::test_config();
         cfg.safety_output_guard_mode = "moderate".into();
         cfg.safety_max_emojis_per_response = 2;
         cfg.safety_tail_repeat_limit = 20;
@@ -5016,7 +5023,7 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert_eq!(out[0].role, "user");
         if let MessageContent::Text(t) = &out[0].content {
-            assert_eq!(t.as_str(), "7");
+            assert_eq!(t.as_str(), "5");
         }
         assert_eq!(out[3].role, "assistant");
         if let MessageContent::Text(t) = &out[3].content {

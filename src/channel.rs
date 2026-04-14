@@ -132,32 +132,6 @@ pub async fn deliver_and_store_bot_message(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::normalize_persona_prefixed_text;
-
-    #[test]
-    fn persona_prefix_is_added_once() {
-        let out = normalize_persona_prefixed_text("InfluencerPZ", "Hello");
-        assert_eq!(out, "[InfluencerPZ] Hello");
-    }
-
-    #[test]
-    fn repeated_leading_persona_tags_are_collapsed() {
-        let out = normalize_persona_prefixed_text(
-            "InfluencerPZ",
-            "[InfluencerPZ] [InfluencerPZ] [InfluencerPZ] Hi there",
-        );
-        assert_eq!(out, "[InfluencerPZ] Hi there");
-    }
-
-    #[test]
-    fn other_persona_tag_is_replaced_with_current() {
-        let out = normalize_persona_prefixed_text("Trader", "[InfluencerPZ] Market open");
-        assert_eq!(out, "[Trader] Market open");
-    }
-}
-
 /// Store the bot message once under canonical_chat_id and deliver to all bound channels (Telegram, Discord, web).
 /// Used for unified contact sync: the same reply appears on every linked channel.
 pub async fn deliver_to_contact(
@@ -243,4 +217,30 @@ pub async fn deliver_to_contact(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_persona_prefixed_text;
+
+    #[test]
+    fn persona_prefix_is_added_once() {
+        let out = normalize_persona_prefixed_text("InfluencerPZ", "Hello");
+        assert_eq!(out, "[InfluencerPZ] Hello");
+    }
+
+    #[test]
+    fn repeated_leading_persona_tags_are_collapsed() {
+        let out = normalize_persona_prefixed_text(
+            "InfluencerPZ",
+            "[InfluencerPZ] [InfluencerPZ] [InfluencerPZ] Hi there",
+        );
+        assert_eq!(out, "[InfluencerPZ] Hi there");
+    }
+
+    #[test]
+    fn other_persona_tag_is_replaced_with_current() {
+        let out = normalize_persona_prefixed_text("Trader", "[InfluencerPZ] Market open");
+        assert_eq!(out, "[Trader] Market open");
+    }
 }
