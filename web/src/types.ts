@@ -20,6 +20,17 @@ export type Persona = {
 export type ChannelBinding = {
   channel_type: string
   channel_handle: string
+  persona_mode?: 'all' | 'single'
+  persona_id?: number | null
+}
+
+export type RuntimeSettingItem = {
+  key: string
+  value: string
+  raw_value: string
+  is_secret: boolean
+  updated_at?: string
+  source?: string
 }
 
 export type ScheduleTask = {

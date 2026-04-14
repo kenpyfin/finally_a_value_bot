@@ -2,8 +2,7 @@ use finally_a_value_bot::claude::{Message, MessageContent};
 use finally_a_value_bot::config::Config;
 use finally_a_value_bot::error::FinallyAValueBotError;
 use finally_a_value_bot::{
-    builtin_skills, config_wizard, db, doctor, gateway, logging, mcp, memory, setup, skills,
-    telegram,
+    builtin_skills, db, doctor, gateway, logging, mcp, memory, skills, telegram,
 };
 use std::path::Path;
 use tracing::info;
@@ -20,10 +19,10 @@ USAGE:
 COMMANDS:
     start       Start the bot (Telegram + optional WhatsApp/Discord)
     gateway     Manage gateway service (install/uninstall/start/stop/status/logs)
-    config      Run interactive Q&A config flow (recommended)
+    config      (retired) Use Web UI Settings instead
     doctor      Run preflight diagnostics (cross-platform)
     test-llm [--with-tools]   Test LLM connection (use --with-tools to send tools like Telegram)
-    setup       Run interactive setup wizard
+    setup       (retired) Use Web UI onboarding instead
     version     Show version information
     help        Show this help message
 
@@ -45,14 +44,12 @@ FEATURES:
     - Sensitive path blacklisting for file tools
 
 SETUP:
-    1. Run: finally_a_value_bot config
-       (or run finally_a_value_bot start and follow auto-config on first launch)
-    2. Copy .env.example to .env and fill in required values (or run finally_a_value_bot setup):
+    1. Copy .env.example to .env and set bootstrap values:
+       FINALLY_A_VALUE_BOT_WORKSPACE_DIR (or WORKSPACE_DIR), WEB_HOST/WEB_PORT, WEB_AUTH_TOKEN when exposing non-local.
+    2. Start the app: finally_a_value_bot start
+    3. Open Web UI: http://127.0.0.1:10961 and finish runtime settings there.
 
-       api_key               LLM API key (optional when llm_provider=ollama|llama|llamacpp)
-       At least one channel token must be set (Telegram or Discord)
-
-    3. Run: finally_a_value_bot start
+       Runtime channel/LLM settings are now managed from Web UI and persisted in SQLite.
 
 CONFIG FILE (.env):
     FinallyAValueBot reads configuration from .env in the current directory.
@@ -96,12 +93,12 @@ EXAMPLES:
     finally_a_value_bot gateway install     Install and enable gateway service
     finally_a_value_bot gateway status      Show gateway service status
     finally_a_value_bot gateway logs 100    Show last 100 lines of gateway logs
-    finally_a_value_bot config              Run interactive Q&A config flow
+    finally_a_value_bot config              Retired; use Web UI Settings
     finally_a_value_bot doctor              Run preflight diagnostics
     finally_a_value_bot doctor --json       Output diagnostics as JSON
     finally_a_value_bot test-llm            Test LLM API connection (no tools)
     finally_a_value_bot test-llm --with-tools   Test LLM with full tool list (like Telegram)
-    finally_a_value_bot setup               Run full-screen setup wizard
+    finally_a_value_bot setup               Retired; use Web UI onboarding
     finally_a_value_bot version             Show version
     finally_a_value_bot help                Show this message
 
@@ -395,6 +392,46 @@ fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
     }
 }
 
+fn is_llm_ready(config: &Config) -> bool {
+    !config.api_key.is_empty()
+        || matches!(
+            config.llm_provider.as_str(),
+            "ollama" | "llama" | "llamacpp"
+        )
+}
+
+fn has_any_realtime_channel(config: &Config) -> bool {
+    !config.telegram_bot_token.trim().is_empty() || config.discord_bot_token.is_some()
+}
+
+fn apply_runtime_settings_from_db(db: &db::Database) -> Result<usize, FinallyAValueBotError> {
+    const BOOTSTRAP_ONLY_KEYS: &[&str] = &[
+        "WORKSPACE_DIR",
+        "FINALLY_A_VALUE_BOT_WORKSPACE_DIR",
+        "FINALLY_A_VALUE_BOT_CONFIG",
+        "WEB_HOST",
+        "WEB_PORT",
+        "WEB_AUTH_TOKEN",
+    ];
+    let settings = db.list_app_settings()?;
+    let mut applied = 0usize;
+    for setting in settings {
+        if BOOTSTRAP_ONLY_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(setting.key.as_str()))
+        {
+            continue;
+        }
+        // SAFETY: startup path runs before the async runtime starts handling requests.
+        // Mutating process env is confined to initialization.
+        unsafe {
+            std::env::set_var(&setting.key, &setting.value);
+        }
+        applied = applied.saturating_add(1);
+    }
+    Ok(applied)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -407,21 +444,13 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("setup") => {
-            let saved = setup::run_setup_wizard()?;
-            if saved {
-                println!("Setup saved to .env");
-            } else {
-                println!("Setup canceled");
-            }
+            println!("`setup` is retired. Use Web UI onboarding instead.");
+            println!("Start the app, then open http://127.0.0.1:10961 and configure Settings.");
             return Ok(());
         }
         Some("config") => {
-            let saved = config_wizard::run_config_wizard()?;
-            if saved {
-                println!("Config saved");
-            } else {
-                println!("Config canceled");
-            }
+            println!("`config` is retired. Use Web UI onboarding instead.");
+            println!("Start the app, then open http://127.0.0.1:10961 and configure Settings.");
             return Ok(());
         }
         Some("doctor") => {
@@ -448,24 +477,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(c) => c,
         Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config missing/invalid: {e}");
-            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                eprintln!("Launching interactive config...");
-                let saved = config_wizard::run_config_wizard()?;
-                if !saved {
-                    return Err(anyhow::anyhow!(
-                        "config canceled and config is still incomplete"
-                    ));
-                }
-                Config::load()?
-            } else {
-                eprintln!("Not running in a terminal (e.g. Docker). Create or fix .env instead of using interactive config.");
-                eprintln!("  cp .env.example .env && edit .env with TELEGRAM_BOT_TOKEN, BOT_USERNAME, LLM_API_KEY, etc.");
-                return Err(anyhow::anyhow!("config required: {e}"));
-            }
+            eprintln!("Create or fix .env (bootstrap values), then open Web UI to finish setup.");
+            eprintln!(
+                "Example: cp .env.example .env && finally_a_value_bot start (then visit Web UI)"
+            );
+            return Err(anyhow::anyhow!("config required: {e}"));
         }
         Err(e) => return Err(e.into()),
     };
@@ -491,15 +511,29 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
+    // Load runtime settings persisted by Web UI and merge into effective process env.
+    let applied_settings = apply_runtime_settings_from_db(&db)?;
+    if applied_settings > 0 {
+        let mut merged = Config::load_from_env();
+        merged.post_deserialize()?;
+        config = merged;
+        info!(
+            "Applied {} runtime settings from database",
+            applied_settings
+        );
+    }
+
     // Seed onboarding task for fresh installations
-    let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
-    let seed_persona_id = db.get_current_persona_id(seed_chat_id)?;
-    if let Err(e) = db.ensure_onboarding_task(
-        seed_chat_id,
-        seed_persona_id,
-        "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track."
-    ) {
-        tracing::warn!("Failed to seed onboarding task: {}", e);
+    if is_llm_ready(&config) && has_any_realtime_channel(&config) {
+        let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
+        let seed_persona_id = db.get_current_persona_id(seed_chat_id)?;
+        if let Err(e) = db.ensure_onboarding_task(
+            seed_chat_id,
+            seed_persona_id,
+            "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track."
+        ) {
+            tracing::warn!("Failed to seed onboarding task: {}", e);
+        }
     }
 
     let principles_path = config

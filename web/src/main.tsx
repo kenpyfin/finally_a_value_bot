@@ -44,7 +44,7 @@ import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
 import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
-import type { Persona, ScheduleTask, ChannelBinding, ArtifactItem } from './types'
+import type { Persona, ScheduleTask, ChannelBinding, ArtifactItem, RuntimeSettingItem } from './types'
 
 type BackendMessage = {
   id?: string
@@ -75,6 +75,13 @@ type QueueLane = {
   project_id?: number | null
   workflow_id?: number | null
   items?: QueueItem[]
+}
+
+type InstallationStatus = {
+  llm_ready: boolean
+  channel_ready: boolean
+  web_enabled: boolean
+  requires_restart_to_apply_runtime_settings: boolean
 }
 
 type Appearance = 'dark' | 'light'
@@ -736,6 +743,17 @@ function App() {
   const [agentsMdError, setAgentsMdError] = useState('')
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
+  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
+  const [settingsBusy, setSettingsBusy] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingItem[]>([])
+  const [installationStatus, setInstallationStatus] = useState<InstallationStatus | null>(null)
+  const [llmProviderInput, setLlmProviderInput] = useState('')
+  const [llmApiKeyInput, setLlmApiKeyInput] = useState('')
+  const [llmModelInput, setLlmModelInput] = useState('')
+  const [telegramTokenInput, setTelegramTokenInput] = useState('')
+  const [botUsernameInput, setBotUsernameInput] = useState('')
+  const [discordTokenInput, setDiscordTokenInput] = useState('')
 
   const historySeedRef = useRef<ThreadMessageLike[]>([])
   const deferredHistoryRef = useRef<ThreadMessageLike[] | null>(null)
@@ -1216,6 +1234,15 @@ function App() {
   }, [agentHistoryDialogOpen, activePersonaId])
 
   useEffect(() => {
+    if (!settingsDialogOpen) return
+    void loadSettings()
+    if (chatId != null) {
+      void loadBindings(chatId)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsDialogOpen, chatId])
+
+  useEffect(() => {
     if (!agentHistoryDialogOpen) return
     const n = agentHistoryParsed?.iterations.length ?? 0
     if (n === 0) return
@@ -1259,6 +1286,96 @@ function App() {
     } catch {
       setBindings([])
     }
+  }
+
+  async function loadSettings(): Promise<void> {
+    setSettingsBusy(true)
+    setSettingsError('')
+    try {
+      const data = await api<{
+        settings?: RuntimeSettingItem[]
+        installation_status?: InstallationStatus
+      }>('/api/settings')
+      const items = Array.isArray(data.settings) ? data.settings : []
+      setRuntimeSettings(items)
+      setInstallationStatus(data.installation_status ?? null)
+      const byKey = new Map<string, RuntimeSettingItem>()
+      for (const item of items) {
+        byKey.set(item.key.toUpperCase(), item)
+      }
+      setLlmProviderInput(byKey.get('LLM_PROVIDER')?.raw_value ?? '')
+      setLlmApiKeyInput(byKey.get('LLM_API_KEY')?.raw_value ?? '')
+      setLlmModelInput(byKey.get('LLM_MODEL')?.raw_value ?? '')
+      setTelegramTokenInput(byKey.get('TELEGRAM_BOT_TOKEN')?.raw_value ?? '')
+      setBotUsernameInput(byKey.get('BOT_USERNAME')?.raw_value ?? '')
+      setDiscordTokenInput(byKey.get('DISCORD_BOT_TOKEN')?.raw_value ?? '')
+    } catch (e) {
+      setSettingsError(e instanceof Error ? e.message : String(e))
+      setRuntimeSettings([])
+      setInstallationStatus(null)
+    } finally {
+      setSettingsBusy(false)
+    }
+  }
+
+  async function saveSettings(): Promise<void> {
+    setSettingsBusy(true)
+    setSettingsError('')
+    try {
+      const upsert: Record<string, string> = {}
+      const remove: string[] = []
+      const put = (key: string, value: string): void => {
+        const trimmed = value.trim()
+        if (trimmed.length === 0) {
+          remove.push(key)
+        } else {
+          upsert[key] = trimmed
+        }
+      }
+      put('LLM_PROVIDER', llmProviderInput)
+      put('LLM_API_KEY', llmApiKeyInput)
+      put('LLM_MODEL', llmModelInput)
+      put('TELEGRAM_BOT_TOKEN', telegramTokenInput)
+      put('BOT_USERNAME', botUsernameInput)
+      put('DISCORD_BOT_TOKEN', discordTokenInput)
+      await api('/api/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          upsert: Object.keys(upsert).length > 0 ? upsert : undefined,
+          remove: remove.length > 0 ? remove : undefined,
+        }),
+      })
+      await loadSettings()
+    } catch (e) {
+      setSettingsError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSettingsBusy(false)
+    }
+  }
+
+  async function updateChannelPersonaPolicy(
+    channelType: string,
+    mode: 'all' | 'single',
+    personaId?: number,
+  ): Promise<void> {
+    if (chatId == null) return
+    if (mode === 'all') {
+      await api('/api/channel_persona_policy', {
+        method: 'DELETE',
+        body: JSON.stringify({ chat_id: chatId, channel_type: channelType }),
+      })
+    } else {
+      await api('/api/channel_persona_policy', {
+        method: 'POST',
+        body: JSON.stringify({
+          chat_id: chatId,
+          channel_type: channelType,
+          mode: 'single',
+          persona_id: personaId,
+        }),
+      })
+    }
+    await loadBindings(chatId)
   }
 
   async function loadQueueDiagnostics(cid: number | null = chatId): Promise<void> {
@@ -1573,6 +1690,152 @@ function App() {
                   <Text size="2" color="gray">
                     {statusText}
                   </Text>
+                  <Dialog.Root open={settingsDialogOpen} onOpenChange={setSettingsDialogOpen}>
+                    <Dialog.Trigger>
+                      <Button size="1" variant="soft">Settings</Button>
+                    </Dialog.Trigger>
+                    <Dialog.Content style={{ maxWidth: 920 }}>
+                      <Dialog.Title>Web UI configuration</Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        Configure runtime settings from Web UI. Bootstrap values still come from repo-root .env. Runtime changes are saved to DB and apply after restart.
+                      </Dialog.Description>
+                      {settingsError ? (
+                        <Callout.Root color="red" size="1" variant="soft" className="mb-2">
+                          <Callout.Text>{settingsError}</Callout.Text>
+                        </Callout.Root>
+                      ) : null}
+                      {installationStatus ? (
+                        <Flex gap="2" wrap="wrap" mb="3">
+                          <Text size="1" color={installationStatus.llm_ready ? 'green' : 'orange'}>
+                            LLM: {installationStatus.llm_ready ? 'ready' : 'missing'}
+                          </Text>
+                          <Text size="1" color={installationStatus.channel_ready ? 'green' : 'orange'}>
+                            Channels: {installationStatus.channel_ready ? 'ready' : 'missing'}
+                          </Text>
+                          <Text size="1" color="gray">
+                            Restart required: {installationStatus.requires_restart_to_apply_runtime_settings ? 'yes' : 'no'}
+                          </Text>
+                        </Flex>
+                      ) : null}
+                      <div
+                        className="rounded-md border p-3"
+                        style={appearance === 'dark'
+                          ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
+                          : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
+                      >
+                        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                          <TextField.Root
+                            placeholder="LLM_PROVIDER (e.g. anthropic/openai)"
+                            value={llmProviderInput}
+                            onChange={(e) => setLlmProviderInput(e.target.value)}
+                          />
+                          <TextField.Root
+                            placeholder="LLM_MODEL"
+                            value={llmModelInput}
+                            onChange={(e) => setLlmModelInput(e.target.value)}
+                          />
+                          <TextField.Root
+                            placeholder="LLM_API_KEY"
+                            value={llmApiKeyInput}
+                            onChange={(e) => setLlmApiKeyInput(e.target.value)}
+                          />
+                          <TextField.Root
+                            placeholder="TELEGRAM_BOT_TOKEN"
+                            value={telegramTokenInput}
+                            onChange={(e) => setTelegramTokenInput(e.target.value)}
+                          />
+                          <TextField.Root
+                            placeholder="BOT_USERNAME"
+                            value={botUsernameInput}
+                            onChange={(e) => setBotUsernameInput(e.target.value)}
+                          />
+                          <TextField.Root
+                            placeholder="DISCORD_BOT_TOKEN"
+                            value={discordTokenInput}
+                            onChange={(e) => setDiscordTokenInput(e.target.value)}
+                          />
+                        </div>
+                        <Flex justify="between" align="center" mt="3" gap="2" wrap="wrap">
+                          <Text size="1" color="gray">
+                            Saved runtime settings: {runtimeSettings.length}
+                          </Text>
+                          <Flex gap="2">
+                            <Button size="1" variant="soft" onClick={() => void loadSettings()} disabled={settingsBusy}>
+                              Reload
+                            </Button>
+                            <Button size="1" onClick={() => void saveSettings()} disabled={settingsBusy}>
+                              {settingsBusy ? 'Saving…' : 'Save'}
+                            </Button>
+                          </Flex>
+                        </Flex>
+                      </div>
+                      <div
+                        className="mt-3 rounded-md border p-3"
+                        style={appearance === 'dark'
+                          ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
+                          : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
+                      >
+                        <Text size="2" weight="bold">Channel persona mode</Text>
+                        <Text size="1" color="gray" className="mb-2 block">
+                          Set each channel to use all personas (current behavior) or force a single persona.
+                        </Text>
+                        <div className="space-y-2">
+                          {bindings.length === 0 ? (
+                            <Text size="1" color="gray">No channel bindings found for this contact.</Text>
+                          ) : bindings.map((b) => {
+                            const currentMode = b.persona_mode === 'single' ? 'single' : 'all'
+                            const currentPersonaId = b.persona_id ?? activePersonaId ?? personas[0]?.id ?? null
+                            return (
+                              <Flex key={`${b.channel_type}:${b.channel_handle}`} gap="2" align="center" wrap="wrap">
+                                <Text size="1" className="min-w-[180px]">{b.channel_type}: {b.channel_handle}</Text>
+                                <Select.Root
+                                  value={currentMode}
+                                  onValueChange={(mode) => {
+                                    if (mode === 'all') {
+                                      void updateChannelPersonaPolicy(b.channel_type, 'all')
+                                    } else if (currentPersonaId != null) {
+                                      void updateChannelPersonaPolicy(b.channel_type, 'single', currentPersonaId)
+                                    }
+                                  }}
+                                >
+                                  <Select.Trigger className="w-[140px]" />
+                                  <Select.Content>
+                                    <Select.Item value="all">All personas</Select.Item>
+                                    <Select.Item value="single">Single persona</Select.Item>
+                                  </Select.Content>
+                                </Select.Root>
+                                {currentMode === 'single' ? (
+                                  <Select.Root
+                                    value={currentPersonaId != null ? String(currentPersonaId) : ''}
+                                    onValueChange={(value) => {
+                                      const pid = Number(value)
+                                      if (Number.isFinite(pid) && pid > 0) {
+                                        void updateChannelPersonaPolicy(b.channel_type, 'single', pid)
+                                      }
+                                    }}
+                                  >
+                                    <Select.Trigger className="w-[180px]" placeholder="Persona" />
+                                    <Select.Content>
+                                      {personas.map((p) => (
+                                        <Select.Item key={p.id} value={String(p.id)}>
+                                          {p.name}
+                                        </Select.Item>
+                                      ))}
+                                    </Select.Content>
+                                  </Select.Root>
+                                ) : null}
+                              </Flex>
+                            )
+                          })}
+                        </div>
+                      </div>
+                      <Flex justify="end" mt="4">
+                        <Dialog.Close>
+                          <Button variant="soft">Close</Button>
+                        </Dialog.Close>
+                      </Flex>
+                    </Dialog.Content>
+                  </Dialog.Root>
                   <Dialog.Root open={queueDialogOpen} onOpenChange={setQueueDialogOpen}>
                     <Dialog.Trigger>
                       <Button size="1" variant="soft" title={queueLane?.last_error ?? undefined}>

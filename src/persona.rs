@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::db::{call_blocking, Database};
+use crate::db::{call_blocking, ChannelPersonaMode, Database};
 use crate::error::FinallyAValueBotError;
 
 /// Leading `[token]` values that are transport/system tags, not persona names.
@@ -25,18 +25,41 @@ pub fn resolve_incoming_run_persona(
     chat_id: i64,
     text: &str,
 ) -> Result<(i64, String), FinallyAValueBotError> {
+    resolve_incoming_run_persona_for_channel(db, chat_id, "telegram", text)
+}
+
+/// Resolve run persona with optional per-channel policy.
+///
+/// Policy key: `(canonical_chat_id, channel_type)`:
+/// - `all`: use standard `[PersonaName]` token resolution.
+/// - `single`: force the configured `persona_id` and strip only transport tags.
+pub fn resolve_incoming_run_persona_for_channel(
+    db: &Database,
+    chat_id: i64,
+    channel_type: &str,
+    text: &str,
+) -> Result<(i64, String), FinallyAValueBotError> {
+    let policy = db.get_channel_persona_policy(chat_id, channel_type)?;
+    if let Some(policy) = policy {
+        if policy.mode == ChannelPersonaMode::Single {
+            let forced = policy
+                .persona_id
+                .filter(|id| *id > 0)
+                .filter(|id| db.persona_exists(chat_id, *id).unwrap_or(false))
+                .unwrap_or(db.get_current_persona_id(chat_id)?);
+            let trimmed = text.trim_start();
+            if let Some((_, rest)) = parse_leading_token(trimmed) {
+                return Ok((forced, rest.trim_start().to_string()));
+            }
+            return Ok((forced, text.to_string()));
+        }
+    }
+
     let fallback_pid = db.get_current_persona_id(chat_id)?;
     let trimmed = text.trim_start();
-    if !trimmed.starts_with('[') {
-        return Ok((fallback_pid, text.to_string()));
-    }
-    let Some(close_idx) = trimmed.find(']') else {
+    let Some((token, body)) = parse_leading_token(trimmed) else {
         return Ok((fallback_pid, text.to_string()));
     };
-    let token = &trimmed[1..close_idx];
-    if token.is_empty() || token.len() > 64 || token.contains('\n') {
-        return Ok((fallback_pid, text.to_string()));
-    }
     let token_lower = token.to_lowercase();
     if RESERVED_INBOUND_PERSONA_TOKENS
         .iter()
@@ -48,9 +71,20 @@ pub fn resolve_incoming_run_persona(
     let Some(persona) = personas.iter().find(|p| p.name.eq_ignore_ascii_case(token)) else {
         return Ok((fallback_pid, text.to_string()));
     };
-    let body = trimmed[close_idx + 1..].trim_start();
-    let stored = body.to_string();
+    let stored = body.trim_start().to_string();
     Ok((persona.id, stored))
+}
+
+fn parse_leading_token(trimmed: &str) -> Option<(&str, &str)> {
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let close_idx = trimmed.find(']')?;
+    let token = &trimmed[1..close_idx];
+    if token.is_empty() || token.len() > 64 || token.contains('\n') {
+        return None;
+    }
+    Some((token, &trimmed[close_idx + 1..]))
 }
 
 /// Handle a persona command payload (e.g. from API or internal call).

@@ -95,6 +95,51 @@ pub struct ChannelBinding {
 }
 
 #[derive(Debug, Clone)]
+pub struct AppSetting {
+    pub key: String,
+    pub value: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPersonaMode {
+    All,
+    Single,
+}
+
+impl ChannelPersonaMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Single => "single",
+        }
+    }
+}
+
+impl TryFrom<&str> for ChannelPersonaMode {
+    type Error = FinallyAValueBotError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "all" => Ok(Self::All),
+            "single" => Ok(Self::Single),
+            other => Err(FinallyAValueBotError::ToolExecution(format!(
+                "Invalid channel persona mode: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelPersonaPolicy {
+    pub canonical_chat_id: i64,
+    pub channel_type: String,
+    pub mode: ChannelPersonaMode,
+    pub persona_id: Option<i64>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct BackgroundJob {
     pub id: String,
     pub chat_id: i64,
@@ -409,7 +454,24 @@ impl Database {
                 FOREIGN KEY (canonical_chat_id) REFERENCES chats(chat_id)
             );
             CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
-                ON channel_bindings(canonical_chat_id);",
+                ON channel_bindings(canonical_chat_id);
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_persona_policy (
+                canonical_chat_id INTEGER NOT NULL,
+                channel_type TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'all',
+                persona_id INTEGER,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (canonical_chat_id, channel_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_persona_policy_chat
+                ON channel_persona_policy(canonical_chat_id);",
         )?;
 
         Self::migrate_persona_schema(&conn)?;
@@ -1110,6 +1172,166 @@ impl Database {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_app_settings(&self) -> Result<Vec<AppSetting>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT key, value, updated_at FROM app_settings ORDER BY key COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AppSetting {
+                key: row.get(0)?,
+                value: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_app_setting(&self, key: &str, value: &str) -> Result<(), FinallyAValueBotError> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "App setting key cannot be empty".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![key, value, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_app_setting(&self, key: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+        Ok(rows > 0)
+    }
+
+    pub fn list_channel_persona_policies(
+        &self,
+        canonical_chat_id: i64,
+    ) -> Result<Vec<ChannelPersonaPolicy>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_chat_id, channel_type, mode, persona_id, updated_at
+             FROM channel_persona_policy
+             WHERE canonical_chat_id = ?1
+             ORDER BY channel_type COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt.query_map(params![canonical_chat_id], |row| {
+            let mode_raw: String = row.get(2)?;
+            let mode = ChannelPersonaMode::try_from(mode_raw.as_str()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(ChannelPersonaPolicy {
+                canonical_chat_id: row.get(0)?,
+                channel_type: row.get(1)?,
+                mode,
+                persona_id: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_channel_persona_policy(
+        &self,
+        canonical_chat_id: i64,
+        channel_type: &str,
+    ) -> Result<Option<ChannelPersonaPolicy>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_chat_id, channel_type, mode, persona_id, updated_at
+             FROM channel_persona_policy
+             WHERE canonical_chat_id = ?1 AND channel_type = ?2",
+        )?;
+        let row = stmt.query_row(params![canonical_chat_id, channel_type], |row| {
+            let mode_raw: String = row.get(2)?;
+            let mode = ChannelPersonaMode::try_from(mode_raw.as_str()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(ChannelPersonaPolicy {
+                canonical_chat_id: row.get(0)?,
+                channel_type: row.get(1)?,
+                mode,
+                persona_id: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        });
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_channel_persona_policy(
+        &self,
+        canonical_chat_id: i64,
+        channel_type: &str,
+        mode: ChannelPersonaMode,
+        persona_id: Option<i64>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let normalized_channel = channel_type.trim().to_ascii_lowercase();
+        if normalized_channel.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "channel_type cannot be empty".to_string(),
+            ));
+        }
+        if mode == ChannelPersonaMode::Single {
+            let pid = persona_id.ok_or_else(|| {
+                FinallyAValueBotError::ToolExecution(
+                    "persona_id is required for single persona mode".to_string(),
+                )
+            })?;
+            if !self.persona_exists(canonical_chat_id, pid)? {
+                return Err(FinallyAValueBotError::ToolExecution(format!(
+                    "persona_id {pid} does not exist for chat {canonical_chat_id}"
+                )));
+            }
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let pid = if mode == ChannelPersonaMode::Single {
+            persona_id
+        } else {
+            None
+        };
+        conn.execute(
+            "INSERT INTO channel_persona_policy (canonical_chat_id, channel_type, mode, persona_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(canonical_chat_id, channel_type)
+             DO UPDATE SET mode=excluded.mode, persona_id=excluded.persona_id, updated_at=excluded.updated_at",
+            params![canonical_chat_id, normalized_channel, mode.as_str(), pid, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_channel_persona_policy(
+        &self,
+        canonical_chat_id: i64,
+        channel_type: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM channel_persona_policy WHERE canonical_chat_id = ?1 AND channel_type = ?2",
+            params![canonical_chat_id, channel_type.trim().to_ascii_lowercase()],
+        )?;
+        Ok(rows > 0)
     }
 
     /// Get messages since the bot's last response in this chat/persona.

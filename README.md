@@ -23,28 +23,24 @@ Alternatives: **Homebrew** (macOS) — `brew tap everettjf/tap && brew install f
 
 The bot reads configuration from a **`.env` file in the current working directory** (or from the path in `FINALLY_A_VALUE_BOT_CONFIG`). Use a dedicated project directory and keep your `.env` there.
 
-### 2. Configure
+### 2. Bootstrap `.env`
 
-**Recommended:** run the interactive Q&A wizard:
-
-```bash
-finally-a-value-bot config
-```
-
-**Alternative:** full-screen setup (TUI):
-
-```bash
-finally-a-value-bot setup
-```
-
-**First run:** If `.env` is missing or invalid and you start the bot in a terminal (`finally-a-value-bot start`), the same `config` flow runs automatically.
-
-**Manual:** copy the example file and edit values:
+Copy the example file and set only bootstrap variables:
 
 ```bash
 cp .env.example .env
-# Edit .env — see .env.example for every variable and default
+# Set workspace + web bootstrap values in .env
 ```
+
+Bootstrap variables stay in `.env` (repo root): workspace path, config path override, and web host/port/auth values needed before the web server starts.
+
+### 3. Start and finish onboarding in Web UI
+
+```bash
+finally-a-value-bot start
+```
+
+Then open **http://127.0.0.1:10961** and complete configuration in **Settings** (LLM, channel tokens, persona behavior). Runtime settings are stored in SQLite and currently apply after restart.
 
 **Useful checks:**
 
@@ -61,19 +57,11 @@ finally-a-value-bot help        # all commands
 
 See [.env.example](.env.example) for the full list (web UI, scheduler, vault, safety, etc.).
 
-### 3. Web UI (optional)
+### 4. Web UI
 
 When web is enabled (default), the UI is served at **http://127.0.0.1:10961** by default (`WEB_PORT`). If you bind to a non-local address, set `WEB_AUTH_TOKEN`.
 
-### 4. Start
-
-**Foreground:**
-
-```bash
-finally-a-value-bot start
-```
-
-**Background (system service):**
+### 5. Background service (optional)
 
 ```bash
 finally-a-value-bot gateway install   # install and start service
@@ -81,7 +69,7 @@ finally-a-value-bot gateway status
 finally-a-value-bot gateway logs
 ```
 
-On first run, FinallyAValueBot seeds an onboarding task so you can get started from chat.
+When channel + LLM configuration is complete, FinallyAValueBot seeds an onboarding task so you can get started from chat.
 
 ### Vault search (optional)
 

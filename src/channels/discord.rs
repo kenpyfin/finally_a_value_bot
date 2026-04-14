@@ -265,7 +265,12 @@ impl EventHandler for Handler {
         // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
         let text_for_resolve = text.clone();
         let (persona_id, text) = match call_blocking(self.app_state.db.clone(), move |db| {
-            crate::persona::resolve_incoming_run_persona(&db, canonical_chat_id, &text_for_resolve)
+            crate::persona::resolve_incoming_run_persona_for_channel(
+                &db,
+                canonical_chat_id,
+                "discord",
+                &text_for_resolve,
+            )
         })
         .await
         {

@@ -190,6 +190,11 @@ Every entry path (Telegram, Discord, Web, Scheduler) **resolves** `(channel_type
 
 DB helpers: `resolve_canonical_chat_id(channel_type, channel_handle, create_with_canonical_id)`, `link_channel(canonical_chat_id, channel_type, channel_handle)`, `unlink_channel`, `list_bindings_for_contact`. Messages and sessions are keyed by `(chat_id, persona_id)` where `chat_id` is always the canonical one.
 
+Per-channel persona scope is stored in `channel_persona_policy`:
+
+- `mode=all` (default): channel can use all personas (current behavior).
+- `mode=single`: channel is locked to one persona id; inbound routing forces that persona, and cross-channel delivery skips that channel for other personas.
+
 ### Delivery (sync across channels)
 
 After the agent produces a reply, the handler does **not** store and send only to the requesting channel. It calls **`deliver_to_contact(state, canonical_chat_id, persona_id, text)`** (in `src/channel.rs`), which:
@@ -214,6 +219,13 @@ Web has no native identity. To sync with Telegram/Discord, the user **binds** th
 - `discord_http` (optional `Arc<serenity::http::Http>`) for sending to Discord from non-Discord code (e.g. when a reply is delivered to all bound channels)
 
 It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which reads `bot` and `discord_http` from state.
+
+## 8. Web-first Runtime Settings
+
+- Bootstrap values are still read from repo-root `.env` (`WORKSPACE_DIR` / `FINALLY_A_VALUE_BOT_WORKSPACE_DIR`, web bind/auth, and config path override).
+- Runtime operator settings (LLM, channel tokens, etc.) are persisted in SQLite `app_settings` via Web UI `/api/settings`.
+- On startup, runtime settings are loaded from DB, merged into process env, and used to build effective `Config`.
+- Runtime settings currently require restart to apply to all subsystems.
 
 ---
 

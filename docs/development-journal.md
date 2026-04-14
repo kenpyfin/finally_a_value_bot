@@ -18,6 +18,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-14 — Web-first settings/onboarding + channel persona mode
+
+- **Area:** config / startup / web / channels / onboarding
+- **Summary:** Added SQLite-backed runtime settings (`app_settings`) editable from Web UI (`GET/PATCH /api/settings`) and startup merge from DB into effective config. Startup no longer auto-launches CLI setup; `config`/`setup` commands are retired with Web UI guidance, and Telegram dispatcher is optional when no token is configured.
+- **Rationale:** Move operator-facing setup from CLI to web-first onboarding while keeping only bootstrap env values in repo-root `.env`; allow installations to start in web-only mode and complete channel/LLM setup from UI.
+- **Key files / symbols:** `src/db.rs` (`AppSetting`, `channel_persona_policy`, CRUD methods), `src/main.rs` (`apply_runtime_settings_from_db`, retired CLI config/setup flow), `src/config.rs` (relaxed validation for web-first bootstrap), `src/web.rs` (`/api/settings`, `/api/channel_persona_policy`, enriched `/api/contacts/bindings`), `web/src/main.tsx` (Settings dialog + channel persona controls), `src/persona.rs` (`resolve_incoming_run_persona_for_channel`), `src/channel.rs` (`deliver_to_contact` policy filtering), `src/channels/{telegram,discord,whatsapp}.rs` (policy-aware persona resolve), `install.sh`, `install.ps1`, `README.md`, `DEVELOP.md`, `ARCHITECTURE.md`.
+- **Follow-ups:** Add optional encryption-at-rest for secret settings and selective hot-reload so some runtime settings can apply without restart.
+
 ### 2026-04-14 — Cursor rule: prevent behavior-test drift in Rust changes
 
 - **Area:** repo policy / CI / tests

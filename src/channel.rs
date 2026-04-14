@@ -24,7 +24,7 @@ pub async fn enforce_channel_policy(
     };
 
     if is_web_chat(db, auth.caller_chat_id).await && auth.caller_chat_id != target_chat_id {
-        return Err("Permission denied: web chats cannot operate on other chats".into());
+        return Err("Permission denied: web UI sessions cannot operate on other chats".into());
     }
 
     Ok(())
@@ -163,8 +163,28 @@ pub async fn deliver_to_contact(
     })
     .await
     .map_err(|e| format!("Failed to list bindings: {e}"))?;
+    let policies = call_blocking(db.clone(), move |d| {
+        d.list_channel_persona_policies(canonical_chat_id)
+    })
+    .await
+    .map_err(|e| format!("Failed to list channel persona policies: {e}"))?;
+    let mut policy_by_channel: std::collections::HashMap<
+        String,
+        (crate::db::ChannelPersonaMode, Option<i64>),
+    > = std::collections::HashMap::new();
+    for p in policies {
+        policy_by_channel.insert(p.channel_type, (p.mode, p.persona_id));
+    }
 
     for b in &bindings {
+        if let Some((mode, policy_persona_id)) = policy_by_channel.get(&b.channel_type) {
+            if *mode == crate::db::ChannelPersonaMode::Single
+                && policy_persona_id.is_some()
+                && *policy_persona_id != Some(persona_id)
+            {
+                continue;
+            }
+        }
         match b.channel_type.as_str() {
             "telegram" => {
                 if let Some(bot) = bot {

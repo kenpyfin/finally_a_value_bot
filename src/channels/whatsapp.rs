@@ -454,9 +454,10 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 let (persona_id, text) = match call_blocking(
                     state.app_state.db.clone(),
                     move |db| {
-                        crate::persona::resolve_incoming_run_persona(
+                        crate::persona::resolve_incoming_run_persona_for_channel(
                             &db,
                             chat_id,
+                            "whatsapp",
                             &text_for_resolve,
                         )
                     },

@@ -5,10 +5,12 @@
 ```sh
 git clone <repo-url>
 cd finally-a-value-bot
-cp finally-a-value-bot.config.example.yaml finally-a-value-bot.config.yaml
-# Edit finally-a-value-bot.config.yaml with your credentials
+cp .env.example .env
+# Set bootstrap vars in .env (workspace + web host/port/auth when needed)
 cargo run -- start
 ```
+
+Then open `http://127.0.0.1:10961` and finish runtime configuration in Web UI Settings. CLI `config` and `setup` are retired.
 
 ## Prerequisites
 
@@ -23,7 +25,7 @@ No other external dependencies. SQLite is bundled via `rusqlite`.
 ```
 src/
     main.rs              # Entry point. Parses CLI args, initializes subsystems, starts bot.
-    config.rs            # Config struct. All settings loaded from finally-a-value-bot.config.yaml.
+    config.rs            # Config struct. Bootstrap from .env + runtime overrides from DB app_settings.
     error.rs             # FinallyAValueBotError enum (thiserror). Centralized error types.
     telegram.rs          # Core orchestration:
                          #   - Telegram message handler

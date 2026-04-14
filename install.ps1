@@ -119,8 +119,9 @@ try {
   Write-Info ""
   Write-Info "Next steps:"
   Write-Info "  1) In a project folder, add .env (copy .env.example from the repo if needed)"
-  Write-Info "  2) Run: finally-a-value-bot config   (or: finally-a-value-bot setup)"
+  Write-Info "  2) Set bootstrap vars in .env (workspace + web host/port/auth when needed)"
   Write-Info "  3) Start: finally-a-value-bot start"
+  Write-Info "  4) Open Web UI: http://127.0.0.1:10961 and finish channel/LLM/persona settings"
   Write-Info "See README.md — finally-a-value-bot doctor for preflight checks."
 } finally {
   Remove-Item -Recurse -Force $tmpDir.FullName -ErrorAction SilentlyContinue

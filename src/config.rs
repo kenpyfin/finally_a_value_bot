@@ -588,7 +588,7 @@ impl Config {
     }
 
     /// Build Config from current environment (after dotenvy has loaded .env).
-    fn load_from_env() -> Self {
+    pub fn load_from_env() -> Self {
         let vault = {
             let has_vault = Self::env("VAULT_ORIGIN_VAULT_PATH").is_some()
                 || Self::env("VAULT_VECTOR_DB_PATH").is_some()
@@ -797,7 +797,7 @@ impl Config {
     }
 
     /// Apply post-deserialization normalization and validation.
-    pub(crate) fn post_deserialize(&mut self) -> Result<(), FinallyAValueBotError> {
+    pub fn post_deserialize(&mut self) -> Result<(), FinallyAValueBotError> {
         self.llm_provider = self.llm_provider.trim().to_lowercase();
         self.safety_output_guard_mode = self.safety_output_guard_mode.trim().to_ascii_lowercase();
         self.safety_execution_mode = self.safety_execution_mode.trim().to_ascii_lowercase();
@@ -975,13 +975,15 @@ impl Config {
         }
 
         // Validate required fields
-        if self.telegram_bot_token.is_empty() && self.discord_bot_token.is_none() {
+        let has_channel = !self.telegram_bot_token.is_empty() || self.discord_bot_token.is_some();
+        if !has_channel && !self.web_enabled {
             return Err(FinallyAValueBotError::Config(
-                "At least one of telegram_bot_token or discord_bot_token must be set".into(),
+                "At least one of telegram_bot_token or discord_bot_token must be set (unless web_enabled=true)".into(),
             ));
         }
         if self.api_key.is_empty()
             && !matches!(self.llm_provider.as_str(), "ollama" | "llama" | "llamacpp")
+            && !self.web_enabled
         {
             return Err(FinallyAValueBotError::Config("api_key is required".into()));
         }

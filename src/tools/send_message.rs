@@ -730,7 +730,7 @@ mod tests {
         assert!(result.is_error);
         assert!(result
             .content
-            .contains("web chats cannot operate on other chats"));
+            .contains("web UI sessions cannot operate on other chats"));
         cleanup(&dir);
     }
 

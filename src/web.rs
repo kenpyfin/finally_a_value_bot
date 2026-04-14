@@ -21,7 +21,7 @@ use crate::channel::deliver_to_contact;
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
-use crate::db::{call_blocking, JobHeartbeat, Persona, StoredMessage};
+use crate::db::{call_blocking, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
@@ -2703,6 +2703,52 @@ struct ContactsBindingsQuery {
     chat_id: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SettingsPatchRequest {
+    upsert: Option<HashMap<String, String>>,
+    remove: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelPersonaPolicyUpsertRequest {
+    chat_id: Option<i64>,
+    channel_type: String,
+    mode: String, // "all" | "single"
+    persona_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelPersonaPolicyDeleteRequest {
+    chat_id: Option<i64>,
+    channel_type: String,
+}
+
+fn setting_is_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("API_KEY")
+        || upper.ends_with("_KEY")
+        || upper.contains("PASSWORD")
+}
+
+fn mask_setting_value(value: &str) -> String {
+    if value.len() <= 6 {
+        return "***".to_string();
+    }
+    let prefix = &value[..3];
+    let suffix = &value[value.len().saturating_sub(2)..];
+    format!("{prefix}***{suffix}")
+}
+
+fn is_llm_ready(cfg: &Config) -> bool {
+    !cfg.api_key.is_empty() || matches!(cfg.llm_provider.as_str(), "ollama" | "llama" | "llamacpp")
+}
+
+fn is_channel_ready(cfg: &Config) -> bool {
+    !cfg.telegram_bot_token.trim().is_empty() || cfg.discord_bot_token.is_some()
+}
+
 async fn api_contacts_bindings(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -2717,16 +2763,211 @@ async fn api_contacts_bindings(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let policies = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_channel_persona_policies(chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut policy_by_channel: HashMap<String, (String, Option<i64>)> = HashMap::new();
+    for p in policies {
+        let mode = match p.mode {
+            ChannelPersonaMode::All => "all",
+            ChannelPersonaMode::Single => "single",
+        };
+        policy_by_channel.insert(p.channel_type, (mode.to_string(), p.persona_id));
+    }
 
     let items: Vec<serde_json::Value> = bindings
         .into_iter()
-        .map(|b| json!({ "channel_type": b.channel_type, "channel_handle": b.channel_handle }))
+        .map(|b| {
+            let (mode, persona_id) = policy_by_channel
+                .get(&b.channel_type)
+                .cloned()
+                .unwrap_or_else(|| ("all".to_string(), None));
+            json!({
+                "channel_type": b.channel_type,
+                "channel_handle": b.channel_handle,
+                "persona_mode": mode,
+                "persona_id": persona_id
+            })
+        })
         .collect();
 
     Ok(Json(json!({
         "ok": true,
         "chat_id": chat_id,
         "bindings": items,
+    })))
+}
+
+async fn api_settings_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let settings = call_blocking(state.app_state.db.clone(), move |db| db.list_app_settings())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut items: Vec<serde_json::Value> = settings
+        .into_iter()
+        .map(|s| {
+            let secret = setting_is_secret(&s.key);
+            json!({
+                "key": s.key,
+                "value": if secret { mask_setting_value(&s.value) } else { s.value.clone() },
+                "raw_value": s.value,
+                "is_secret": secret,
+                "updated_at": s.updated_at,
+                "source": "runtime_db",
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        let ak = a
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let bk = b
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        ak.cmp(&bk)
+    });
+
+    let cfg = &state.app_state.config;
+    Ok(Json(json!({
+        "ok": true,
+        "settings": items,
+        "bootstrap": {
+            "workspace_dir": cfg.workspace_dir,
+            "web_enabled": cfg.web_enabled,
+            "web_host": cfg.web_host,
+            "web_port": cfg.web_port,
+            "web_auth_token_set": cfg.web_auth_token.as_ref().is_some_and(|v| !v.trim().is_empty()),
+        },
+        "installation_status": {
+            "llm_ready": is_llm_ready(cfg),
+            "channel_ready": is_channel_ready(cfg),
+            "web_enabled": cfg.web_enabled,
+            "requires_restart_to_apply_runtime_settings": true,
+        }
+    })))
+}
+
+async fn api_settings_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<SettingsPatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let mut upserts = 0usize;
+    let mut removed = 0usize;
+    if let Some(upsert) = body.upsert {
+        for (key, value) in upsert {
+            let trimmed_key = key.trim().to_string();
+            if trimmed_key.is_empty() {
+                continue;
+            }
+            call_blocking(state.app_state.db.clone(), move |db| {
+                db.set_app_setting(&trimmed_key, &value)
+            })
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            upserts = upserts.saturating_add(1);
+        }
+    }
+    if let Some(remove_keys) = body.remove {
+        for key in remove_keys {
+            let trimmed = key.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+                db.remove_app_setting(&trimmed)
+            })
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            if deleted {
+                removed = removed.saturating_add(1);
+            }
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "upserts": upserts,
+        "removed": removed,
+        "message": "Settings saved. Restart process to apply.",
+    })))
+}
+
+async fn api_channel_persona_policy_upsert(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ChannelPersonaPolicyUpsertRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let channel_type = body.channel_type.trim().to_ascii_lowercase();
+    if channel_type.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "channel_type is required".to_string(),
+        ));
+    }
+    let mode = match body.mode.as_str() {
+        "all" => ChannelPersonaMode::All,
+        "single" => ChannelPersonaMode::Single,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "mode must be 'all' or 'single'".to_string(),
+            ))
+        }
+    };
+    let persona_id = body.persona_id.filter(|id| *id > 0);
+    let channel_type_for_db = channel_type.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_channel_persona_policy(chat_id, &channel_type_for_db, mode, persona_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "channel_type": channel_type,
+        "mode": body.mode,
+        "persona_id": persona_id,
+    })))
+}
+
+async fn api_channel_persona_policy_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ChannelPersonaPolicyDeleteRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let channel_type = body.channel_type.trim().to_ascii_lowercase();
+    if channel_type.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "channel_type is required".to_string(),
+        ));
+    }
+    let removed = call_blocking(state.app_state.db.clone(), move |db| {
+        db.clear_channel_persona_policy(chat_id, &channel_type)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "removed": removed,
     })))
 }
 
@@ -3088,6 +3329,14 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/contacts/bind", post(api_contacts_bind))
         .route("/api/contacts/unlink", post(api_contacts_unlink))
         .route("/api/contacts/bindings", get(api_contacts_bindings))
+        .route(
+            "/api/settings",
+            get(api_settings_get).patch(api_settings_patch),
+        )
+        .route(
+            "/api/channel_persona_policy",
+            post(api_channel_persona_policy_upsert).delete(api_channel_persona_policy_delete),
+        )
         .route(
             "/api/schedules",
             get(api_schedules_list).post(api_schedules_create),

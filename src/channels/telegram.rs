@@ -123,34 +123,44 @@ pub async fn run_bot(
     skills: SkillManager,
     mcp_manager: crate::mcp::McpManager,
 ) -> anyhow::Result<()> {
-    let bot = Bot::new(&config.telegram_bot_token);
+    let telegram_enabled = !config.telegram_bot_token.trim().is_empty();
+    let bot_token = if telegram_enabled {
+        config.telegram_bot_token.as_str()
+    } else {
+        "telegram-disabled"
+    };
+    let bot = Bot::new(bot_token);
     let db = Arc::new(db);
 
-    // Register slash commands so they appear in the Telegram menu
-    let commands = [
-        BotCommand {
-            command: "reset".into(),
-            description: "Clear conversation (memory unchanged)".into(),
-        },
-        BotCommand {
-            command: "skills".into(),
-            description: "List available skills".into(),
-        },
-        BotCommand {
-            command: "persona".into(),
-            description: "Manage personas (tap to switch)".into(),
-        },
-        BotCommand {
-            command: "archive".into(),
-            description: "Archive conversation to markdown".into(),
-        },
-        BotCommand {
-            command: "schedule".into(),
-            description: "List and manage scheduled jobs".into(),
-        },
-    ];
-    if let Err(e) = bot.set_my_commands(commands).await {
-        error!("Failed to set Telegram bot commands: {}", e);
+    if telegram_enabled {
+        // Register slash commands so they appear in the Telegram menu
+        let commands = [
+            BotCommand {
+                command: "reset".into(),
+                description: "Clear conversation (memory unchanged)".into(),
+            },
+            BotCommand {
+                command: "skills".into(),
+                description: "List available skills".into(),
+            },
+            BotCommand {
+                command: "persona".into(),
+                description: "Manage personas (tap to switch)".into(),
+            },
+            BotCommand {
+                command: "archive".into(),
+                description: "Archive conversation to markdown".into(),
+            },
+            BotCommand {
+                command: "schedule".into(),
+                description: "List and manage scheduled jobs".into(),
+            },
+        ];
+        if let Err(e) = bot.set_my_commands(commands).await {
+            error!("Failed to set Telegram bot commands: {}", e);
+        }
+    } else {
+        info!("Telegram channel disabled (no TELEGRAM_BOT_TOKEN configured)");
     }
 
     let llm: Arc<dyn LlmProvider> = Arc::from(crate::llm::create_provider(&config));
@@ -227,38 +237,43 @@ pub async fn run_bot(
         });
     }
 
-    const TELEGRAM_RETRY_DELAY_SECS: u64 = 10;
-    loop {
-        let bot_clone = bot.clone();
-        let state_clone = state.clone();
-        let join_result = tokio::spawn(async move {
-            let handler = dptree::entry()
-                .branch(Update::filter_message().endpoint(handle_message))
-                .branch(Update::filter_callback_query().endpoint(handle_callback_query));
-            Dispatcher::builder(bot_clone, handler)
-                .default_handler(|_| async {})
-                .dependencies(dptree::deps![state_clone])
-                .enable_ctrlc_handler()
-                .build()
-                .dispatch()
-                .await;
-        })
-        .await;
+    if telegram_enabled {
+        const TELEGRAM_RETRY_DELAY_SECS: u64 = 10;
+        loop {
+            let bot_clone = bot.clone();
+            let state_clone = state.clone();
+            let join_result = tokio::spawn(async move {
+                let handler = dptree::entry()
+                    .branch(Update::filter_message().endpoint(handle_message))
+                    .branch(Update::filter_callback_query().endpoint(handle_callback_query));
+                Dispatcher::builder(bot_clone, handler)
+                    .default_handler(|_| async {})
+                    .dependencies(dptree::deps![state_clone])
+                    .enable_ctrlc_handler()
+                    .build()
+                    .dispatch()
+                    .await;
+            })
+            .await;
 
-        match join_result {
-            Ok(()) => {
-                // Dispatcher exited gracefully (e.g. Ctrl-C).
-                break;
-            }
-            Err(e) => {
-                error!(
-                    "Telegram dispatcher crashed: {}. Retrying in {}s (other channels stay active).",
-                    e,
-                    TELEGRAM_RETRY_DELAY_SECS
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(TELEGRAM_RETRY_DELAY_SECS)).await;
+            match join_result {
+                Ok(()) => {
+                    // Dispatcher exited gracefully (e.g. Ctrl-C).
+                    break;
+                }
+                Err(e) => {
+                    error!(
+                        "Telegram dispatcher crashed: {}. Retrying in {}s (other channels stay active).",
+                        e,
+                        TELEGRAM_RETRY_DELAY_SECS
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(TELEGRAM_RETRY_DELAY_SECS))
+                        .await;
+                }
             }
         }
+    } else {
+        tokio::signal::ctrl_c().await?;
     }
 
     Ok(())
@@ -352,6 +367,25 @@ async fn send_persona_menu(
     canonical_chat_id: i64,
     thread_id: Option<ThreadId>,
 ) {
+    let policy = call_blocking(state.db.clone(), move |db| {
+        db.get_channel_persona_policy(canonical_chat_id, "telegram")
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(policy) = policy {
+        if policy.mode == crate::db::ChannelPersonaMode::Single {
+            let _ = send_response_plain(
+                bot,
+                chat_id,
+                "Persona switching is locked for Telegram in Web UI (single-persona mode).",
+                thread_id,
+                None,
+            )
+            .await;
+            return;
+        }
+    }
     match build_persona_menu_payload(state, canonical_chat_id).await {
         Ok((text, keyboard)) => {
             let mut req = bot.send_message(chat_id, text).reply_markup(keyboard);
@@ -426,6 +460,22 @@ async fn handle_callback_query(
                 return Ok(());
             }
         };
+
+    let locked_single = call_blocking(state.db.clone(), move |db| {
+        Ok(matches!(
+            db.get_channel_persona_policy(canonical_chat_id, "telegram")?,
+            Some(p) if p.mode == crate::db::ChannelPersonaMode::Single
+        ))
+    })
+    .await
+    .unwrap_or(false);
+    if locked_single {
+        let _ = bot
+            .answer_callback_query(q.id)
+            .text("Persona switching is locked in Web UI for Telegram.")
+            .await;
+        return Ok(());
+    }
 
     let exists = call_blocking(state.db.clone(), move |db| {
         db.persona_exists(canonical_chat_id, persona_id)
@@ -817,7 +867,12 @@ async fn handle_message(
     // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
     let text_for_resolve = text.clone();
     let (persona_id, text) = match call_blocking(state.db.clone(), move |db| {
-        crate::persona::resolve_incoming_run_persona(&db, canonical_chat_id, &text_for_resolve)
+        crate::persona::resolve_incoming_run_persona_for_channel(
+            &db,
+            canonical_chat_id,
+            "telegram",
+            &text_for_resolve,
+        )
     })
     .await
     {
