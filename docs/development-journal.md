@@ -18,6 +18,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-14 — Web: queue detail + cancel, schedule prompt edit, AGENTS.md editor
+
+- **Area:** web / API / queue / agent / memory
+- **Summary:** Extended `ChatRunQueue` with per-run metadata (`QueueEnqueueMeta`, `QueueSource`), ordered `items` in diagnostics, and `request_cancel` via `Arc<AtomicBool>`. `process_with_agent_with_events` cooperatively exits when cancelled between iterations. Added `GET /api/queue_diagnostics` item rows (persona name, label, state), `POST /api/queue/cancel`, `PATCH /api/schedules/:id` with `prompt`, and `GET`/`PUT /api/workspace/agents_md` using `MemoryManager::write_groups_root_memory`. Web header: **Queue** dialog with **Stop**, **Schedules** row **Details** + prompt editor, **Principles** dialog for workspace AGENTS.md.
+- **Rationale:** Operators need visibility into FIFO agent work, safe stop, schedule prompt edits without SQL, and in-UI editing of shared principles path.
+- **Key files / symbols:** `chat_queue::{ChatRunQueue, QueueEnqueueMeta, QueueSource, request_cancel}`; `telegram::process_with_agent_with_events(..., cancel)`; `web::{api_queue_diagnostics, api_queue_cancel, api_workspace_agents_md_get/put, api_schedules_update}`; `db::update_task_prompt`; `memory::write_groups_root_memory`, `groups_root_memory_path` pub; `web/src/main.tsx` dialogs.
+- **Follow-ups:** Optional SSE `done` publish on cancel for streaming runs; optional editing schedule expressions with preflight.
+
 ### 2026-04-13 — Unit tests: align with Telegram HTML, trim, tools, web limits
 
 - **Area:** tests / telegram / llm / web / builtin_skills

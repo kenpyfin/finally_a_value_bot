@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -7,6 +8,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::channel::deliver_to_contact;
+use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::{call_blocking, ScheduledTask};
 use crate::error::FinallyAValueBotError;
 use crate::job_heartbeat::{
@@ -161,10 +163,26 @@ async fn run_due_tasks(
                 Err(_) => return,
             };
             let chat_id_for_queue = prepared.chat_id;
+            let prompt_label = prepared.prompt.chars().take(120).collect::<String>();
+            let queue_run_id = uuid::Uuid::new_v4().to_string();
+            let queue_meta = QueueEnqueueMeta {
+                run_id: queue_run_id,
+                persona_id: prepared.persona_id,
+                source: QueueSource::Scheduler,
+                label: prompt_label,
+                project_id: None,
+                workflow_id: None,
+            };
             let chat_queue = state.chat_queue.clone();
-            let queue_position = chat_queue
-                .enqueue(chat_id_for_queue, async move {
-                    run_scheduled_agent_and_finalize(state, prepared, task_timeout_secs).await;
+            let (queue_position, _) = chat_queue
+                .enqueue_with_meta(chat_id_for_queue, queue_meta, |cancel| async move {
+                    run_scheduled_agent_and_finalize(
+                        state,
+                        prepared,
+                        task_timeout_secs,
+                        Some(cancel),
+                    )
+                    .await;
                 })
                 .await;
             info!(
@@ -311,6 +329,7 @@ async fn run_scheduled_agent_and_finalize(
     state: Arc<AppState>,
     p: PreparedScheduledRun,
     task_timeout_secs: u64,
+    cancel: Option<Arc<AtomicBool>>,
 ) {
     let task_id = p.task_id;
     let chat_id = p.chat_id;
@@ -361,6 +380,7 @@ async fn run_scheduled_agent_and_finalize(
         Some(&prompt),
         None,
         Some(&evt_tx),
+        cancel,
     );
 
     let (success, result_summary) = match tokio::time::timeout(

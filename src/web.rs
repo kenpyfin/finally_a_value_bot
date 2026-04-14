@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path as FsPath;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info};
 
+use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::channel::deliver_to_contact;
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
@@ -23,8 +25,8 @@ use crate::db::{call_blocking, JobHeartbeat, Persona, StoredMessage};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent, process_with_agent_with_events, AgentEvent,
-    AgentRequestContext, AppState, BACKGROUND_JOB_HANDOFF_PREFIX,
+    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
+    BACKGROUND_JOB_HANDOFF_PREFIX,
 };
 use std::time::SystemTime;
 
@@ -393,6 +395,7 @@ struct DeleteSessionRequest {
 struct ScheduleUpdateRequest {
     status: Option<String>, // "paused" | "active" | "cancelled"
     persona_id: Option<i64>,
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -616,13 +619,30 @@ async fn api_send(
     }
     let run_id = uuid::Uuid::new_v4().to_string();
     state.run_hub.create(&run_id).await;
+    let cid = chat_id;
+    let persona_id_queue = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let queue_label = body.message.chars().take(120).collect::<String>();
+    let queue_meta = QueueEnqueueMeta {
+        run_id: run_id.clone(),
+        persona_id: persona_id_queue,
+        source: QueueSource::Web,
+        label: queue_label,
+        project_id: None,
+        workflow_id: None,
+    };
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();
     let limits = state.limits.clone();
-    let queue_position = state
+    let (queue_position, _) = state
         .app_state
         .chat_queue
-        .enqueue(chat_id, async move {
+        .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {
             state_for_task
                 .run_hub
                 .publish(
@@ -637,6 +657,7 @@ async fn api_send(
                 body,
                 None,
                 Some(&run_id_for_task),
+                Some(cancel),
             )
             .await
             {
@@ -739,13 +760,30 @@ async fn api_send_stream(
 
     let run_id = uuid::Uuid::new_v4().to_string();
     state.run_hub.create(&run_id).await;
+    let cid = chat_id;
+    let persona_id_queue = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| db.get_current_persona_id(cid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let queue_label = text.chars().take(120).collect::<String>();
+    let queue_meta = QueueEnqueueMeta {
+        run_id: run_id.clone(),
+        persona_id: persona_id_queue,
+        source: QueueSource::Web,
+        label: queue_label,
+        project_id: None,
+        workflow_id: None,
+    };
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();
     let limits = state.limits.clone();
-    let queue_position = state
+    let (queue_position, _) = state
         .app_state
         .chat_queue
-        .enqueue(chat_id, async move {
+        .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {
         let run_start = Instant::now();
         state_for_task
             .run_hub
@@ -859,6 +897,7 @@ async fn api_send_stream(
             body,
             Some(&evt_tx),
             Some(&run_id_for_task),
+            Some(cancel),
         )
         .await
         {
@@ -1213,24 +1252,77 @@ async fn api_queue_diagnostics(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let lanes = state.app_state.chat_queue.diagnostics().await;
-    let rows = lanes
-        .into_iter()
-        .map(|lane| {
-            json!({
-                "chat_id": lane.chat_id,
-                "pending": lane.pending,
-                "active_for_ms": lane.active_for_ms,
-                "oldest_wait_ms": lane.oldest_wait_ms,
-                "last_error": lane.last_error,
-                "project_id": lane.project_id,
-                "workflow_id": lane.workflow_id,
+    let db = state.app_state.db.clone();
+    let mut rows = Vec::new();
+    for lane in lanes {
+        let chat_id = lane.chat_id;
+        let mut items = Vec::new();
+        for it in lane.items {
+            let cid = chat_id;
+            let pid = it.persona_id;
+            let persona_name = call_blocking(db.clone(), move |db| {
+                Ok(db
+                    .get_persona(pid)?
+                    .filter(|p| p.chat_id == cid)
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| format!("persona #{pid}")))
             })
-        })
-        .collect::<Vec<_>>();
+            .await
+            .unwrap_or_else(|_| format!("persona #{pid}"));
+            items.push(json!({
+                "run_id": it.run_id,
+                "persona_id": it.persona_id,
+                "persona_name": persona_name,
+                "source": it.source,
+                "label": it.label,
+                "state": it.state,
+                "project_id": it.project_id,
+                "workflow_id": it.workflow_id,
+                "position": it.position,
+            }));
+        }
+        rows.push(json!({
+            "chat_id": lane.chat_id,
+            "pending": lane.pending,
+            "active_for_ms": lane.active_for_ms,
+            "oldest_wait_ms": lane.oldest_wait_ms,
+            "last_error": lane.last_error,
+            "project_id": lane.project_id,
+            "workflow_id": lane.workflow_id,
+            "items": items,
+        }));
+    }
     Ok(Json(json!({
         "ok": true,
         "lanes": rows,
     })))
+}
+
+#[derive(Deserialize)]
+struct QueueCancelRequest {
+    run_id: String,
+    chat_id: Option<i64>,
+}
+
+async fn api_queue_cancel(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<QueueCancelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    if body.run_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "run_id is required".into()));
+    }
+    let ok = state
+        .app_state
+        .chat_queue
+        .request_cancel(body.run_id.trim(), chat_id)
+        .await;
+    if !ok {
+        return Err((StatusCode::NOT_FOUND, "run not found for this chat".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn send_and_store_response_with_events(
@@ -1238,6 +1330,7 @@ async fn send_and_store_response_with_events(
     body: SendRequest,
     event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     run_key: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let raw_text = body.message.trim().to_string();
     let mut text = raw_text.clone();
@@ -1396,42 +1489,24 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let response = if let Some(tx) = event_tx {
-        process_with_agent_with_events(
-            &state.app_state,
-            AgentRequestContext {
-                caller_channel: "web",
-                chat_id,
-                chat_type: "private",
-                persona_id,
-                is_scheduled_task: false,
-                is_background_job: false,
-                run_key: run_key.map(|s| s.to_string()),
-            },
-            None,
-            image_data,
-            Some(tx),
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        process_with_agent(
-            &state.app_state,
-            AgentRequestContext {
-                caller_channel: "web",
-                chat_id,
-                chat_type: "private",
-                persona_id,
-                is_scheduled_task: false,
-                is_background_job: false,
-                run_key: run_key.map(|s| s.to_string()),
-            },
-            None,
-            image_data,
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let response = process_with_agent_with_events(
+        &state.app_state,
+        AgentRequestContext {
+            caller_channel: "web",
+            chat_id,
+            chat_type: "private",
+            persona_id,
+            is_scheduled_task: false,
+            is_background_job: false,
+            run_key: run_key.map(|s| s.to_string()),
+        },
+        None,
+        image_data,
+        event_tx,
+        cancel,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if !response.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
         deliver_to_contact(
@@ -1832,6 +1907,75 @@ async fn api_persona_memory_put(
     })))
 }
 
+async fn api_workspace_agents_md_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let path = state.app_state.memory.groups_root_memory_path();
+    let content = state
+        .app_state
+        .memory
+        .read_groups_root_memory()
+        .unwrap_or_default();
+    let mtime_ms = file_mtime_ms(&path).unwrap_or(0);
+    Ok(Json(json!({
+        "ok": true,
+        "content": content,
+        "mtime_ms": mtime_ms,
+        "path": path.to_string_lossy(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceAgentsMdPutBody {
+    content: String,
+    if_match_mtime_ms: Option<i64>,
+}
+
+async fn api_workspace_agents_md_put(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<WorkspaceAgentsMdPutBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    if body.content.len() > 256 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "principles content too large".into(),
+        ));
+    }
+
+    let path = state.app_state.memory.groups_root_memory_path();
+    let current_mtime = file_mtime_ms(&path).unwrap_or(0);
+    if let Some(expected) = body.if_match_mtime_ms {
+        if expected != current_mtime {
+            return Err((
+                StatusCode::CONFLICT,
+                "principles file was modified; reload and retry".into(),
+            ));
+        }
+    }
+
+    state
+        .app_state
+        .memory
+        .write_groups_root_memory(&body.content)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let new_mtime = file_mtime_ms(&path).unwrap_or(0);
+    Ok(Json(json!({
+        "ok": true,
+        "mtime_ms": new_mtime,
+    })))
+}
+
 async fn api_persona_agent_history_latest(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -2098,10 +2242,11 @@ async fn api_schedules_update(
         None => None,
     };
     let persona_id = body.persona_id;
-    if status.is_none() && persona_id.is_none() {
+    let prompt_update = body.prompt.as_ref().map(|p| p.trim().to_string());
+    if status.is_none() && persona_id.is_none() && prompt_update.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Provide at least one field to update: status or persona_id".into(),
+            "Provide at least one field to update: status, persona_id, or prompt".into(),
         ));
     }
     if let Some(pid) = persona_id {
@@ -2139,6 +2284,12 @@ async fn api_schedules_update(
         }
     }
 
+    if let Some(ref p) = prompt_update {
+        if p.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "prompt must not be empty".into()));
+        }
+    }
+
     if let Some(next_status) = status {
         let ok = call_blocking(state.app_state.db.clone(), move |db| {
             db.update_task_status(task_id, next_status)
@@ -2152,6 +2303,16 @@ async fn api_schedules_update(
     if let Some(pid) = persona_id {
         let ok = call_blocking(state.app_state.db.clone(), move |db| {
             db.update_task_persona(task_id, pid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !ok {
+            return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+        }
+    }
+    if let Some(p) = prompt_update {
+        let ok = call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_task_prompt(task_id, &p)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2657,6 +2818,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/stream", get(api_stream))
         .route("/api/run_status", get(api_run_status))
         .route("/api/queue_diagnostics", get(api_queue_diagnostics))
+        .route("/api/queue/cancel", post(api_queue_cancel))
         .route("/api/reset", post(api_reset))
         .route("/api/delete_session", post(api_delete_session))
         .route("/api/personas", get(api_personas))
@@ -2670,6 +2832,10 @@ fn build_router(web_state: WebState) -> Router {
         .route(
             "/api/personas/:persona_id/agent_history/latest",
             get(api_persona_agent_history_latest),
+        )
+        .route(
+            "/api/workspace/agents_md",
+            get(api_workspace_agents_md_get).put(api_workspace_agents_md_put),
         )
         .route("/api/oauth/authorize/:platform", get(api_oauth_authorize))
         .route("/api/oauth/callback/:platform", get(api_oauth_callback))

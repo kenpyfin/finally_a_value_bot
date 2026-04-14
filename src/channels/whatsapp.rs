@@ -11,10 +11,11 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::channel::with_persona_indicator;
+use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
-use crate::telegram::{AgentRequestContext, AppState};
+use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 // --- Webhook query params for verification ---
 
@@ -515,9 +516,19 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 let access_token = state.access_token.clone();
                 let phone_number_id = state.phone_number_id.clone();
                 let to_phone = message.from.clone();
-                let queue_position = chat_queue
-                    .enqueue(chat_id, async move {
-                        match crate::telegram::process_with_agent(
+                let queue_run_id = uuid::Uuid::new_v4().to_string();
+                let queue_label = text.chars().take(120).collect::<String>();
+                let queue_meta = QueueEnqueueMeta {
+                    run_id: queue_run_id,
+                    persona_id,
+                    source: QueueSource::Whatsapp,
+                    label: queue_label,
+                    project_id: None,
+                    workflow_id: None,
+                };
+                let (queue_position, _) = chat_queue
+                    .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {
+                        match process_with_agent_with_events(
                             &app_state,
                             AgentRequestContext {
                                 caller_channel: "whatsapp",
@@ -530,6 +541,8 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             },
                             None,
                             image_data,
+                            None,
+                            Some(cancel),
                         )
                         .await
                         {

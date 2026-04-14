@@ -1515,6 +1515,15 @@ impl Database {
         Ok(rows > 0)
     }
 
+    pub fn update_task_prompt(&self, task_id: i64, prompt: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE scheduled_tasks SET prompt = ?1 WHERE id = ?2",
+            params![prompt, task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_task_after_run(
         &self,
         task_id: i64,

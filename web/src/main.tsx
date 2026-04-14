@@ -54,6 +54,18 @@ type BackendMessage = {
   timestamp?: string
 }
 
+type QueueItem = {
+  run_id: string
+  persona_id: number
+  persona_name: string
+  source: string
+  label: string
+  state: string
+  project_id?: number | null
+  workflow_id?: number | null
+  position: number
+}
+
 type QueueLane = {
   chat_id: number
   pending: number
@@ -62,6 +74,7 @@ type QueueLane = {
   last_error?: string | null
   project_id?: number | null
   workflow_id?: number | null
+  items?: QueueItem[]
 }
 
 type Appearance = 'dark' | 'light'
@@ -690,6 +703,16 @@ function App() {
   const [pendingRunIds, setPendingRunIds] = useState<string[]>([])
   const [backgroundActiveCount, setBackgroundActiveCount] = useState(0)
   const [queueLane, setQueueLane] = useState<QueueLane | null>(null)
+  const [queueDialogOpen, setQueueDialogOpen] = useState(false)
+  const [scheduleDetailTask, setScheduleDetailTask] = useState<ScheduleTask | null>(null)
+  const [scheduleDetailPrompt, setScheduleDetailPrompt] = useState('')
+  const [scheduleDetailBusy, setScheduleDetailBusy] = useState(false)
+  const [agentsMdOpen, setAgentsMdOpen] = useState(false)
+  const [agentsMdContent, setAgentsMdContent] = useState('')
+  const [agentsMdMtimeMs, setAgentsMdMtimeMs] = useState<number | null>(null)
+  const [agentsMdPath, setAgentsMdPath] = useState('')
+  const [agentsMdBusy, setAgentsMdBusy] = useState(false)
+  const [agentsMdError, setAgentsMdError] = useState('')
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
 
@@ -1098,6 +1121,22 @@ function App() {
   }, [memoryDialogOpen, activePersonaId])
 
   useEffect(() => {
+    if (!agentsMdOpen) return
+    void loadWorkspaceAgentsMd()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentsMdOpen])
+
+  useEffect(() => {
+    if (!queueDialogOpen || chatId == null) return
+    void loadQueueDiagnostics(chatId)
+    const id = setInterval(() => {
+      void loadQueueDiagnostics(chatId)
+    }, 2500)
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueDialogOpen, chatId])
+
+  useEffect(() => {
     if (!agentHistoryDialogOpen) return
     if (activePersonaId == null) return
     void loadAgentHistoryLatest(activePersonaId)
@@ -1213,13 +1252,62 @@ function App() {
 
   async function updateSchedule(
     taskId: number,
-    patch: { status?: string; persona_id?: number },
+    patch: { status?: string; persona_id?: number; prompt?: string },
   ): Promise<void> {
     await api(`/api/schedules/${taskId}`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
     })
     await loadSchedules(chatId)
+  }
+
+  async function cancelQueueRun(runId: string): Promise<void> {
+    await api('/api/queue/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId, chat_id: chatId ?? undefined }),
+    })
+    await loadQueueDiagnostics(chatId)
+  }
+
+  async function loadWorkspaceAgentsMd(): Promise<void> {
+    setAgentsMdError('')
+    setAgentsMdBusy(true)
+    try {
+      const data = await api<{ content?: string; mtime_ms?: number; path?: string }>('/api/workspace/agents_md')
+      setAgentsMdContent(typeof data.content === 'string' ? data.content : '')
+      setAgentsMdMtimeMs(typeof data.mtime_ms === 'number' ? data.mtime_ms : null)
+      setAgentsMdPath(typeof data.path === 'string' ? data.path : '')
+    } catch (e) {
+      setAgentsMdError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setAgentsMdBusy(false)
+    }
+  }
+
+  async function saveWorkspaceAgentsMd(): Promise<void> {
+    setAgentsMdError('')
+    setAgentsMdBusy(true)
+    try {
+      const data = await api<{ mtime_ms?: number }>('/api/workspace/agents_md', {
+        method: 'PUT',
+        body: JSON.stringify({
+          content: agentsMdContent,
+          if_match_mtime_ms: agentsMdMtimeMs ?? undefined,
+        }),
+      })
+      if (typeof data.mtime_ms === 'number') {
+        setAgentsMdMtimeMs(data.mtime_ms)
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (msg.includes('409') || msg.toLowerCase().includes('conflict')) {
+        setAgentsMdError('File changed on disk. Reload and retry.')
+      } else {
+        setAgentsMdError(msg)
+      }
+    } finally {
+      setAgentsMdBusy(false)
+    }
   }
 
   useEffect(() => {
@@ -1413,16 +1501,71 @@ function App() {
                   <Text size="2" color="gray">
                     {statusText}
                   </Text>
-                  <Text
-                    size="2"
-                    color={(queueLane?.last_error ? 'red' : 'gray') as never}
-                    title={queueLane?.last_error ?? undefined}
-                  >
-                    Queue: {(queueLane?.pending ?? 0) > 0 ? String(queueLane?.pending ?? 0) : 'idle'}
-                    {(queueLane?.pending ?? 0) > 0 && (queueLane?.oldest_wait_ms ?? 0) > 0
-                      ? ` · ${Math.round((queueLane?.oldest_wait_ms ?? 0) / 1000)}s`
-                      : ''}
-                  </Text>
+                  <Dialog.Root open={queueDialogOpen} onOpenChange={setQueueDialogOpen}>
+                    <Dialog.Trigger>
+                      <Button size="1" variant="soft" title={queueLane?.last_error ?? undefined}>
+                        Queue: {(queueLane?.pending ?? 0) > 0 ? String(queueLane?.pending ?? 0) : 'idle'}
+                        {(queueLane?.pending ?? 0) > 0 && (queueLane?.oldest_wait_ms ?? 0) > 0
+                          ? ` · ${Math.round((queueLane?.oldest_wait_ms ?? 0) / 1000)}s`
+                          : ''}
+                        {queueLane?.last_error ? ' (!)' : ''}
+                      </Button>
+                    </Dialog.Trigger>
+                    <Dialog.Content style={{ maxWidth: 920 }}>
+                      <Dialog.Title>Run queue</Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        Pending and running agent work for this chat (FIFO). Stop requests cooperative cancellation between iterations.
+                      </Dialog.Description>
+                      <div className="max-h-[min(420px,60vh)] overflow-auto rounded-md border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
+                        {(queueLane?.items?.length ?? 0) === 0 ? (
+                          <Text size="2" color="gray">No queued runs (lane idle or diagnostics loading).</Text>
+                        ) : (
+                          <table className="w-full border-collapse text-left text-sm">
+                            <thead>
+                              <tr className={appearance === 'dark' ? 'text-slate-400' : 'text-slate-600'}>
+                                <th className="p-1 pr-2">#</th>
+                                <th className="p-1 pr-2">State</th>
+                                <th className="p-1 pr-2">Persona</th>
+                                <th className="p-1 pr-2">Source</th>
+                                <th className="p-1 min-w-[120px]">Context</th>
+                                <th className="p-1 pr-2">Project</th>
+                                <th className="p-1 pr-2">Workflow</th>
+                                <th className="p-1 text-right"> </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(queueLane?.items ?? []).map((it) => (
+                                <tr key={it.run_id} className="border-t border-[color:var(--gray-6)] align-top">
+                                  <td className="p-1 pr-2 font-mono text-xs">{it.position}</td>
+                                  <td className="p-1 pr-2">{it.state}</td>
+                                  <td className="p-1 pr-2">{it.persona_name}</td>
+                                  <td className="p-1 pr-2">{it.source}</td>
+                                  <td className="p-1 max-w-[280px] break-words" title={it.label}>{it.label || '—'}</td>
+                                  <td className="p-1 pr-2 font-mono text-xs">{it.project_id ?? '—'}</td>
+                                  <td className="p-1 pr-2 font-mono text-xs">{it.workflow_id ?? '—'}</td>
+                                  <td className="p-1 text-right">
+                                    <Button
+                                      size="1"
+                                      variant="soft"
+                                      color="red"
+                                      onClick={() => void cancelQueueRun(it.run_id)}
+                                    >
+                                      Stop
+                                    </Button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                      <Flex justify="end" mt="3">
+                        <Dialog.Close>
+                          <Button variant="soft">Close</Button>
+                        </Dialog.Close>
+                      </Flex>
+                    </Dialog.Content>
+                  </Dialog.Root>
                   <Text
                     size="2"
                     color={(backgroundActiveCount > 0 ? 'blue' : 'gray') as never}
@@ -1471,6 +1614,16 @@ function App() {
                               }>
                                 {t.status === 'running' ? 'active' : t.status}
                               </Text>
+                              <Button
+                                size="1"
+                                variant="soft"
+                                onClick={() => {
+                                  setScheduleDetailTask(t)
+                                  setScheduleDetailPrompt(t.prompt)
+                                }}
+                              >
+                                Details
+                              </Button>
                               {t.status === 'active' ? (
                                 <Button size="1" variant="soft" onClick={() => void updateSchedule(t.id, { status: 'paused' })}>Pause</Button>
                               ) : t.status === 'paused' ? (
@@ -1539,6 +1692,127 @@ function App() {
                         <Dialog.Close>
                           <Button variant="soft">Close</Button>
                         </Dialog.Close>
+                      </Flex>
+                    </Dialog.Content>
+                  </Dialog.Root>
+
+                  <Dialog.Root
+                    open={scheduleDetailTask != null}
+                    onOpenChange={(o) => {
+                      if (!o) {
+                        setScheduleDetailTask(null)
+                        setScheduleDetailBusy(false)
+                      }
+                    }}
+                  >
+                    <Dialog.Content style={{ maxWidth: 720 }}>
+                      <Dialog.Title>
+                        {scheduleDetailTask != null ? `Schedule #${scheduleDetailTask.id}` : 'Schedule'}
+                      </Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        View metadata and edit the prompt. Cron/once expression changes require recreating the task for now.
+                      </Dialog.Description>
+                      {scheduleDetailTask != null ? (
+                        <>
+                          <div className="mb-3 space-y-1 text-sm">
+                            <Text size="2"><strong>Persona:</strong> {personas.find((p) => p.id === scheduleDetailTask.persona_id)?.name ?? scheduleDetailTask.persona_id}</Text>
+                            <Text size="2"><strong>Type:</strong> {scheduleDetailTask.schedule_type}</Text>
+                            <Text size="2" className="break-all"><strong>Schedule:</strong> {scheduleDetailTask.schedule_value}</Text>
+                            <Text size="2"><strong>Next run:</strong> {scheduleDetailTask.next_run ?? '—'}</Text>
+                            <Text size="2"><strong>Last run:</strong> {scheduleDetailTask.last_run ?? '—'}</Text>
+                            <Text size="2"><strong>Status:</strong> {scheduleDetailTask.status}</Text>
+                            <Text size="2"><strong>Created:</strong> {scheduleDetailTask.created_at ?? '—'}</Text>
+                          </div>
+                          <Text size="2" weight="bold" mb="1">Prompt</Text>
+                          <textarea
+                            value={scheduleDetailPrompt}
+                            onChange={(e) => setScheduleDetailPrompt(e.target.value)}
+                            spellCheck={false}
+                            disabled={scheduleDetailTask.status === 'cancelled'}
+                            className={appearance === 'dark'
+                              ? 'min-h-[160px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-slate-100'
+                              : 'min-h-[160px] w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-xs text-slate-900'}
+                          />
+                          <Flex justify="end" gap="2" mt="3" wrap="wrap">
+                            <Dialog.Close>
+                              <Button variant="soft" size="1">Close</Button>
+                            </Dialog.Close>
+                            <Button
+                              size="1"
+                              disabled={
+                                scheduleDetailBusy
+                                || scheduleDetailTask.status === 'cancelled'
+                                || scheduleDetailPrompt.trim() === scheduleDetailTask.prompt.trim()
+                                || scheduleDetailPrompt.trim().length === 0
+                              }
+                              onClick={() => {
+                                if (scheduleDetailTask == null) return
+                                setScheduleDetailBusy(true)
+                                updateSchedule(scheduleDetailTask.id, { prompt: scheduleDetailPrompt.trim() })
+                                  .then(() => setScheduleDetailTask(null))
+                                  .catch(() => { /* api throws */ })
+                                  .finally(() => setScheduleDetailBusy(false))
+                              }}
+                            >
+                              {scheduleDetailBusy ? 'Saving…' : 'Save prompt'}
+                            </Button>
+                          </Flex>
+                        </>
+                      ) : null}
+                    </Dialog.Content>
+                  </Dialog.Root>
+
+                  <Dialog.Root
+                    open={agentsMdOpen}
+                    onOpenChange={(o) => {
+                      setAgentsMdOpen(o)
+                      if (!o) {
+                        setAgentsMdError('')
+                        setAgentsMdBusy(false)
+                      }
+                    }}
+                  >
+                    <Dialog.Trigger>
+                      <Button size="1" variant="soft">Principles</Button>
+                    </Dialog.Trigger>
+                    <Dialog.Content style={{ maxWidth: 900 }}>
+                      <Dialog.Title>Workspace principles (AGENTS.md)</Dialog.Title>
+                      <Dialog.Description size="2" mb="3">
+                        Shared agent principles for this workspace. Same file the bot loads from your configured workspace path.
+                      </Dialog.Description>
+                      {agentsMdPath ? (
+                        <Text size="1" color="gray" className="mb-2 block break-all">
+                          {agentsMdPath}
+                        </Text>
+                      ) : null}
+                      {agentsMdError ? (
+                        <Callout.Root color="red" size="1" variant="soft" className="mb-2">
+                          <Callout.Text>{agentsMdError}</Callout.Text>
+                        </Callout.Root>
+                      ) : null}
+                      <textarea
+                        value={agentsMdContent}
+                        onChange={(e) => setAgentsMdContent(e.target.value)}
+                        spellCheck={false}
+                        className={appearance === 'dark'
+                          ? 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-slate-100'
+                          : 'h-[420px] w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-xs text-slate-900'}
+                      />
+                      <Flex justify="between" align="center" mt="3" wrap="wrap" gap="2">
+                        <Text size="1" color="gray">
+                          {agentsMdMtimeMs != null ? `mtime: ${agentsMdMtimeMs}` : ''}
+                        </Text>
+                        <Flex gap="2">
+                          <Button size="1" variant="soft" onClick={() => void loadWorkspaceAgentsMd()} disabled={agentsMdBusy}>
+                            Reload
+                          </Button>
+                          <Button size="1" onClick={() => void saveWorkspaceAgentsMd()} disabled={agentsMdBusy}>
+                            {agentsMdBusy ? 'Saving…' : 'Save'}
+                          </Button>
+                          <Dialog.Close>
+                            <Button size="1" variant="soft">Close</Button>
+                          </Dialog.Close>
+                        </Flex>
                       </Flex>
                     </Dialog.Content>
                   </Dialog.Root>
