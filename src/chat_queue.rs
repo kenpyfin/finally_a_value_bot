@@ -10,6 +10,9 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 type BoxTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type RunCancel = Arc<AtomicBool>;
+type RunRegistryValue = (i64, RunCancel);
+type RunRegistry = HashMap<String, RunRegistryValue>;
 
 /// Where the queued work originated (for web diagnostics).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,7 +133,7 @@ pub struct LaneDiagnostic {
 pub struct ChatRunQueue {
     lanes: Arc<Mutex<HashMap<i64, ChatLane>>>,
     /// `run_id` -> (`chat_id`, cancel flag) for `request_cancel`.
-    runs: Arc<Mutex<HashMap<String, (i64, Arc<AtomicBool>)>>>,
+    runs: Arc<Mutex<RunRegistry>>,
 }
 
 impl ChatRunQueue {
