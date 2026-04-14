@@ -197,6 +197,7 @@ impl MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn test_memory_manager() -> (MemoryManager, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -217,7 +218,7 @@ mod tests {
         let (mm, dir) = test_memory_manager();
         let path = mm.global_memory_path();
         assert!(
-            path.ends_with("shared/AGENTS.md"),
+            path.ends_with(Path::new("shared").join("AGENTS.md")),
             "path = {}",
             path.display()
         );
@@ -228,7 +229,7 @@ mod tests {
     fn test_chat_memory_path() {
         let (mm, dir) = test_memory_manager();
         let path = mm.chat_memory_path(12345);
-        assert!(path.to_str().unwrap().contains("groups/12345/AGENTS.md"));
+        assert!(path.ends_with(Path::new("groups").join("12345").join("AGENTS.md")));
         cleanup(&dir);
     }
 
@@ -236,7 +237,7 @@ mod tests {
     fn test_persona_memory_path() {
         let (mm, dir) = test_memory_manager();
         let path = mm.persona_memory_path(997894126, 1);
-        assert!(path.to_str().unwrap().contains("997894126/1/MEMORY.md"));
+        assert!(path.ends_with(Path::new("997894126").join("1").join("MEMORY.md")));
         cleanup(&dir);
     }
 

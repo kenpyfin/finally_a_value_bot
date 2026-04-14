@@ -5,9 +5,9 @@ alwaysApply: true
 
 # Rust formatting (CI)
 
-GitHub Actions runs `cargo fmt --all --check` and fails if formatting is not up to date.
+GitHub Actions runs `cargo fmt --all --check` (and fails the job if the tree is not formatted).
 
-After editing any `*.rs` file, run:
+**After editing any `*.rs` file**, run:
 
 ```sh
 cargo fmt --all
@@ -19,4 +19,4 @@ Before pushing or marking Rust work complete, verify:
 cargo fmt --all --check
 ```
 
-This is separate from tests. Keep the existing project rule that avoids long-running test commands.
+exits with status 0. This is separate from tests (`cargo test` is still avoided per project rules when tests are slow); `rustfmt` is fast and required for CI green.

@@ -1,5 +1,7 @@
 //! Integration tests for configuration loading and validation.
 
+use std::path::{Path, PathBuf};
+
 use finally_a_value_bot::config::Config;
 
 /// Helper to create a minimal valid config for testing.
@@ -101,8 +103,10 @@ fn test_workspace_dir_paths() {
     let mut config = minimal_config();
     config.workspace_dir = "/opt/workspace".into();
 
-    assert!(config.runtime_data_dir().ends_with("workspace/runtime"));
-    assert!(config.skills_data_dir().ends_with("workspace/skills"));
+    let runtime = PathBuf::from(config.runtime_data_dir());
+    let skills = PathBuf::from(config.skills_data_dir());
+    assert!(runtime.ends_with(Path::new("workspace").join("runtime")));
+    assert!(skills.ends_with(Path::new("workspace").join("skills")));
 }
 
 #[test]

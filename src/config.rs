@@ -1320,8 +1320,10 @@ mod tests {
     fn test_runtime_and_skills_dirs_from_workspace_dir() {
         let mut config = test_config();
         config.workspace_dir = "./workspace".into();
-        assert!(config.runtime_data_dir().ends_with("workspace/runtime"));
-        assert!(config.skills_data_dir().ends_with("workspace/skills"));
+        let runtime = std::path::PathBuf::from(config.runtime_data_dir());
+        let skills = std::path::PathBuf::from(config.skills_data_dir());
+        assert!(runtime.ends_with(std::path::Path::new("workspace").join("runtime")));
+        assert!(skills.ends_with(std::path::Path::new("workspace").join("skills")));
     }
 
     #[test]
