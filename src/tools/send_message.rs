@@ -764,7 +764,12 @@ mod tests {
             .execute(json!({
                 "chat_id": 999,
                 "attachment_path": attachment.to_string_lossy(),
-                "caption": "test"
+                "caption": "test",
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 999,
+                    "caller_channel": "web",
+                    "control_chat_ids": []
+                }
             }))
             .await;
         assert!(result.is_error);
@@ -785,6 +790,11 @@ mod tests {
             .execute(json!({
                 "chat_id": 123,
                 "attachment_path": attachment.to_string_lossy(),
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 123,
+                    "caller_channel": "discord",
+                    "control_chat_ids": []
+                }
             }))
             .await;
         assert!(result.is_error);
@@ -806,6 +816,11 @@ mod tests {
             .execute(json!({
                 "chat_id": 861234567890i64,
                 "attachment_path": attachment.to_string_lossy(),
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 861234567890i64,
+                    "caller_channel": "whatsapp",
+                    "control_chat_ids": []
+                }
             }))
             .await;
         assert!(result.is_error);

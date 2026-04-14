@@ -1,11 +1,16 @@
 ---
-description: Run rustfmt on Rust changes; CI fails if cargo fmt --check fails
+description: Run rustfmt and clippy on Rust changes; CI fails on fmt/clippy warnings
 alwaysApply: true
 ---
 
-# Rust formatting (CI)
+# Rust formatting and linting (CI)
 
-GitHub Actions runs `cargo fmt --all --check` (and fails the job if the tree is not formatted).
+GitHub Actions runs both:
+
+- `cargo fmt --all --check`
+- `cargo clippy -- -D warnings`
+
+CI fails if either check fails.
 
 **After editing any `*.rs` file**, run:
 
@@ -17,6 +22,15 @@ Before pushing or marking Rust work complete, verify:
 
 ```sh
 cargo fmt --all --check
+cargo clippy -- -D warnings
 ```
 
-exits with status 0. This is separate from tests (`cargo test` is still avoided per project rules when tests are slow); `rustfmt` is fast and required for CI green.
+Both commands must exit with status 0. This is separate from tests (`cargo test` is still avoided per project rules when tests are slow); `rustfmt` and clippy preflight are required for CI green.
+
+## Preventing `type_complexity` failures
+
+When clippy reports `type_complexity` (for example nested `Arc<Mutex<HashMap<...>>>` types), refactor complex signatures/fields with `type` aliases instead of suppressing the lint. Prefer:
+
+- `type` aliases near the top of the file for readability and reuse
+- descriptive alias names (`RunRegistry`, `RunCancel`, etc.)
+- keeping behavior unchanged while simplifying exposed type expressions

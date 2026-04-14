@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-14 — Cursor rule: require clippy preflight for Rust CI
+
+- **Area:** repo policy / CI / linting
+- **Summary:** Updated [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) to require both `cargo fmt --all --check` and `cargo clippy -- -D warnings` before Rust work is considered complete, and added guidance to fix `clippy::type_complexity` with `type` aliases instead of suppressing lints.
+- **Rationale:** A recent CI failure (`-D warnings`) from a complex Rust type made it clear formatting-only guidance was insufficient; explicit clippy preflight prevents repeat regressions.
+- **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc` (`cargo clippy -- -D warnings`, `type_complexity` prevention section).
+
 ### 2026-04-14 — Channel-local attachments + web artifacts viewer
 
 - **Area:** tools / web / channel delivery

@@ -459,7 +459,7 @@ fn artifact_kind_from_filename(name: &str) -> String {
 }
 
 fn extract_upload_urls_from_text(text: &str) -> Vec<String> {
-    let Some(re) = regex::Regex::new(r#"/api/uploads/[^\s\)>"]+"#).ok() else {
+    let Some(re) = regex::Regex::new(r#"/api/uploads/[^\s\)\]\(<>"']+"#).ok() else {
         return Vec::new();
     };
     re.find_iter(text).map(|m| m.as_str().to_string()).collect()
