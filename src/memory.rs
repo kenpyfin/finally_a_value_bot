@@ -40,7 +40,7 @@ impl MemoryManager {
 
     /// Path for shared principles for all chats/personas: workspace_dir/AGENTS.md (at workspace root),
     /// or vault.principles_path if configured (e.g. shared/ORIGIN/AGENTS.md).
-    fn groups_root_memory_path(&self) -> PathBuf {
+    pub fn groups_root_memory_path(&self) -> PathBuf {
         if let Some(ref p) = self.principles_path_override {
             self.working_dir.join(p.trim().trim_start_matches('/'))
         } else {
@@ -79,6 +79,15 @@ impl MemoryManager {
     pub fn read_groups_root_memory(&self) -> Option<String> {
         let path = self.groups_root_memory_path();
         std::fs::read_to_string(path).ok()
+    }
+
+    /// Write principles to the same path as [`Self::read_groups_root_memory`] (workspace AGENTS.md or `vault.principles_path`).
+    pub fn write_groups_root_memory(&self, content: &str) -> std::io::Result<()> {
+        let path = self.groups_root_memory_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, content)
     }
 
     pub fn read_chat_memory(&self, chat_id: i64) -> Option<String> {

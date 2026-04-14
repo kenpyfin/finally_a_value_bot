@@ -18,6 +18,36 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-14 — Cursor rule: require clippy preflight for Rust CI
+
+- **Area:** repo policy / CI / linting
+- **Summary:** Updated [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) to require both `cargo fmt --all --check` and `cargo clippy -- -D warnings` before Rust work is considered complete, and added guidance to fix `clippy::type_complexity` with `type` aliases instead of suppressing lints.
+- **Rationale:** A recent CI failure (`-D warnings`) from a complex Rust type made it clear formatting-only guidance was insufficient; explicit clippy preflight prevents repeat regressions.
+- **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc` (`cargo clippy -- -D warnings`, `type_complexity` prevention section).
+
+### 2026-04-14 — Channel-local attachments + web artifacts viewer
+
+- **Area:** tools / web / channel delivery
+- **Summary:** Changed `send_message` attachment routing to follow `ToolAuthContext.caller_channel` (active channel) rather than `chats.chat_type`, so attachments remain channel-local by default. Added a web artifacts feature: backend `GET /api/artifacts`, safer upload serving with preview/download semantics, and a new **Artifacts** dialog in web UI with list/filter/preview/open/download.
+- **Rationale:** Cross-channel attachment behavior was inconsistent and surprising; channel-local delivery matches user intent and avoids silent fanout mismatches. Web needed a first-class way to inspect generated/uploaded files without forcing re-send from other channels.
+- **Key files / symbols:** `src/tools/send_message.rs` — `resolve_active_attachment_target`, `ActiveAttachmentTarget`; `src/web.rs` — `api_artifacts`, `list_chat_artifacts`, `process_web_attachments` (`url=` + renderable links), `upload_file` (`preview`/`download`, shared+legacy roots), `guess_upload_content_type`; `web/src/main.tsx` — Artifacts dialog and preview UX; `web/src/types.ts` — `ArtifactItem`.
+- **Follow-ups:** Consider adding pagination and server-side search for very large artifact sets; add frontend automated tests for artifact dialog interactions when UI test harness is available.
+
+### 2026-04-14 — Cursor rules: rustfmt CI + cross-platform tests
+
+- **Area:** repo policy / CI / tests
+- **Summary:** Added [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) to enforce `cargo fmt --all` and `cargo fmt --all --check` before completion, and [`.cursor/rules/cross-platform-tests.mdc`](.cursor/rules/cross-platform-tests.mdc) to require OS-agnostic path assertions plus shell-aware test commands (PowerShell vs `/bin/sh`) with Windows path normalization guidance.
+- **Rationale:** Recent CI failures repeated around Windows path separators, PowerShell output differences, and rustfmt drift; explicit always-apply rules reduce regressions and rework.
+- **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc`, `.cursor/rules/cross-platform-tests.mdc`; guidance references `Path::ends_with`, `PathBuf::from`, and Windows `\\?\` prefix handling.
+
+### 2026-04-14 — Web: queue detail + cancel, schedule prompt edit, AGENTS.md editor
+
+- **Area:** web / API / queue / agent / memory
+- **Summary:** Extended `ChatRunQueue` with per-run metadata (`QueueEnqueueMeta`, `QueueSource`), ordered `items` in diagnostics, and `request_cancel` via `Arc<AtomicBool>`. `process_with_agent_with_events` cooperatively exits when cancelled between iterations. Added `GET /api/queue_diagnostics` item rows (persona name, label, state), `POST /api/queue/cancel`, `PATCH /api/schedules/:id` with `prompt`, and `GET`/`PUT /api/workspace/agents_md` using `MemoryManager::write_groups_root_memory`. Web header: **Queue** dialog with **Stop**, **Schedules** row **Details** + prompt editor, **Principles** dialog for workspace AGENTS.md.
+- **Rationale:** Operators need visibility into FIFO agent work, safe stop, schedule prompt edits without SQL, and in-UI editing of shared principles path.
+- **Key files / symbols:** `chat_queue::{ChatRunQueue, QueueEnqueueMeta, QueueSource, request_cancel}`; `telegram::process_with_agent_with_events(..., cancel)`; `web::{api_queue_diagnostics, api_queue_cancel, api_workspace_agents_md_get/put, api_schedules_update}`; `db::update_task_prompt`; `memory::write_groups_root_memory`, `groups_root_memory_path` pub; `web/src/main.tsx` dialogs.
+- **Follow-ups:** Optional SSE `done` publish on cancel for streaming runs; optional editing schedule expressions with preflight.
+
 ### 2026-04-13 — Unit tests: align with Telegram HTML, trim, tools, web limits
 
 - **Area:** tests / telegram / llm / web / builtin_skills

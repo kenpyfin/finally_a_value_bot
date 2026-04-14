@@ -74,6 +74,7 @@ pub fn spawn_background_job(
             Some(&prompt),
             None,
             Some(&evt_tx),
+            None,
         )
         .await;
         drop(evt_tx);

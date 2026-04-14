@@ -15,6 +15,13 @@ use crate::claude::ToolDefinition;
 use crate::config::Config;
 use crate::db::{call_blocking, Database, StoredMessage};
 
+enum ActiveAttachmentTarget {
+    Telegram(i64),
+    Discord(i64),
+    Whatsapp(i64),
+    Web(i64),
+}
+
 pub struct SendMessageTool {
     bot: Bot,
     db: Arc<Database>,
@@ -265,7 +272,8 @@ impl SendMessageTool {
             .map_err(|e| format!("Failed to read attachment file: {e}"))?;
 
         let uploads_dir = Path::new(cfg.working_dir())
-            .join("uploads")
+            .join("shared")
+            .join("upload")
             .join("web")
             .join(chat_id.to_string());
         tokio::fs::create_dir_all(&uploads_dir)
@@ -293,6 +301,61 @@ impl SendMessageTool {
             }
         };
         Ok(content)
+    }
+
+    fn normalize_caller_channel(channel: &str) -> Option<&'static str> {
+        match channel.trim().to_ascii_lowercase().as_str() {
+            "telegram" => Some("telegram"),
+            "discord" => Some("discord"),
+            "whatsapp" => Some("whatsapp"),
+            "web" => Some("web"),
+            _ => None,
+        }
+    }
+
+    async fn resolve_active_attachment_target(
+        &self,
+        canonical_chat_id: i64,
+        caller_channel: &str,
+    ) -> Result<ActiveAttachmentTarget, String> {
+        let normalized = Self::normalize_caller_channel(caller_channel).ok_or_else(|| {
+            format!(
+                "Attachment sending is only available from active channels: telegram, web, discord, whatsapp (got: {})",
+                caller_channel
+            )
+        })?;
+
+        if normalized == "web" {
+            return Ok(ActiveAttachmentTarget::Web(canonical_chat_id));
+        }
+
+        let cid = canonical_chat_id;
+        let bindings = call_blocking(self.db.clone(), move |db| db.list_bindings_for_contact(cid))
+            .await
+            .map_err(|e| format!("Failed to resolve channel bindings: {e}"))?;
+
+        if let Some(binding) = bindings.iter().find(|b| b.channel_type == normalized) {
+            let handle = binding.channel_handle.parse::<i64>().map_err(|_| {
+                format!(
+                    "Invalid {} channel handle for contact {}: {}",
+                    normalized, canonical_chat_id, binding.channel_handle
+                )
+            })?;
+            return Ok(match normalized {
+                "telegram" => ActiveAttachmentTarget::Telegram(handle),
+                "discord" => ActiveAttachmentTarget::Discord(handle),
+                "whatsapp" => ActiveAttachmentTarget::Whatsapp(handle),
+                _ => unreachable!(),
+            });
+        }
+
+        // Back-compat: in single-channel setups, canonical chat id may itself be the handle.
+        Ok(match normalized {
+            "telegram" => ActiveAttachmentTarget::Telegram(canonical_chat_id),
+            "discord" => ActiveAttachmentTarget::Discord(canonical_chat_id),
+            "whatsapp" => ActiveAttachmentTarget::Whatsapp(canonical_chat_id),
+            _ => unreachable!(),
+        })
     }
 }
 
@@ -421,11 +484,14 @@ impl Tool for SendMessageTool {
         }
 
         if let Some(path) = attachment_path {
-            let chat_type =
-                match call_blocking(self.db.clone(), move |db| db.get_chat_type(chat_id)).await {
-                    Ok(v) => v,
-                    Err(e) => return ToolResult::error(format!("Failed to read chat type: {e}")),
-                };
+            let auth = match auth_context_from_input(&input) {
+                Some(a) => a,
+                None => {
+                    return ToolResult::error(
+                        "Attachment sending requires active channel context. Try again from the channel where you want to send the attachment.".into(),
+                    )
+                }
+            };
 
             let file_path = PathBuf::from(&path);
             if !file_path.is_file() {
@@ -442,35 +508,31 @@ impl Tool for SendMessageTool {
                 }
             });
 
-            let send_result = match chat_type.as_deref() {
-                Some("telegram_private")
-                | Some("telegram_group")
-                | Some("telegram_supergroup")
-                | Some("telegram_channel")
-                | Some("telegram")
-                | Some("private")
-                | Some("group")
-                | Some("supergroup")
-                | Some("channel") => {
-                    self.send_telegram_attachment(chat_id, file_path.clone(), used_caption.clone())
+            let target = match self
+                .resolve_active_attachment_target(chat_id, &auth.caller_channel)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => return ToolResult::error(e),
+            };
+
+            let send_result = match target {
+                ActiveAttachmentTarget::Telegram(handle) => {
+                    self.send_telegram_attachment(handle, file_path.clone(), used_caption.clone())
                         .await
                 }
-                Some("discord") => {
-                    self.send_discord_attachment(chat_id, file_path.clone(), used_caption.clone())
+                ActiveAttachmentTarget::Discord(handle) => {
+                    self.send_discord_attachment(handle, file_path.clone(), used_caption.clone())
                         .await
                 }
-                Some("whatsapp") => {
-                    self.send_whatsapp_attachment(chat_id, file_path.clone(), used_caption.clone())
+                ActiveAttachmentTarget::Whatsapp(handle) => {
+                    self.send_whatsapp_attachment(handle, file_path.clone(), used_caption.clone())
                         .await
                 }
-                Some("web") => {
-                    self.send_web_attachment(chat_id, file_path.clone(), used_caption.clone())
+                ActiveAttachmentTarget::Web(canonical) => {
+                    self.send_web_attachment(canonical, file_path.clone(), used_caption.clone())
                         .await
                 }
-                Some(other) => Err(format!(
-                    "attachment sending is not supported for chat type: {other}"
-                )),
-                None => Err("target chat not found".to_string()),
             };
 
             match send_result {
@@ -702,7 +764,12 @@ mod tests {
             .execute(json!({
                 "chat_id": 999,
                 "attachment_path": attachment.to_string_lossy(),
-                "caption": "test"
+                "caption": "test",
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 999,
+                    "caller_channel": "web",
+                    "control_chat_ids": []
+                }
             }))
             .await;
         assert!(result.is_error);
@@ -723,6 +790,11 @@ mod tests {
             .execute(json!({
                 "chat_id": 123,
                 "attachment_path": attachment.to_string_lossy(),
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 123,
+                    "caller_channel": "discord",
+                    "control_chat_ids": []
+                }
             }))
             .await;
         assert!(result.is_error);
@@ -744,10 +816,60 @@ mod tests {
             .execute(json!({
                 "chat_id": 861234567890i64,
                 "attachment_path": attachment.to_string_lossy(),
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 861234567890i64,
+                    "caller_channel": "whatsapp",
+                    "control_chat_ids": []
+                }
             }))
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("config unavailable"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_send_attachment_requires_active_channel_context() {
+        let (db, dir) = test_db();
+        db.upsert_chat(999, Some("web-main"), "web").unwrap();
+
+        let attachment = dir.join("sample.txt");
+        std::fs::write(&attachment, "hello").unwrap();
+
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db, "bot".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 999,
+                "attachment_path": attachment.to_string_lossy(),
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("requires active channel context"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_send_attachment_rejects_unknown_active_channel() {
+        let (db, dir) = test_db();
+        db.upsert_chat(999, Some("web-main"), "web").unwrap();
+
+        let attachment = dir.join("sample.txt");
+        std::fs::write(&attachment, "hello").unwrap();
+
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db, "bot".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 999,
+                "attachment_path": attachment.to_string_lossy(),
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 999,
+                    "caller_channel": "scheduler",
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("active channels"));
         cleanup(&dir);
     }
 }

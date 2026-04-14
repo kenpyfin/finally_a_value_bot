@@ -9,11 +9,14 @@ use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 use tracing::{error, info};
 
+use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::claude::Message as ClaudeMessage;
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
-use crate::telegram::{archive_conversation, AgentRequestContext, AppState};
+use crate::telegram::{
+    archive_conversation, process_with_agent_with_events, AgentRequestContext, AppState,
+};
 
 struct Handler {
     app_state: Arc<AppState>,
@@ -333,12 +336,22 @@ impl EventHandler for Handler {
         let channel_id_for_send = msg.channel_id;
         let is_guild = msg.guild_id.is_some();
         let http = ctx.http.clone();
-        let queue_position = chat_queue
-            .enqueue(canonical_chat_id, async move {
+        let queue_run_id = uuid::Uuid::new_v4().to_string();
+        let queue_label = text.chars().take(120).collect::<String>();
+        let queue_meta = QueueEnqueueMeta {
+            run_id: queue_run_id,
+            persona_id,
+            source: QueueSource::Discord,
+            label: queue_label,
+            project_id: None,
+            workflow_id: None,
+        };
+        let (queue_position, _) = chat_queue
+            .enqueue_with_meta(canonical_chat_id, queue_meta, |cancel| async move {
                 // Start typing indicator while this queued item is running.
                 let typing = channel_id_for_send.start_typing(&http);
 
-                match crate::telegram::process_with_agent(
+                match process_with_agent_with_events(
                     &app_state,
                     AgentRequestContext {
                         caller_channel: "discord",
@@ -351,6 +364,8 @@ impl EventHandler for Handler {
                     },
                     None,
                     image_data,
+                    None,
+                    Some(cancel),
                 )
                 .await
                 {

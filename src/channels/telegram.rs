@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -16,7 +17,7 @@ use tracing::{error, info, warn};
 use crate::agent_history::{
     truncate_preview, write_agent_history_run, AgentRunRecord, IterationRecord, ToolCallRecord,
 };
-use crate::chat_queue::ChatRunQueue;
+use crate::chat_queue::{ChatRunQueue, QueueEnqueueMeta, QueueSource};
 use crate::claude::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
 use crate::db::{call_blocking, Database, StoredMessage};
@@ -954,9 +955,19 @@ async fn handle_message(
     let thread_id_spawn = msg.thread_id;
     let runtime_chat_type_owned = runtime_chat_type.to_string();
     let canonical_chat_id_spawn = canonical_chat_id;
-    let queue_position = state
+    let queue_label = text.chars().take(120).collect::<String>();
+    let queue_run_id = uuid::Uuid::new_v4().to_string();
+    let queue_meta = QueueEnqueueMeta {
+        run_id: queue_run_id,
+        persona_id,
+        source: QueueSource::Telegram,
+        label: queue_label,
+        project_id: None,
+        workflow_id: None,
+    };
+    let (queue_position, _) = state
         .chat_queue
-        .enqueue(canonical_chat_id_spawn, async move {
+        .enqueue_with_meta(canonical_chat_id_spawn, queue_meta, |cancel| async move {
         // Typing indicator for the duration of the run
         let typing_bot = bot_spawn.clone();
         let typing_chat_id = chat_id_spawn;
@@ -1029,6 +1040,7 @@ async fn handle_message(
             None,
             image_data,
             Some(&event_tx),
+            Some(cancel),
         )
         .await;
 
@@ -1176,7 +1188,7 @@ pub async fn process_with_agent(
     override_prompt: Option<&str>,
     image_data: Option<(String, String)>,
 ) -> anyhow::Result<String> {
-    process_with_agent_with_events(state, context, override_prompt, image_data, None).await
+    process_with_agent_with_events(state, context, override_prompt, image_data, None, None).await
 }
 
 pub async fn process_with_agent_with_events(
@@ -1185,6 +1197,7 @@ pub async fn process_with_agent_with_events(
     override_prompt: Option<&str>,
     image_data: Option<(String, String)>,
     event_tx: Option<&UnboundedSender<AgentEvent>>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<String> {
     let chat_id = context.chat_id;
     let persona_id = context.persona_id;
@@ -1643,6 +1656,13 @@ pub async fn process_with_agent_with_events(
     }
 
     for iteration in 0..state.config.max_tool_iterations {
+        if cancel
+            .as_ref()
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            return Ok("Run cancelled.".to_string());
+        }
         if let Some(tx) = event_tx {
             let _ = tx.send(AgentEvent::Iteration {
                 iteration: iteration + 1,
