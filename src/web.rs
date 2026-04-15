@@ -22,7 +22,8 @@ use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
 use crate::db::{
-    call_blocking, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage, BOT_INSTANCE_WEB,
+    call_blocking, ChannelBotInstance, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage,
+    BOT_INSTANCE_WEB,
 };
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
@@ -2705,7 +2706,9 @@ struct ContactsBindingsQuery {
     chat_id: Option<i64>,
 }
 
+/// Accepted for API compatibility; [`api_settings_patch`] always returns 501.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SettingsPatchRequest {
     upsert: Option<HashMap<String, String>>,
     remove: Option<Vec<String>>,
@@ -2857,7 +2860,9 @@ async fn api_settings_get(
             "llm_ready": is_llm_ready(cfg),
             "channel_ready": is_channel_ready(cfg),
             "web_enabled": cfg.web_enabled,
-            "requires_restart_to_apply_runtime_settings": true,
+            "requires_restart_for_env_changes": true,
+            "runtime_env_merge_from_app_settings": false,
+            "restart_hook_configured": restart_hook_command().is_some(),
         }
     })))
 }
@@ -2865,53 +2870,174 @@ async fn api_settings_get(
 async fn api_settings_patch(
     headers: HeaderMap,
     State(state): State<WebState>,
-    Json(body): Json<SettingsPatchRequest>,
+    Json(_): Json<SettingsPatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let mut upserts = 0usize;
-    let mut removed = 0usize;
-    if let Some(upsert) = body.upsert {
-        for (key, value) in upsert {
-            let trimmed_key = key.trim().to_string();
-            if trimmed_key.is_empty() {
-                continue;
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        "Persisting generic key/value settings to SQLite is disabled. Configure the process via repo-root .env (or process environment). The app_settings table is legacy and not merged at startup.".to_string(),
+    ))
+}
+
+fn restart_hook_command() -> Option<String> {
+    std::env::var("FINALLY_A_VALUE_BOT_RESTART_COMMAND")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Spawn the configured restart hook (e.g. `systemctl restart finally-a-value-bot`). Never runs arbitrary client input.
+async fn api_restart_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let Some(cmd) = restart_hook_command() else {
+        return Ok((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "ok": false,
+                "configured": false,
+                "message": "Set FINALLY_A_VALUE_BOT_RESTART_COMMAND in the process environment to a fixed supervisor command (e.g. systemctl restart my-bot).",
+                "examples": {
+                    "systemd": "systemctl restart finally-a-value-bot",
+                    "docker_compose": "docker compose restart bot"
+                }
+            })),
+        ));
+    };
+
+    let cmd_trim = cmd.trim().to_string();
+    tokio::spawn(async move {
+        #[cfg(windows)]
+        let result = tokio::process::Command::new("cmd.exe")
+            .args(["/C", &cmd_trim])
+            .output()
+            .await;
+        #[cfg(not(windows))]
+        let result = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&cmd_trim)
+            .output()
+            .await;
+        match result {
+            Ok(out) => {
+                info!(
+                    target: "web",
+                    status = ?out.status,
+                    "FINALLY_A_VALUE_BOT_RESTART_COMMAND finished"
+                );
             }
-            if crate::config::is_llm_related_runtime_setting_key(&trimmed_key) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "LLM-related settings must be set in repo-root .env (not persisted in the database). See LLM_PROVIDER, LLM_API_KEY, LLM_MODEL, etc.".to_string(),
-                ));
-            }
-            call_blocking(state.app_state.db.clone(), move |db| {
-                db.set_app_setting(&trimmed_key, &value)
-            })
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-            upserts = upserts.saturating_add(1);
+            Err(e) => error!(target: "web", error = %e, "restart hook spawn failed"),
         }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "message": "Restart hook started. The process may exit shortly if the hook stops this service."
+        })),
+    ))
+}
+
+fn json_channel_bot_instance_redacted(inst: &ChannelBotInstance) -> serde_json::Value {
+    let masked = mask_setting_value(&inst.token);
+    json!({
+        "id": inst.id,
+        "platform": inst.platform,
+        "label": inst.label,
+        "token_redacted": masked,
+        "created_at": inst.created_at,
+        "env_primary": (1..=3).contains(&inst.id),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelBotInstanceCreateRequest {
+    platform: String,
+    label: String,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelBotInstanceUpdateRequest {
+    label: String,
+    token: String,
+}
+
+async fn api_channel_bot_instances_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let list = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_all_channel_bot_instances()
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(|i| json_channel_bot_instance_redacted(i))
+        .collect();
+    Ok(Json(json!({ "ok": true, "instances": items })))
+}
+
+async fn api_channel_bot_instances_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ChannelBotInstanceCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let platform = body.platform;
+    let label = body.label;
+    let token = body.token;
+    let id = call_blocking(state.app_state.db.clone(), move |db| {
+        db.create_channel_bot_instance(&platform, &label, &token)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(
+        json!({ "ok": true, "id": id, "message": "Bot instance created. Restart the process to run dispatchers for new instances." }),
+    ))
+}
+
+async fn api_channel_bot_instances_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ChannelBotInstanceUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let label = body.label;
+    let token = body.token;
+    let updated = call_blocking(state.app_state.db.clone(), move |db| {
+        db.update_channel_bot_instance(id, &label, &token)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "Unknown bot instance id".into()));
     }
-    if let Some(remove_keys) = body.remove {
-        for key in remove_keys {
-            let trimmed = key.trim().to_string();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let deleted = call_blocking(state.app_state.db.clone(), move |db| {
-                db.remove_app_setting(&trimmed)
-            })
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-            if deleted {
-                removed = removed.saturating_add(1);
-            }
-        }
+    Ok(Json(
+        json!({ "ok": true, "message": "Updated. Restart the process to apply token changes to dispatchers." }),
+    ))
+}
+
+async fn api_channel_bot_instances_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_channel_bot_instance(id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Not found or cannot delete".into()));
     }
-    Ok(Json(json!({
-        "ok": true,
-        "upserts": upserts,
-        "removed": removed,
-        "message": "Settings saved. Restart process to apply.",
-    })))
+    Ok(Json(json!({ "ok": true, "removed": true })))
 }
 
 async fn api_channel_persona_policy_upsert(
@@ -3329,6 +3455,15 @@ fn build_router(web_state: WebState) -> Router {
         .route(
             "/api/settings",
             get(api_settings_get).patch(api_settings_patch),
+        )
+        .route("/api/restart", post(api_restart_post))
+        .route(
+            "/api/channel_bot_instances",
+            get(api_channel_bot_instances_get).post(api_channel_bot_instances_post),
+        )
+        .route(
+            "/api/channel_bot_instances/:id",
+            patch(api_channel_bot_instances_patch).delete(api_channel_bot_instances_delete),
         )
         .route(
             "/api/channel_persona_policy",

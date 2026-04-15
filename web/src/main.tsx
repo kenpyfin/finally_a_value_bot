@@ -44,7 +44,15 @@ import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { SessionSidebar } from './components/session-sidebar'
 import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
-import type { Persona, ScheduleTask, ChannelBinding, ArtifactItem, RuntimeSettingItem } from './types'
+import type {
+  Persona,
+  ScheduleTask,
+  ChannelBinding,
+  ArtifactItem,
+  RuntimeSettingItem,
+  InstallationStatus,
+  BotInstanceRow,
+} from './types'
 
 type BackendMessage = {
   id?: string
@@ -75,13 +83,6 @@ type QueueLane = {
   project_id?: number | null
   workflow_id?: number | null
   items?: QueueItem[]
-}
-
-type InstallationStatus = {
-  llm_ready: boolean
-  channel_ready: boolean
-  web_enabled: boolean
-  requires_restart_to_apply_runtime_settings: boolean
 }
 
 type Appearance = 'dark' | 'light'
@@ -368,7 +369,8 @@ async function extractLatestUserInput(
     const message = messages[i]
     if (message.role !== 'user') continue
 
-    const content = message.content
+    // Runtime may supply string or non-array shapes; library types are array-only for user messages.
+    const content = message.content as unknown
     let text = ''
     const attachments: SendAttachmentPayload[] = []
 
@@ -748,12 +750,13 @@ function App() {
   const [settingsError, setSettingsError] = useState('')
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingItem[]>([])
   const [installationStatus, setInstallationStatus] = useState<InstallationStatus | null>(null)
-  const [llmProviderInput, setLlmProviderInput] = useState('')
-  const [llmApiKeyInput, setLlmApiKeyInput] = useState('')
-  const [llmModelInput, setLlmModelInput] = useState('')
-  const [telegramTokenInput, setTelegramTokenInput] = useState('')
-  const [botUsernameInput, setBotUsernameInput] = useState('')
-  const [discordTokenInput, setDiscordTokenInput] = useState('')
+  const [botInstances, setBotInstances] = useState<BotInstanceRow[]>([])
+  const [restartBusy, setRestartBusy] = useState(false)
+  const [botFormBusy, setBotFormBusy] = useState(false)
+  const [newBotPlatform, setNewBotPlatform] = useState<'telegram' | 'discord'>('telegram')
+  const [newBotLabel, setNewBotLabel] = useState('')
+  const [newBotToken, setNewBotToken] = useState('')
+  const [restartNotice, setRestartNotice] = useState<string | null>(null)
 
   const historySeedRef = useRef<ThreadMessageLike[]>([])
   const deferredHistoryRef = useRef<ThreadMessageLike[] | null>(null)
@@ -1236,6 +1239,7 @@ function App() {
   useEffect(() => {
     if (!settingsDialogOpen) return
     void loadSettings()
+    void loadBotInstances()
     if (chatId != null) {
       void loadBindings(chatId)
     }
@@ -1299,16 +1303,6 @@ function App() {
       const items = Array.isArray(data.settings) ? data.settings : []
       setRuntimeSettings(items)
       setInstallationStatus(data.installation_status ?? null)
-      const byKey = new Map<string, RuntimeSettingItem>()
-      for (const item of items) {
-        byKey.set(item.key.toUpperCase(), item)
-      }
-      setLlmProviderInput(byKey.get('LLM_PROVIDER')?.raw_value ?? '')
-      setLlmApiKeyInput(byKey.get('LLM_API_KEY')?.raw_value ?? '')
-      setLlmModelInput(byKey.get('LLM_MODEL')?.raw_value ?? '')
-      setTelegramTokenInput(byKey.get('TELEGRAM_BOT_TOKEN')?.raw_value ?? '')
-      setBotUsernameInput(byKey.get('BOT_USERNAME')?.raw_value ?? '')
-      setDiscordTokenInput(byKey.get('DISCORD_BOT_TOKEN')?.raw_value ?? '')
     } catch (e) {
       setSettingsError(e instanceof Error ? e.message : String(e))
       setRuntimeSettings([])
@@ -1318,43 +1312,74 @@ function App() {
     }
   }
 
-  async function saveSettings(): Promise<void> {
-    setSettingsBusy(true)
-    setSettingsError('')
+  async function loadBotInstances(): Promise<void> {
     try {
-      const upsert: Record<string, string> = {}
-      const remove: string[] = []
-      const put = (key: string, value: string): void => {
-        const trimmed = value.trim()
-        if (trimmed.length === 0) {
-          remove.push(key)
-        } else {
-          upsert[key] = trimmed
-        }
-      }
-      put('LLM_PROVIDER', llmProviderInput)
-      put('LLM_API_KEY', llmApiKeyInput)
-      put('LLM_MODEL', llmModelInput)
-      put('TELEGRAM_BOT_TOKEN', telegramTokenInput)
-      put('BOT_USERNAME', botUsernameInput)
-      put('DISCORD_BOT_TOKEN', discordTokenInput)
-      await api('/api/settings', {
-        method: 'PATCH',
-        body: JSON.stringify({
-          upsert: Object.keys(upsert).length > 0 ? upsert : undefined,
-          remove: remove.length > 0 ? remove : undefined,
-        }),
-      })
-      await loadSettings()
+      const data = await api<{ instances?: BotInstanceRow[] }>('/api/channel_bot_instances')
+      setBotInstances(Array.isArray(data.instances) ? data.instances : [])
+    } catch {
+      setBotInstances([])
+    }
+  }
+
+  async function requestRestart(): Promise<void> {
+    setSettingsError('')
+    setRestartNotice(null)
+    setRestartBusy(true)
+    try {
+      const data = await api<{ ok?: boolean; message?: string }>('/api/restart', { method: 'POST' })
+      setRestartNotice(data.message ?? 'Restart initiated.')
     } catch (e) {
       setSettingsError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSettingsBusy(false)
+      setRestartBusy(false)
+    }
+  }
+
+  async function addBotInstance(): Promise<void> {
+    const label = newBotLabel.trim()
+    const token = newBotToken.trim()
+    if (!label || !token) {
+      setSettingsError('Label and token are required.')
+      return
+    }
+    setSettingsError('')
+    setBotFormBusy(true)
+    try {
+      await api('/api/channel_bot_instances', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          platform: newBotPlatform,
+          label,
+          token,
+        }),
+      })
+      setNewBotLabel('')
+      setNewBotToken('')
+      await loadBotInstances()
+    } catch (e) {
+      setSettingsError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBotFormBusy(false)
+    }
+  }
+
+  async function removeBotInstance(id: number): Promise<void> {
+    if (!window.confirm('Delete this bot instance? This cannot be undone.')) return
+    setSettingsError('')
+    setBotFormBusy(true)
+    try {
+      await api(`/api/channel_bot_instances/${id}`, { method: 'DELETE' })
+      await loadBotInstances()
+    } catch (e) {
+      setSettingsError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBotFormBusy(false)
     }
   }
 
   async function updateChannelPersonaPolicy(
-    channelType: string,
+    botInstanceId: number,
     mode: 'all' | 'single',
     personaId?: number,
   ): Promise<void> {
@@ -1362,14 +1387,14 @@ function App() {
     if (mode === 'all') {
       await api('/api/channel_persona_policy', {
         method: 'DELETE',
-        body: JSON.stringify({ chat_id: chatId, channel_type: channelType }),
+        body: JSON.stringify({ chat_id: chatId, bot_instance_id: botInstanceId }),
       })
     } else {
       await api('/api/channel_persona_policy', {
         method: 'POST',
         body: JSON.stringify({
           chat_id: chatId,
-          channel_type: channelType,
+          bot_instance_id: botInstanceId,
           mode: 'single',
           persona_id: personaId,
         }),
@@ -1697,15 +1722,20 @@ function App() {
                     <Dialog.Content style={{ maxWidth: 920 }}>
                       <Dialog.Title>Web UI configuration</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
-                        Configure runtime settings from Web UI. Bootstrap values still come from repo-root .env. Runtime changes are saved to DB and apply after restart.
+                        LLM provider, API keys, and models are configured in repo-root <code className="text-xs">.env</code> only (for example <code className="text-xs">LLM_PROVIDER</code>, <code className="text-xs">LLM_API_KEY</code>, <code className="text-xs">LLM_MODEL</code>). Changing <code className="text-xs">.env</code> requires a process restart. Generic key-value writes to <code className="text-xs">app_settings</code> are disabled; the list below is read-only.
                       </Dialog.Description>
                       {settingsError ? (
                         <Callout.Root color="red" size="1" variant="soft" className="mb-2">
                           <Callout.Text>{settingsError}</Callout.Text>
                         </Callout.Root>
                       ) : null}
+                      {restartNotice ? (
+                        <Callout.Root color="green" size="1" variant="soft" className="mb-2">
+                          <Callout.Text>{restartNotice}</Callout.Text>
+                        </Callout.Root>
+                      ) : null}
                       {installationStatus ? (
-                        <Flex gap="2" wrap="wrap" mb="3">
+                        <Flex gap="2" wrap="wrap" align="center" mb="3">
                           <Text size="1" color={installationStatus.llm_ready ? 'green' : 'orange'}>
                             LLM: {installationStatus.llm_ready ? 'ready' : 'missing'}
                           </Text>
@@ -1713,8 +1743,24 @@ function App() {
                             Channels: {installationStatus.channel_ready ? 'ready' : 'missing'}
                           </Text>
                           <Text size="1" color="gray">
-                            Restart required: {installationStatus.requires_restart_to_apply_runtime_settings ? 'yes' : 'no'}
+                            Env restart needed:{' '}
+                            {(installationStatus.requires_restart_for_env_changes ??
+                              installationStatus.requires_restart_to_apply_runtime_settings) === true
+                              ? 'yes'
+                              : 'no'}
                           </Text>
+                          <Text size="1" color="gray">
+                            One-click restart: {installationStatus.restart_hook_configured ? 'configured' : 'not set'}{' '}
+                            (<code className="text-xs">FINALLY_A_VALUE_BOT_RESTART_COMMAND</code>)
+                          </Text>
+                          <Button
+                            size="1"
+                            variant="solid"
+                            disabled={restartBusy}
+                            onClick={() => void requestRestart()}
+                          >
+                            {restartBusy ? 'Restarting…' : 'Restart'}
+                          </Button>
                         </Flex>
                       ) : null}
                       <div
@@ -1723,50 +1769,17 @@ function App() {
                           ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
                           : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
                       >
-                        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                          <TextField.Root
-                            placeholder="LLM_PROVIDER (e.g. anthropic/openai)"
-                            value={llmProviderInput}
-                            onChange={(e) => setLlmProviderInput(e.target.value)}
-                          />
-                          <TextField.Root
-                            placeholder="LLM_MODEL"
-                            value={llmModelInput}
-                            onChange={(e) => setLlmModelInput(e.target.value)}
-                          />
-                          <TextField.Root
-                            placeholder="LLM_API_KEY"
-                            value={llmApiKeyInput}
-                            onChange={(e) => setLlmApiKeyInput(e.target.value)}
-                          />
-                          <TextField.Root
-                            placeholder="TELEGRAM_BOT_TOKEN"
-                            value={telegramTokenInput}
-                            onChange={(e) => setTelegramTokenInput(e.target.value)}
-                          />
-                          <TextField.Root
-                            placeholder="BOT_USERNAME"
-                            value={botUsernameInput}
-                            onChange={(e) => setBotUsernameInput(e.target.value)}
-                          />
-                          <TextField.Root
-                            placeholder="DISCORD_BOT_TOKEN"
-                            value={discordTokenInput}
-                            onChange={(e) => setDiscordTokenInput(e.target.value)}
-                          />
-                        </div>
-                        <Flex justify="between" align="center" mt="3" gap="2" wrap="wrap">
+                        <Text size="2" weight="bold" className="mb-1">Legacy app_settings (read-only)</Text>
+                        <Text size="1" color="gray" className="mb-2 block">
+                          Rows are not merged into process env at startup. Use <code className="text-xs">.env</code> for configuration. LLM keys are not stored here.
+                        </Text>
+                        <Flex justify="between" align="center" gap="2" wrap="wrap">
                           <Text size="1" color="gray">
-                            Saved runtime settings: {runtimeSettings.length}
+                            Rows: {runtimeSettings.length}
                           </Text>
-                          <Flex gap="2">
-                            <Button size="1" variant="soft" onClick={() => void loadSettings()} disabled={settingsBusy}>
-                              Reload
-                            </Button>
-                            <Button size="1" onClick={() => void saveSettings()} disabled={settingsBusy}>
-                              {settingsBusy ? 'Saving…' : 'Save'}
-                            </Button>
-                          </Flex>
+                          <Button size="1" variant="soft" onClick={() => void loadSettings()} disabled={settingsBusy}>
+                            Reload
+                          </Button>
                         </Flex>
                       </div>
                       <div
@@ -1775,9 +1788,94 @@ function App() {
                           ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
                           : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
                       >
-                        <Text size="2" weight="bold">Channel persona mode</Text>
+                        <Text size="2" weight="bold" className="mb-1">Bot integrations</Text>
                         <Text size="1" color="gray" className="mb-2 block">
-                          Set each channel to use all personas (current behavior) or force a single persona.
+                          Additional Telegram or Discord bots beyond env-seeded instances. Tokens are stored in the database; primary instances from config may be read-only here.
+                        </Text>
+                        <div className="mb-3 space-y-1">
+                          {botInstances.length === 0 ? (
+                            <Text size="1" color="gray">No instances loaded (check auth).</Text>
+                          ) : (
+                            botInstances.map((row) => (
+                              <Flex
+                                key={row.id}
+                                gap="2"
+                                align="center"
+                                wrap="wrap"
+                                className="border-t border-[color:var(--gray-6)] pt-2 first:border-t-0 first:pt-0"
+                              >
+                                <Text size="1" className="min-w-[120px] font-mono">
+                                  #{row.id} {row.platform}
+                                </Text>
+                                <Text size="1" className="min-w-[100px]">
+                                  {row.label}
+                                </Text>
+                                <Text size="1" color="gray">
+                                  {row.token_redacted}
+                                </Text>
+                                {row.env_primary ? (
+                                  <Text size="1" color="gray">(from env)</Text>
+                                ) : (
+                                  <Button
+                                    size="1"
+                                    color="red"
+                                    variant="soft"
+                                    disabled={botFormBusy}
+                                    onClick={() => void removeBotInstance(row.id)}
+                                  >
+                                    Delete
+                                  </Button>
+                                )}
+                              </Flex>
+                            ))
+                          )}
+                        </div>
+                        <Text size="1" weight="bold" className="mb-1 block">Add bot instance</Text>
+                        <Flex gap="2" wrap="wrap" align="end">
+                          <div>
+                            <Text size="1" color="gray" className="mb-1 block">Platform</Text>
+                            <Select.Root
+                              value={newBotPlatform}
+                              onValueChange={(v) => setNewBotPlatform(v === 'discord' ? 'discord' : 'telegram')}
+                            >
+                              <Select.Trigger className="w-[140px]" />
+                              <Select.Content>
+                                <Select.Item value="telegram">telegram</Select.Item>
+                                <Select.Item value="discord">discord</Select.Item>
+                              </Select.Content>
+                            </Select.Root>
+                          </div>
+                          <TextField.Root
+                            className="min-w-[160px] flex-1"
+                            placeholder="Label"
+                            value={newBotLabel}
+                            onChange={(e) => setNewBotLabel(e.target.value)}
+                          />
+                          <TextField.Root
+                            className="min-w-[200px] flex-1"
+                            type="password"
+                            placeholder="Bot token"
+                            value={newBotToken}
+                            onChange={(e) => setNewBotToken(e.target.value)}
+                          />
+                          <Button
+                            size="1"
+                            disabled={botFormBusy}
+                            onClick={() => void addBotInstance()}
+                          >
+                            {botFormBusy ? '…' : 'Add'}
+                          </Button>
+                        </Flex>
+                      </div>
+                      <div
+                        className="mt-3 rounded-md border p-3"
+                        style={appearance === 'dark'
+                          ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
+                          : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
+                      >
+                        <Text size="2" weight="bold">External channel persona mode</Text>
+                        <Text size="1" color="gray" className="mb-2 block">
+                          Per Telegram/Discord/WhatsApp bot instance: allow all personas or lock to one. Web chat is not listed here — use the persona selector in the chat UI.
                         </Text>
                         <div className="space-y-2">
                           {bindings.length === 0 ? (
@@ -1786,15 +1884,17 @@ function App() {
                             const currentMode = b.persona_mode === 'single' ? 'single' : 'all'
                             const currentPersonaId = b.persona_id ?? activePersonaId ?? personas[0]?.id ?? null
                             return (
-                              <Flex key={`${b.channel_type}:${b.channel_handle}`} gap="2" align="center" wrap="wrap">
-                                <Text size="1" className="min-w-[180px]">{b.channel_type}: {b.channel_handle}</Text>
+                              <Flex key={`${b.bot_instance_id}:${b.channel_type}:${b.channel_handle}`} gap="2" align="center" wrap="wrap">
+                                <Text size="1" className="min-w-[200px]">
+                                  {b.channel_type} (bot #{b.bot_instance_id}): {b.channel_handle}
+                                </Text>
                                 <Select.Root
                                   value={currentMode}
                                   onValueChange={(mode) => {
                                     if (mode === 'all') {
-                                      void updateChannelPersonaPolicy(b.channel_type, 'all')
+                                      void updateChannelPersonaPolicy(b.bot_instance_id, 'all')
                                     } else if (currentPersonaId != null) {
-                                      void updateChannelPersonaPolicy(b.channel_type, 'single', currentPersonaId)
+                                      void updateChannelPersonaPolicy(b.bot_instance_id, 'single', currentPersonaId)
                                     }
                                   }}
                                 >
@@ -1810,7 +1910,7 @@ function App() {
                                     onValueChange={(value) => {
                                       const pid = Number(value)
                                       if (Number.isFinite(pid) && pid > 0) {
-                                        void updateChannelPersonaPolicy(b.channel_type, 'single', pid)
+                                        void updateChannelPersonaPolicy(b.bot_instance_id, 'single', pid)
                                       }
                                     }}
                                   >

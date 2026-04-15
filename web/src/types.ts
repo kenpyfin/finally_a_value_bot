@@ -18,6 +18,7 @@ export type Persona = {
 }
 
 export type ChannelBinding = {
+  bot_instance_id: number
   channel_type: string
   channel_handle: string
   persona_mode?: 'all' | 'single'
@@ -31,6 +32,28 @@ export type RuntimeSettingItem = {
   is_secret: boolean
   updated_at?: string
   source?: string
+}
+
+/** Matches `/api/settings` `installation_status` and web Settings UI. */
+export type InstallationStatus = {
+  llm_ready: boolean
+  channel_ready: boolean
+  web_enabled: boolean
+  /** @deprecated use requires_restart_for_env_changes */
+  requires_restart_to_apply_runtime_settings?: boolean
+  requires_restart_for_env_changes?: boolean
+  runtime_env_merge_from_app_settings?: boolean
+  restart_hook_configured?: boolean
+}
+
+/** Redacted row from `GET /api/channel_bot_instances`. */
+export type BotInstanceRow = {
+  id: number
+  platform: string
+  label: string
+  token_redacted: string
+  created_at: string
+  env_primary: boolean
 }
 
 export type ScheduleTask = {

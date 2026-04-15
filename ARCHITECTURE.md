@@ -214,18 +214,23 @@ Web has no native identity. To sync with Telegram/Discord, the user **binds** th
 
 `AppState` (Arc-wrapped) holds:
 
-- `config`, `db`, `llm`, `tools`, `memory`, `skills`, `scheduler`, `mcp_manager`
-- `bot` (Telegram `Bot`) for sending to Telegram
-- `discord_http` (optional `Arc<serenity::http::Http>`) for sending to Discord from non-Discord code (e.g. when a reply is delivered to all bound channels)
+- `config`, `db`, `llm`, `tools`, `memory`, `skills`, `mcp` (via tools), `chat_queue`
+- `telegram_bots`: `HashMap<i64, Bot>` — one Telegram `Bot` per row in `channel_bot_instances` (platform `telegram`)
+- `discord_http`: `HashMap<i64, Arc<Http>>` — one Discord HTTP client per `channel_bot_instances` row (platform `discord`)
 
-It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which reads `bot` and `discord_http` from state.
+It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which picks the correct `Bot` / Discord client per binding’s `bot_instance_id`.
 
-## 8. Web-first Runtime Settings
+## 8. Configuration and settings
 
-- Bootstrap values are still read from repo-root `.env` (`WORKSPACE_DIR` / `FINALLY_A_VALUE_BOT_WORKSPACE_DIR`, web bind/auth, and config path override).
-- Runtime operator settings (LLM, channel tokens, etc.) are persisted in SQLite `app_settings` via Web UI `/api/settings`.
-- On startup, runtime settings are loaded from DB, merged into process env, and used to build effective `Config`.
-- Runtime settings currently require restart to apply to all subsystems.
+- **Effective config** is built from repo-root `.env` (or `FINALLY_A_VALUE_BOT_CONFIG`) plus process environment — see `Config::load` / `load_from_env` in `src/config.rs`.
+- **LLM and secrets** (e.g. `LLM_*`, API keys, primary bot tokens) are **env-only**, not merged from SQLite.
+- The legacy `app_settings` table may still contain old rows; it is **not** merged into the environment at startup. `PATCH /api/settings` is disabled (501); use `.env` for configuration.
+- **Bot instances** (including extra Telegram/Discord bots) are stored in `channel_bot_instances`, seeded from env for primary ids 1–3 and extended via `/api/channel_bot_instances`. **Restart** the process after adding instances so new dispatchers start.
+- **Restart hook:** set `FINALLY_A_VALUE_BOT_RESTART_COMMAND` to a fixed supervisor command; authenticated `POST /api/restart` runs it (optional one-click from Web UI).
+
+### Universal chat id (`997894126` / `UNIVERSAL_CHAT_ID`)
+
+Web resolves a single canonical `chat_id` (default placeholder `997894126` or `UNIVERSAL_CHAT_ID`). When `UNIVERSAL_CHAT_ID` is set, external channels can bind to that same contact for a unified inbox. **Future work:** multiple selectable contacts / sessions in web and clearer separation from “one magic id” defaults — see development journal.
 
 ---
 

@@ -18,6 +18,21 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-14 — Runtime DB merge removed, restart hook, bot instances in Settings
+
+- **Area:** config / web API / web UI / docs
+- **Summary:** Startup no longer merges `app_settings` into env; `GET /api/settings` reports `runtime_env_merge_from_app_settings: false`, `requires_restart_for_env_changes`, and `restart_hook_configured`; `PATCH /api/settings` returns 501. Added `FINALLY_A_VALUE_BOT_RESTART_COMMAND` + `POST /api/restart` (501 with copy-paste examples when unset; 202 when hook runs). Exposed authenticated CRUD for `channel_bot_instances` (`GET/POST /api/channel_bot_instances`, `PATCH/DELETE /api/channel_bot_instances/:id`, tokens redacted on GET). Web Settings: legacy `app_settings` read-only section, **Restart** button, **Bot integrations** list/add/delete (non–env-primary rows). `DEVELOP.md` config line no longer claims DB runtime overrides.
+- **Rationale:** Align runtime config with `.env`-only mental model; give operators a safe optional one-click restart; manage extra Telegram/Discord bot rows without SQL.
+- **Key files / symbols:** `src/main.rs` (no `apply_runtime_settings_from_db`); `src/web.rs` (`api_settings_get`/`patch`, `restart_hook_command`, `api_restart`, `api_channel_bot_instances_*`); `src/db.rs` (`list_all_channel_bot_instances`, `create_channel_bot_instance`, `update_channel_bot_instance`, `delete_channel_bot_instance`); `web/src/main.tsx`, `web/src/types.ts` (`InstallationStatus`, `BotInstanceRow`), `web/src/vite-env.d.ts`; `ARCHITECTURE.md` §8; `DEVELOP.md` (project structure blurb).
+- **Follow-ups:** Multi-contact web sessions and optional behavior when `UNIVERSAL_CHAT_ID` is unset (see `ARCHITECTURE.md` “Universal chat id”); optional UI for `PATCH` bot instance label/token.
+
+### 2026-04-14 — LLM env-only, per-bot-instance persona policy, multi Telegram/Discord dispatch
+
+- **Area:** config / DB / channels / web UI
+- **Summary:** LLM-related keys are no longer loaded from `app_settings` at startup or accepted via `PATCH /api/settings` (use repo-root `.env`). Channel bindings and persona scope policy are keyed by `bot_instance_id` (`channel_bot_instances` table, seeded from env for primary Telegram/Discord/WhatsApp). Multiple Telegram dispatchers and Discord clients run when multiple rows exist. Web chat is excluded from external “single vs all persona” policy; `/api/contacts/bindings` omits web rows for persona controls.
+- **Rationale:** Operators asked for LLM config strictly in `.env`, independent web persona selection, and separate all/single-persona policy per external bot instance.
+- **Key files / symbols:** `src/config.rs` (`is_llm_related_runtime_setting_key`), `src/main.rs` (`apply_runtime_settings_from_db`, `sync_channel_bot_instances_from_config`), `src/db.rs` (`channel_bot_instances`, `BOT_INSTANCE_*`, migrations, `sync_channel_bot_instances_from_config`, binding/policy APIs), `src/persona.rs` (`resolve_incoming_run_persona_for_channel` skips policy for web / `bot_instance_id == 0`), `src/channel.rs` (`deliver_to_contact` uses per-instance `Bot` / `Http` maps), `src/channels/telegram.rs` (`AppState.telegram_bots`, dispatcher `deps` include `telegram_bot_instance_id`), `src/channels/discord.rs` (`Handler.discord_bot_instance_id`, `start_discord_bot(..., id)`), `src/web.rs` (settings GET filter, PATCH reject LLM; persona API uses `bot_instance_id`), `web/src/main.tsx` (Settings copy; persona policy by `bot_instance_id`).
+
 ### 2026-04-14 — Web-first settings/onboarding + channel persona mode
 
 - **Area:** config / startup / web / channels / onboarding

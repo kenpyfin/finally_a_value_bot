@@ -1,5 +1,5 @@
 use finally_a_value_bot::claude::{Message, MessageContent};
-use finally_a_value_bot::config::{is_llm_related_runtime_setting_key, Config};
+use finally_a_value_bot::config::Config;
 use finally_a_value_bot::error::FinallyAValueBotError;
 use finally_a_value_bot::{
     builtin_skills, db, doctor, gateway, logging, mcp, memory, skills, telegram,
@@ -404,37 +404,6 @@ fn has_any_realtime_channel(config: &Config) -> bool {
     !config.telegram_bot_token.trim().is_empty() || config.discord_bot_token.is_some()
 }
 
-fn apply_runtime_settings_from_db(db: &db::Database) -> Result<usize, FinallyAValueBotError> {
-    const BOOTSTRAP_ONLY_KEYS: &[&str] = &[
-        "WORKSPACE_DIR",
-        "FINALLY_A_VALUE_BOT_WORKSPACE_DIR",
-        "FINALLY_A_VALUE_BOT_CONFIG",
-        "WEB_HOST",
-        "WEB_PORT",
-        "WEB_AUTH_TOKEN",
-    ];
-    let settings = db.list_app_settings()?;
-    let mut applied = 0usize;
-    for setting in settings {
-        if is_llm_related_runtime_setting_key(&setting.key) {
-            continue;
-        }
-        if BOOTSTRAP_ONLY_KEYS
-            .iter()
-            .any(|k| k.eq_ignore_ascii_case(setting.key.as_str()))
-        {
-            continue;
-        }
-        // SAFETY: startup path runs before the async runtime starts handling requests.
-        // Mutating process env is confined to initialization.
-        unsafe {
-            std::env::set_var(&setting.key, &setting.value);
-        }
-        applied = applied.saturating_add(1);
-    }
-    Ok(applied)
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -480,7 +449,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut config = match Config::load() {
+    let config = match Config::load() {
         Ok(c) => c,
         Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config missing/invalid: {e}");
@@ -513,18 +482,6 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
-
-    // Load runtime settings persisted by Web UI and merge into effective process env.
-    let applied_settings = apply_runtime_settings_from_db(&db)?;
-    if applied_settings > 0 {
-        let mut merged = Config::load_from_env();
-        merged.post_deserialize()?;
-        config = merged;
-        info!(
-            "Applied {} runtime settings from database",
-            applied_settings
-        );
-    }
 
     db.sync_channel_bot_instances_from_config(&config)?;
 

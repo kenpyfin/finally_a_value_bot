@@ -1402,6 +1402,87 @@ impl Database {
         }
     }
 
+    /// All bot instances (Telegram, Discord, WhatsApp, etc.), ordered by id.
+    pub fn list_all_channel_bot_instances(
+        &self,
+    ) -> Result<Vec<ChannelBotInstance>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, platform, label, token, created_at FROM channel_bot_instances ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ChannelBotInstance {
+                id: row.get(0)?,
+                platform: row.get(1)?,
+                label: row.get(2)?,
+                token: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Insert a non-primary bot instance (id auto-assigned). Primary ids 1–3 are reserved for env sync.
+    pub fn create_channel_bot_instance(
+        &self,
+        platform: &str,
+        label: &str,
+        token: &str,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let p = platform.trim().to_ascii_lowercase();
+        if !matches!(p.as_str(), "telegram" | "discord") {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "platform must be telegram or discord".into(),
+            ));
+        }
+        if token.trim().is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "token cannot be empty".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO channel_bot_instances (platform, label, token, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![p, label.trim(), token.trim(), now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_channel_bot_instance(
+        &self,
+        id: i64,
+        label: &str,
+        token: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        if token.trim().is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "token cannot be empty".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE channel_bot_instances SET label = ?1, token = ?2 WHERE id = ?3",
+            params![label.trim(), token.trim(), id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Deletes a bot instance. Ids 1–3 are reserved for primary env-backed rows and cannot be deleted here.
+    pub fn delete_channel_bot_instance(&self, id: i64) -> Result<bool, FinallyAValueBotError> {
+        if (1..=3).contains(&id) {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Cannot delete primary bot instances (ids 1–3) managed from .env".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM channel_bot_instances WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn list_app_settings(&self) -> Result<Vec<AppSetting>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

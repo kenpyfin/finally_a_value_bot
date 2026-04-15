@@ -25,7 +25,7 @@ No other external dependencies. SQLite is bundled via `rusqlite`.
 ```
 src/
     main.rs              # Entry point. Parses CLI args, initializes subsystems, starts bot.
-    config.rs            # Config struct. Bootstrap from .env + runtime overrides from DB app_settings.
+    config.rs            # Config struct. Bootstrap from .env (no startup merge from app_settings).
     error.rs             # FinallyAValueBotError enum (thiserror). Centralized error types.
     telegram.rs          # Core orchestration:
                          #   - Telegram message handler

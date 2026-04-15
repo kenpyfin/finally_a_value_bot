@@ -40,7 +40,7 @@ Bootstrap variables stay in `.env` (repo root): workspace path, config path over
 finally-a-value-bot start
 ```
 
-Then open **http://127.0.0.1:10961** and complete configuration in **Settings** (LLM, channel tokens, persona behavior). Runtime settings are stored in SQLite and currently apply after restart.
+Then open **http://127.0.0.1:10961**. Configure **LLM and bot tokens in repo-root `.env`** (see `.env.example`). Use **Settings** for bot integrations (extra instances), persona scope per channel, and optional **restart** when `FINALLY_A_VALUE_BOT_RESTART_COMMAND` is set. Changes to `.env` require a process restart.
 
 **Useful checks:**
 
