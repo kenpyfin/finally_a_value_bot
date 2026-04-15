@@ -1,5 +1,5 @@
 use finally_a_value_bot::claude::{Message, MessageContent};
-use finally_a_value_bot::config::Config;
+use finally_a_value_bot::config::{is_llm_related_runtime_setting_key, Config};
 use finally_a_value_bot::error::FinallyAValueBotError;
 use finally_a_value_bot::{
     builtin_skills, db, doctor, gateway, logging, mcp, memory, skills, telegram,
@@ -416,6 +416,9 @@ fn apply_runtime_settings_from_db(db: &db::Database) -> Result<usize, FinallyAVa
     let settings = db.list_app_settings()?;
     let mut applied = 0usize;
     for setting in settings {
+        if is_llm_related_runtime_setting_key(&setting.key) {
+            continue;
+        }
         if BOOTSTRAP_ONLY_KEYS
             .iter()
             .any(|k| k.eq_ignore_ascii_case(setting.key.as_str()))
@@ -522,6 +525,8 @@ async fn main() -> anyhow::Result<()> {
             applied_settings
         );
     }
+
+    db.sync_channel_bot_instances_from_config(&config)?;
 
     // Seed onboarding task for fresh installations
     if is_llm_ready(&config) && has_any_realtime_channel(&config) {

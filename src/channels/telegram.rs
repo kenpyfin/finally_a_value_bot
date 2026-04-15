@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -56,15 +56,23 @@ enum UserIntent {
 
 pub struct AppState {
     pub config: Config,
-    pub bot: Bot,
+    /// Telegram bots keyed by `channel_bot_instances.id` (see `Database::sync_channel_bot_instances_from_config`).
+    pub telegram_bots: Arc<HashMap<i64, Bot>>,
     pub db: Arc<Database>,
     pub memory: MemoryManager,
     pub skills: SkillManager,
     pub llm: Arc<dyn LlmProvider>,
     pub tools: ToolRegistry,
-    /// When Discord is enabled, used by deliver_to_contact to send to bound Discord channels.
-    pub discord_http: Option<Arc<SerenityHttp>>,
+    /// Discord HTTP clients keyed by `channel_bot_instances.id`.
+    pub discord_http: Arc<HashMap<i64, Arc<SerenityHttp>>>,
     pub chat_queue: ChatRunQueue,
+}
+
+impl AppState {
+    pub fn primary_telegram_bot(&self) -> Option<&Bot> {
+        self.telegram_bots
+            .get(&crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY)
+    }
 }
 
 const PERSONA_SWITCH_CALLBACK_PREFIX: &str = "persona:switch:";
@@ -124,16 +132,31 @@ pub async fn run_bot(
     mcp_manager: crate::mcp::McpManager,
 ) -> anyhow::Result<()> {
     let telegram_enabled = !config.telegram_bot_token.trim().is_empty();
-    let bot_token = if telegram_enabled {
-        config.telegram_bot_token.as_str()
-    } else {
-        "telegram-disabled"
-    };
-    let bot = Bot::new(bot_token);
+
+    let mut telegram_bots_map: HashMap<i64, Bot> = HashMap::new();
+    let tg_rows = db.list_channel_bot_instances_by_platform("telegram")?;
+    for row in tg_rows {
+        if row.token.trim().is_empty() {
+            continue;
+        }
+        telegram_bots_map.insert(row.id, Bot::new(row.token.as_str()));
+    }
+    if telegram_bots_map.is_empty() && telegram_enabled {
+        telegram_bots_map.insert(
+            crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY,
+            Bot::new(config.telegram_bot_token.as_str()),
+        );
+    }
+
     let db = Arc::new(db);
 
+    let tool_bot = telegram_bots_map
+        .get(&crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY)
+        .cloned()
+        .unwrap_or_else(|| Bot::new("telegram-disabled"));
+
     if telegram_enabled {
-        // Register slash commands so they appear in the Telegram menu
+        // Register slash commands so they appear in the Telegram menu (every instance).
         let commands = [
             BotCommand {
                 command: "reset".into(),
@@ -156,15 +179,17 @@ pub async fn run_bot(
                 description: "List and manage scheduled jobs".into(),
             },
         ];
-        if let Err(e) = bot.set_my_commands(commands).await {
-            error!("Failed to set Telegram bot commands: {}", e);
+        for b in telegram_bots_map.values() {
+            if let Err(e) = b.set_my_commands(commands.clone()).await {
+                error!("Failed to set Telegram bot commands: {}", e);
+            }
         }
     } else {
         info!("Telegram channel disabled (no TELEGRAM_BOT_TOKEN configured)");
     }
 
     let llm: Arc<dyn LlmProvider> = Arc::from(crate::llm::create_provider(&config));
-    let mut tools = ToolRegistry::new(&config, bot.clone(), db.clone());
+    let mut tools = ToolRegistry::new(&config, tool_bot, db.clone());
 
     let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
     info!(
@@ -178,20 +203,37 @@ pub async fn run_bot(
         tools.add_tool(Box::new(crate::tools::mcp::McpTool::new(server, tool_info)));
     }
 
-    let discord_http = config
-        .discord_bot_token
-        .as_ref()
-        .map(|token| Arc::new(SerenityHttp::new(token.as_str())));
+    let mut discord_http_map: HashMap<i64, Arc<SerenityHttp>> = HashMap::new();
+    let mut discord_launches: Vec<(i64, String)> = Vec::new();
+    let dc_rows = db.list_channel_bot_instances_by_platform("discord")?;
+    for row in dc_rows {
+        if row.token.trim().is_empty() {
+            continue;
+        }
+        discord_launches.push((row.id, row.token.clone()));
+        discord_http_map.insert(row.id, Arc::new(SerenityHttp::new(row.token.as_str())));
+    }
+    if discord_http_map.is_empty() {
+        if let Some(ref t) = config.discord_bot_token {
+            if !t.trim().is_empty() {
+                discord_launches.push((crate::db::BOT_INSTANCE_DISCORD_PRIMARY, t.clone()));
+                discord_http_map.insert(
+                    crate::db::BOT_INSTANCE_DISCORD_PRIMARY,
+                    Arc::new(SerenityHttp::new(t.as_str())),
+                );
+            }
+        }
+    }
 
     let state = Arc::new(AppState {
         config,
-        bot: bot.clone(),
+        telegram_bots: Arc::new(telegram_bots_map),
         db,
         memory,
         skills,
         llm,
         tools,
-        discord_http,
+        discord_http: Arc::new(discord_http_map),
         chat_queue: ChatRunQueue::default(),
     });
 
@@ -215,13 +257,12 @@ pub async fn run_bot(
         });
     }
 
-    // Start Discord bot if configured
-    if let Some(ref token) = state.config.discord_bot_token {
+    // Start one Discord client per configured Discord bot instance
+    for (inst_id, token) in discord_launches {
         let discord_state = state.clone();
-        let token = token.clone();
-        info!("Starting Discord bot");
+        info!("Starting Discord bot instance {inst_id}");
         tokio::spawn(async move {
-            crate::discord::start_discord_bot(discord_state, &token).await;
+            crate::discord::start_discord_bot(discord_state, token.as_str(), inst_id).await;
         });
     }
 
@@ -239,39 +280,49 @@ pub async fn run_bot(
 
     if telegram_enabled {
         const TELEGRAM_RETRY_DELAY_SECS: u64 = 10;
-        loop {
-            let bot_clone = bot.clone();
+        for (inst_id, bot) in state.telegram_bots.iter() {
+            let bot = bot.clone();
+            let inst_id = *inst_id;
             let state_clone = state.clone();
-            let join_result = tokio::spawn(async move {
-                let handler = dptree::entry()
-                    .branch(Update::filter_message().endpoint(handle_message))
-                    .branch(Update::filter_callback_query().endpoint(handle_callback_query));
-                Dispatcher::builder(bot_clone, handler)
-                    .default_handler(|_| async {})
-                    .dependencies(dptree::deps![state_clone])
-                    .enable_ctrlc_handler()
-                    .build()
-                    .dispatch()
+            tokio::spawn(async move {
+                loop {
+                    let bot_clone = bot.clone();
+                    let state_inner = state_clone.clone();
+                    let join_result = tokio::spawn(async move {
+                        let handler = dptree::entry()
+                            .branch(Update::filter_message().endpoint(handle_message))
+                            .branch(
+                                Update::filter_callback_query().endpoint(handle_callback_query),
+                            );
+                        Dispatcher::builder(bot_clone, handler)
+                            .default_handler(|_| async {})
+                            .dependencies(dptree::deps![state_inner, inst_id])
+                            .enable_ctrlc_handler()
+                            .build()
+                            .dispatch()
+                            .await;
+                    })
                     .await;
-            })
-            .await;
 
-            match join_result {
-                Ok(()) => {
-                    // Dispatcher exited gracefully (e.g. Ctrl-C).
-                    break;
+                    match join_result {
+                        Ok(()) => break,
+                        Err(e) => {
+                            error!(
+                                "Telegram dispatcher crashed (instance {}): {}. Retrying in {}s (other channels stay active).",
+                                inst_id,
+                                e,
+                                TELEGRAM_RETRY_DELAY_SECS
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                TELEGRAM_RETRY_DELAY_SECS,
+                            ))
+                            .await;
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "Telegram dispatcher crashed: {}. Retrying in {}s (other channels stay active).",
-                        e,
-                        TELEGRAM_RETRY_DELAY_SECS
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(TELEGRAM_RETRY_DELAY_SECS))
-                        .await;
-                }
-            }
+            });
         }
+        tokio::signal::ctrl_c().await?;
     } else {
         tokio::signal::ctrl_c().await?;
     }
@@ -282,16 +333,18 @@ pub async fn run_bot(
 async fn resolve_canonical_chat_id_for_telegram(
     state: Arc<AppState>,
     telegram_chat_id: i64,
+    telegram_bot_instance_id: i64,
 ) -> Result<i64, String> {
     let telegram_handle = telegram_chat_id.to_string();
     let universal_chat_id = state.config.universal_chat_id;
+    let bid = telegram_bot_instance_id;
     call_blocking(state.db.clone(), move |db| {
         if let Some(cid) = universal_chat_id {
             db.upsert_chat(cid, None, "telegram")?;
-            db.link_channel(cid, "telegram", &telegram_handle)?;
+            db.link_channel(cid, bid, "telegram", &telegram_handle)?;
             Ok(cid)
         } else {
-            db.resolve_canonical_chat_id("telegram", &telegram_handle, None)
+            db.resolve_canonical_chat_id(bid, "telegram", &telegram_handle, None)
         }
     })
     .await
@@ -366,9 +419,10 @@ async fn send_persona_menu(
     chat_id: ChatId,
     canonical_chat_id: i64,
     thread_id: Option<ThreadId>,
+    telegram_bot_instance_id: i64,
 ) {
     let policy = call_blocking(state.db.clone(), move |db| {
-        db.get_channel_persona_policy(canonical_chat_id, "telegram")
+        db.get_channel_persona_policy(canonical_chat_id, telegram_bot_instance_id)
     })
     .await
     .ok()
@@ -416,6 +470,7 @@ async fn handle_callback_query(
     bot: Bot,
     q: CallbackQuery,
     state: Arc<AppState>,
+    telegram_bot_instance_id: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(data) = q.data.as_deref() else {
         return Ok(());
@@ -448,22 +503,27 @@ async fn handle_callback_query(
         }
     };
 
-    let canonical_chat_id =
-        match resolve_canonical_chat_id_for_telegram(state.clone(), chat_id.0).await {
-            Ok(id) => id,
-            Err(e) => {
-                error!("Persona callback resolve chat failed: {}", e);
-                let _ = bot
-                    .answer_callback_query(q.id)
-                    .text("Could not resolve chat for persona switch.")
-                    .await;
-                return Ok(());
-            }
-        };
+    let canonical_chat_id = match resolve_canonical_chat_id_for_telegram(
+        state.clone(),
+        chat_id.0,
+        telegram_bot_instance_id,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Persona callback resolve chat failed: {}", e);
+            let _ = bot
+                .answer_callback_query(q.id)
+                .text("Could not resolve chat for persona switch.")
+                .await;
+            return Ok(());
+        }
+    };
 
     let locked_single = call_blocking(state.db.clone(), move |db| {
         Ok(matches!(
-            db.get_channel_persona_policy(canonical_chat_id, "telegram")?,
+            db.get_channel_persona_policy(canonical_chat_id, telegram_bot_instance_id)?,
             Some(p) if p.mode == crate::db::ChannelPersonaMode::Single
         ))
     })
@@ -487,7 +547,15 @@ async fn handle_callback_query(
             .answer_callback_query(q.id)
             .text("Persona not found.")
             .await;
-        send_persona_menu(&bot, state.clone(), chat_id, canonical_chat_id, thread_id).await;
+        send_persona_menu(
+            &bot,
+            state.clone(),
+            chat_id,
+            canonical_chat_id,
+            thread_id,
+            telegram_bot_instance_id,
+        )
+        .await;
         return Ok(());
     }
 
@@ -534,11 +602,14 @@ async fn handle_message(
     bot: Bot,
     msg: teloxide::types::Message,
     state: Arc<AppState>,
+    telegram_bot_instance_id: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let chat_id = msg.chat.id.0;
 
     // Resolve to unified contact (canonical_chat_id).
-    let canonical_chat_id = resolve_canonical_chat_id_for_telegram(state.clone(), chat_id).await?;
+    let canonical_chat_id =
+        resolve_canonical_chat_id_for_telegram(state.clone(), chat_id, telegram_bot_instance_id)
+            .await?;
 
     // Extract content: text, photo, or voice
     let mut text = msg.text().unwrap_or("").to_string();
@@ -603,6 +674,7 @@ async fn handle_message(
                         msg.chat.id,
                         canonical_chat_id,
                         msg.thread_id,
+                        telegram_bot_instance_id,
                     )
                     .await;
                 } else {
@@ -866,11 +938,13 @@ async fn handle_message(
 
     // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
     let text_for_resolve = text.clone();
+    let bid = telegram_bot_instance_id;
     let (persona_id, text) = match call_blocking(state.db.clone(), move |db| {
         crate::persona::resolve_incoming_run_persona_for_channel(
             &db,
             canonical_chat_id,
             "telegram",
+            bid,
             &text_for_resolve,
         )
     })
@@ -1164,8 +1238,8 @@ async fn handle_message(
                     );
                 } else if let Err(e) = crate::channel::deliver_to_contact(
                     state_spawn.db.clone(),
-                    Some(&state_spawn.bot),
-                    state_spawn.discord_http.as_deref(),
+                    state_spawn.telegram_bots.as_ref(),
+                    state_spawn.discord_http.as_ref(),
                     &state_spawn.config.bot_username,
                     canonical_chat_id_spawn,
                     persona_id,

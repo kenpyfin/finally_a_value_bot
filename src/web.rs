@@ -21,7 +21,9 @@ use crate::channel::deliver_to_contact;
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
-use crate::db::{call_blocking, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage};
+use crate::db::{
+    call_blocking, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage, BOT_INSTANCE_WEB,
+};
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
@@ -512,7 +514,7 @@ async fn ensure_web_binding_for_universal(
     let cid = chat_id;
     call_blocking(state.app_state.db.clone(), move |db| {
         db.upsert_chat(cid, None, "web")?;
-        db.link_channel(cid, "web", "default")?;
+        db.link_channel(cid, BOT_INSTANCE_WEB, "web", "default")?;
         Ok(())
     })
     .await
@@ -1652,8 +1654,8 @@ async fn send_and_store_response_with_events(
 
         deliver_to_contact(
             state.app_state.db.clone(),
-            Some(&state.app_state.bot),
-            state.app_state.discord_http.as_deref(),
+            state.app_state.telegram_bots.as_ref(),
+            state.app_state.discord_http.as_ref(),
             &state.app_state.config.bot_username,
             chat_id,
             persona_id,
@@ -1733,8 +1735,8 @@ async fn send_and_store_response_with_events(
     if !response.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
         deliver_to_contact(
             state.app_state.db.clone(),
-            Some(&state.app_state.bot),
-            state.app_state.discord_http.as_deref(),
+            state.app_state.telegram_bots.as_ref(),
+            state.app_state.discord_http.as_ref(),
             &state.app_state.config.bot_username,
             chat_id,
             persona_id,
@@ -2311,7 +2313,7 @@ async fn api_contacts_bind(
 
     let contact_chat_id = body.contact_chat_id;
     call_blocking(state.app_state.db.clone(), move |db| {
-        db.link_channel(contact_chat_id, "web", "default")
+        db.link_channel(contact_chat_id, BOT_INSTANCE_WEB, "web", "default")
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2331,7 +2333,7 @@ async fn api_contacts_unlink(
     require_auth(&headers, state.auth_token.as_deref())?;
 
     let removed = call_blocking(state.app_state.db.clone(), move |db| {
-        db.unlink_channel("web", "default")
+        db.unlink_channel(BOT_INSTANCE_WEB, "web", "default")
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2712,7 +2714,7 @@ struct SettingsPatchRequest {
 #[derive(Debug, Deserialize)]
 struct ChannelPersonaPolicyUpsertRequest {
     chat_id: Option<i64>,
-    channel_type: String,
+    bot_instance_id: i64,
     mode: String, // "all" | "single"
     persona_id: Option<i64>,
 }
@@ -2720,7 +2722,7 @@ struct ChannelPersonaPolicyUpsertRequest {
 #[derive(Debug, Deserialize)]
 struct ChannelPersonaPolicyDeleteRequest {
     chat_id: Option<i64>,
-    channel_type: String,
+    bot_instance_id: i64,
 }
 
 fn setting_is_secret(key: &str) -> bool {
@@ -2768,23 +2770,25 @@ async fn api_contacts_bindings(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mut policy_by_channel: HashMap<String, (String, Option<i64>)> = HashMap::new();
+    let mut policy_by_instance: HashMap<i64, (String, Option<i64>)> = HashMap::new();
     for p in policies {
         let mode = match p.mode {
             ChannelPersonaMode::All => "all",
             ChannelPersonaMode::Single => "single",
         };
-        policy_by_channel.insert(p.channel_type, (mode.to_string(), p.persona_id));
+        policy_by_instance.insert(p.bot_instance_id, (mode.to_string(), p.persona_id));
     }
 
     let items: Vec<serde_json::Value> = bindings
         .into_iter()
+        .filter(|b| b.channel_type != "web")
         .map(|b| {
-            let (mode, persona_id) = policy_by_channel
-                .get(&b.channel_type)
+            let (mode, persona_id) = policy_by_instance
+                .get(&b.bot_instance_id)
                 .cloned()
                 .unwrap_or_else(|| ("all".to_string(), None));
             json!({
+                "bot_instance_id": b.bot_instance_id,
                 "channel_type": b.channel_type,
                 "channel_handle": b.channel_handle,
                 "persona_mode": mode,
@@ -2811,6 +2815,7 @@ async fn api_settings_get(
 
     let mut items: Vec<serde_json::Value> = settings
         .into_iter()
+        .filter(|s| !crate::config::is_llm_related_runtime_setting_key(&s.key))
         .map(|s| {
             let secret = setting_is_secret(&s.key);
             json!({
@@ -2871,6 +2876,12 @@ async fn api_settings_patch(
             if trimmed_key.is_empty() {
                 continue;
             }
+            if crate::config::is_llm_related_runtime_setting_key(&trimmed_key) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "LLM-related settings must be set in repo-root .env (not persisted in the database). See LLM_PROVIDER, LLM_API_KEY, LLM_MODEL, etc.".to_string(),
+                ));
+            }
             call_blocking(state.app_state.db.clone(), move |db| {
                 db.set_app_setting(&trimmed_key, &value)
             })
@@ -2911,13 +2922,6 @@ async fn api_channel_persona_policy_upsert(
     require_auth(&headers, state.auth_token.as_deref())?;
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
-    let channel_type = body.channel_type.trim().to_ascii_lowercase();
-    if channel_type.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "channel_type is required".to_string(),
-        ));
-    }
     let mode = match body.mode.as_str() {
         "all" => ChannelPersonaMode::All,
         "single" => ChannelPersonaMode::Single,
@@ -2929,9 +2933,9 @@ async fn api_channel_persona_policy_upsert(
         }
     };
     let persona_id = body.persona_id.filter(|id| *id > 0);
-    let channel_type_for_db = channel_type.clone();
+    let bot_instance_id = body.bot_instance_id;
     call_blocking(state.app_state.db.clone(), move |db| {
-        db.set_channel_persona_policy(chat_id, &channel_type_for_db, mode, persona_id)
+        db.set_channel_persona_policy(chat_id, bot_instance_id, mode, persona_id)
     })
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -2939,7 +2943,7 @@ async fn api_channel_persona_policy_upsert(
     Ok(Json(json!({
         "ok": true,
         "chat_id": chat_id,
-        "channel_type": channel_type,
+        "bot_instance_id": bot_instance_id,
         "mode": body.mode,
         "persona_id": persona_id,
     })))
@@ -2953,15 +2957,8 @@ async fn api_channel_persona_policy_delete(
     require_auth(&headers, state.auth_token.as_deref())?;
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
-    let channel_type = body.channel_type.trim().to_ascii_lowercase();
-    if channel_type.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "channel_type is required".to_string(),
-        ));
-    }
     let removed = call_blocking(state.app_state.db.clone(), move |db| {
-        db.clear_channel_persona_policy(chat_id, &channel_type)
+        db.clear_channel_persona_policy(chat_id, body.bot_instance_id)
     })
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3535,9 +3532,11 @@ mod tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let db = Arc::new(Database::new(&runtime_dir).unwrap());
         let bot = Bot::new("123456:TEST_TOKEN");
+        let mut telegram_bots = std::collections::HashMap::new();
+        telegram_bots.insert(crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY, bot.clone());
         let state = AppState {
             config: cfg.clone(),
-            bot: bot.clone(),
+            telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),
             skills: {
@@ -3549,7 +3548,7 @@ mod tests {
             },
             llm,
             tools: ToolRegistry::new(&cfg, bot, db),
-            discord_http: None,
+            discord_http: Arc::new(std::collections::HashMap::new()),
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
         };
         Arc::new(state)

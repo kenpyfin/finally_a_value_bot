@@ -151,8 +151,8 @@ pub fn spawn_background_job(
                 );
                 if let Err(e) = deliver_to_contact(
                     state.db.clone(),
-                    Some(&state.bot),
-                    state.discord_http.as_deref(),
+                    state.telegram_bots.as_ref(),
+                    state.discord_http.as_ref(),
                     &state.config.bot_username,
                     chat_id,
                     persona_id,
@@ -196,8 +196,8 @@ pub fn spawn_background_job(
                 };
                 let _ = deliver_to_contact(
                     state.db.clone(),
-                    Some(&state.bot),
-                    state.discord_http.as_deref(),
+                    state.telegram_bots.as_ref(),
+                    state.discord_http.as_ref(),
                     &state.config.bot_username,
                     chat_id,
                     persona_id,

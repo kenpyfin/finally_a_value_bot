@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -136,8 +137,8 @@ pub async fn deliver_and_store_bot_message(
 /// Used for unified contact sync: the same reply appears on every linked channel.
 pub async fn deliver_to_contact(
     db: Arc<Database>,
-    bot: Option<&Bot>,
-    discord_http: Option<&serenity::http::Http>,
+    telegram_bots: &HashMap<i64, Bot>,
+    discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
     bot_username: &str,
     canonical_chat_id: i64,
     persona_id: i64,
@@ -168,16 +169,16 @@ pub async fn deliver_to_contact(
     })
     .await
     .map_err(|e| format!("Failed to list channel persona policies: {e}"))?;
-    let mut policy_by_channel: std::collections::HashMap<
-        String,
+    let mut policy_by_instance: std::collections::HashMap<
+        i64,
         (crate::db::ChannelPersonaMode, Option<i64>),
     > = std::collections::HashMap::new();
     for p in policies {
-        policy_by_channel.insert(p.channel_type, (p.mode, p.persona_id));
+        policy_by_instance.insert(p.bot_instance_id, (p.mode, p.persona_id));
     }
 
     for b in &bindings {
-        if let Some((mode, policy_persona_id)) = policy_by_channel.get(&b.channel_type) {
+        if let Some((mode, policy_persona_id)) = policy_by_instance.get(&b.bot_instance_id) {
             if *mode == crate::db::ChannelPersonaMode::Single
                 && policy_persona_id.is_some()
                 && *policy_persona_id != Some(persona_id)
@@ -187,7 +188,10 @@ pub async fn deliver_to_contact(
         }
         match b.channel_type.as_str() {
             "telegram" => {
-                if let Some(bot) = bot {
+                let tg_bot = telegram_bots
+                    .get(&b.bot_instance_id)
+                    .or_else(|| telegram_bots.get(&crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY));
+                if let Some(bot) = tg_bot {
                     if let Ok(chat_id) = b.channel_handle.parse::<i64>() {
                         if let Err(e) = send_response_result(
                             bot,
@@ -210,20 +214,23 @@ pub async fn deliver_to_contact(
                 }
             }
             "discord" => {
-                if let Some(http) = discord_http {
+                let http = discord_http
+                    .get(&b.bot_instance_id)
+                    .or_else(|| discord_http.get(&crate::db::BOT_INSTANCE_DISCORD_PRIMARY));
+                if let Some(http) = http {
                     if let Ok(channel_id_u64) = b.channel_handle.parse::<u64>() {
                         let channel_id = serenity::model::id::ChannelId::new(channel_id_u64);
                         const MAX_LEN: usize = 2000;
                         let content = text.to_string();
                         if content.len() <= MAX_LEN {
-                            if let Err(e) = channel_id.say(http, &content).await {
+                            if let Err(e) = channel_id.say(http.as_ref(), &content).await {
                                 tracing::warn!(target: "channel", channel_id = %channel_id_u64, error = %e, "Discord delivery to bound channel failed");
                             }
                         } else {
                             let chars: Vec<char> = content.chars().collect();
                             for chunk in chars.chunks(MAX_LEN) {
                                 let s: String = chunk.iter().collect();
-                                let _ = channel_id.say(http, &s).await;
+                                let _ = channel_id.say(http.as_ref(), &s).await;
                             }
                         }
                     }

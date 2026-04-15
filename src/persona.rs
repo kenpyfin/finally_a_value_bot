@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::db::{call_blocking, ChannelPersonaMode, Database};
+use crate::db::{call_blocking, ChannelPersonaMode, Database, BOT_INSTANCE_WEB};
 use crate::error::FinallyAValueBotError;
 
 /// Leading `[token]` values that are transport/system tags, not persona names.
@@ -25,21 +25,35 @@ pub fn resolve_incoming_run_persona(
     chat_id: i64,
     text: &str,
 ) -> Result<(i64, String), FinallyAValueBotError> {
-    resolve_incoming_run_persona_for_channel(db, chat_id, "telegram", text)
+    resolve_incoming_run_persona_for_channel(
+        db,
+        chat_id,
+        "telegram",
+        crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY,
+        text,
+    )
 }
 
-/// Resolve run persona with optional per-channel policy.
+/// Resolve run persona with optional per-bot-instance policy (Telegram/Discord/WhatsApp).
 ///
-/// Policy key: `(canonical_chat_id, channel_type)`:
+/// Web chat does not use this policy: pass `channel_type == "web"` or `bot_instance_id == 0`
+/// to always use standard `[PersonaName]` resolution (Web UI selects persona separately).
+///
+/// Policy key: `(canonical_chat_id, bot_instance_id)`:
 /// - `all`: use standard `[PersonaName]` token resolution.
 /// - `single`: force the configured `persona_id` and strip only transport tags.
 pub fn resolve_incoming_run_persona_for_channel(
     db: &Database,
     chat_id: i64,
     channel_type: &str,
+    bot_instance_id: i64,
     text: &str,
 ) -> Result<(i64, String), FinallyAValueBotError> {
-    let policy = db.get_channel_persona_policy(chat_id, channel_type)?;
+    if channel_type == "web" || bot_instance_id == BOT_INSTANCE_WEB {
+        return resolve_incoming_run_persona_all_personas(db, chat_id, text);
+    }
+
+    let policy = db.get_channel_persona_policy(chat_id, bot_instance_id)?;
     if let Some(policy) = policy {
         if policy.mode == ChannelPersonaMode::Single {
             let forced = policy
@@ -55,6 +69,14 @@ pub fn resolve_incoming_run_persona_for_channel(
         }
     }
 
+    resolve_incoming_run_persona_all_personas(db, chat_id, text)
+}
+
+fn resolve_incoming_run_persona_all_personas(
+    db: &Database,
+    chat_id: i64,
+    text: &str,
+) -> Result<(i64, String), FinallyAValueBotError> {
     let fallback_pid = db.get_current_persona_id(chat_id)?;
     let trimmed = text.trim_start();
     let Some((token, body)) = parse_leading_token(trimmed) else {

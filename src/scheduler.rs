@@ -406,8 +406,8 @@ async fn run_scheduled_agent_and_finalize(
             );
             let delivery_ok = deliver_to_contact(
                 state.db.clone(),
-                Some(&state.bot),
-                state.discord_http.as_deref(),
+                state.telegram_bots.as_ref(),
+                state.discord_http.as_ref(),
                 &state.config.bot_username,
                 chat_id,
                 persona_id,
@@ -474,8 +474,8 @@ async fn run_scheduled_agent_and_finalize(
             } else {
                 match deliver_to_contact(
                     state.db.clone(),
-                    Some(&state.bot),
-                    state.discord_http.as_deref(),
+                    state.telegram_bots.as_ref(),
+                    state.discord_http.as_ref(),
                     &state.config.bot_username,
                     chat_id,
                     persona_id,
@@ -527,8 +527,8 @@ async fn run_scheduled_agent_and_finalize(
             let err_text = format!("Scheduled task #{} failed: {e}", task_id);
             let delivery_ok = deliver_to_contact(
                 state.db.clone(),
-                Some(&state.bot),
-                state.discord_http.as_deref(),
+                state.telegram_bots.as_ref(),
+                state.discord_http.as_ref(),
                 &state.config.bot_username,
                 chat_id,
                 persona_id,

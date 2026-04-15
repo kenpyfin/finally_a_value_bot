@@ -87,9 +87,25 @@ pub struct ScheduledTask {
     pub created_at: String,
 }
 
+/// External channel identity for delivery and persona policy. `0` = web (no bot token).
+pub const BOT_INSTANCE_WEB: i64 = 0;
+pub const BOT_INSTANCE_TELEGRAM_PRIMARY: i64 = 1;
+pub const BOT_INSTANCE_DISCORD_PRIMARY: i64 = 2;
+pub const BOT_INSTANCE_WHATSAPP_PRIMARY: i64 = 3;
+
+#[derive(Debug, Clone)]
+pub struct ChannelBotInstance {
+    pub id: i64,
+    pub platform: String,
+    pub label: String,
+    pub token: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelBinding {
     pub canonical_chat_id: i64,
+    pub bot_instance_id: i64,
     pub channel_type: String,
     pub channel_handle: String,
 }
@@ -133,7 +149,7 @@ impl TryFrom<&str> for ChannelPersonaMode {
 #[derive(Debug, Clone)]
 pub struct ChannelPersonaPolicy {
     pub canonical_chat_id: i64,
-    pub channel_type: String,
+    pub bot_instance_id: i64,
     pub mode: ChannelPersonaMode,
     pub persona_id: Option<i64>,
     pub updated_at: String,
@@ -477,12 +493,125 @@ impl Database {
         Self::migrate_persona_schema(&conn)?;
         Self::migrate_scheduled_tasks_persona_schema(&conn)?;
         Self::migrate_channel_bindings(&conn)?;
+        Self::migrate_channel_bot_instances_and_policy(&conn)?;
         Self::migrate_fts(&conn)?;
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn column_exists(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut stmt = conn
+            .prepare(&pragma)
+            .map_err(|e| FinallyAValueBotError::ToolExecution(format!("pragma {table}: {e}")))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for r in rows {
+            if r? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn migrate_channel_bot_instances_and_policy(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_bot_instances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                token TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_bot_instances_platform
+                ON channel_bot_instances(platform);",
+        )?;
+
+        let has_bi = Self::column_exists(conn, "channel_bindings", "bot_instance_id")?;
+        if !has_bi {
+            conn.execute_batch(
+                "CREATE TABLE channel_bindings_new (
+                    bot_instance_id INTEGER NOT NULL,
+                    canonical_chat_id INTEGER NOT NULL,
+                    channel_type TEXT NOT NULL,
+                    channel_handle TEXT NOT NULL,
+                    PRIMARY KEY (bot_instance_id, channel_type, channel_handle)
+                );
+                CREATE INDEX IF NOT EXISTS idx_channel_bindings_new_canonical
+                    ON channel_bindings_new(canonical_chat_id);",
+            )?;
+            conn.execute(
+                "INSERT INTO channel_bindings_new (bot_instance_id, canonical_chat_id, channel_type, channel_handle)
+                 SELECT
+                    CASE channel_type
+                        WHEN 'web' THEN 0
+                        WHEN 'telegram' THEN 1
+                        WHEN 'discord' THEN 2
+                        WHEN 'whatsapp' THEN 3
+                        ELSE 1
+                    END,
+                    canonical_chat_id, channel_type, channel_handle
+                 FROM channel_bindings",
+                [],
+            )?;
+            conn.execute_batch(
+                "DROP TABLE channel_bindings;
+                 ALTER TABLE channel_bindings_new RENAME TO channel_bindings;
+                 CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
+                     ON channel_bindings(canonical_chat_id);",
+            )?;
+        }
+
+        let policy_has_bot =
+            Self::column_exists(conn, "channel_persona_policy", "bot_instance_id")?;
+        if !policy_has_bot {
+            let has_channel_type =
+                Self::column_exists(conn, "channel_persona_policy", "channel_type")?;
+            if has_channel_type {
+                conn.execute_batch(
+                    "CREATE TABLE channel_persona_policy_new (
+                        canonical_chat_id INTEGER NOT NULL,
+                        bot_instance_id INTEGER NOT NULL,
+                        mode TEXT NOT NULL DEFAULT 'all',
+                        persona_id INTEGER,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (canonical_chat_id, bot_instance_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_channel_persona_policy_new_chat
+                        ON channel_persona_policy_new(canonical_chat_id);",
+                )?;
+                conn.execute(
+                    "INSERT INTO channel_persona_policy_new (canonical_chat_id, bot_instance_id, mode, persona_id, updated_at)
+                     SELECT canonical_chat_id,
+                        CASE channel_type
+                            WHEN 'telegram' THEN 1
+                            WHEN 'discord' THEN 2
+                            WHEN 'whatsapp' THEN 3
+                            ELSE 0
+                        END,
+                        mode, persona_id, updated_at
+                     FROM channel_persona_policy
+                     WHERE channel_type IN ('telegram', 'discord', 'whatsapp')",
+                    [],
+                )?;
+                conn.execute_batch(
+                    "DROP TABLE channel_persona_policy;
+                     ALTER TABLE channel_persona_policy_new RENAME TO channel_persona_policy;
+                     CREATE INDEX IF NOT EXISTS idx_channel_persona_policy_chat
+                         ON channel_persona_policy(canonical_chat_id);",
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     fn migrate_persona_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
@@ -1075,11 +1204,12 @@ impl Database {
 
     // --- Channel bindings (unified contact) ---
 
-    /// Resolve (channel_type, channel_handle) to canonical_chat_id. If no binding exists, creates one:
+    /// Resolve (`bot_instance_id`, `channel_type`, `channel_handle`) to canonical_chat_id. If no binding exists, creates one:
     /// - telegram/discord: use handle (as i64) as canonical_chat_id, ensure chat exists, insert binding.
     /// - web: use create_with_canonical_id as the new canonical (caller provides e.g. hash-based id), ensure chat exists, insert binding.
     pub fn resolve_canonical_chat_id(
         &self,
+        bot_instance_id: i64,
         channel_type: &str,
         channel_handle: &str,
         create_with_canonical_id: Option<i64>,
@@ -1087,8 +1217,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         if let Some(canonical) = conn
             .query_row(
-                "SELECT canonical_chat_id FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
-                params![channel_type, channel_handle],
+                "SELECT canonical_chat_id FROM channel_bindings WHERE bot_instance_id = ?1 AND channel_type = ?2 AND channel_handle = ?3",
+                params![bot_instance_id, channel_type, channel_handle],
                 |row| row.get::<_, i64>(0),
             )
             .ok()
@@ -1120,37 +1250,39 @@ impl Database {
             params![canonical, channel_type, now],
         )?;
         conn.execute(
-            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
-            params![canonical, channel_type, channel_handle],
+            "INSERT OR REPLACE INTO channel_bindings (bot_instance_id, canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3, ?4)",
+            params![bot_instance_id, canonical, channel_type, channel_handle],
         )?;
         Ok(canonical)
     }
 
-    /// Add a binding from (channel_type, channel_handle) to canonical_chat_id. If that (type, handle) already exists, updates to this contact.
+    /// Add a binding from (`bot_instance_id`, `channel_type`, `channel_handle`) to canonical_chat_id.
     pub fn link_channel(
         &self,
         canonical_chat_id: i64,
+        bot_instance_id: i64,
         channel_type: &str,
         channel_handle: &str,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
-            params![canonical_chat_id, channel_type, channel_handle],
+            "INSERT OR REPLACE INTO channel_bindings (bot_instance_id, canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3, ?4)",
+            params![bot_instance_id, canonical_chat_id, channel_type, channel_handle],
         )?;
         Ok(())
     }
 
-    /// Remove the binding for (channel_type, channel_handle).
+    /// Remove the binding for (`bot_instance_id`, `channel_type`, `channel_handle`).
     pub fn unlink_channel(
         &self,
+        bot_instance_id: i64,
         channel_type: &str,
         channel_handle: &str,
     ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
-            "DELETE FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
-            params![channel_type, channel_handle],
+            "DELETE FROM channel_bindings WHERE bot_instance_id = ?1 AND channel_type = ?2 AND channel_handle = ?3",
+            params![bot_instance_id, channel_type, channel_handle],
         )?;
         Ok(rows > 0)
     }
@@ -1162,16 +1294,112 @@ impl Database {
     ) -> Result<Vec<ChannelBinding>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT canonical_chat_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
+            "SELECT canonical_chat_id, bot_instance_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
         )?;
         let rows = stmt.query_map(params![canonical_chat_id], |row| {
             Ok(ChannelBinding {
                 canonical_chat_id: row.get(0)?,
-                channel_type: row.get(1)?,
-                channel_handle: row.get(2)?,
+                bot_instance_id: row.get(1)?,
+                channel_type: row.get(2)?,
+                channel_handle: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Upsert primary bot rows from `.env` so Telegram/Discord/WhatsApp dispatchers can list tokens.
+    pub fn sync_channel_bot_instances_from_config(
+        &self,
+        config: &crate::config::Config,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        if !config.telegram_bot_token.trim().is_empty() {
+            conn.execute(
+                "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+                 VALUES (1, 'telegram', 'Primary (TELEGRAM_BOT_TOKEN)', ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    platform=excluded.platform,
+                    label=excluded.label,
+                    token=excluded.token,
+                    created_at=excluded.created_at",
+                params![config.telegram_bot_token.trim(), now],
+            )?;
+        }
+        if let Some(ref t) = config.discord_bot_token {
+            if !t.trim().is_empty() {
+                conn.execute(
+                    "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+                     VALUES (2, 'discord', 'Primary (DISCORD_BOT_TOKEN)', ?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET
+                        platform=excluded.platform,
+                        label=excluded.label,
+                        token=excluded.token,
+                        created_at=excluded.created_at",
+                    params![t.trim(), now],
+                )?;
+            }
+        }
+        let wa = config.whatsapp_access_token.as_deref().unwrap_or("").trim();
+        if !wa.is_empty() {
+            conn.execute(
+                "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+                 VALUES (3, 'whatsapp', 'Primary (WHATSAPP_ACCESS_TOKEN)', ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    platform=excluded.platform,
+                    label=excluded.label,
+                    token=excluded.token,
+                    created_at=excluded.created_at",
+                params![wa, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_channel_bot_instances_by_platform(
+        &self,
+        platform: &str,
+    ) -> Result<Vec<ChannelBotInstance>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, platform, label, token, created_at FROM channel_bot_instances
+             WHERE platform = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![platform], |row| {
+            Ok(ChannelBotInstance {
+                id: row.get(0)?,
+                platform: row.get(1)?,
+                label: row.get(2)?,
+                token: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_channel_bot_instance(
+        &self,
+        id: i64,
+    ) -> Result<Option<ChannelBotInstance>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT id, platform, label, token, created_at FROM channel_bot_instances WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(ChannelBotInstance {
+                    id: row.get(0)?,
+                    platform: row.get(1)?,
+                    label: row.get(2)?,
+                    token: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            },
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn list_app_settings(&self) -> Result<Vec<AppSetting>, FinallyAValueBotError> {
@@ -1219,10 +1447,10 @@ impl Database {
     ) -> Result<Vec<ChannelPersonaPolicy>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT canonical_chat_id, channel_type, mode, persona_id, updated_at
+            "SELECT canonical_chat_id, bot_instance_id, mode, persona_id, updated_at
              FROM channel_persona_policy
              WHERE canonical_chat_id = ?1
-             ORDER BY channel_type COLLATE NOCASE ASC",
+             ORDER BY bot_instance_id ASC",
         )?;
         let rows = stmt.query_map(params![canonical_chat_id], |row| {
             let mode_raw: String = row.get(2)?;
@@ -1235,7 +1463,7 @@ impl Database {
             })?;
             Ok(ChannelPersonaPolicy {
                 canonical_chat_id: row.get(0)?,
-                channel_type: row.get(1)?,
+                bot_instance_id: row.get(1)?,
                 mode,
                 persona_id: row.get(3)?,
                 updated_at: row.get(4)?,
@@ -1247,15 +1475,15 @@ impl Database {
     pub fn get_channel_persona_policy(
         &self,
         canonical_chat_id: i64,
-        channel_type: &str,
+        bot_instance_id: i64,
     ) -> Result<Option<ChannelPersonaPolicy>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT canonical_chat_id, channel_type, mode, persona_id, updated_at
+            "SELECT canonical_chat_id, bot_instance_id, mode, persona_id, updated_at
              FROM channel_persona_policy
-             WHERE canonical_chat_id = ?1 AND channel_type = ?2",
+             WHERE canonical_chat_id = ?1 AND bot_instance_id = ?2",
         )?;
-        let row = stmt.query_row(params![canonical_chat_id, channel_type], |row| {
+        let row = stmt.query_row(params![canonical_chat_id, bot_instance_id], |row| {
             let mode_raw: String = row.get(2)?;
             let mode = ChannelPersonaMode::try_from(mode_raw.as_str()).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -1266,7 +1494,7 @@ impl Database {
             })?;
             Ok(ChannelPersonaPolicy {
                 canonical_chat_id: row.get(0)?,
-                channel_type: row.get(1)?,
+                bot_instance_id: row.get(1)?,
                 mode,
                 persona_id: row.get(3)?,
                 updated_at: row.get(4)?,
@@ -1282,14 +1510,14 @@ impl Database {
     pub fn set_channel_persona_policy(
         &self,
         canonical_chat_id: i64,
-        channel_type: &str,
+        bot_instance_id: i64,
         mode: ChannelPersonaMode,
         persona_id: Option<i64>,
     ) -> Result<(), FinallyAValueBotError> {
-        let normalized_channel = channel_type.trim().to_ascii_lowercase();
-        if normalized_channel.is_empty() {
+        if bot_instance_id == BOT_INSTANCE_WEB {
             return Err(FinallyAValueBotError::ToolExecution(
-                "channel_type cannot be empty".to_string(),
+                "Persona scope policy does not apply to web chat; the Web UI selects persona."
+                    .into(),
             ));
         }
         if mode == ChannelPersonaMode::Single {
@@ -1312,11 +1540,11 @@ impl Database {
             None
         };
         conn.execute(
-            "INSERT INTO channel_persona_policy (canonical_chat_id, channel_type, mode, persona_id, updated_at)
+            "INSERT INTO channel_persona_policy (canonical_chat_id, bot_instance_id, mode, persona_id, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(canonical_chat_id, channel_type)
+             ON CONFLICT(canonical_chat_id, bot_instance_id)
              DO UPDATE SET mode=excluded.mode, persona_id=excluded.persona_id, updated_at=excluded.updated_at",
-            params![canonical_chat_id, normalized_channel, mode.as_str(), pid, now],
+            params![canonical_chat_id, bot_instance_id, mode.as_str(), pid, now],
         )?;
         Ok(())
     }
@@ -1324,12 +1552,12 @@ impl Database {
     pub fn clear_channel_persona_policy(
         &self,
         canonical_chat_id: i64,
-        channel_type: &str,
+        bot_instance_id: i64,
     ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
-            "DELETE FROM channel_persona_policy WHERE canonical_chat_id = ?1 AND channel_type = ?2",
-            params![canonical_chat_id, channel_type.trim().to_ascii_lowercase()],
+            "DELETE FROM channel_persona_policy WHERE canonical_chat_id = ?1 AND bot_instance_id = ?2",
+            params![canonical_chat_id, bot_instance_id],
         )?;
         Ok(rows > 0)
     }

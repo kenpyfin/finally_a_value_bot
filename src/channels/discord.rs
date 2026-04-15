@@ -20,6 +20,7 @@ use crate::telegram::{
 
 struct Handler {
     app_state: Arc<AppState>,
+    discord_bot_instance_id: i64,
 }
 
 #[async_trait]
@@ -134,13 +135,14 @@ impl EventHandler for Handler {
         // Resolve to unified contact (canonical_chat_id).
         // When UNIVERSAL_CHAT_ID is configured, bind this Discord handle to that canonical contact.
         let universal_chat_id = self.app_state.config.universal_chat_id;
+        let inst_id = self.discord_bot_instance_id;
         let canonical_chat_id = match call_blocking(self.app_state.db.clone(), move |db| {
             if let Some(cid) = universal_chat_id {
                 db.upsert_chat(cid, None, "discord")?;
-                db.link_channel(cid, "discord", &channel_handle)?;
+                db.link_channel(cid, inst_id, "discord", &channel_handle)?;
                 Ok(cid)
             } else {
-                db.resolve_canonical_chat_id("discord", &channel_handle, None)
+                db.resolve_canonical_chat_id(inst_id, "discord", &channel_handle, None)
             }
         })
         .await
@@ -264,11 +266,13 @@ impl EventHandler for Handler {
 
         // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
         let text_for_resolve = text.clone();
+        let inst_id = self.discord_bot_instance_id;
         let (persona_id, text) = match call_blocking(self.app_state.db.clone(), move |db| {
             crate::persona::resolve_incoming_run_persona_for_channel(
                 &db,
                 canonical_chat_id,
                 "discord",
+                inst_id,
                 &text_for_resolve,
             )
         })
@@ -379,8 +383,8 @@ impl EventHandler for Handler {
                         if !response.is_empty() {
                             if let Err(e) = crate::channel::deliver_to_contact(
                                 app_state.db.clone(),
-                                Some(&app_state.bot),
-                                app_state.discord_http.as_deref(),
+                                app_state.telegram_bots.as_ref(),
+                                app_state.discord_http.as_ref(),
                                 &app_state.config.bot_username,
                                 canonical_chat_id,
                                 persona_id,
@@ -460,13 +464,20 @@ async fn send_discord_response_to_http(
     }
 }
 
-/// Start the Discord bot. Called from run_bot() if discord_bot_token is configured.
-pub async fn start_discord_bot(app_state: Arc<AppState>, token: &str) {
+/// Start one Discord bot instance. `discord_bot_instance_id` matches `channel_bot_instances.id`.
+pub async fn start_discord_bot(
+    app_state: Arc<AppState>,
+    token: &str,
+    discord_bot_instance_id: i64,
+) {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let handler = Handler { app_state };
+    let handler = Handler {
+        app_state,
+        discord_bot_instance_id,
+    };
 
     let mut client = match Client::builder(token, intents).event_handler(handler).await {
         Ok(c) => c,

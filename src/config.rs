@@ -185,6 +185,30 @@ fn is_local_web_host(host: &str) -> bool {
     h == "127.0.0.1" || h == "localhost" || h == "::1"
 }
 
+/// Keys that configure LLM providers, models, and related limits. These must come from repo-root
+/// `.env` / process environment only — not from `app_settings` (Web UI persistence).
+pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
+    let u = key.trim().to_ascii_uppercase();
+    if u.starts_with("LLM_") {
+        return true;
+    }
+    matches!(
+        u.as_str(),
+        "OPENAI_API_KEY"
+            | "MAX_TOKENS"
+            | "MAX_TOOL_ITERATIONS"
+            | "MAX_HISTORY_MESSAGES"
+            | "MAX_DOCUMENT_SIZE_MB"
+            | "ORCHESTRATOR_MODEL"
+            | "ORCHESTRATOR_ENABLED"
+            | "TOOL_SKILL_AGENT_MODEL"
+            | "TOOL_SKILL_AGENT_ENABLED"
+            | "POST_TOOL_EVALUATOR_MODEL"
+            | "POST_TOOL_EVALUATOR_ENABLED"
+            | "SHOW_THINKING"
+    )
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SocialPlatformConfig {
     pub client_id: Option<String>,

@@ -182,7 +182,12 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 let chat_id = match call_blocking(state.app_state.db.clone(), move |db| {
                     if let Some(cid) = universal_chat_id {
                         db.upsert_chat(cid, None, "whatsapp")?;
-                        db.link_channel(cid, "whatsapp", &wa_handle)?;
+                        db.link_channel(
+                            cid,
+                            crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
+                            "whatsapp",
+                            &wa_handle,
+                        )?;
                         Ok(cid)
                     } else {
                         Ok(parsed_phone_chat_id)
@@ -458,6 +463,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             &db,
                             chat_id,
                             "whatsapp",
+                            crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
                             &text_for_resolve,
                         )
                     },
