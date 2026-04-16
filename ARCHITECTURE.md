@@ -61,6 +61,10 @@ The main chat agent is the single orchestrator: it decides when to reply directl
      - `tool_use` → for each `ResponseContentBlock::ToolUse`, call `tools.execute_with_auth(name, input, tool_auth)`, append `ContentBlock::ToolResult` to messages, continue loop.
 4. **Timeouts**: LLM round 180s, tool execution 120s.
 
+### Learned workflows (SQLite)
+
+After the base system prompt is built (principles, memory, skills catalog, etc.), the shared agent path may append a **Learned Workflow Hint** when a `workflows` row matches the chat and normalized user intent with sufficient confidence. This stores **tool-name order** learned from past runs; it is not a separate planner and does not replace skills. See [`docs/workflow.md`](docs/workflow.md).
+
 ### Stop Reason
 
 `stop_reason` is **not** sent to the LLM; it is a **response field** from the provider indicating why the model stopped. The code normalizes provider-specific values to:

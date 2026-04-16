@@ -2,6 +2,8 @@
 
 Tracking runtime improvements for project continuity, workflow reuse, and reliability.
 
+**Learned workflows (intent → tool-sequence hints, confidence, learning):** see [`docs/workflow.md`](workflow.md). (This doc’s “workflow” means that feature, not GitHub Actions.)
+
 ## Completed
 
 - Added global `projects`, `project_artifacts`, and `project_runs` persistence in `src/db.rs`.
@@ -17,7 +19,7 @@ Tracking runtime improvements for project continuity, workflow reuse, and reliab
 ## In Progress
 
 - Better project matching heuristics (current strategy uses lightweight title/type inference from latest user request).
-- Workflow replay strictness enforcement (currently captured in config and prompt hints; deterministic replay policies can be tightened).
+- Workflow replay strictness enforcement (currently captured in config and prompt hints; deterministic replay policies can be tightened). `WORKFLOW_REPLAY_STRICTNESS` and `WORKFLOW_MIN_SUCCESS_REPETITIONS` are not fully enforced in code yet (see [`docs/workflow.md`](workflow.md)).
 
 ## Deferred
 

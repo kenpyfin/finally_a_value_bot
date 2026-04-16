@@ -7,7 +7,7 @@ alwaysApply: true
 
 Before implementing, refactoring, or fixing code, review project documentation and conventions from:
 
-- `docs/` folder
+- `docs/` folder (including `docs/workflow.md` for SQLite-backed **learned workflows** — not `.github/workflows/`)
 - `DEVELOP.md`
 - `TEST.md`
 

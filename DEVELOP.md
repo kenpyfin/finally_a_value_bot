@@ -71,6 +71,13 @@ src/
 
 ## Architecture overview
 
+### Related documentation
+
+| Topic | Doc |
+| --- | --- |
+| Learned workflows (SQLite hints, post-run learning, confidence) | [`docs/workflow.md`](docs/workflow.md) |
+| Runtime parity / deferred agent-runtime items | [`docs/runtime-gap-analysis.md`](docs/runtime-gap-analysis.md) |
+
 ### Data flow
 
 ```

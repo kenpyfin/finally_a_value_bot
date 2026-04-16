@@ -18,12 +18,26 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-16 — Web restart: gateway service instead of env hook
+
+- **Area:** web API / gateway / web UI
+- **Summary:** `POST /api/restart` now schedules a restart of the user-level gateway installed via `finally_a_value_bot gateway install` (Linux: `systemctl --user restart finally_a_value_bot-gateway.service`; macOS: `launchctl kickstart -k` on the launchd label), after a short delay so the HTTP response can flush. Removed `FINALLY_A_VALUE_BOT_RESTART_COMMAND` / `restart_hook_configured`. Settings shows **Restart gateway** only; 400 if the unit/plist is missing.
+- **Rationale:** Operators should not configure a separate supervisor command; restart should match the documented gateway install path.
+- **Key files / symbols:** `src/gateway.rs` (`user_gateway_service_installed`, `schedule_user_gateway_restart`, `restart_user_gateway_now`); `src/web.rs` (`api_restart_post`, `installation_status` JSON); `web/src/main.tsx`, `web/src/types.ts` (`InstallationStatus`).
+
+### 2026-04-15 — Documentation: learned workflows
+
+- **Area:** docs / Cursor rules
+- **Summary:** Added canonical [`docs/workflow.md`](workflow.md) (storage, intent signatures, selection threshold, confidence smoothing, learning vs execution log, config, interactions with scheduler/skills, fresh install). Linked from [`docs/runtime-gap-analysis.md`](runtime-gap-analysis.md), [`DEVELOP.md`](../DEVELOP.md), [`docs/architecture_review.md`](architecture_review.md), and [`.cursor/rules/development-doc-references.mdc`](../.cursor/rules/development-doc-references.mdc). Added optional [`.cursor/rules/learned-workflows.mdc`](../.cursor/rules/learned-workflows.mdc) for agent/DB workflow changes.
+- **Rationale:** Operators and agents needed a single place describing auto-learned workflows distinct from GitHub Actions and from skills; reduces confusion about confidence, `workflow_min_success_repetitions`, and prompt vs post-run learning.
+- **Key files / symbols:** `docs/workflow.md`; `learned-workflows.mdc` → `docs/workflow.md`.
+
 ### 2026-04-14 — Runtime DB merge removed, restart hook, bot instances in Settings
 
 - **Area:** config / web API / web UI / docs
 - **Summary:** Startup no longer merges `app_settings` into env; `GET /api/settings` reports `runtime_env_merge_from_app_settings: false`, `requires_restart_for_env_changes`, and `restart_hook_configured`; `PATCH /api/settings` returns 501. Added `FINALLY_A_VALUE_BOT_RESTART_COMMAND` + `POST /api/restart` (501 with copy-paste examples when unset; 202 when hook runs). Exposed authenticated CRUD for `channel_bot_instances` (`GET/POST /api/channel_bot_instances`, `PATCH/DELETE /api/channel_bot_instances/:id`, tokens redacted on GET). Web Settings: legacy `app_settings` read-only section, **Restart** button, **Bot integrations** list/add/delete (non–env-primary rows). `DEVELOP.md` config line no longer claims DB runtime overrides.
 - **Rationale:** Align runtime config with `.env`-only mental model; give operators a safe optional one-click restart; manage extra Telegram/Discord bot rows without SQL.
-- **Key files / symbols:** `src/main.rs` (no `apply_runtime_settings_from_db`); `src/web.rs` (`api_settings_get`/`patch`, `restart_hook_command`, `api_restart`, `api_channel_bot_instances_*`); `src/db.rs` (`list_all_channel_bot_instances`, `create_channel_bot_instance`, `update_channel_bot_instance`, `delete_channel_bot_instance`); `web/src/main.tsx`, `web/src/types.ts` (`InstallationStatus`, `BotInstanceRow`), `web/src/vite-env.d.ts`; `ARCHITECTURE.md` §8; `DEVELOP.md` (project structure blurb).
+- **Key files / symbols:** `src/main.rs` (no `apply_runtime_settings_from_db`); `src/web.rs` (`api_settings_get`/`patch`, `restart_hook_command`, `api_restart`, `api_channel_bot_instances_`*); `src/db.rs` (`list_all_channel_bot_instances`, `create_channel_bot_instance`, `update_channel_bot_instance`, `delete_channel_bot_instance`); `web/src/main.tsx`, `web/src/types.ts` (`InstallationStatus`, `BotInstanceRow`), `web/src/vite-env.d.ts`; `ARCHITECTURE.md` §8; `DEVELOP.md` (project structure blurb).
 - **Follow-ups:** Multi-contact web sessions and optional behavior when `UNIVERSAL_CHAT_ID` is unset (see `ARCHITECTURE.md` “Universal chat id”); optional UI for `PATCH` bot instance label/token.
 
 ### 2026-04-14 — LLM env-only, per-bot-instance persona policy, multi Telegram/Discord dispatch
@@ -31,7 +45,7 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Area:** config / DB / channels / web UI
 - **Summary:** LLM-related keys are no longer loaded from `app_settings` at startup or accepted via `PATCH /api/settings` (use repo-root `.env`). Channel bindings and persona scope policy are keyed by `bot_instance_id` (`channel_bot_instances` table, seeded from env for primary Telegram/Discord/WhatsApp). Multiple Telegram dispatchers and Discord clients run when multiple rows exist. Web chat is excluded from external “single vs all persona” policy; `/api/contacts/bindings` omits web rows for persona controls.
 - **Rationale:** Operators asked for LLM config strictly in `.env`, independent web persona selection, and separate all/single-persona policy per external bot instance.
-- **Key files / symbols:** `src/config.rs` (`is_llm_related_runtime_setting_key`), `src/main.rs` (`apply_runtime_settings_from_db`, `sync_channel_bot_instances_from_config`), `src/db.rs` (`channel_bot_instances`, `BOT_INSTANCE_*`, migrations, `sync_channel_bot_instances_from_config`, binding/policy APIs), `src/persona.rs` (`resolve_incoming_run_persona_for_channel` skips policy for web / `bot_instance_id == 0`), `src/channel.rs` (`deliver_to_contact` uses per-instance `Bot` / `Http` maps), `src/channels/telegram.rs` (`AppState.telegram_bots`, dispatcher `deps` include `telegram_bot_instance_id`), `src/channels/discord.rs` (`Handler.discord_bot_instance_id`, `start_discord_bot(..., id)`), `src/web.rs` (settings GET filter, PATCH reject LLM; persona API uses `bot_instance_id`), `web/src/main.tsx` (Settings copy; persona policy by `bot_instance_id`).
+- **Key files / symbols:** `src/config.rs` (`is_llm_related_runtime_setting_key`), `src/main.rs` (`apply_runtime_settings_from_db`, `sync_channel_bot_instances_from_config`), `src/db.rs` (`channel_bot_instances`, `BOT_INSTANCE_`*, migrations, `sync_channel_bot_instances_from_config`, binding/policy APIs), `src/persona.rs` (`resolve_incoming_run_persona_for_channel` skips policy for web / `bot_instance_id == 0`), `src/channel.rs` (`deliver_to_contact` uses per-instance `Bot` / `Http` maps), `src/channels/telegram.rs` (`AppState.telegram_bots`, dispatcher `deps` include `telegram_bot_instance_id`), `src/channels/discord.rs` (`Handler.discord_bot_instance_id`, `start_discord_bot(..., id)`), `src/web.rs` (settings GET filter, PATCH reject LLM; persona API uses `bot_instance_id`), `web/src/main.tsx` (Settings copy; persona policy by `bot_instance_id`).
 
 ### 2026-04-14 — Web-first settings/onboarding + channel persona mode
 
@@ -44,14 +58,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 ### 2026-04-14 — Cursor rule: prevent behavior-test drift in Rust changes
 
 - **Area:** repo policy / CI / tests
-- **Summary:** Extended [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) with a new behavior-test drift section: when tool contracts change, tests must update in the same change (notably `ToolAuthContext`-dependent attachment tests and parser boundary assertions for URL extraction).
+- **Summary:** Extended `[.cursor/rules/rustfmt-ci.mdc](.cursor/rules/rustfmt-ci.mdc)` with a new behavior-test drift section: when tool contracts change, tests must update in the same change (notably `ToolAuthContext`-dependent attachment tests and parser boundary assertions for URL extraction).
 - **Rationale:** Recent failures came from stale test assumptions after contract updates (`caller_channel` auth requirement and markdown URL token boundaries), not compiler/lint issues.
 - **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc` (`Preventing behavior-test drift`); references `__finally_a_value_bot_auth`, `ToolAuthContext`, URL parser boundary assertions.
 
 ### 2026-04-14 — Cursor rule: require clippy preflight for Rust CI
 
 - **Area:** repo policy / CI / linting
-- **Summary:** Updated [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) to require both `cargo fmt --all --check` and `cargo clippy -- -D warnings` before Rust work is considered complete, and added guidance to fix `clippy::type_complexity` with `type` aliases instead of suppressing lints.
+- **Summary:** Updated `[.cursor/rules/rustfmt-ci.mdc](.cursor/rules/rustfmt-ci.mdc)` to require both `cargo fmt --all --check` and `cargo clippy -- -D warnings` before Rust work is considered complete, and added guidance to fix `clippy::type_complexity` with `type` aliases instead of suppressing lints.
 - **Rationale:** A recent CI failure (`-D warnings`) from a complex Rust type made it clear formatting-only guidance was insufficient; explicit clippy preflight prevents repeat regressions.
 - **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc` (`cargo clippy -- -D warnings`, `type_complexity` prevention section).
 
@@ -66,7 +80,7 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 ### 2026-04-14 — Cursor rules: rustfmt CI + cross-platform tests
 
 - **Area:** repo policy / CI / tests
-- **Summary:** Added [`.cursor/rules/rustfmt-ci.mdc`](.cursor/rules/rustfmt-ci.mdc) to enforce `cargo fmt --all` and `cargo fmt --all --check` before completion, and [`.cursor/rules/cross-platform-tests.mdc`](.cursor/rules/cross-platform-tests.mdc) to require OS-agnostic path assertions plus shell-aware test commands (PowerShell vs `/bin/sh`) with Windows path normalization guidance.
+- **Summary:** Added `[.cursor/rules/rustfmt-ci.mdc](.cursor/rules/rustfmt-ci.mdc)` to enforce `cargo fmt --all` and `cargo fmt --all --check` before completion, and `[.cursor/rules/cross-platform-tests.mdc](.cursor/rules/cross-platform-tests.mdc)` to require OS-agnostic path assertions plus shell-aware test commands (PowerShell vs `/bin/sh`) with Windows path normalization guidance.
 - **Rationale:** Recent CI failures repeated around Windows path separators, PowerShell output differences, and rustfmt drift; explicit always-apply rules reduce regressions and rework.
 - **Key files / symbols:** `.cursor/rules/rustfmt-ci.mdc`, `.cursor/rules/cross-platform-tests.mdc`; guidance references `Path::ends_with`, `PathBuf::from`, and Windows `\\?\` prefix handling.
 
@@ -87,14 +101,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 ### 2026-04-13 — CI: fix Clippy + tests after Config API drift
 
 - **Area:** infra / config / tests
-- **Summary:** Aligned `test_config` and test-only `Config` literals with the current [`Config`](src/config.rs) struct (removed obsolete `max_session_messages` / `compact_keep_recent` / delegate fields). Exposed `pub fn test_config()` at the `config` module root under `cfg(test)` for unit tests; integration tests use YAML-based minimal config. Updated `history_to_claude_messages` unit tests for the `keep_trailing_assistant` parameter. Resolved Clippy 1.94 (`is_some_and` / `is_none_or`, `cursor_agent` init, `channel` test module placement, `[lints.clippy]` allows for noisy lints, `DummyTool` dead_code).
+- **Summary:** Aligned `test_config` and test-only `Config` literals with the current `[Config](src/config.rs)` struct (removed obsolete `max_session_messages` / `compact_keep_recent` / delegate fields). Exposed `pub fn test_config()` at the `config` module root under `cfg(test)` for unit tests; integration tests use YAML-based minimal config. Updated `history_to_claude_messages` unit tests for the `keep_trailing_assistant` parameter. Resolved Clippy 1.94 (`is_some_and` / `is_none_or`, `cursor_agent` init, `channel` test module placement, `[lints.clippy]` allows for noisy lints, `DummyTool` dead_code).
 - **Rationale:** `cargo clippy -- -D warnings` on CI was failing on private `config::tests`, stale struct fields, and new Clippy suggestions.
 - **Key files / symbols:** `src/config.rs` — `test_config`; `src/channels/telegram.rs`; `src/llm.rs` / `src/web.rs` tests use `crate::config::test_config()`; `tests/config_validation.rs`; `Cargo.toml` `[lints.clippy]`; `src/channel.rs` — `mod tests` at EOF; `src/tools/cursor_agent.rs`.
 
 ### 2026-04-13 — GitHub Actions: action bumps, Dependabot, CI polish
 
 - **Area:** infra / CI
-- **Summary:** Pinned first-party actions to current majors (`actions/checkout@v6`, `actions/setup-node@v6`, `actions/upload-artifact@v6`, `actions/download-artifact@v6`) in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/release-assets.yml`](.github/workflows/release-assets.yml). Added [`.github/dependabot.yml`](.github/dependabot.yml) (weekly) for `github-actions`, `cargo`, and `npm` under `web/`. CI now uses `concurrency` (cancel in-progress on same ref), `workflow_dispatch`, and passes `web/dist` from the web job to the release build job via artifacts so `npm ci` + web build run once per run.
+- **Summary:** Pinned first-party actions to current majors (`actions/checkout@v6`, `actions/setup-node@v6`, `actions/upload-artifact@v6`, `actions/download-artifact@v6`) in `[.github/workflows/ci.yml](.github/workflows/ci.yml)` and `[.github/workflows/release-assets.yml](.github/workflows/release-assets.yml)`. Added `[.github/dependabot.yml](.github/dependabot.yml)` (weekly) for `github-actions`, `cargo`, and `npm` under `web/`. CI now uses `concurrency` (cancel in-progress on same ref), `workflow_dispatch`, and passes `web/dist` from the web job to the release build job via artifacts so `npm ci` + web build run once per run.
 - **Rationale:** Stay on supported action runtimes; reduce duplicate web builds; automated dependency PRs for workflows and lockfiles.
 - **Key files / symbols:** `.github/workflows/ci.yml` — `web-dist` artifact; `.github/workflows/release-assets.yml`; `.github/dependabot.yml`.
 
@@ -134,10 +148,11 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Rationale:** Users can address a non-active persona per message while keeping UI “active” unchanged; agentic tool calls must stay on the run’s persona.
 - **Key files / symbols:** `persona::resolve_incoming_run_persona`; `tools::default_persona_id_for_chat`; `send_message` / `export_chat`; `channels/telegram.rs`, `discord.rs`, `whatsapp.rs` ingress.
 - **Follow-ups:** Optional same prefix convention on web; optional DRY with `schedule_task` persona resolution.
+
 ### 2026-04-09 — README, install scripts, `.env.example`, Docker doc posture
 
 - **Area:** docs / onboarding / config
-- **Summary:** Rebuilt [.env.example](.env.example) from `Config::load_from_env` (sections for channels, LLM, web, scheduler, agent stack, runtime/workflow, cursor-agent, browser, safety, optional vault/social/git); removed obsolete `DELEGATE_*`; vault block commented so a copy does not enable vault by default. Refreshed [README.md](README.md) for native install, `config` / `setup`, `doctor`, minimum Telegram-or-Discord + LLM rules, web URL, vault pointer; Docker no longer recommended (legacy pointer to [DOCKER.md](DOCKER.md)). [install.sh](install.sh) / [install.ps1](install.ps1) next steps now emphasize `config`/`setup`. [DOCKER.md](DOCKER.md) opens with a non-recommended banner and clarifies host-prepared `.env`. Fixed misleading `setup` success message in [src/main.rs](src/main.rs) (saves `.env`, not YAML).
+- **Summary:** Rebuilt [.env.example](.env.example) from `Config::load_from_env` (sections for channels, LLM, web, scheduler, agent stack, runtime/workflow, cursor-agent, browser, safety, optional vault/social/git); removed obsolete `DELEGATE`_*; vault block commented so a copy does not enable vault by default. Refreshed [README.md](README.md) for native install, `config` / `setup`, `doctor`, minimum Telegram-or-Discord + LLM rules, web URL, vault pointer; Docker no longer recommended (legacy pointer to [DOCKER.md](DOCKER.md)). [install.sh](install.sh) / [install.ps1](install.ps1) next steps now emphasize `config`/`setup`. [DOCKER.md](DOCKER.md) opens with a non-recommended banner and clarifies host-prepared `.env`. Fixed misleading `setup` success message in [src/main.rs](src/main.rs) (saves `.env`, not YAML).
 - **Rationale:** Onboarding docs and the example env had drifted from the actual config surface and implied Docker as a first-class path; operators need one accurate reference aligned with `src/config.rs`.
 - **Key files / symbols:** `.env.example`; `README.md`; `install.sh`, `install.ps1`; `DOCKER.md`; `main.rs` — `Some("setup")` branch `println!`.
 

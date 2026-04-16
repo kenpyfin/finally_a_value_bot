@@ -2862,7 +2862,6 @@ async fn api_settings_get(
             "web_enabled": cfg.web_enabled,
             "requires_restart_for_env_changes": true,
             "runtime_env_merge_from_app_settings": false,
-            "restart_hook_configured": restart_hook_command().is_some(),
         }
     })))
 }
@@ -2879,65 +2878,39 @@ async fn api_settings_patch(
     ))
 }
 
-fn restart_hook_command() -> Option<String> {
-    std::env::var("FINALLY_A_VALUE_BOT_RESTART_COMMAND")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-/// Spawn the configured restart hook (e.g. `systemctl restart finally-a-value-bot`). Never runs arbitrary client input.
+/// Restarts the user-level gateway service installed via `finally_a_value_bot gateway install` (systemd user unit or launchd).
 async fn api_restart_post(
     headers: HeaderMap,
     State(state): State<WebState>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let Some(cmd) = restart_hook_command() else {
-        return Ok((
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        return Err((
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "ok": false,
-                "configured": false,
-                "message": "Set FINALLY_A_VALUE_BOT_RESTART_COMMAND in the process environment to a fixed supervisor command (e.g. systemctl restart my-bot).",
-                "examples": {
-                    "systemd": "systemctl restart finally-a-value-bot",
-                    "docker_compose": "docker compose restart bot"
-                }
-            })),
+            "Gateway restart is only supported on Linux and macOS.".to_string(),
         ));
-    };
-
-    let cmd_trim = cmd.trim().to_string();
-    tokio::spawn(async move {
-        #[cfg(windows)]
-        let result = tokio::process::Command::new("cmd.exe")
-            .args(["/C", &cmd_trim])
-            .output()
-            .await;
-        #[cfg(not(windows))]
-        let result = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&cmd_trim)
-            .output()
-            .await;
-        match result {
-            Ok(out) => {
-                info!(
-                    target: "web",
-                    status = ?out.status,
-                    "FINALLY_A_VALUE_BOT_RESTART_COMMAND finished"
-                );
-            }
-            Err(e) => error!(target: "web", error = %e, "restart hook spawn failed"),
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if !crate::gateway::user_gateway_service_installed() {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "message": "Gateway service is not installed for this user. Run: finally_a_value_bot gateway install"
+                })),
+            ));
         }
-    });
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "ok": true,
-            "message": "Restart hook started. The process may exit shortly if the hook stops this service."
-        })),
-    ))
+        crate::gateway::schedule_user_gateway_restart();
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "ok": true,
+                "message": "Gateway restart scheduled. The page may disconnect briefly."
+            })),
+        ))
+    }
 }
 
 fn json_channel_bot_instance_redacted(inst: &ChannelBotInstance) -> serde_json::Value {

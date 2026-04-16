@@ -1,0 +1,16 @@
+---
+description: Learned workflows (SQLite hints + post-run learning) — read before changing agent/DB workflow behavior
+alwaysApply: false
+---
+
+# Learned workflows
+
+**Canonical doc:** [`docs/workflow.md`](docs/workflow.md)
+
+Before changing workflow **selection**, **learning**, **confidence**, or the **`workflows` / `workflow_executions`** schema:
+
+- Read [`docs/workflow.md`](docs/workflow.md) for storage layout, intent signatures, the **0.7 / 0.3** confidence update, **0.6** selection threshold, and the distinction between `workflows.confidence` and `workflow_executions.score`.
+- Keep behavior-test and integration expectations aligned if lookup thresholds, `normalize_intent_signature`, or learning gates change.
+- `workflow_min_success_repetitions` in config is **not** currently wired to SQL; do not assume it affects promotion without implementing that path.
+
+Do not confuse this with **GitHub Actions** under `.github/workflows/`.

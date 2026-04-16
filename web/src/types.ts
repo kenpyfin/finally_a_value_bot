@@ -43,7 +43,6 @@ export type InstallationStatus = {
   requires_restart_to_apply_runtime_settings?: boolean
   requires_restart_for_env_changes?: boolean
   runtime_env_merge_from_app_settings?: boolean
-  restart_hook_configured?: boolean
 }
 
 /** Redacted row from `GET /api/channel_bot_instances`. */

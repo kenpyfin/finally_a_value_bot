@@ -73,6 +73,58 @@ run: finally_a_value_bot gateway uninstall && finally_a_value_bot gateway instal
     );
 }
 
+/// Returns true when the user-level gateway unit/plist from `gateway install` is present.
+pub fn user_gateway_service_installed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_unit_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac_plist_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restart_user_gateway_now() -> Result<()> {
+    let output = run_command("systemctl", &["--user", "restart", LINUX_SERVICE_NAME])?;
+    ensure_success(
+        output,
+        "systemctl",
+        &["--user", "restart", LINUX_SERVICE_NAME],
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn restart_user_gateway_now() -> Result<()> {
+    let target = mac_target_label()?;
+    let output = run_command("launchctl", &["kickstart", "-k", &target])?;
+    ensure_success(
+        output,
+        "launchctl",
+        &["kickstart", "-k", &target],
+    )
+}
+
+/// Restart after a short delay so an in-process HTTP response can flush before the gateway exits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn schedule_user_gateway_restart() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(300));
+        if let Err(e) = restart_user_gateway_now() {
+            eprintln!("finally_a_value_bot: gateway restart failed: {e}");
+        }
+    });
+}
+
 fn install() -> Result<()> {
     let ctx = build_context()?;
     if cfg!(target_os = "macos") {

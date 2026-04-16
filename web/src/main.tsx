@@ -1749,17 +1749,13 @@ function App() {
                               ? 'yes'
                               : 'no'}
                           </Text>
-                          <Text size="1" color="gray">
-                            One-click restart: {installationStatus.restart_hook_configured ? 'configured' : 'not set'}{' '}
-                            (<code className="text-xs">FINALLY_A_VALUE_BOT_RESTART_COMMAND</code>)
-                          </Text>
                           <Button
                             size="1"
                             variant="solid"
                             disabled={restartBusy}
                             onClick={() => void requestRestart()}
                           >
-                            {restartBusy ? 'Restarting…' : 'Restart'}
+                            {restartBusy ? 'Restarting…' : 'Restart gateway'}
                           </Button>
                         </Flex>
                       ) : null}
