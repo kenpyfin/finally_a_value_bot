@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { createRoot } from 'react-dom/client'
 import type { ChatModelAdapter, ChatModelRunOptions, ChatModelRunResult, ThreadMessageLike } from '@assistant-ui/react'
@@ -452,6 +452,16 @@ function App() {
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState<boolean>(readDesktopSidebarOpen)
+  const isMdUp = useSyncExternalStore(
+    (onStoreChange) => {
+      if (typeof window === 'undefined') return () => {}
+      const mq = window.matchMedia('(min-width: 768px)')
+      mq.addEventListener('change', onStoreChange)
+      return () => mq.removeEventListener('change', onStoreChange)
+    },
+    () => (typeof window === 'undefined' ? false : window.matchMedia('(min-width: 768px)').matches),
+    () => false,
+  )
   const [desktopSidebarWidth, setDesktopSidebarWidth] = useState<number>(readDesktopSidebarWidth)
   const [desktopSidebarResizing, setDesktopSidebarResizing] = useState(false)
   const [onboardingDismissed, setOnboardingDismissed] = useState(() => {
@@ -462,6 +472,10 @@ function App() {
       return false
     }
   })
+  useEffect(() => {
+    if (isMdUp) setMobileNavOpen(false)
+  }, [isMdUp])
+
   useEffect(() => {
     saveDesktopSidebarOpen(desktopSidebarOpen)
   }, [desktopSidebarOpen])
@@ -1479,15 +1493,30 @@ function App() {
                     size="3"
                     variant="soft"
                     color="gray"
-                    className="!hidden shrink-0 md:!inline-flex"
+                    className="shrink-0 !inline-flex"
                     type="button"
-                    aria-expanded={desktopSidebarOpen}
-                    aria-label={desktopSidebarOpen ? 'Hide personas sidebar' : 'Show personas sidebar'}
-                    title={desktopSidebarOpen ? 'Hide personas' : 'Show personas'}
-                    onClick={() => setDesktopSidebarOpen((v) => !v)}
+                    aria-expanded={isMdUp ? desktopSidebarOpen : mobileNavOpen}
+                    aria-label={
+                      isMdUp
+                        ? desktopSidebarOpen
+                          ? 'Hide personas sidebar'
+                          : 'Show personas sidebar'
+                        : mobileNavOpen
+                          ? 'Personas menu open'
+                          : 'Open personas and sessions'
+                    }
+                    title={isMdUp ? (desktopSidebarOpen ? 'Hide personas' : 'Show personas') : 'Personas & sessions'}
+                    onClick={() => {
+                      if (isMdUp) {
+                        setMobileNavOpen(false)
+                        setDesktopSidebarOpen((v) => !v)
+                      } else {
+                        setMobileNavOpen(true)
+                      }
+                    }}
                   >
                     <span aria-hidden className="text-base leading-none">
-                      {desktopSidebarOpen ? '⟨' : '⟩'}
+                      {isMdUp && desktopSidebarOpen ? '⟨' : '⟩'}
                     </span>
                   </IconButton>
                   <Heading size="6" className="min-w-0 flex-1 truncate max-md:[font-size:1.125rem]">
