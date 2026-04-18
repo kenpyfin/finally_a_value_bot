@@ -14,6 +14,8 @@ type SessionSidebarProps = {
   onPersonaSelect: (personaName: string) => void
   onCreatePersona: () => void
   onDeletePersona: (personaId: number) => void
+  /** Called after choosing a persona (e.g. close mobile drawer). */
+  onCloseRequest?: () => void
 }
 
 export function SessionSidebar({
@@ -28,6 +30,7 @@ export function SessionSidebar({
   onPersonaSelect,
   onCreatePersona,
   onDeletePersona,
+  onCloseRequest,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
@@ -61,16 +64,12 @@ export function SessionSidebar({
       style={isDark ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-sidebar)' } : undefined}
     >
       <Flex justify="between" align="center" className="mb-4">
-        <div className="flex items-center gap-2">
-          <img
-            src="/icon.png"
-            alt="FinallyAValueBot"
-            className="h-7 w-7 rounded-md border border-black/10 object-cover"
-            loading="eager"
-            decoding="async"
-          />
-          <Text size="5" weight="bold">
+        <div className="min-w-0">
+          <Text size="5" weight="bold" className="tracking-tight">
             FinallyAValueBot
+          </Text>
+          <Text size="1" color="gray" className="mt-0.5 block">
+            Personas & sessions
           </Text>
         </div>
         <div className="relative flex items-center gap-2">
@@ -194,7 +193,10 @@ export function SessionSidebar({
                   <button
                     type="button"
                     className="min-w-0 flex-1 text-left text-sm font-medium"
-                    onClick={() => onPersonaSelect(p.name)}
+                    onClick={() => {
+                      onPersonaSelect(p.name)
+                      onCloseRequest?.()
+                    }}
                   >
                     <span className="inline-flex items-center gap-2">
                       <span className="truncate">{p.name}</span>
@@ -228,16 +230,6 @@ export function SessionSidebar({
             )}
           </div>
         </ScrollArea>
-      </div>
-
-      <div className={isDark ? 'mt-4 rounded-lg border border-[color:var(--mc-border-soft)] p-3' : 'mt-4 rounded-lg border border-slate-200 p-3'}>
-        <Text size="2" weight="bold" className="mb-2 block">Human–AI relationship</Text>
-        <img
-          src="/human-ai-relationship.png"
-          alt="Human and AI collaboration"
-          className="w-full rounded-md border border-black/10 object-contain"
-          loading="lazy"
-        />
       </div>
 
       <div className={isDark ? 'mt-4 border-t border-[color:var(--mc-border-soft)] pt-3' : 'mt-4 border-t border-slate-200 pt-3'}>

@@ -86,3 +86,35 @@ export type ArtifactItem = {
   url: string
   preview_url: string
 }
+
+/** Message row from `GET /api/history`. */
+export type BackendMessage = {
+  id?: string
+  sender_name?: string
+  content?: string
+  is_from_bot?: boolean
+  timestamp?: string
+}
+
+export type QueueItem = {
+  run_id: string
+  persona_id: number
+  persona_name: string
+  source: string
+  label: string
+  state: string
+  project_id?: number | null
+  workflow_id?: number | null
+  position: number
+}
+
+export type QueueLane = {
+  chat_id: number
+  pending: number
+  active_for_ms: number
+  oldest_wait_ms: number
+  last_error?: string | null
+  project_id?: number | null
+  workflow_id?: number | null
+  items?: QueueItem[]
+}

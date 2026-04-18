@@ -18,6 +18,41 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-16 — API: `requires_restart_for_env_changes` no longer always true
+
+- **Area:** web API / web UI cockpit
+- **Summary:** `GET /api/settings` embedded `installation_status.requires_restart_for_env_changes: true` unconditionally, so the cockpit (and Settings overview) always showed **Restart needed**. It is now **`false`**: generic settings PATCH is disabled and runtime env is not merged from `app_settings`, so there is no server-derived “pending restart” signal until we implement a real one.
+- **Key files / symbols:** `src/web.rs` (`api_settings_get` JSON).
+
+### 2026-04-16 — Web: retractable desktop persona sidebar
+
+- **Area:** web UI
+- **Summary:** `desktopSidebarOpen` persisted in `localStorage` (`finally-a-value-bot_desktop_sidebar_open`, default open). `md+` grid shows the `SessionSidebar` column only when open; collapsed layout is single-column full-width chat. Header **⟨** / **⟩** `IconButton` toggles visibility; sidebar header gets optional **⟨** “Hide sidebar” when `onRequestCollapse` is passed (desktop column only, not the mobile slide-over).
+- **Key files / symbols:** `web/src/main.tsx` (`readDesktopSidebarOpen` / `saveDesktopSidebarOpen`, grid conditional); `web/src/components/session-sidebar.tsx` (`onRequestCollapse`).
+
+### 2026-04-16 — Web: cockpit status strip (queue, background, setup)
+
+- **Area:** web UI
+- **Summary:** Added `web/src/components/cockpit-bar.tsx`: a full-width strip under the main header toolbar showing **session status text**, **queue** (click opens run-queue dialog; no duplicate toolbar button), **background job count**, and compact **LLM / Channels / restart** readiness from `installationStatus`. Desktop toolbar and mobile title row no longer repeat queue/background/status; mobile **More** moved beside the session title. Header split into padded toolbar `div` + cockpit (operational state separate from Settings / Schedules / etc.).
+- **Rationale:** Matches “cockpit vs tooling” — operators see live ops state at a glance without crowding action buttons.
+- **Key files / symbols:** `web/src/main.tsx` (`<CockpitBar />`, `setQueueDialogOpen`); `web/src/components/cockpit-bar.tsx`.
+
+### 2026-04-16 — Web polish: TanStack Query ops poll, schedules filter, Vitest, visual refresh
+
+- **Area:** web UI
+- **Summary:** Replaced manual `setInterval` ops polling with `@tanstack/react-query` (`useOpsPoll`, `invalidateOps`) and shared fetch helpers under `web/src/api/ops-fetch.ts`. Schedules dialog: **Show completed / cancelled** switch, `schedulesFiltered` list, dashed empty state when the filter hides everything. Added Vitest (`vitest.config.ts`, `npm run test`) and `web/src/lib/history-sync.test.ts` for `mapBackendHistory` / `historiesEqual`. Visual refresh: Instrument Sans + JetBrains Mono (Google Fonts), radial page backgrounds tied to `--mc-accent`, dark-mode scrollbar tint, translucent Radix panels (`Theme` `radius="large"` `panelBackground="translucent"`), sidebar brand block + subtitle. Removed unused `QueueLane` import from `main.tsx`.
+- **Rationale:** Centralized polling improves backoff alignment with `useDocumentVisible`; tests lock history-sync behavior; typography and surfaces reduce the flat single-color shell feel without rewriting Radix layouts.
+- **Key files / symbols:** `web/src/query-client.ts`, `web/src/hooks/use-ops-poll.ts`, `web/src/api/ops-fetch.ts`, `web/src/main.tsx` (`QueryClientProvider`, schedules UI), `web/src/styles.css`, `web/index.html`, `web/src/components/session-sidebar.tsx`, `web/vitest.config.ts`.
+- **Follow-ups:** Optional split of `main.tsx` into `app-shell` + dialog modules; expand Vitest beyond `history-sync`.
+
+### 2026-04-16 — Web UI overhaul: responsive shell, settings tabs, modular front-end
+
+- **Area:** web UI
+- **Summary:** Responsive layout: `md+` keeps the persona sidebar; narrow viewports use a hamburger that opens a slide-over with the same `SessionSidebar`. Header uses a **More** dropdown on small screens; Queue stays one tap away. Settings dialog split into **Overview / Integrations / Channels / Legacy** tabs; queue runs show as cards on small screens; artifacts list stacks above preview on mobile. Extracted `web/src/api/client.ts`, `web/src/components/thread-pane.tsx`, `web/src/lib/history-sync.ts`, `web/src/hooks/use-document-visible.ts`; shared `BackendMessage` / queue types in `web/src/types.ts`. Onboarding callout when LLM or channels are not ready; `loadSettings()` on boot for `installation_status`; polling uses a 60s interval when the document tab is hidden.
+- **Rationale:** The UI was desktop-fixed (`grid-cols-[320px_…]`) and operationally dense in the header; modular pieces reduce risk around `ThreadPane` `React.memo` and future changes.
+- **Key files / symbols:** `web/src/main.tsx` (shell, `DropdownMenu`, `Tabs`, onboarding); `web/src/components/session-sidebar.tsx` (`onCloseRequest`); `web/dist/*` (rebuilt bundle).
+- **Follow-ups:** Further split `main.tsx` into dialog components; optional TanStack Query for polls.
+
 ### 2026-04-16 — Web restart: gateway service instead of env hook
 
 - **Area:** web API / gateway / web UI

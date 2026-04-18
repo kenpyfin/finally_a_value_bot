@@ -1,38 +1,18 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { QueryClientProvider } from '@tanstack/react-query'
 import { createRoot } from 'react-dom/client'
-import {
-  AssistantRuntimeProvider,
-  CompositeAttachmentAdapter,
-  MessagePrimitive,
-  SimpleImageAttachmentAdapter,
-  SimpleTextAttachmentAdapter,
-  useMessage,
-  useLocalRuntime,
-  type AttachmentAdapter,
-  type ChatModelAdapter,
-  type ChatModelRunOptions,
-  type ChatModelRunResult,
-  type CompleteAttachment,
-  type PendingAttachment,
-  type ThreadMessageLike,
-  type ToolCallMessagePartProps,
-} from '@assistant-ui/react'
-import {
-  AssistantActionBar,
-  AssistantMessage,
-  BranchPicker,
-  Thread,
-  UserActionBar,
-  UserMessage,
-  makeMarkdownText,
-} from '@assistant-ui/react-ui'
+import type { ChatModelAdapter, ChatModelRunOptions, ChatModelRunResult, ThreadMessageLike } from '@assistant-ui/react'
 import {
   Button,
   Callout,
   Dialog,
+  DropdownMenu,
   Flex,
   Heading,
+  IconButton,
   Select,
+  Switch,
+  Tabs,
   Text,
   TextField,
   Theme,
@@ -42,48 +22,25 @@ import ReactMarkdown from 'react-markdown'
 import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
+import { api, AUTH_REQUIRED_EVENT, makeHeaders, sanitizeHttpHeaderValue, WEB_AUTH_STORAGE_KEY } from './api/client'
+import { CockpitBar } from './components/cockpit-bar'
 import { SessionSidebar } from './components/session-sidebar'
+import { ThreadPane } from './components/thread-pane'
+import { useDocumentVisible } from './hooks/use-document-visible'
+import { useOpsPoll } from './hooks/use-ops-poll'
+import { queryClient } from './query-client'
+import { historiesEqual, mapBackendHistory, shouldDeferHistoryRemount } from './lib/history-sync'
 import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
 import type {
-  Persona,
-  ScheduleTask,
-  ChannelBinding,
   ArtifactItem,
-  RuntimeSettingItem,
-  InstallationStatus,
+  BackendMessage,
   BotInstanceRow,
+  ChannelBinding,
+  InstallationStatus,
+  Persona,
+  RuntimeSettingItem,
+  ScheduleTask,
 } from './types'
-
-type BackendMessage = {
-  id?: string
-  sender_name?: string
-  content?: string
-  is_from_bot?: boolean
-  timestamp?: string
-}
-
-type QueueItem = {
-  run_id: string
-  persona_id: number
-  persona_name: string
-  source: string
-  label: string
-  state: string
-  project_id?: number | null
-  workflow_id?: number | null
-  position: number
-}
-
-type QueueLane = {
-  chat_id: number
-  pending: number
-  active_for_ms: number
-  oldest_wait_ms: number
-  last_error?: string | null
-  project_id?: number | null
-  workflow_id?: number | null
-  items?: QueueItem[]
-}
 
 type Appearance = 'dark' | 'light'
 type UiTheme =
@@ -141,6 +98,68 @@ function readUiTheme(): UiTheme {
 
 function saveUiTheme(value: UiTheme): void {
   localStorage.setItem('finally-a-value-bot_ui_theme', value)
+}
+
+const DESKTOP_SIDEBAR_OPEN_KEY = 'finally-a-value-bot_desktop_sidebar_open'
+const DESKTOP_SIDEBAR_WIDTH_KEY = 'finally-a-value-bot_desktop_sidebar_width'
+const DESKTOP_SIDEBAR_DEFAULT_WIDTH = 320
+const DESKTOP_SIDEBAR_MIN_WIDTH = 260
+const DESKTOP_SIDEBAR_MAX_WIDTH = 520
+const DESKTOP_MAIN_PANEL_MIN_WIDTH = 480
+
+function readDesktopSidebarOpen(): boolean {
+  if (typeof window === 'undefined') return true
+  try {
+    return localStorage.getItem(DESKTOP_SIDEBAR_OPEN_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+
+function saveDesktopSidebarOpen(open: boolean): void {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(DESKTOP_SIDEBAR_OPEN_KEY, open ? '1' : '0')
+  } catch {
+    /* ignore */
+  }
+}
+
+function desktopSidebarViewportMax(viewportWidth: number): number {
+  return Math.min(
+    DESKTOP_SIDEBAR_MAX_WIDTH,
+    Math.max(DESKTOP_SIDEBAR_MIN_WIDTH, Math.round(viewportWidth - DESKTOP_MAIN_PANEL_MIN_WIDTH)),
+  )
+}
+
+function clampDesktopSidebarWidth(value: number, viewportWidth?: number): number {
+  const fallback = Number.isFinite(value) ? value : DESKTOP_SIDEBAR_DEFAULT_WIDTH
+  const hardClamped = Math.min(
+    DESKTOP_SIDEBAR_MAX_WIDTH,
+    Math.max(DESKTOP_SIDEBAR_MIN_WIDTH, Math.round(fallback)),
+  )
+  if (typeof viewportWidth !== 'number') return hardClamped
+  return Math.min(hardClamped, desktopSidebarViewportMax(viewportWidth))
+}
+
+function readDesktopSidebarWidth(): number {
+  if (typeof window === 'undefined') return DESKTOP_SIDEBAR_DEFAULT_WIDTH
+  try {
+    const raw = localStorage.getItem(DESKTOP_SIDEBAR_WIDTH_KEY)
+    const parsed = raw == null ? DESKTOP_SIDEBAR_DEFAULT_WIDTH : Number(raw)
+    return clampDesktopSidebarWidth(parsed, window.innerWidth)
+  } catch {
+    return DESKTOP_SIDEBAR_DEFAULT_WIDTH
+  }
+}
+
+function saveDesktopSidebarWidth(width: number): void {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(DESKTOP_SIDEBAR_WIDTH_KEY, String(clampDesktopSidebarWidth(width)))
+  } catch {
+    /* ignore */
+  }
 }
 
 const PERSONA_STORAGE_KEY = 'finally-a-value-bot_selected_persona_id'
@@ -202,99 +221,6 @@ function toMs(iso: string | null | undefined): number | null {
 if (typeof document !== 'undefined') {
   document.documentElement.classList.toggle('dark', readAppearance() === 'dark')
   document.documentElement.setAttribute('data-ui-theme', readUiTheme())
-}
-
-const WEB_AUTH_STORAGE_KEY = 'web_auth_token'
-
-function sanitizeHttpHeaderValue(value: string): string | null {
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  if (trimmed.includes('\r') || trimmed.includes('\n')) return null
-  for (let i = 0; i < trimmed.length; i += 1) {
-    const code = trimmed.charCodeAt(i)
-    // Browser header values must be ISO-8859-1 representable.
-    if (code > 0xff) return null
-  }
-  return trimmed
-}
-
-function getStoredAuthToken(): string | null {
-  if (typeof sessionStorage === 'undefined') return null
-  try {
-    const t = sessionStorage.getItem(WEB_AUTH_STORAGE_KEY)
-    if (!t) return null
-    const sanitized = sanitizeHttpHeaderValue(t)
-    if (!sanitized) {
-      sessionStorage.removeItem(WEB_AUTH_STORAGE_KEY)
-      return null
-    }
-    return sanitized
-  } catch {
-    return null
-  }
-}
-
-function makeHeaders(options: RequestInit = {}): HeadersInit {
-  const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string> | undefined),
-  }
-  for (const [key, value] of Object.entries(headers)) {
-    if (typeof value !== 'string') {
-      delete headers[key]
-      continue
-    }
-    const sanitized = sanitizeHttpHeaderValue(value)
-    if (!sanitized) {
-      delete headers[key]
-      continue
-    }
-    headers[key] = sanitized
-  }
-  const token = getStoredAuthToken()
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`
-  }
-  if (options.body && !headers['Content-Type']) {
-    headers['Content-Type'] = 'application/json'
-  }
-  return headers
-}
-
-export const AUTH_REQUIRED_EVENT = 'web-auth-required'
-
-function messageForFailedResponse(status: number, data: Record<string, unknown>, bodyText?: string): string {
-  if (status === 401) {
-    return 'Unauthorized. Enter the API token (WEB_AUTH_TOKEN from .env).'
-  }
-  if (status === 429) {
-    const serverMsg = String(data.error || data.message || bodyText || '').trim()
-    return serverMsg
-      ? `Too many requests: ${serverMsg} Please wait a moment before sending again.`
-      : 'Too many requests. Please wait a moment before sending again.'
-  }
-  return String(data.error || data.message || bodyText || `HTTP ${status}`)
-}
-
-async function api<T>(
-  path: string,
-  options: RequestInit = {},
-): Promise<T> {
-  const res = await fetch(path, { ...options, headers: makeHeaders(options) })
-  const bodyText = await res.text()
-  let data: Record<string, unknown> = {}
-  try {
-    data = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {}
-  } catch {
-    data = { message: bodyText || undefined }
-  }
-  if (res.status === 401) {
-    window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
-    throw new Error(messageForFailedResponse(401, data, bodyText))
-  }
-  if (!res.ok) {
-    throw new Error(messageForFailedResponse(res.status, data, bodyText))
-  }
-  return data as T
 }
 
 type SendAttachmentPayload = {
@@ -422,89 +348,6 @@ async function extractLatestUserInput(
   return { text: '', attachments: [] }
 }
 
-/** Catch-all for PDFs, archives, and other types not covered by image/text adapters. Keeps `file` on the attachment for upload extraction. */
-class WebWildcardAttachmentAdapter implements AttachmentAdapter {
-  readonly accept = '*'
-
-  async add(state: { file: File }): Promise<PendingAttachment> {
-    return {
-      id: `${state.file.name}-${state.file.size}-${state.file.lastModified}`,
-      type: 'document',
-      name: state.file.name,
-      contentType: state.file.type,
-      file: state.file,
-      status: { type: 'requires-action', reason: 'composer-send' },
-    }
-  }
-
-  async send(attachment: PendingAttachment): Promise<CompleteAttachment> {
-    return {
-      ...attachment,
-      status: { type: 'complete' },
-      content: [{ type: 'text', text: '' }],
-    }
-  }
-
-  async remove(): Promise<void> {
-    // noop
-  }
-}
-
-const webAttachmentAdapter = new CompositeAttachmentAdapter([
-  new SimpleImageAttachmentAdapter(),
-  new SimpleTextAttachmentAdapter(),
-  new WebWildcardAttachmentAdapter(),
-])
-
-function mapBackendHistory(messages: BackendMessage[]): ThreadMessageLike[] {
-  return messages.map((item, index) => ({
-    id: item.id || `history-${index}`,
-    role: item.is_from_bot ? 'assistant' : 'user',
-    content: item.content || '',
-    createdAt: item.timestamp ? new Date(item.timestamp) : new Date(),
-  }))
-}
-
-/** Compare history for sync/remount decisions: id, role, content only — ignore `createdAt` (server timestamps can jitter between polls). */
-function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): boolean {
-  if (a.length !== b.length) return false
-  for (let i = 0; i < a.length; i += 1) {
-    const x = a[i]
-    const y = b[i]
-    if (x.id !== y.id) return false
-    if (x.role !== y.role) return false
-    if (x.content !== y.content) return false
-  }
-  return true
-}
-
-function shouldDeferHistoryRemount(): boolean {
-  if (typeof document === 'undefined') return false
-  const inComposer = Boolean(document.activeElement?.closest?.('.aui-composer-root'))
-  const vp = document.querySelector('.aui-thread-viewport')
-  if (!vp) return inComposer
-  const el = vp as HTMLElement
-  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
-  const scrolledAwayFromBottom = gap > 100
-  return inComposer || scrolledAwayFromBottom
-}
-
-function asObject(value: unknown): Record<string, unknown> {
-  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-    return value as Record<string, unknown>
-  }
-  return {}
-}
-
-function formatUnknown(value: unknown): string {
-  if (typeof value === 'string') return value
-  try {
-    return JSON.stringify(value, null, 2)
-  } catch {
-    return String(value)
-  }
-}
-
 function formatBytes(value: number | null | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return 'unknown size'
   if (value < 1024) return `${value} B`
@@ -516,154 +359,6 @@ function artifactPreviewUrl(item: ArtifactItem): string {
   if (item.kind === 'html') return item.preview_url || `${item.url}?preview=1`
   return item.url
 }
-
-function ToolCallCard(props: ToolCallMessagePartProps) {
-  const result = asObject(props.result)
-  const hasResult = Object.keys(result).length > 0
-  const output = result.output
-  const duration = result.duration_ms
-  const bytes = result.bytes
-  const statusCode = result.status_code
-  const errorType = result.error_type
-
-  return (
-    <div className="tool-card">
-      <div className="tool-card-head">
-        <span className="tool-card-name">{props.toolName}</span>
-        <span className={`tool-card-state ${hasResult ? (props.isError ? 'error' : 'ok') : 'running'}`}>
-          {hasResult ? (props.isError ? 'error' : 'done') : 'running'}
-        </span>
-      </div>
-      {Object.keys(props.args || {}).length > 0 ? (
-        <pre className="tool-card-pre">{JSON.stringify(props.args, null, 2)}</pre>
-      ) : null}
-      {hasResult ? (
-        <div className="tool-card-meta">
-          {typeof duration === 'number' ? <span>{duration}ms</span> : null}
-          {typeof bytes === 'number' ? <span>{bytes}b</span> : null}
-          {typeof statusCode === 'number' ? <span>HTTP {statusCode}</span> : null}
-          {typeof errorType === 'string' && errorType ? <span>{errorType}</span> : null}
-        </div>
-      ) : null}
-      {output !== undefined ? <pre className="tool-card-pre">{formatUnknown(output)}</pre> : null}
-    </div>
-  )
-}
-
-function MessageTimestamp({ align }: { align: 'left' | 'right' }) {
-  const createdAt = useMessage((m) => m.createdAt)
-  const formatted = createdAt ? createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
-  return (
-    <div className={align === 'right' ? 'mc-msg-time mc-msg-time-right' : 'mc-msg-time'}>
-      {formatted}
-    </div>
-  )
-}
-
-function CustomAssistantMessage() {
-  const hasRenderableContent = useMessage((m) =>
-    Array.isArray(m.content)
-      ? m.content.some((part) => {
-        if (part.type === 'text') return Boolean(part.text?.trim())
-        return part.type === 'tool-call'
-      })
-      : false,
-  )
-
-  return (
-    <AssistantMessage.Root>
-      <AssistantMessage.Avatar />
-      {hasRenderableContent ? (
-        <AssistantMessage.Content />
-      ) : (
-        <div className="mc-assistant-placeholder" aria-live="polite">
-          <span className="mc-assistant-placeholder-dot" />
-          <span className="mc-assistant-placeholder-dot" />
-          <span className="mc-assistant-placeholder-dot" />
-          <span className="mc-assistant-placeholder-text">Thinking</span>
-        </div>
-      )}
-      <BranchPicker />
-      <AssistantActionBar />
-      <MessageTimestamp align="left" />
-    </AssistantMessage.Root>
-  )
-}
-
-function CustomUserMessage() {
-  return (
-    <UserMessage.Root>
-      <UserMessage.Attachments />
-      <MessagePrimitive.If hasContent>
-        <UserActionBar />
-        <div className="mc-user-content-wrap">
-          <UserMessage.Content />
-          <MessageTimestamp align="right" />
-        </div>
-      </MessagePrimitive.If>
-      <BranchPicker />
-    </UserMessage.Root>
-  )
-}
-
-type ThreadPaneProps = {
-  adapter: ChatModelAdapter
-  initialMessages: ThreadMessageLike[]
-  runtimeKey: string
-}
-
-/** Isolated from App re-renders (persona poll, queue lane, schedules, etc.). `useLocalRuntime` runs an effect after every render that touches options/load; re-rendering on unrelated parent state was resetting the composer and scroll. */
-const ThreadPane = React.memo(function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
-  const MarkdownText = makeMarkdownText({
-    remarkPlugins: [remarkGfm],
-    components: {
-      table: ({ className, ...props }) => (
-        <div className="mc-md-table-scroll">
-          <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
-        </div>
-      ),
-    },
-  })
-  const runtime = useLocalRuntime(adapter, {
-    initialMessages,
-    maxSteps: 100,
-    adapters: {
-      attachments: webAttachmentAdapter,
-    },
-  })
-
-  return (
-    <AssistantRuntimeProvider key={runtimeKey} runtime={runtime}>
-      <div className="aui-root h-full min-h-0">
-        <Thread
-          assistantMessage={{
-            allowCopy: true,
-            allowReload: false,
-            allowSpeak: false,
-            allowFeedbackNegative: false,
-            allowFeedbackPositive: false,
-            components: {
-              Text: MarkdownText,
-              ToolFallback: ToolCallCard,
-            },
-          }}
-          userMessage={{ allowEdit: false }}
-          composer={{ allowAttachments: true }}
-          components={{
-            AssistantMessage: CustomAssistantMessage,
-            UserMessage: CustomUserMessage,
-          }}
-          strings={{
-            composer: {
-              input: { placeholder: 'Message FinallyAValueBot...' },
-            },
-          }}
-          assistantAvatar={{ fallback: 'M' }}
-        />
-      </div>
-    </AssistantRuntimeProvider>
-  )
-})
 
 function AgentHistoryMarkdownBody({ markdown }: { markdown: string }) {
   return (
@@ -690,7 +385,6 @@ function App() {
   const [chatId, setChatId] = useState<number | null>(null)
   const [historySeed, setHistorySeed] = useState<ThreadMessageLike[]>([])
   const [historyByDay, setHistoryByDay] = useState<Record<string, ThreadMessageLike[]>>({})
-  const [loadingOlder, setLoadingOlder] = useState(false)
   const [runtimeNonce, setRuntimeNonce] = useState<number>(0)
   const [error, setError] = useState<string>('')
   const [statusText, setStatusText] = useState<string>('Idle')
@@ -701,6 +395,7 @@ function App() {
   const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
   const [schedulesDialogOpen, setSchedulesDialogOpen] = useState<boolean>(false)
+  const [schedulesShowArchived, setSchedulesShowArchived] = useState(false)
   const [memoryDialogOpen, setMemoryDialogOpen] = useState<boolean>(false)
   const [artifactsDialogOpen, setArtifactsDialogOpen] = useState<boolean>(false)
   const [artifacts, setArtifacts] = useState<ArtifactItem[]>([])
@@ -731,8 +426,6 @@ function App() {
   const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
   const [pendingRunIds, setPendingRunIds] = useState<string[]>([])
-  const [backgroundActiveCount, setBackgroundActiveCount] = useState(0)
-  const [queueLane, setQueueLane] = useState<QueueLane | null>(null)
   const [queueDialogOpen, setQueueDialogOpen] = useState(false)
   const [scheduleDetailTask, setScheduleDetailTask] = useState<ScheduleTask | null>(null)
   const [scheduleDetailPrompt, setScheduleDetailPrompt] = useState('')
@@ -757,6 +450,70 @@ function App() {
   const [newBotLabel, setNewBotLabel] = useState('')
   const [newBotToken, setNewBotToken] = useState('')
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState<boolean>(readDesktopSidebarOpen)
+  const [desktopSidebarWidth, setDesktopSidebarWidth] = useState<number>(readDesktopSidebarWidth)
+  const [desktopSidebarResizing, setDesktopSidebarResizing] = useState(false)
+  const [onboardingDismissed, setOnboardingDismissed] = useState(() => {
+    if (typeof sessionStorage === 'undefined') return false
+    try {
+      return sessionStorage.getItem('finally-a-value-bot_onboarding_banner_dismissed') === '1'
+    } catch {
+      return false
+    }
+  })
+  useEffect(() => {
+    saveDesktopSidebarOpen(desktopSidebarOpen)
+  }, [desktopSidebarOpen])
+  useEffect(() => {
+    saveDesktopSidebarWidth(desktopSidebarWidth)
+  }, [desktopSidebarWidth])
+  useEffect(() => {
+    const onResize = () => {
+      setDesktopSidebarWidth((current) => clampDesktopSidebarWidth(current, window.innerWidth))
+    }
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.removeEventListener('resize', onResize)
+    }
+  }, [])
+
+  const beginDesktopSidebarResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = desktopSidebarWidth
+    setDesktopSidebarResizing(true)
+    const previousCursor = document.body.style.cursor
+    const previousUserSelect = document.body.style.userSelect
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const deltaX = moveEvent.clientX - startX
+      setDesktopSidebarWidth(clampDesktopSidebarWidth(startWidth + deltaX, window.innerWidth))
+    }
+    const stopResizing = () => {
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', stopResizing)
+      window.removeEventListener('pointercancel', stopResizing)
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousUserSelect
+      setDesktopSidebarResizing(false)
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', stopResizing)
+    window.addEventListener('pointercancel', stopResizing)
+  }, [desktopSidebarWidth])
+
+  const docVisible = useDocumentVisible()
+  const { queueLane, backgroundActiveCount, invalidateOps } = useOpsPoll({
+    chatId,
+    docVisible,
+    pendingRunIdsLength: pendingRunIds.length,
+    setPersonas,
+  })
 
   const historySeedRef = useRef<ThreadMessageLike[]>([])
   const deferredHistoryRef = useRef<ThreadMessageLike[] | null>(null)
@@ -773,6 +530,11 @@ function App() {
     setHistorySeed(pending)
     setRuntimeNonce((x) => x + 1)
   }, [])
+
+  const schedulesFiltered = useMemo(() => {
+    if (schedulesShowArchived) return schedules
+    return schedules.filter((t) => t.status !== 'completed' && t.status !== 'cancelled')
+  }, [schedules, schedulesShowArchived])
 
   const personaHasNew = useMemo<Record<number, boolean>>(() => {
     if (chatId == null) return {}
@@ -844,18 +606,6 @@ function App() {
       setPersonas([])
       setActivePersonaId(null)
       return null
-    }
-  }
-
-  async function refreshPersonas(cid: number | null = chatId): Promise<void> {
-    if (cid == null) return
-    try {
-      const query = new URLSearchParams({ chat_id: String(cid) })
-      const data = await api<{ personas?: { id: number; name: string; is_active: boolean; last_bot_message_at?: string | null }[] }>(`/api/personas?${query.toString()}`)
-      const list = Array.isArray(data.personas) ? data.personas : []
-      setPersonas(list.map((p) => ({ id: p.id, name: p.name, is_active: p.is_active, last_bot_message_at: p.last_bot_message_at ?? null })))
-    } catch {
-      // ignore refresh errors
     }
   }
 
@@ -1010,31 +760,6 @@ function App() {
     }
   }
 
-  async function loadOlderDay(): Promise<void> {
-    if (chatId == null || loadingOlder) return
-    setLoadingOlder(true)
-    try {
-      const daysRes = await api<{ days?: string[] }>(`/api/history/days?chat_id=${chatId}${activePersonaId ? `&persona_id=${activePersonaId}` : ''}`)
-      const allDays = Array.isArray(daysRes.days) ? daysRes.days : []
-      if (allDays.length === 0) return
-      const loadedDays = Object.keys(historyByDay).sort()
-      const oldestLoaded = loadedDays.length > 0
-        ? loadedDays[0]
-        : (() => {
-          const first = historySeed[0] as { createdAt?: Date } | undefined
-          if (first?.createdAt) {
-            return new Date(first.createdAt).toISOString().slice(0, 10)
-          }
-          return allDays[0]
-        })()
-      const idx = allDays.indexOf(oldestLoaded)
-      const nextOlder = idx >= 0 && idx < allDays.length - 1 ? allDays[idx + 1] : null
-      if (nextOlder) await loadHistory(chatId, activePersonaId ?? undefined, nextOlder, { force: true })
-    } finally {
-      setLoadingOlder(false)
-    }
-  }
-
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
       run: async function* (options): AsyncGenerator<ChatModelRunResult, void> {
@@ -1144,6 +869,7 @@ function App() {
     ; (async () => {
       try {
         setError('')
+        void loadSettings()
         const data = await api<{ chat_id?: number; persona_id?: number }>('/api/chat')
         const cid = typeof data.chat_id === 'number' ? data.chat_id : null
         const pid = typeof data.persona_id === 'number' ? data.persona_id : null
@@ -1153,8 +879,7 @@ function App() {
           const chosen = await loadPersonas(cid)
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
-          loadQueueDiagnostics(cid).catch(() => { })
-          loadBackgroundVisibility(cid).catch(() => { })
+          void invalidateOps(cid)
           await loadHistory(cid, chosen?.id ?? pid, null, { force: true })
           const readId = chosen?.id ?? pid ?? null
           if (readId != null) markPersonaRead(readId)
@@ -1221,13 +946,12 @@ function App() {
 
   useEffect(() => {
     if (!queueDialogOpen || chatId == null) return
-    void loadQueueDiagnostics(chatId)
+    void invalidateOps(chatId)
     const id = setInterval(() => {
-      void loadQueueDiagnostics(chatId)
+      void invalidateOps(chatId)
     }, 2500)
     return () => clearInterval(id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queueDialogOpen, chatId])
+  }, [queueDialogOpen, chatId, invalidateOps])
 
   useEffect(() => {
     if (!agentHistoryDialogOpen) return
@@ -1262,24 +986,6 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [agentHistoryDialogOpen, agentHistoryParsed?.iterations.length])
-
-  useEffect(() => {
-    if (chatId == null) return
-    let cancelled = false
-    const activePending = (queueLane?.pending ?? 0) > 0 || pendingRunIds.length > 0 || backgroundActiveCount > 0
-    const intervalMs = activePending ? 2500 : 10000
-    const interval = setInterval(() => {
-      if (cancelled) return
-      loadQueueDiagnostics(chatId).catch(() => { })
-      loadBackgroundVisibility(chatId).catch(() => { })
-      refreshPersonas(chatId).catch(() => { })
-    }, intervalMs)
-    return () => {
-      cancelled = true
-      clearInterval(interval)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatId, pendingRunIds.length, queueLane?.pending, backgroundActiveCount])
 
   async function loadBindings(cid: number | null = chatId): Promise<void> {
     if (cid == null) return
@@ -1404,27 +1110,11 @@ function App() {
   }
 
   async function loadQueueDiagnostics(cid: number | null = chatId): Promise<void> {
-    if (cid == null) return
-    try {
-      const data = await api<{ lanes?: QueueLane[] }>('/api/queue_diagnostics')
-      const lanes = Array.isArray(data.lanes) ? data.lanes : []
-      const lane = lanes.find((l) => l.chat_id === cid) ?? null
-      setQueueLane(lane)
-    } catch {
-      setQueueLane(null)
-    }
+    await invalidateOps(cid)
   }
 
   async function loadBackgroundVisibility(cid: number | null = chatId): Promise<void> {
-    if (cid == null) return
-    try {
-      const q = new URLSearchParams({ chat_id: String(cid) })
-      const data = await api<{ active_heartbeats?: unknown[] }>(`/api/background_jobs?${q.toString()}`)
-      const arr = Array.isArray(data.active_heartbeats) ? data.active_heartbeats : []
-      setBackgroundActiveCount(arr.length)
-    } catch {
-      setBackgroundActiveCount(0)
-    }
+    await invalidateOps(cid)
   }
 
   async function bindToContact(contactChatId: number): Promise<void> {
@@ -1532,7 +1222,7 @@ function App() {
       if (cancelled) return
       loadBindings(chatId).catch(() => { })
       loadSchedules(chatId).catch(() => { })
-      loadBackgroundVisibility(chatId).catch(() => { })
+      void invalidateOps(chatId)
       if (chosen) {
         try {
           await api('/api/personas/switch', {
@@ -1549,8 +1239,7 @@ function App() {
     }
     init()
     return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatId])
+  }, [chatId, invalidateOps])
 
   useEffect(() => {
     if (activePersonaId != null && activePersonaId > 0) {
@@ -1651,7 +1340,14 @@ function App() {
   }
 
   return (
-    <Theme appearance={appearance} accentColor={radixAccent as never} grayColor="slate" radius="medium" scaling="100%">
+    <Theme
+      appearance={appearance}
+      accentColor={radixAccent as never}
+      grayColor="slate"
+      radius="large"
+      panelBackground="translucent"
+      scaling="100%"
+    >
       <Dialog.Root open={authRequired} onOpenChange={(open) => !open && setAuthRequired(false)}>
         <Dialog.Content>
           <Dialog.Title>API token required</Dialog.Title>
@@ -1674,24 +1370,87 @@ function App() {
       <div
         className={
           appearance === 'dark'
-            ? 'h-screen w-screen bg-[var(--mc-bg-main)]'
-            : 'h-screen w-screen bg-[radial-gradient(1200px_560px_at_-8%_-10%,#d1fae5_0%,transparent_58%),radial-gradient(1200px_560px_at_108%_-12%,#e0f2fe_0%,transparent_58%),#f8fafc]'
+            ? 'h-[100dvh] w-screen bg-[var(--mc-bg-main)] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
+            : 'h-[100dvh] w-screen bg-[radial-gradient(1200px_560px_at_-8%_-10%,#d1fae5_0%,transparent_58%),radial-gradient(1200px_560px_at_108%_-12%,#e0f2fe_0%,transparent_58%),#f8fafc] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
         }
       >
-        <div className="grid h-full min-h-0 grid-cols-[320px_minmax(0,1fr)]">
-          <SessionSidebar
-            appearance={appearance}
-            onToggleAppearance={toggleAppearance}
-            uiTheme={uiTheme}
-            onUiThemeChange={(theme) => setUiTheme(theme as UiTheme)}
-            uiThemeOptions={UI_THEME_OPTIONS}
-            personas={personas}
-            personaHasNew={personaHasNew}
-            selectedPersonaId={activePersonaId}
-            onPersonaSelect={(name) => void switchPersona(name)}
-            onCreatePersona={() => void onCreatePersona()}
-            onDeletePersona={(id) => void onDeletePersona(id)}
-          />
+        {mobileNavOpen ? (
+          <div
+            className="fixed inset-0 z-[100] flex md:hidden"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Persona and theme"
+          >
+            <button
+              type="button"
+              className="absolute inset-0 bg-black/50"
+              aria-label="Close menu"
+              onClick={() => setMobileNavOpen(false)}
+            />
+            <div
+              className={
+                appearance === 'dark'
+                  ? 'relative z-[101] flex h-full min-h-0 w-[min(320px,100vw)] max-w-[90vw] flex-col border-r border-[color:var(--mc-border-soft)] shadow-xl'
+                  : 'relative z-[101] flex h-full min-h-0 w-[min(320px,100vw)] max-w-[90vw] flex-col border-r border-slate-200 bg-white shadow-xl'
+              }
+              style={appearance === 'dark' ? { background: 'var(--mc-bg-sidebar)' } : undefined}
+            >
+              <SessionSidebar
+                appearance={appearance}
+                onToggleAppearance={toggleAppearance}
+                uiTheme={uiTheme}
+                onUiThemeChange={(theme) => setUiTheme(theme as UiTheme)}
+                uiThemeOptions={UI_THEME_OPTIONS}
+                personas={personas}
+                personaHasNew={personaHasNew}
+                selectedPersonaId={activePersonaId}
+                onPersonaSelect={(name) => void switchPersona(name)}
+                onCreatePersona={() => void onCreatePersona()}
+                onDeletePersona={(id) => void onDeletePersona(id)}
+                onCloseRequest={() => setMobileNavOpen(false)}
+              />
+            </div>
+          </div>
+        ) : null}
+
+        <div
+          className={desktopSidebarOpen ? 'mc-layout-grid mc-layout-grid--sidebar-open' : 'mc-layout-grid'}
+          style={desktopSidebarOpen ? ({ '--mc-sidebar-width': `${desktopSidebarWidth}px` } as React.CSSProperties) : undefined}
+        >
+          {desktopSidebarOpen ? (
+            <div id="desktop-session-sidebar" className="relative hidden min-h-0 md:flex md:flex-col">
+              <SessionSidebar
+                appearance={appearance}
+                onToggleAppearance={toggleAppearance}
+                uiTheme={uiTheme}
+                onUiThemeChange={(theme) => setUiTheme(theme as UiTheme)}
+                uiThemeOptions={UI_THEME_OPTIONS}
+                personas={personas}
+                personaHasNew={personaHasNew}
+                selectedPersonaId={activePersonaId}
+                onPersonaSelect={(name) => void switchPersona(name)}
+                onCreatePersona={() => void onCreatePersona()}
+                onDeletePersona={(id) => void onDeletePersona(id)}
+              />
+              <div
+                role="separator"
+                tabIndex={0}
+                aria-label="Resize personas sidebar"
+                aria-orientation="vertical"
+                aria-valuemin={DESKTOP_SIDEBAR_MIN_WIDTH}
+                aria-valuemax={DESKTOP_SIDEBAR_MAX_WIDTH}
+                aria-valuenow={desktopSidebarWidth}
+                className={desktopSidebarResizing ? 'mc-sidebar-resize-handle mc-sidebar-resize-handle--active' : 'mc-sidebar-resize-handle'}
+                onPointerDown={beginDesktopSidebarResize}
+                onKeyDown={(event) => {
+                  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+                  event.preventDefault()
+                  const delta = event.key === 'ArrowRight' ? 16 : -16
+                  setDesktopSidebarWidth((current) => clampDesktopSidebarWidth(current + delta, window.innerWidth))
+                }}
+              />
+            </div>
+          ) : null}
 
           <main
             className={
@@ -1703,21 +1462,68 @@ function App() {
             <header
               className={
                 appearance === 'dark'
-                  ? 'sticky top-0 z-10 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/95 px-4 py-3 backdrop-blur-sm'
-                  : 'sticky top-0 z-10 border-b border-slate-200 bg-white/92 px-4 py-3 backdrop-blur-sm'
+                  ? 'sticky top-0 z-10 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/95 backdrop-blur-sm'
+                  : 'sticky top-0 z-10 border-b border-slate-200 bg-white/92 backdrop-blur-sm'
               }
             >
-              <Flex justify="between" align="center" gap="3" wrap="wrap">
-                <Heading size="6">
-                  {selectedSessionLabel}
-                </Heading>
-                <Flex align="center" gap="3" wrap="wrap" justify="end">
-                  <Text size="2" color="gray">
-                    {statusText}
-                  </Text>
+              <div className="px-4 py-3">
+              <Flex
+                justify="between"
+                align="center"
+                gap="2"
+                wrap="wrap"
+                className="w-full flex-col md:flex-row md:flex-wrap"
+              >
+                <Flex align="center" gap="2" className="min-h-[44px] min-w-0 w-full md:flex-1">
+                  <IconButton
+                    size="3"
+                    variant="soft"
+                    color="gray"
+                    className="!hidden shrink-0 md:!inline-flex"
+                    type="button"
+                    aria-expanded={desktopSidebarOpen}
+                    aria-label={desktopSidebarOpen ? 'Hide personas sidebar' : 'Show personas sidebar'}
+                    title={desktopSidebarOpen ? 'Hide personas' : 'Show personas'}
+                    onClick={() => setDesktopSidebarOpen((v) => !v)}
+                  >
+                    <span aria-hidden className="text-base leading-none">
+                      {desktopSidebarOpen ? '⟨' : '⟩'}
+                    </span>
+                  </IconButton>
+                  <Heading size="6" className="min-w-0 flex-1 truncate max-md:[font-size:1.125rem]">
+                    {selectedSessionLabel}
+                  </Heading>
+                  <div className="ml-auto shrink-0 md:hidden">
+                    <DropdownMenu.Root>
+                      <DropdownMenu.Trigger>
+                        <Button size="2" variant="soft" type="button" className="min-h-10">
+                          More
+                        </Button>
+                      </DropdownMenu.Trigger>
+                      <DropdownMenu.Content size="2">
+                        <DropdownMenu.Item onSelect={() => setSettingsDialogOpen(true)}>Settings</DropdownMenu.Item>
+                        <DropdownMenu.Item onSelect={() => setSchedulesDialogOpen(true)}>Schedules</DropdownMenu.Item>
+                        <DropdownMenu.Item onSelect={() => setAgentsMdOpen(true)}>Principles</DropdownMenu.Item>
+                        <DropdownMenu.Item onSelect={() => setArtifactsDialogOpen(true)}>Artifacts</DropdownMenu.Item>
+                        <DropdownMenu.Item onSelect={() => setMemoryDialogOpen(true)}>Memory</DropdownMenu.Item>
+                        <DropdownMenu.Item
+                          disabled={activePersonaId == null}
+                          onSelect={() => {
+                            if (activePersonaId != null) setAgentHistoryDialogOpen(true)
+                          }}
+                        >
+                          Last agent run
+                        </DropdownMenu.Item>
+                      </DropdownMenu.Content>
+                    </DropdownMenu.Root>
+                  </div>
+                </Flex>
+                <Flex align="center" gap="2" wrap="wrap" justify="end" className="!hidden md:!flex">
                   <Dialog.Root open={settingsDialogOpen} onOpenChange={setSettingsDialogOpen}>
-                    <Dialog.Trigger>
-                      <Button size="1" variant="soft">Settings</Button>
+                    <Dialog.Trigger className="!hidden md:!inline-flex">
+                      <Button size="1" variant="soft">
+                        Settings
+                      </Button>
                     </Dialog.Trigger>
                     <Dialog.Content style={{ maxWidth: 920 }}>
                       <Dialog.Title>Web UI configuration</Dialog.Title>
@@ -1734,31 +1540,52 @@ function App() {
                           <Callout.Text>{restartNotice}</Callout.Text>
                         </Callout.Root>
                       ) : null}
-                      {installationStatus ? (
-                        <Flex gap="2" wrap="wrap" align="center" mb="3">
-                          <Text size="1" color={installationStatus.llm_ready ? 'green' : 'orange'}>
-                            LLM: {installationStatus.llm_ready ? 'ready' : 'missing'}
-                          </Text>
-                          <Text size="1" color={installationStatus.channel_ready ? 'green' : 'orange'}>
-                            Channels: {installationStatus.channel_ready ? 'ready' : 'missing'}
-                          </Text>
-                          <Text size="1" color="gray">
-                            Env restart needed:{' '}
-                            {(installationStatus.requires_restart_for_env_changes ??
-                              installationStatus.requires_restart_to_apply_runtime_settings) === true
-                              ? 'yes'
-                              : 'no'}
-                          </Text>
-                          <Button
-                            size="1"
-                            variant="solid"
-                            disabled={restartBusy}
-                            onClick={() => void requestRestart()}
-                          >
-                            {restartBusy ? 'Restarting…' : 'Restart gateway'}
-                          </Button>
-                        </Flex>
-                      ) : null}
+                      <Tabs.Root defaultValue="overview">
+                        <Tabs.List size="1" className="mb-3 flex-wrap">
+                          <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
+                          <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
+                          <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
+                          <Tabs.Trigger value="legacy">Legacy</Tabs.Trigger>
+                        </Tabs.List>
+                        <Tabs.Content value="overview">
+                          {installationStatus ? (
+                            <Flex direction="column" gap="2" mb="2">
+                              <Flex gap="2" wrap="wrap" align="center">
+                                <Text size="1" color={installationStatus.llm_ready ? 'green' : 'orange'}>
+                                  LLM: {installationStatus.llm_ready ? 'ready' : 'missing'}
+                                </Text>
+                                <Text size="1" color={installationStatus.channel_ready ? 'green' : 'orange'}>
+                                  Channels: {installationStatus.channel_ready ? 'ready' : 'missing'}
+                                </Text>
+                                <Text size="1" color="gray">
+                                  Env restart needed:{' '}
+                                  {(installationStatus.requires_restart_for_env_changes ??
+                                    installationStatus.requires_restart_to_apply_runtime_settings) === true
+                                    ? 'yes'
+                                    : 'no'}
+                                </Text>
+                              </Flex>
+                              <Text size="1" color="gray">
+                                Stop requests between LLM/tool iterations (cooperative cancel). Use Queue for FIFO visibility.
+                              </Text>
+                              <div>
+                                <Button
+                                  size="1"
+                                  variant="solid"
+                                  disabled={restartBusy}
+                                  onClick={() => void requestRestart()}
+                                >
+                                  {restartBusy ? 'Restarting…' : 'Restart gateway'}
+                                </Button>
+                              </div>
+                            </Flex>
+                          ) : (
+                            <Text size="2" color="gray" mb="2">
+                              Loading installation status…
+                            </Text>
+                          )}
+                        </Tabs.Content>
+                        <Tabs.Content value="legacy">
                       <div
                         className="rounded-md border p-3"
                         style={appearance === 'dark'
@@ -1778,8 +1605,10 @@ function App() {
                           </Button>
                         </Flex>
                       </div>
+                        </Tabs.Content>
+                        <Tabs.Content value="integrations">
                       <div
-                        className="mt-3 rounded-md border p-3"
+                        className="rounded-md border p-3"
                         style={appearance === 'dark'
                           ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
                           : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
@@ -1863,8 +1692,10 @@ function App() {
                           </Button>
                         </Flex>
                       </div>
+                        </Tabs.Content>
+                        <Tabs.Content value="channels">
                       <div
-                        className="mt-3 rounded-md border p-3"
+                        className="rounded-md border p-3"
                         style={appearance === 'dark'
                           ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
                           : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
@@ -1925,6 +1756,8 @@ function App() {
                           })}
                         </div>
                       </div>
+                        </Tabs.Content>
+                      </Tabs.Root>
                       <Flex justify="end" mt="4">
                         <Dialog.Close>
                           <Button variant="soft">Close</Button>
@@ -1933,15 +1766,6 @@ function App() {
                     </Dialog.Content>
                   </Dialog.Root>
                   <Dialog.Root open={queueDialogOpen} onOpenChange={setQueueDialogOpen}>
-                    <Dialog.Trigger>
-                      <Button size="1" variant="soft" title={queueLane?.last_error ?? undefined}>
-                        Queue: {(queueLane?.pending ?? 0) > 0 ? String(queueLane?.pending ?? 0) : 'idle'}
-                        {(queueLane?.pending ?? 0) > 0 && (queueLane?.oldest_wait_ms ?? 0) > 0
-                          ? ` · ${Math.round((queueLane?.oldest_wait_ms ?? 0) / 1000)}s`
-                          : ''}
-                        {queueLane?.last_error ? ' (!)' : ''}
-                      </Button>
-                    </Dialog.Trigger>
                     <Dialog.Content style={{ maxWidth: 920 }}>
                       <Dialog.Title>Run queue</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
@@ -1951,30 +1775,58 @@ function App() {
                         {(queueLane?.items?.length ?? 0) === 0 ? (
                           <Text size="2" color="gray">No queued runs (lane idle or diagnostics loading).</Text>
                         ) : (
-                          <table className="w-full border-collapse text-left text-sm">
-                            <thead>
-                              <tr className={appearance === 'dark' ? 'text-slate-400' : 'text-slate-600'}>
-                                <th className="p-1 pr-2">#</th>
-                                <th className="p-1 pr-2">State</th>
-                                <th className="p-1 pr-2">Persona</th>
-                                <th className="p-1 pr-2">Source</th>
-                                <th className="p-1 min-w-[120px]">Context</th>
-                                <th className="p-1 pr-2">Project</th>
-                                <th className="p-1 pr-2">Workflow</th>
-                                <th className="p-1 text-right"> </th>
-                              </tr>
-                            </thead>
-                            <tbody>
+                          <>
+                            <table className="hidden w-full border-collapse text-left text-sm md:table">
+                              <thead>
+                                <tr className={appearance === 'dark' ? 'text-slate-400' : 'text-slate-600'}>
+                                  <th className="p-1 pr-2">#</th>
+                                  <th className="p-1 pr-2">State</th>
+                                  <th className="p-1 pr-2">Persona</th>
+                                  <th className="p-1 pr-2">Source</th>
+                                  <th className="p-1 min-w-[120px]">Context</th>
+                                  <th className="p-1 pr-2">Project</th>
+                                  <th className="p-1 pr-2">Workflow</th>
+                                  <th className="p-1 text-right"> </th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {(queueLane?.items ?? []).map((it) => (
+                                  <tr key={it.run_id} className="border-t border-[color:var(--gray-6)] align-top">
+                                    <td className="p-1 pr-2 font-mono text-xs">{it.position}</td>
+                                    <td className="p-1 pr-2">{it.state}</td>
+                                    <td className="p-1 pr-2">{it.persona_name}</td>
+                                    <td className="p-1 pr-2">{it.source}</td>
+                                    <td className="p-1 max-w-[280px] break-words" title={it.label}>{it.label || '—'}</td>
+                                    <td className="p-1 pr-2 font-mono text-xs">{it.project_id ?? '—'}</td>
+                                    <td className="p-1 pr-2 font-mono text-xs">{it.workflow_id ?? '—'}</td>
+                                    <td className="p-1 text-right">
+                                      <Button
+                                        size="1"
+                                        variant="soft"
+                                        color="red"
+                                        onClick={() => void cancelQueueRun(it.run_id)}
+                                      >
+                                        Stop
+                                      </Button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                            <div className="flex flex-col gap-2 md:hidden">
                               {(queueLane?.items ?? []).map((it) => (
-                                <tr key={it.run_id} className="border-t border-[color:var(--gray-6)] align-top">
-                                  <td className="p-1 pr-2 font-mono text-xs">{it.position}</td>
-                                  <td className="p-1 pr-2">{it.state}</td>
-                                  <td className="p-1 pr-2">{it.persona_name}</td>
-                                  <td className="p-1 pr-2">{it.source}</td>
-                                  <td className="p-1 max-w-[280px] break-words" title={it.label}>{it.label || '—'}</td>
-                                  <td className="p-1 pr-2 font-mono text-xs">{it.project_id ?? '—'}</td>
-                                  <td className="p-1 pr-2 font-mono text-xs">{it.workflow_id ?? '—'}</td>
-                                  <td className="p-1 text-right">
+                                <div
+                                  key={it.run_id}
+                                  className={
+                                    appearance === 'dark'
+                                      ? 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
+                                      : 'rounded-lg border border-slate-200 p-3 text-sm'
+                                  }
+                                >
+                                  <Flex justify="between" align="start" gap="2" mb="2">
+                                    <Text size="2" weight="bold">
+                                      #{it.position} · {it.state}
+                                    </Text>
                                     <Button
                                       size="1"
                                       variant="soft"
@@ -1983,11 +1835,20 @@ function App() {
                                     >
                                       Stop
                                     </Button>
-                                  </td>
-                                </tr>
+                                  </Flex>
+                                  <Text size="1" color="gray" className="mb-1 block">
+                                    {it.persona_name} · {it.source}
+                                  </Text>
+                                  <Text size="1" className="break-words">
+                                    {it.label || '—'}
+                                  </Text>
+                                  <Text size="1" color="gray" className="mt-1 block font-mono">
+                                    project {it.project_id ?? '—'} · workflow {it.workflow_id ?? '—'}
+                                  </Text>
+                                </div>
                               ))}
-                            </tbody>
-                          </table>
+                            </div>
+                          </>
                         )}
                       </div>
                       <Flex justify="end" mt="3">
@@ -1997,20 +1858,15 @@ function App() {
                       </Flex>
                     </Dialog.Content>
                   </Dialog.Root>
-                  <Text
-                    size="2"
-                    color={(backgroundActiveCount > 0 ? 'blue' : 'gray') as never}
-                    title="Long-running web background jobs (heartbeat active)"
-                  >
-                    Background: {backgroundActiveCount > 0 ? `${backgroundActiveCount} active` : 'none'}
-                  </Text>
 
                   <Dialog.Root
                     open={schedulesDialogOpen}
                     onOpenChange={(open) => setSchedulesDialogOpen(open)}
                   >
-                    <Dialog.Trigger>
-                      <Button size="1" variant="soft">Schedules</Button>
+                    <Dialog.Trigger className="!hidden md:!inline-flex">
+                      <Button size="1" variant="soft">
+                        Schedules
+                      </Button>
                     </Dialog.Trigger>
                     <Dialog.Content style={{ maxWidth: 820 }}>
                       <Dialog.Title>Schedules</Dialog.Title>
@@ -2018,10 +1874,38 @@ function App() {
                         Create and manage scheduled prompts for this chat.
                       </Dialog.Description>
 
-                      <div className="rounded-md border p-3" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' } : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}>
-                        <ul className="mb-3 list-none space-y-2">
-                          {schedules.map((t) => (
-                            <li key={t.id} className="flex flex-wrap items-center gap-2 rounded border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
+                      <Flex align="center" justify="between" gap="3" mb="3" wrap="wrap">
+                        <Text size="2" weight="medium">
+                          Active schedules
+                        </Text>
+                        <label htmlFor="sched-archived" className="flex cursor-pointer items-center gap-2">
+                          <Text size="1" color="gray">
+                            Show completed / cancelled
+                          </Text>
+                          <Switch
+                            id="sched-archived"
+                            checked={schedulesShowArchived}
+                            onCheckedChange={setSchedulesShowArchived}
+                          />
+                        </label>
+                      </Flex>
+
+                      <div className="rounded-lg border p-3" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' } : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}>
+                        <ul className="mb-3 list-none space-y-3">
+                          {schedulesFiltered.length === 0 ? (
+                            <li
+                              className="rounded-lg border border-dashed px-4 py-10 text-center"
+                              style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}
+                            >
+                              <Text size="2" color="gray">
+                                {schedules.length === 0
+                                  ? 'No schedules yet. Add one below.'
+                                  : 'No active schedules. Enable “Show completed / cancelled” to see finished runs.'}
+                              </Text>
+                            </li>
+                          ) : null}
+                          {schedulesFiltered.map((t) => (
+                            <li key={t.id} className="flex flex-wrap items-center gap-2 rounded-lg border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
                               <span className="min-w-0 flex-1 truncate" title={t.prompt}>{t.prompt}</span>
                               <Select.Root
                                 value={String(t.persona_id)}
@@ -2212,8 +2096,10 @@ function App() {
                       }
                     }}
                   >
-                    <Dialog.Trigger>
-                      <Button size="1" variant="soft">Principles</Button>
+                    <Dialog.Trigger className="!hidden md:!inline-flex">
+                      <Button size="1" variant="soft">
+                        Principles
+                      </Button>
                     </Dialog.Trigger>
                     <Dialog.Content style={{ maxWidth: 900 }}>
                       <Dialog.Title>Workspace principles (AGENTS.md)</Dialog.Title>
@@ -2267,16 +2153,18 @@ function App() {
                       }
                     }}
                   >
-                    <Dialog.Trigger>
-                      <Button size="1" variant="soft">Artifacts</Button>
+                    <Dialog.Trigger className="!hidden md:!inline-flex">
+                      <Button size="1" variant="soft">
+                        Artifacts
+                      </Button>
                     </Dialog.Trigger>
                     <Dialog.Content style={{ maxWidth: 980 }}>
                       <Dialog.Title>Artifacts</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
                         View files produced or referenced in this chat persona. Attachments stay channel-local; web can preview them here.
                       </Dialog.Description>
-                      <Flex gap="3" align="start" wrap="wrap">
-                        <div className="min-w-[250px] flex-1">
+                      <Flex gap="3" align="start" wrap="wrap" className="flex-col md:flex-row">
+                        <div className="min-w-0 w-full flex-1 md:min-w-[250px]">
                           <Flex justify="between" align="center" mb="2" gap="2" wrap="wrap">
                             <Select.Root value={artifactKindFilter} onValueChange={setArtifactKindFilter}>
                               <Select.Trigger className="w-[150px]" />
@@ -2332,8 +2220,8 @@ function App() {
                           </div>
                         </div>
                         <div className={appearance === 'dark'
-                          ? 'min-w-[320px] flex-[2] rounded-md border border-[color:var(--mc-border-soft)] p-2'
-                          : 'min-w-[320px] flex-[2] rounded-md border border-slate-300 p-2'
+                          ? 'min-h-[200px] min-w-0 w-full flex-[2] rounded-md border border-[color:var(--mc-border-soft)] p-2 md:min-w-[320px]'
+                          : 'min-h-[200px] min-w-0 w-full flex-[2] rounded-md border border-slate-300 p-2 md:min-w-[320px]'
                         }>
                           {selectedArtifact == null ? (
                             <Text size="2" color="gray">Select an artifact to preview.</Text>
@@ -2415,8 +2303,10 @@ function App() {
                       }
                     }}
                   >
-                    <Dialog.Trigger>
-                      <Button size="1" variant="soft">Memory</Button>
+                    <Dialog.Trigger className="!hidden md:!inline-flex">
+                      <Button size="1" variant="soft">
+                        Memory
+                      </Button>
                     </Dialog.Trigger>
                     <Dialog.Content style={{ maxWidth: 900 }}>
                       <Dialog.Title>Persona memory</Dialog.Title>
@@ -2487,7 +2377,7 @@ function App() {
                       }
                     }}
                   >
-                    <Dialog.Trigger>
+                    <Dialog.Trigger className="!hidden md:!inline-flex">
                       <Button size="1" variant="soft" disabled={activePersonaId == null}>
                         Last agent run
                       </Button>
@@ -2619,6 +2509,15 @@ function App() {
                   </Dialog.Root>
                 </Flex>
               </Flex>
+              </div>
+              <CockpitBar
+                appearance={appearance}
+                statusText={statusText}
+                queueLane={queueLane}
+                backgroundActiveCount={backgroundActiveCount}
+                installationStatus={installationStatus}
+                onQueueClick={() => setQueueDialogOpen(true)}
+              />
             </header>
 
             <div
@@ -2629,6 +2528,36 @@ function App() {
               }
             >
               <div className="mx-auto w-full max-w-5xl px-3 pt-3">
+                {installationStatus != null &&
+                !onboardingDismissed &&
+                (!installationStatus.llm_ready || !installationStatus.channel_ready) ? (
+                  <Callout.Root color="orange" size="1" variant="soft" className="mb-2">
+                    <Flex direction="column" gap="2">
+                      <Callout.Text>
+                        Finish setup: configure <code className="text-xs">.env</code> with at least one channel (Telegram or Discord) and LLM keys, then restart the gateway if needed. See Settings for status.
+                      </Callout.Text>
+                      <Flex gap="2" align="center" wrap="wrap">
+                        <Button size="1" variant="solid" onClick={() => setSettingsDialogOpen(true)}>
+                          Open Settings
+                        </Button>
+                        <Button
+                          size="1"
+                          variant="soft"
+                          onClick={() => {
+                            try {
+                              sessionStorage.setItem('finally-a-value-bot_onboarding_banner_dismissed', '1')
+                            } catch {
+                              /* ignore */
+                            }
+                            setOnboardingDismissed(true)
+                          }}
+                        >
+                          Dismiss
+                        </Button>
+                      </Flex>
+                    </Flex>
+                  </Callout.Root>
+                ) : null}
                 {replayNotice ? (
                   <Callout.Root color="orange" size="1" variant="soft">
                     <Callout.Text>{replayNotice}</Callout.Text>
@@ -2642,11 +2571,9 @@ function App() {
               </div>
 
               <div className="min-h-0 flex-1 px-1 pb-1 flex flex-col">
-                <div className="flex justify-center py-2">
-                  <Button size="1" variant="soft" onClick={() => void loadOlderDay()} disabled={loadingOlder}>
-                    {loadingOlder ? 'Loading…' : 'Load older'}
-                  </Button>
-                </div>
+                <Text size="1" color="gray" className="mb-1 px-2">
+                  Tip: On Telegram/Discord you can prefix a message with <code className="text-xs">[PersonaName]</code> to target a persona for that message.
+                </Text>
                 <div className="min-h-0 flex-1">
                   <ThreadPane key={runtimeKey} adapter={adapter} initialMessages={historySeed} runtimeKey={runtimeKey} />
                 </div>
@@ -2660,4 +2587,8 @@ function App() {
   )
 }
 
-createRoot(document.getElementById('root')!).render(<App />)
+createRoot(document.getElementById('root')!).render(
+  <QueryClientProvider client={queryClient}>
+    <App />
+  </QueryClientProvider>,
+)

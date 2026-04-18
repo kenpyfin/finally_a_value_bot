@@ -2860,7 +2860,8 @@ async fn api_settings_get(
             "llm_ready": is_llm_ready(cfg),
             "channel_ready": is_channel_ready(cfg),
             "web_enabled": cfg.web_enabled,
-            "requires_restart_for_env_changes": true,
+            // PATCH /api/settings is disabled; no in-app "pending restart" until we track real diffs.
+            "requires_restart_for_env_changes": false,
             "runtime_env_merge_from_app_settings": false,
         }
     })))
