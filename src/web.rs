@@ -399,6 +399,10 @@ struct ScheduleUpdateRequest {
     status: Option<String>, // "paused" | "active" | "cancelled"
     persona_id: Option<i64>,
     prompt: Option<String>,
+    /// When changing timing, send both `schedule_type` and `schedule_value` (same semantics as create).
+    schedule_type: Option<String>,
+    schedule_value: Option<String>,
+    timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2477,10 +2481,20 @@ async fn api_schedules_update(
     };
     let persona_id = body.persona_id;
     let prompt_update = body.prompt.as_ref().map(|p| p.trim().to_string());
-    if status.is_none() && persona_id.is_none() && prompt_update.is_none() {
+    let schedule_type_in = body.schedule_type.as_ref().map(|s| s.trim().to_string());
+    let schedule_value_in = body.schedule_value.as_ref().map(|s| s.trim().to_string());
+    let has_schedule_pair = schedule_type_in.is_some() && schedule_value_in.is_some();
+    let schedule_partial = schedule_type_in.is_some() ^ schedule_value_in.is_some();
+    if schedule_partial {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Provide at least one field to update: status, persona_id, or prompt".into(),
+            "Provide both schedule_type and schedule_value to change the schedule".into(),
+        ));
+    }
+    if status.is_none() && persona_id.is_none() && prompt_update.is_none() && !has_schedule_pair {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide at least one field to update: status, persona_id, prompt, or schedule_type+schedule_value".into(),
         ));
     }
     if let Some(pid) = persona_id {
@@ -2524,6 +2538,25 @@ async fn api_schedules_update(
         }
     }
 
+    let schedule_preflight = if has_schedule_pair {
+        let st = schedule_type_in.as_ref().unwrap().as_str();
+        let sv = schedule_value_in.as_ref().unwrap().as_str();
+        let effective_tz = body.timezone.as_deref().or_else(|| {
+            let default = state.app_state.config.timezone.trim();
+            if default.is_empty() {
+                None
+            } else {
+                Some(default)
+            }
+        });
+        Some(
+            crate::tools::schedule::preflight_schedule_request(st, sv, effective_tz)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        )
+    } else {
+        None
+    };
+
     if let Some(next_status) = status {
         let ok = call_blocking(state.app_state.db.clone(), move |db| {
             db.update_task_status(task_id, next_status)
@@ -2555,10 +2588,40 @@ async fn api_schedules_update(
         }
     }
 
-    Ok(Json(json!({
+    if let Some(pref) = &schedule_preflight {
+        let schedule_type_owned = schedule_type_in.as_ref().unwrap().clone();
+        let schedule_value_owned = pref.schedule_value.clone();
+        let next_run_owned = pref.next_run.clone();
+        let ok = call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_task_schedule(
+                task_id,
+                &schedule_type_owned,
+                &schedule_value_owned,
+                &next_run_owned,
+            )
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !ok {
+            return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+        }
+    }
+
+    let mut response = json!({
         "ok": true,
         "message": "Task updated",
-    })))
+    });
+    if let Some(pref) = schedule_preflight {
+        response["next_run"] = json!(pref.next_run);
+        response["timezone"] = json!(pref.timezone_used);
+        response["timezone_assumption"] = json!(if pref.timezone_defaulted_to_utc {
+            "Timezone not provided. UTC was assumed."
+        } else {
+            "Timezone provided by request."
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // --- Background jobs API ---
@@ -2951,7 +3014,7 @@ async fn api_channel_bot_instances_get(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let items: Vec<serde_json::Value> = list
         .iter()
-        .map(|i| json_channel_bot_instance_redacted(i))
+        .map(json_channel_bot_instance_redacted)
         .collect();
     Ok(Json(json!({ "ok": true, "instances": items })))
 }

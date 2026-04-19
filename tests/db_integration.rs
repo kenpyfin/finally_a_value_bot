@@ -208,6 +208,23 @@ fn test_scheduled_task_lifecycle() {
 }
 
 #[test]
+fn test_update_task_schedule() {
+    let (db, dir) = test_db();
+    let id = db
+        .create_scheduled_task(100, "x", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+        .unwrap();
+    assert!(db
+        .update_task_schedule(id, "cron", "0 0 * * * *", "2024-01-02T00:00:00Z")
+        .unwrap());
+    let t = db.get_task_by_id(id).unwrap().unwrap();
+    assert_eq!(t.schedule_type, "cron");
+    assert_eq!(t.schedule_value, "0 0 * * * *");
+    assert_eq!(t.next_run, "2024-01-02T00:00:00Z");
+
+    cleanup(&dir);
+}
+
+#[test]
 fn test_scheduled_task_binds_to_active_persona_at_creation() {
     let (db, dir) = test_db();
     db.upsert_chat(100, None, "private").unwrap();

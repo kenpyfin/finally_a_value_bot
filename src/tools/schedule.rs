@@ -34,7 +34,7 @@ pub fn format_tasks_list_persona(tasks: &[ScheduledTask]) -> String {
             t.id, t.status, t.persona_id, t.prompt, t.schedule_type, t.schedule_value, t.next_run
         ));
     }
-    output.push_str("\nUse `schedule_task` to add; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
+    output.push_str("\nUse `schedule_task` to add; `update_scheduled_task` to change prompt/timing/status; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
     output
 }
 
@@ -56,7 +56,7 @@ fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> Str
             ));
         }
     }
-    output.push_str("\nUse `schedule_task` to add; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
+    output.push_str("\nUse `schedule_task` to add; `update_scheduled_task` to change prompt/timing/status; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
     output
 }
 
@@ -156,7 +156,7 @@ impl Tool for ScheduleTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "schedule_task".into(),
-            description: "Schedule a recurring or one-time task. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used.".into(),
+            description: "Create a new scheduled task (cron or one-time). This is not the same as learned workflows (intent hints in the DB): cron schedules live in `scheduled_tasks` only. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used. To change an existing task, use `update_scheduled_task`.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -291,7 +291,7 @@ impl Tool for ListTasksTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_scheduled_tasks".into(),
-            description: "List all scheduled tasks (active, running, paused, completed) across all chats and personas.".into(),
+            description: "List all scheduled tasks (active, running, paused, completed) across all chats and personas. Learned workflows (queue `workflow_id`) are unrelated to these cron/once schedules.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -348,7 +348,7 @@ impl Tool for PauseTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "pause_scheduled_task".into(),
-            description: "Pause a scheduled task. It will not run until resumed.".into(),
+            description: "Pause a scheduled task (cron/once row in `scheduled_tasks`). It will not run until resumed.".into(),
             input_schema: schema_object(
                 json!({
                     "task_id": {
@@ -412,7 +412,7 @@ impl Tool for ResumeTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "resume_scheduled_task".into(),
-            description: "Resume a paused scheduled task.".into(),
+            description: "Resume a paused scheduled task (`scheduled_tasks`).".into(),
             input_schema: schema_object(
                 json!({
                     "task_id": {
@@ -476,7 +476,7 @@ impl Tool for CancelTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "cancel_scheduled_task".into(),
-            description: "Cancel (delete) a scheduled task permanently.".into(),
+            description: "Cancel a scheduled task permanently (marks cancelled; not related to learned workflows).".into(),
             input_schema: schema_object(
                 json!({
                     "task_id": {
@@ -516,6 +516,239 @@ impl Tool for CancelTaskTool {
             Ok(false) => ToolResult::error(format!("Task #{task_id} not found.")),
             Err(e) => ToolResult::error(format!("Failed to cancel task: {e}")),
         }
+    }
+}
+
+// --- update_scheduled_task ---
+
+pub struct UpdateScheduledTaskTool {
+    db: Arc<Database>,
+    default_timezone: String,
+}
+
+impl UpdateScheduledTaskTool {
+    pub fn new(db: Arc<Database>, default_timezone: String) -> Self {
+        UpdateScheduledTaskTool {
+            db,
+            default_timezone,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for UpdateScheduledTaskTool {
+    fn name(&self) -> &str {
+        "update_scheduled_task"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "update_scheduled_task".into(),
+            description: "Update an existing scheduled task by id: optional status (paused/active/cancelled), persona_id, prompt, and/or schedule (schedule_type + schedule_value with optional timezone). Same preflight rules as `schedule_task`. Not related to learned workflows. Activate the `schedule-job` skill before changing schedule fields.".into(),
+            input_schema: schema_object(
+                json!({
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Scheduled task id (from list_scheduled_tasks)"
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Optional: paused, active (or resumed), or cancelled"
+                    },
+                    "persona_id": {
+                        "type": "integer",
+                        "description": "Optional: persona id for this chat"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Optional: new prompt text (non-empty)"
+                    },
+                    "schedule_type": {
+                        "type": "string",
+                        "enum": ["cron", "once"],
+                        "description": "Optional: must be sent with schedule_value to change timing"
+                    },
+                    "schedule_value": {
+                        "type": "string",
+                        "description": "Optional: cron expression or ISO 8601 once timestamp; pair with schedule_type"
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone for schedule preflight; defaults to bot config or UTC"
+                    }
+                }),
+                &["task_id"],
+            ),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> ToolResult {
+        let task_id = match input.get("task_id").and_then(|v| v.as_i64()) {
+            Some(id) => id,
+            None => return ToolResult::error("Missing required parameter: task_id".into()),
+        };
+
+        let task = match call_blocking(self.db.clone(), move |db| db.get_task_by_id(task_id)).await
+        {
+            Ok(Some(t)) => t,
+            Ok(None) => return ToolResult::error(format!("Task #{task_id} not found.")),
+            Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
+        };
+        if let Err(e) = authorize_chat_access(&input, task.chat_id) {
+            return ToolResult::error(e);
+        }
+        if let Err(e) = enforce_channel_policy(self.db.clone(), &input, task.chat_id).await {
+            return ToolResult::error(e);
+        }
+
+        let status = match input.get("status").and_then(|v| v.as_str()) {
+            Some("paused") => Some("paused"),
+            Some("active") | Some("resumed") => Some("active"),
+            Some("cancelled") => Some("cancelled"),
+            Some(other) => {
+                return ToolResult::error(format!(
+                    "status must be paused, active, resumed, or cancelled; got {other}"
+                ));
+            }
+            None => None,
+        };
+        let persona_id = input.get("persona_id").and_then(|v| v.as_i64());
+        let prompt_update = input
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|p| p.trim().to_string());
+        let schedule_type_in = input
+            .get("schedule_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string());
+        let schedule_value_in = input
+            .get("schedule_value")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string());
+        let has_schedule_pair = schedule_type_in.is_some() && schedule_value_in.is_some();
+        let schedule_partial = schedule_type_in.is_some() ^ schedule_value_in.is_some();
+        if schedule_partial {
+            return ToolResult::error(
+                "Provide both schedule_type and schedule_value to change the schedule.".into(),
+            );
+        }
+
+        if status.is_none() && persona_id.is_none() && prompt_update.is_none() && !has_schedule_pair
+        {
+            return ToolResult::error(
+                "Provide at least one of: status, persona_id, prompt, or schedule_type+schedule_value."
+                    .into(),
+            );
+        }
+
+        if let Some(pid) = persona_id {
+            if pid <= 0 {
+                return ToolResult::error("persona_id must be a positive integer".into());
+            }
+            let exists = match call_blocking(self.db.clone(), move |db| {
+                db.persona_exists(task.chat_id, pid)
+            })
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => return ToolResult::error(format!("Failed to check persona: {e}")),
+            };
+            if !exists {
+                return ToolResult::error(format!("Persona {} does not exist for this chat", pid));
+            }
+        }
+
+        if let Some(ref p) = prompt_update {
+            if p.is_empty() {
+                return ToolResult::error("prompt must not be empty".into());
+            }
+        }
+
+        let timezone_input = input.get("timezone").and_then(|v| v.as_str());
+        let configured_default_tz = self.default_timezone.trim();
+        let effective_tz = timezone_input.or_else(|| {
+            if configured_default_tz.is_empty() {
+                None
+            } else {
+                Some(configured_default_tz)
+            }
+        });
+
+        let schedule_preflight = if has_schedule_pair {
+            let st = schedule_type_in.as_ref().unwrap().as_str();
+            let sv = schedule_value_in.as_ref().unwrap().as_str();
+            Some(match preflight_schedule_request(st, sv, effective_tz) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::error(e),
+            })
+        } else {
+            None
+        };
+
+        if let Some(next_status) = status {
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_status(task_id, next_status)
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update status: {e}")),
+            }
+        }
+        if let Some(pid) = persona_id {
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_persona(task_id, pid)
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update persona: {e}")),
+            }
+        }
+        if let Some(p) = prompt_update {
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_prompt(task_id, &p)
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update prompt: {e}")),
+            }
+        }
+        if let Some(pref) = &schedule_preflight {
+            let schedule_type_owned = schedule_type_in.as_ref().unwrap().clone();
+            let schedule_value_owned = pref.schedule_value.clone();
+            let next_run_owned = pref.next_run.clone();
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_schedule(
+                    task_id,
+                    &schedule_type_owned,
+                    &schedule_value_owned,
+                    &next_run_owned,
+                )
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update schedule: {e}")),
+            }
+        }
+
+        let mut msg = format!("Task #{task_id} updated.");
+        if let Some(pref) = schedule_preflight {
+            msg.push_str(&format!(
+                " Next run: {} (tz: {}).",
+                pref.next_run, pref.timezone_used
+            ));
+            if pref.timezone_defaulted_to_utc {
+                msg.push_str(" Timezone was not provided for preflight, so UTC was assumed.");
+            }
+        }
+        ToolResult::success(msg)
     }
 }
 
@@ -991,6 +1224,50 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         let task = db.get_task_by_id(task_id).unwrap().unwrap();
         assert_eq!(task.status, "paused");
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_update_scheduled_task_prompt_and_schedule() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "hello", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+            .unwrap();
+        let tool = UpdateScheduledTaskTool::new(db.clone(), "UTC".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 100,
+                "task_id": id,
+                "prompt": "updated prompt",
+                "schedule_type": "cron",
+                "schedule_value": "0 0 * * * *"
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let t = db.get_task_by_id(id).unwrap().unwrap();
+        assert_eq!(t.prompt, "updated prompt");
+        assert_eq!(t.schedule_type, "cron");
+        assert_eq!(t.schedule_value, "0 0 * * * *");
+        assert!(t.next_run.contains("T"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_update_scheduled_task_schedule_only_one_field_errors() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "hello", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+            .unwrap();
+        let tool = UpdateScheduledTaskTool::new(db, "UTC".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 100,
+                "task_id": id,
+                "schedule_type": "cron"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("both schedule_type"));
         cleanup(&dir);
     }
 }

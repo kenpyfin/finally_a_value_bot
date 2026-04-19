@@ -18,6 +18,12 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-19 — Scheduled tasks: PATCH schedule fields, `update_scheduled_task`, skill sync rule
+
+- **Area:** db / web API / agent tools / Telegram prompts / web UI / docs
+- **Summary:** Added `Database::update_task_schedule` for `schedule_type` + `schedule_value` + `next_run` after preflight. Extended `PATCH /api/schedules/:id` with optional `schedule_type`, `schedule_value`, and `timezone`. New agent tool `update_scheduled_task` (mirrors PATCH). Telegram requires `schedule-job` for `update_scheduled_task` like `schedule_task`; capability strings and tool preview updated. Web schedule **Details** dialog can edit cron/once expression (Save schedule). Documented learned workflows vs cron schedules in `schedule-job` SKILL (both [`builtin_skills/schedule-job/SKILL.md`](builtin_skills/schedule-job/SKILL.md) and [`skills/schedule-job/SKILL.md`](skills/schedule-job/SKILL.md)). Added [`.cursor/rules/builtin-skills-workspace-sync.mdc`](.cursor/rules/builtin-skills-workspace-sync.mdc) for builtin ↔ `skills/` mirror sync.
+- **Key files / symbols:** `db::update_task_schedule`; `web.rs` `ScheduleUpdateRequest`, `api_schedules_update`; `schedule::UpdateScheduledTaskTool`, `tools::mod` registration and `tool_risk`; `telegram.rs` missing-schedule-skill gate; `web/src/main.tsx` schedule detail editor.
+
 ### 2026-04-16 — API: `requires_restart_for_env_changes` no longer always true
 
 - **Area:** web API / web UI cockpit

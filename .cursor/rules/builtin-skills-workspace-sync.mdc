@@ -1,0 +1,13 @@
+---
+description: Keep workspace skills/ mirror in sync when editing builtin_skills/
+alwaysApply: false
+globs: builtin_skills/**,skills/**
+---
+
+# Builtin skills and workspace copy
+
+Some built-in skills are duplicated at the repository root under [`skills/<name>/`](skills/) (e.g. [`skills/schedule-job/`](skills/schedule-job/)) so CLI paths and docs like `python3 skills/schedule-job/schedule_helper.py` work from a checkout.
+
+**Rule:** When you edit anything under [`builtin_skills/<skill-name>/`](builtin_skills/), apply the **same change** to [`skills/<skill-name>/`](skills/) in the **same commit** (or immediately after). The [`builtin_skills/`](builtin_skills/) tree remains the canonical packaged copy; [`skills/`](skills/) is the workspace mirror for operators.
+
+If you add a new mirrored skill, add its directory under both trees and mention it here.

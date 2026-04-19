@@ -429,6 +429,8 @@ function App() {
   const [queueDialogOpen, setQueueDialogOpen] = useState(false)
   const [scheduleDetailTask, setScheduleDetailTask] = useState<ScheduleTask | null>(null)
   const [scheduleDetailPrompt, setScheduleDetailPrompt] = useState('')
+  const [scheduleDetailScheduleType, setScheduleDetailScheduleType] = useState<'cron' | 'once'>('cron')
+  const [scheduleDetailScheduleValue, setScheduleDetailScheduleValue] = useState('')
   const [scheduleDetailBusy, setScheduleDetailBusy] = useState(false)
   const [agentsMdOpen, setAgentsMdOpen] = useState(false)
   const [agentsMdContent, setAgentsMdContent] = useState('')
@@ -1156,7 +1158,14 @@ function App() {
 
   async function updateSchedule(
     taskId: number,
-    patch: { status?: string; persona_id?: number; prompt?: string },
+    patch: {
+      status?: string
+      persona_id?: number
+      prompt?: string
+      schedule_type?: string
+      schedule_value?: string
+      timezone?: string
+    },
   ): Promise<void> {
     await api(`/api/schedules/${taskId}`, {
       method: 'PATCH',
@@ -1935,6 +1944,8 @@ function App() {
                                 onClick={() => {
                                   setScheduleDetailTask(t)
                                   setScheduleDetailPrompt(t.prompt)
+                                  setScheduleDetailScheduleType(t.schedule_type === 'once' ? 'once' : 'cron')
+                                  setScheduleDetailScheduleValue(t.schedule_value)
                                 }}
                               >
                                 Details
@@ -2017,6 +2028,7 @@ function App() {
                       if (!o) {
                         setScheduleDetailTask(null)
                         setScheduleDetailBusy(false)
+                        setScheduleDetailScheduleValue('')
                       }
                     }}
                   >
@@ -2025,7 +2037,7 @@ function App() {
                         {scheduleDetailTask != null ? `Schedule #${scheduleDetailTask.id}` : 'Schedule'}
                       </Dialog.Title>
                       <Dialog.Description size="2" mb="3">
-                        View metadata and edit the prompt. Cron/once expression changes require recreating the task for now.
+                        View metadata, edit the prompt, or change the cron/once expression (server runs the same preflight as new schedules).
                       </Dialog.Description>
                       {scheduleDetailTask != null ? (
                         <>
@@ -2057,10 +2069,60 @@ function App() {
                               ? 'min-h-[160px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-slate-100'
                               : 'min-h-[160px] w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-xs text-slate-900'}
                           />
+                          <Text size="2" weight="bold" mb="1" mt="3">Schedule</Text>
+                          <Flex gap="2" align="center" wrap="wrap" mb="2">
+                            <Select.Root
+                              value={scheduleDetailScheduleType}
+                              onValueChange={(v) => setScheduleDetailScheduleType(v as 'cron' | 'once')}
+                              disabled={scheduleDetailTask.status === 'cancelled'}
+                            >
+                              <Select.Trigger className="w-[100px]" />
+                              <Select.Content>
+                                <Select.Item value="cron">Cron</Select.Item>
+                                <Select.Item value="once">Once</Select.Item>
+                              </Select.Content>
+                            </Select.Root>
+                            <input
+                              type="text"
+                              value={scheduleDetailScheduleValue}
+                              onChange={(e) => setScheduleDetailScheduleValue(e.target.value)}
+                              spellCheck={false}
+                              disabled={scheduleDetailTask.status === 'cancelled'}
+                              placeholder={scheduleDetailScheduleType === 'cron' ? '0 9 * * * *' : '2099-12-31T23:59:59+00:00'}
+                              className={appearance === 'dark'
+                                ? 'min-w-[200px] flex-1 rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 font-mono text-xs text-slate-100'
+                                : 'min-w-[200px] flex-1 rounded-md border border-slate-300 bg-white px-2 py-1 font-mono text-xs text-slate-900'}
+                            />
+                          </Flex>
                           <Flex justify="end" gap="2" mt="3" wrap="wrap">
                             <Dialog.Close>
                               <Button variant="soft" size="1">Close</Button>
                             </Dialog.Close>
+                            <Button
+                              size="1"
+                              disabled={
+                                scheduleDetailBusy
+                                || scheduleDetailTask.status === 'cancelled'
+                                || (
+                                  scheduleDetailScheduleType === (scheduleDetailTask.schedule_type === 'once' ? 'once' : 'cron')
+                                  && scheduleDetailScheduleValue.trim() === scheduleDetailTask.schedule_value.trim()
+                                )
+                                || scheduleDetailScheduleValue.trim().length === 0
+                              }
+                              onClick={() => {
+                                if (scheduleDetailTask == null) return
+                                setScheduleDetailBusy(true)
+                                updateSchedule(scheduleDetailTask.id, {
+                                  schedule_type: scheduleDetailScheduleType,
+                                  schedule_value: scheduleDetailScheduleValue.trim(),
+                                })
+                                  .then(() => setScheduleDetailTask(null))
+                                  .catch(() => { /* api throws */ })
+                                  .finally(() => setScheduleDetailBusy(false))
+                              }}
+                            >
+                              {scheduleDetailBusy ? 'Saving…' : 'Save schedule'}
+                            </Button>
                             <Button
                               size="1"
                               disabled={

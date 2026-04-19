@@ -2048,8 +2048,9 @@ pub async fn process_with_agent_with_events(
                         && requested_skill_name
                             .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_SCHEDULING_SKILL))
                             .unwrap_or(false);
-                    let missing_schedule_skill =
-                        name == "schedule_task" && !schedule_skill_activated_this_turn;
+                    let missing_schedule_skill = (name == "schedule_task"
+                        || name == "update_scheduled_task")
+                        && !schedule_skill_activated_this_turn;
 
                     // TSA: allow or deny before execution
                     let tsa_deny = if state.config.tool_skill_agent_enabled {
@@ -2118,7 +2119,7 @@ pub async fn process_with_agent_with_events(
                         deny_result
                     } else if missing_schedule_skill {
                         crate::tools::ToolResult::error(
-                            "schedule_task requires activating the `schedule-job` skill first in this turn. Call `activate_skill` with skill_name `schedule-job`, follow its preflight (including timezone handling), then call schedule_task.".into(),
+                            "schedule_task and update_scheduled_task require activating the `schedule-job` skill first in this turn. Call `activate_skill` with skill_name `schedule-job`, follow its preflight (including timezone handling), then call the scheduling tool.".into(),
                         )
                         .with_error_type("skill_required")
                     } else {
@@ -3052,7 +3053,7 @@ fn build_system_prompt(
 - Read and write persistent memory
 - Search the web (web_search) and fetch web pages (web_fetch)
 - Send messages mid-conversation (send_message) — use this to send intermediate updates
-- Schedule tasks (schedule_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history)
+- Schedule tasks (schedule_task, update_scheduled_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history)
 - Export chat history to markdown (export_chat)
 - Understand images sent by users (they appear as image content blocks)
 - Run the Cursor CLI agent (cursor_agent) for research or code tasks; for long jobs, set detach: true to spawn in tmux and return immediately (then attach with tmux attach -t <session>); use cursor_agent_send to send keys to a running session; use list_cursor_agent_runs to see runs and session names
@@ -3081,7 +3082,7 @@ The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when 
 When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
 
 For scheduling:
-- Always activate `schedule-job` skill before calling `schedule_task`
+- Always activate `schedule-job` skill before calling `schedule_task` or `update_scheduled_task`
 - Use 6-field cron format: sec min hour dom month dow (e.g., "0 */5 * * * *" for every 5 minutes)
 - For standard 5-field cron from the user, prepend "0 " to add the seconds field
 - If timezone is unknown, default to UTC and state that assumption clearly
@@ -3284,6 +3285,11 @@ fn format_tool_status(name: &str, input: &serde_json::Value) -> String {
         "schedule_task" => {
             if let Some(prompt) = str_field("prompt") {
                 return format!("📅 Scheduling: {prompt}");
+            }
+        }
+        "update_scheduled_task" => {
+            if let Some(id) = input.get("task_id").and_then(|v| v.as_i64()) {
+                return format!("📅 Update schedule #{id}");
             }
         }
         "read_memory" | "write_memory" | "tiered_memory_read" | "tiered_memory_write" => {

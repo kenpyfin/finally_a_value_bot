@@ -110,6 +110,7 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "send_message"
         | "sync_skills"
         | "schedule_task"
+        | "update_scheduled_task"
         | "pause_scheduled_task"
         | "resume_scheduled_task"
         | "cancel_scheduled_task" => ToolRisk::Medium,
@@ -334,6 +335,10 @@ impl ToolRegistry {
                 config.clone(),
             )),
             Box::new(schedule::ScheduleTaskTool::new(
+                db.clone(),
+                config.timezone.clone(),
+            )),
+            Box::new(schedule::UpdateScheduledTaskTool::new(
                 db.clone(),
                 config.timezone.clone(),
             )),

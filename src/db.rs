@@ -2059,6 +2059,22 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Update cron/once schedule fields and next run (after preflight). Does not clear `last_run`.
+    pub fn update_task_schedule(
+        &self,
+        task_id: i64,
+        schedule_type: &str,
+        schedule_value: &str,
+        next_run: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE scheduled_tasks SET schedule_type = ?1, schedule_value = ?2, next_run = ?3 WHERE id = ?4",
+            params![schedule_type, schedule_value, next_run, task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_task_after_run(
         &self,
         task_id: i64,

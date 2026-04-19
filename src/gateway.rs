@@ -77,15 +77,11 @@ run: finally_a_value_bot gateway uninstall && finally_a_value_bot gateway instal
 pub fn user_gateway_service_installed() -> bool {
     #[cfg(target_os = "linux")]
     {
-        linux_unit_path()
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        linux_unit_path().map(|p| p.exists()).unwrap_or(false)
     }
     #[cfg(target_os = "macos")]
     {
-        mac_plist_path()
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        mac_plist_path().map(|p| p.exists()).unwrap_or(false)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -107,11 +103,7 @@ fn restart_user_gateway_now() -> Result<()> {
 fn restart_user_gateway_now() -> Result<()> {
     let target = mac_target_label()?;
     let output = run_command("launchctl", &["kickstart", "-k", &target])?;
-    ensure_success(
-        output,
-        "launchctl",
-        &["kickstart", "-k", &target],
-    )
+    ensure_success(output, "launchctl", &["kickstart", "-k", &target])
 }
 
 /// Restart after a short delay so an in-process HTTP response can flush before the gateway exits.
