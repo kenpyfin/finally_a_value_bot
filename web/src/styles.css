@@ -214,6 +214,11 @@ html.dark .aui-thread-root {
 }
 
 html.dark .aui-thread-viewport {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
   padding-top: 14px;
   padding-bottom: 24px;
 }
@@ -438,6 +443,11 @@ html:not(.dark) .aui-thread-root {
 }
 
 html:not(.dark) .aui-thread-viewport {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
   padding-top: 14px;
   padding-bottom: 24px;
 }
@@ -783,7 +793,8 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   display: grid;
   height: 100%;
   min-height: 0;
-  grid-template-columns: 1fr;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
 }
 
 @media (min-width: 768px) {
@@ -826,4 +837,18 @@ html.dark *::-webkit-scrollbar-thumb:hover {
 .mc-sidebar-resize-handle:focus-visible::after,
 .mc-sidebar-resize-handle--active::after {
   opacity: 0.65;
+}
+
+/* Narrow screens: keep thread readable; reduce attachment row padding from assistant-ui defaults */
+@media (max-width: 639px) {
+  html.dark .aui-thread-viewport,
+  html:not(.dark) .aui-thread-viewport {
+    padding-left: 0.5rem;
+    padding-right: 0.5rem;
+  }
+
+  .aui-composer-attachments {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
 }

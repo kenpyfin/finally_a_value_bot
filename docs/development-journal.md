@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-20 — DB: remove unused `project_artifacts` table
+
+- **Area:** db / agent (Telegram tool loop)
+- **Summary:** Dropped the `project_artifacts` table and `upsert_project_artifact`; nothing in the app read that data. New installs no longer create the table; existing DBs run `migrate_drop_project_artifacts` on open. Removed the post-tool `upsert_project_artifact` calls from the main agent loop.
+- **Rationale:** Redundant write-only bookkeeping with no UX or prompt consumption.
+- **Key files / symbols:** `src/db.rs` — `migrate_drop_project_artifacts`, initial schema; `src/channels/telegram.rs` tool completion path; `docs/runtime-gap-analysis.md`.
+
 ### 2026-04-19 — Scheduled tasks: PATCH schedule fields, `update_scheduled_task`, skill sync rule
 
 - **Area:** db / web API / agent tools / Telegram prompts / web UI / docs

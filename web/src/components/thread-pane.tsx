@@ -192,7 +192,7 @@ export const ThreadPane = React.memo(function ThreadPane({ adapter, initialMessa
 
   return (
     <AssistantRuntimeProvider key={runtimeKey} runtime={runtime}>
-      <div className="aui-root h-full min-h-0">
+      <div className="aui-root h-full min-h-0 min-w-0">
         <Thread
           assistantMessage={{
             allowCopy: true,

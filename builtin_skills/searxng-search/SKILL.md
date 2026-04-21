@@ -28,6 +28,9 @@ When SearXNG is used, **web_search** accepts:
 | `categories`  | No       | Comma-separated categories to search. Use to restrict to a tab (e.g. science, files). |
 | `engines`     | No       | Comma-separated engine names to use (e.g. google, semantic_scholar). |
 | `time_range`  | No       | Limit results to: `day`, `week`, `month`, `year`. |
+| `language`    | No       | Preferred language/locale (e.g. `zh`, `zh-CN`, `en`, `all`). Useful for Chinese company/entity search. |
+| `limit`       | No       | Maximum results to return (1-20). Default behavior returns up to 8. |
+| `safesearch`  | No       | SearXNG safesearch level: `0` off, `1` moderate, `2` strict. |
 
 ## Categories (use with `categories` or in-query `!`)
 
@@ -58,6 +61,9 @@ Examples:
 
 - **Recent only:**  
   `web_search(query="climate report", time_range="month")`
+
+- **Result count and safety filter:**  
+  `web_search(query="AI regulation", categories="news", limit=5, safesearch=1)`
 
 ## Query syntax (inside `query`)
 
@@ -119,6 +125,18 @@ You can mix these in the **query** string; SearXNG and underlying engines interp
 3. **Use filetype:pdf** (and category **files** when appropriate) for PDF-only or document-focused search.
 4. **Combine parameters:** e.g. `categories="science"`, `time_range="year"`, and `query="site:arxiv.org ..."` for recent arXiv papers.
 5. Instance capabilities vary: if a category or engine returns no results, try `general` or a simpler query.
+6. **Broad-first workflow:** start with 1-2 broad queries (legal EN company name and full Chinese name), then narrow with quotes/site filters.
+7. If two searches return no results, simplify first: remove quotes and `site:`, split mixed EN/ZH strings, then retry with `categories="general"` and a specific `language`.
+8. Browser search pages are often CAPTCHA/Cloudflare-gated; prefer `web_search` + `web_fetch` before trying browser automation.
+
+## Ops checks for SearXNG quality
+
+When search quality drops (many empty results), verify instance coverage and limits:
+
+1. **Engine responsiveness:** if tool output mentions unresponsive engines repeatedly, switch to a different `engines` set or instance.
+2. **Locale fit:** for Chinese B2B/company lookups, set `language="zh-CN"` and test both Chinese legal name and English legal name.
+3. **Rate limiting:** if you see 429, back off, reduce request bursts, or use another instance.
+4. **Category coverage:** use `general` first, then specialized categories only after a domain signal appears.
 
 ## Examples (concise)
 
@@ -127,3 +145,4 @@ You can mix these in the **query** string; SearXNG and underlying engines interp
 - PDFs: `web_search(query="filetype:pdf BERT survey", categories="files")`
 - Recent news: `web_search(query="AI regulation", categories="news", time_range="month")`
 - In-query syntax: `web_search(query="!science !wp CRISPR")` (Wikipedia + science category)
+- Chinese entities: `web_search(query="佛山市通达进出口有限公司", categories="general", language="zh-CN")`

@@ -49,11 +49,23 @@ impl Tool for WebSearchTool {
                 "type": "string",
                 "description": "Limit results to time range: day, week, month, year. Optional."
             });
+            schema["language"] = json!({
+                "type": "string",
+                "description": "Preferred search language/locale for SearXNG (examples: zh, zh-CN, en, all). Optional."
+            });
+            schema["limit"] = json!({
+                "type": "integer",
+                "description": "Max number of returned results (1-20). Optional; default is 8."
+            });
+            schema["safesearch"] = json!({
+                "type": "integer",
+                "description": "SearXNG safesearch level: 0 (off), 1 (moderate), 2 (strict). Optional."
+            });
         }
         ToolDefinition {
             name: "web_search".into(),
             description: format!(
-                "Search the web using {}. Returns titles, URLs, and snippets. Set SEARXNG_URL in .env to use a SearXNG instance (supports categories, engines, time_range).",
+                "Search the web using {}. Returns titles, URLs, and snippets. Set SEARXNG_URL in .env to use a SearXNG instance (supports categories, engines, time_range, language, limit, safesearch).",
                 backend
             ),
             input_schema: schema_object(
@@ -82,7 +94,22 @@ impl Tool for WebSearchTool {
                 .get("time_range")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty());
-            search_searxng(base, query, categories, engines, time_range).await
+            let language = input
+                .get("language")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
+            let limit = input
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.clamp(1, 20) as usize);
+            let safesearch = input
+                .get("safesearch")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.clamp(0, 2));
+            search_searxng(
+                base, query, categories, engines, time_range, language, limit, safesearch,
+            )
+            .await
         } else {
             search_ddg(query).await
         };
@@ -181,6 +208,9 @@ async fn search_searxng(
     categories: Option<&str>,
     engines: Option<&str>,
     time_range: Option<&str>,
+    language: Option<&str>,
+    limit: Option<usize>,
+    safesearch: Option<u64>,
 ) -> Result<String, String> {
     let base = base_url.trim_end_matches('/');
     let encoded = urlencoding::encode(query);
@@ -201,6 +231,14 @@ async fn search_searxng(
         };
         url.push_str("&time_range=");
         url.push_str(&urlencoding::encode(&tr_val));
+    }
+    if let Some(lang) = language {
+        url.push_str("&language=");
+        url.push_str(&urlencoding::encode(lang));
+    }
+    if let Some(level) = safesearch {
+        url.push_str("&safesearch=");
+        url.push_str(&level.to_string());
     }
 
     let client = build_http_client()?;
@@ -231,7 +269,8 @@ async fn search_searxng(
         .unwrap_or(&[]);
 
     let mut output = String::new();
-    for (i, item) in results.iter().take(8).enumerate() {
+    let result_limit = limit.unwrap_or(8);
+    for (i, item) in results.iter().take(result_limit).enumerate() {
         let title = item
             .get("title")
             .and_then(serde_json::Value::as_str)
@@ -256,7 +295,54 @@ async fn search_searxng(
         ));
     }
 
+    if output.trim().is_empty() {
+        return Ok(build_searxng_no_results_message(&data));
+    }
+
     Ok(output)
+}
+
+fn build_searxng_no_results_message(data: &serde_json::Value) -> String {
+    let mut lines = vec!["No results found.".to_string()];
+
+    let unresponsive = data
+        .get("unresponsive_engines")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(6)
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty());
+
+    if let Some(engines) = unresponsive {
+        lines.push(format!("Unresponsive engines: {engines}."));
+    }
+
+    let answers = data
+        .get("answers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(2)
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .filter(|s| !s.is_empty());
+
+    if let Some(answer_text) = answers {
+        lines.push(format!("Direct answers: {answer_text}"));
+    } else {
+        lines.push(
+            "Hint: simplify the query (drop quotes/site filters), then retry with category=general or set language explicitly (e.g., zh-CN)."
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -274,6 +360,34 @@ mod tests {
         assert!(def.input_schema["properties"]["query"].is_object());
         let required = def.input_schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "query"));
+    }
+
+    #[test]
+    fn test_web_search_definition_searxng_fields() {
+        let tool = WebSearchTool::new(Some("https://search.example.org".into()));
+        let def = tool.definition();
+        assert!(def.description.contains("SearXNG"));
+        assert!(def.input_schema["properties"]["categories"].is_object());
+        assert!(def.input_schema["properties"]["engines"].is_object());
+        assert!(def.input_schema["properties"]["time_range"].is_object());
+        assert!(def.input_schema["properties"]["language"].is_object());
+        assert!(def.input_schema["properties"]["limit"].is_object());
+        assert!(def.input_schema["properties"]["safesearch"].is_object());
+    }
+
+    #[test]
+    fn test_searxng_no_results_message_has_hint() {
+        let msg = build_searxng_no_results_message(&json!({}));
+        assert!(msg.contains("No results found."));
+        assert!(msg.contains("Hint: simplify the query"));
+    }
+
+    #[test]
+    fn test_searxng_no_results_message_includes_unresponsive() {
+        let msg = build_searxng_no_results_message(&json!({
+            "unresponsive_engines": ["google", "brave"]
+        }));
+        assert!(msg.contains("Unresponsive engines: google, brave."));
     }
 
     #[tokio::test]

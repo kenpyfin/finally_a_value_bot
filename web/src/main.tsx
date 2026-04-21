@@ -1379,8 +1379,8 @@ function App() {
       <div
         className={
           appearance === 'dark'
-            ? 'h-[100dvh] w-screen bg-[var(--mc-bg-main)] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
-            : 'h-[100dvh] w-screen bg-[radial-gradient(1200px_560px_at_-8%_-10%,#d1fae5_0%,transparent_58%),radial-gradient(1200px_560px_at_108%_-12%,#e0f2fe_0%,transparent_58%),#f8fafc] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
+            ? 'h-[100dvh] min-w-0 w-full overflow-x-hidden bg-[var(--mc-bg-main)] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
+            : 'h-[100dvh] min-w-0 w-full overflow-x-hidden bg-[radial-gradient(1200px_560px_at_-8%_-10%,#d1fae5_0%,transparent_58%),radial-gradient(1200px_560px_at_108%_-12%,#e0f2fe_0%,transparent_58%),#f8fafc] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
         }
       >
         {mobileNavOpen ? (
@@ -1397,6 +1397,7 @@ function App() {
               onClick={() => setMobileNavOpen(false)}
             />
             <div
+              id="mobile-session-sidebar-panel"
               className={
                 appearance === 'dark'
                   ? 'relative z-[101] flex h-full min-h-0 w-[min(320px,100vw)] max-w-[90vw] flex-col border-r border-[color:var(--mc-border-soft)] shadow-xl'
@@ -1484,6 +1485,32 @@ function App() {
                 className="w-full flex-col md:flex-row md:flex-wrap"
               >
                 <Flex align="center" gap="2" className="min-h-[44px] min-w-0 w-full md:flex-1">
+                  <IconButton
+                    size="3"
+                    variant="soft"
+                    color="gray"
+                    className="shrink-0 md:!hidden min-h-10 min-w-10"
+                    type="button"
+                    aria-expanded={mobileNavOpen}
+                    aria-haspopup="dialog"
+                    aria-controls="mobile-session-sidebar-panel"
+                    aria-label="Open personas and theme"
+                    title="Personas & theme"
+                    onClick={() => setMobileNavOpen(true)}
+                  >
+                    <svg
+                      className="size-5 shrink-0"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden
+                    >
+                      <path d="M4 6h16M4 12h16M4 18h16" />
+                    </svg>
+                  </IconButton>
                   <IconButton
                     size="3"
                     variant="soft"
@@ -2585,8 +2612,8 @@ function App() {
             <div
               className={
                 appearance === 'dark'
-                  ? 'flex min-h-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]'
-                  : 'flex min-h-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]'
+                  ? 'flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]'
+                  : 'flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]'
               }
             >
               <div className="mx-auto w-full max-w-5xl px-3 pt-3">
@@ -2632,11 +2659,14 @@ function App() {
                 ) : null}
               </div>
 
-              <div className="min-h-0 flex-1 px-1 pb-1 flex flex-col">
-                <Text size="1" color="gray" className="mb-1 px-2">
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col px-1 pb-1">
+                <Text size="1" color="gray" className="mb-1 hidden px-2 md:block">
                   Tip: On Telegram/Discord you can prefix a message with <code className="text-xs">[PersonaName]</code> to target a persona for that message.
                 </Text>
-                <div className="min-h-0 flex-1">
+                <Text size="1" color="gray" className="mb-1 px-2 md:hidden">
+                  Tip: Prefix with <code className="text-xs">[PersonaName]</code> on Telegram/Discord.
+                </Text>
+                <div className="min-h-0 min-w-0 flex-1">
                   <ThreadPane key={runtimeKey} adapter={adapter} initialMessages={historySeed} runtimeKey={runtimeKey} />
                 </div>
               </div>

@@ -6,7 +6,7 @@ Tracking runtime improvements for project continuity, workflow reuse, and reliab
 
 ## Completed
 
-- Added global `projects`, `project_artifacts`, and `project_runs` persistence in `src/db.rs`.
+- Added global `projects` and `project_runs` persistence in `src/db.rs`.
 - Added global `workflows` and `workflow_executions` persistence in `src/db.rs`.
 - Added unified `run_timeline_events` persistence in `src/db.rs`.
 - Added project/workflow-aware runtime context bootstrap in `src/channels/telegram.rs`.

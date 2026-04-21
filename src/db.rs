@@ -399,18 +399,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_projects_owner_updated
                 ON projects(owner_chat_id, updated_at DESC);
 
-            CREATE TABLE IF NOT EXISTS project_artifacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER NOT NULL,
-                artifact_type TEXT NOT NULL,
-                artifact_ref TEXT NOT NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL,
-                UNIQUE(project_id, artifact_type, artifact_ref)
-            );
-            CREATE INDEX IF NOT EXISTS idx_project_artifacts_project
-                ON project_artifacts(project_id, updated_at DESC);
-
             CREATE TABLE IF NOT EXISTS project_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -496,6 +484,7 @@ impl Database {
         Self::migrate_channel_bot_instances_and_policy(&conn)?;
         Self::migrate_fts(&conn)?;
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
+        Self::migrate_drop_project_artifacts(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -877,6 +866,15 @@ impl Database {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// Removes unused `project_artifacts` (never read by the app; only written).
+    fn migrate_drop_project_artifacts(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_project_artifacts_project;
+             DROP TABLE IF EXISTS project_artifacts;",
+        )?;
         Ok(())
     }
 
@@ -2466,32 +2464,6 @@ impl Database {
         conn.execute(
             "UPDATE projects SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status, now, project_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn upsert_project_artifact(
-        &self,
-        project_id: i64,
-        artifact_type: &str,
-        artifact_ref: &str,
-        metadata_json: Option<&str>,
-    ) -> Result<(), FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO project_artifacts (project_id, artifact_type, artifact_ref, metadata_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(project_id, artifact_type, artifact_ref) DO UPDATE SET
-               metadata_json = excluded.metadata_json,
-               updated_at = excluded.updated_at",
-            params![
-                project_id,
-                artifact_type,
-                artifact_ref,
-                metadata_json.unwrap_or("{}"),
-                now
-            ],
         )?;
         Ok(())
     }

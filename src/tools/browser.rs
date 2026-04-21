@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -8,6 +10,43 @@ use crate::claude::ToolDefinition;
 use crate::tools::command_runner::agent_browser_program;
 
 use super::{auth_context_from_input, schema_object, Tool, ToolResult};
+
+static PROFILE_IGNORE_WARN_EMITTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn profile_ignore_warning_already_emitted(session_key: &str) -> bool {
+    let lock = PROFILE_IGNORE_WARN_EMITTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut set = lock
+        .lock()
+        .expect("browser profile-warn dedupe mutex poisoned");
+    !set.insert(session_key.to_string())
+}
+
+/// agent-browser keeps a long-lived daemon; `--profile` is only honored when the daemon starts.
+/// After that, the CLI prints a benign warning on every invocation. Strip duplicate noise from
+/// successful runs so agent logs stay readable (first occurrence is kept).
+fn filter_browser_stderr_for_output(stderr: &str, session_key: &str, exit_code: i32) -> String {
+    if exit_code != 0 || stderr.is_empty() {
+        return stderr.to_string();
+    }
+    let needle = "--profile ignored: daemon already running";
+    if !stderr.contains(needle) {
+        return stderr.to_string();
+    }
+    if profile_ignore_warning_already_emitted(session_key) {
+        let mut out = String::new();
+        for line in stderr.lines() {
+            if line.contains(needle) {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+        return out;
+    }
+    stderr.to_string()
+}
 
 pub struct BrowserTool {
     data_dir: PathBuf,
@@ -105,6 +144,8 @@ impl Tool for BrowserTool {
         ToolDefinition {
             name: "browser".into(),
             description: "Browser automation via the agent-browser CLI (npm package). Use this tool with a command string (e.g. open, snapshot, click, fill). Do not run agent-browser in the shell — use this tool only. Browser state (cookies, localStorage, login sessions) persists across calls.\n\n\
+                Public search sites and trade directories are often protected by Cloudflare/CAPTCHA. Prefer web_search + web_fetch for discovery/extraction and use browser when interaction is truly required.\n\
+                If stderr says profile was ignored because a daemon is already running, the current daemon session is reused until restarted.\n\n\
                 ## Basic workflow\n\
                 1. `open <url>` — navigate to a URL\n\
                 2. `snapshot -i` — get interactive elements with refs (@e1, @e2, ...)\n\
@@ -167,7 +208,7 @@ impl Tool for BrowserTool {
             .unwrap_or_else(|| "finally_a_value_bot".to_string());
 
         args.push("--session".to_string());
-        args.push(session_name);
+        args.push(session_name.clone());
 
         if let Some(chat_id) = caller_chat_id {
             let path = self.profile_path(chat_id);
@@ -204,16 +245,19 @@ impl Tool for BrowserTool {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let exit_code = output.status.code().unwrap_or(-1);
 
+                let stderr_filtered =
+                    filter_browser_stderr_for_output(&stderr, &session_name, exit_code);
+
                 let mut result_text = String::new();
                 if !stdout.is_empty() {
                     result_text.push_str(&stdout);
                 }
-                if !stderr.is_empty() {
+                if !stderr_filtered.is_empty() {
                     if !result_text.is_empty() {
                         result_text.push('\n');
                     }
                     result_text.push_str("STDERR:\n");
-                    result_text.push_str(&stderr);
+                    result_text.push_str(&stderr_filtered);
                 }
                 if result_text.is_empty() {
                     result_text = format!("Command completed with exit code {exit_code}");
@@ -319,6 +363,26 @@ mod tests {
             BrowserTool::session_name_for_chat(-100987),
             "finally_a_value_bot-chat-neg100987"
         );
+    }
+
+    #[test]
+    fn test_filter_browser_stderr_dedupes_profile_ignored_warning() {
+        let session = "finally_a_value_bot-chat-test-dedupe-1";
+        let warn = "⚠ --profile ignored: daemon already running. Use 'agent-browser close' first to restart with new options.\n";
+        let first = filter_browser_stderr_for_output(warn, session, 0);
+        assert!(first.contains("--profile ignored"));
+        let second = filter_browser_stderr_for_output(warn, session, 0);
+        assert!(!second.contains("--profile ignored"));
+    }
+
+    #[test]
+    fn test_filter_browser_stderr_keeps_other_lines_on_second_call() {
+        let session = "finally_a_value_bot-chat-test-dedupe-2";
+        let msg = "⚠ --profile ignored: daemon already running.\nother line\n";
+        assert!(filter_browser_stderr_for_output(msg, session, 0).contains("--profile ignored"));
+        let second = filter_browser_stderr_for_output(msg, session, 0);
+        assert!(!second.contains("--profile ignored"));
+        assert!(second.contains("other line"));
     }
 
     #[tokio::test]

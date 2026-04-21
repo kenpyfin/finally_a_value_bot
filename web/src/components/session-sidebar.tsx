@@ -73,6 +73,31 @@ export function SessionSidebar({
           </Text>
         </div>
         <div className="relative flex items-center gap-2">
+          {onCloseRequest ? (
+            <button
+              type="button"
+              onClick={() => onCloseRequest()}
+              aria-label="Close menu"
+              title="Close"
+              className={
+                isDark
+                  ? 'inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] text-slate-300 hover:bg-white/5 hover:text-slate-100 md:hidden'
+                  : 'inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-100 md:hidden'
+              }
+            >
+              <svg
+                className="size-5"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                aria-hidden
+              >
+                <path d="M18 6L6 18M6 6l12 12" />
+              </svg>
+            </button>
+          ) : null}
           <button
             ref={themeButtonRef}
             type="button"
