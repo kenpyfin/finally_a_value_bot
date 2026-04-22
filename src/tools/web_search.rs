@@ -7,14 +7,28 @@ use super::web_html::extract_ddg_results;
 use super::{schema_object, Tool, ToolResult};
 use crate::claude::ToolDefinition;
 
+const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
+
 pub struct WebSearchTool {
-    /// When set, use this SearXNG instance instead of DuckDuckGo (more reliable when DDG blocks or returns no results).
+    /// When set, use Tavily Search API (recommended for agents).
+    pub tavily_api_key: Option<String>,
+    /// When set (and Tavily not configured), use this SearXNG instance instead of DuckDuckGo.
     pub searxng_url: Option<String>,
 }
 
 impl WebSearchTool {
-    pub fn new(searxng_url: Option<String>) -> Self {
-        Self { searxng_url }
+    pub fn new(tavily_api_key: Option<String>, searxng_url: Option<String>) -> Self {
+        Self {
+            tavily_api_key,
+            searxng_url,
+        }
+    }
+
+    fn use_tavily(&self) -> bool {
+        self.tavily_api_key
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
     }
 }
 
@@ -25,18 +39,50 @@ impl Tool for WebSearchTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        let backend = if self.searxng_url.is_some() {
+        let backend = if self.use_tavily() {
+            "Tavily"
+        } else if self.searxng_url.is_some() {
             "SearXNG"
         } else {
             "DuckDuckGo"
         };
+        let query_desc = if self.use_tavily() {
+            "The search query. Use plain keywords; optional topic/time_range/limit refine results."
+        } else {
+            "The search query. With SearXNG you can use !category or !engine (e.g. !science, !files, !wp) and syntax like filetype:pdf, site:example.com."
+        };
         let mut schema = json!({
             "query": {
                 "type": "string",
-                "description": "The search query. With SearXNG you can use !category or !engine (e.g. !science, !files, !wp) and syntax like filetype:pdf, site:example.com."
+                "description": query_desc
             }
         });
-        if self.searxng_url.is_some() {
+        if self.use_tavily() {
+            schema["limit"] = json!({
+                "type": "integer",
+                "description": "Max results to return (1-20). Default 8."
+            });
+            schema["search_depth"] = json!({
+                "type": "string",
+                "description": "Tavily search depth: basic, advanced, fast, or ultra-fast (latency vs. quality). Default basic."
+            });
+            schema["topic"] = json!({
+                "type": "string",
+                "description": "Tavily topic: general, news, or finance. Default general. You can also set categories to include \"news\" to imply news."
+            });
+            schema["time_range"] = json!({
+                "type": "string",
+                "description": "Tavily time filter: day, week, month, or year (optional)."
+            });
+            schema["include_answer"] = json!({
+                "type": "boolean",
+                "description": "If true, include Tavily's LLM summary answer when available (uses extra credits when applicable)."
+            });
+            schema["categories"] = json!({
+                "type": "string",
+                "description": "Optional hint: if this contains \"news\", topic defaults to news (same as SearXNG-style category hints)."
+            });
+        } else if self.searxng_url.is_some() {
             schema["categories"] = json!({
                 "type": "string",
                 "description": "SearXNG categories to search: general, science, files, images, it, news, map, music, social, videos, etc. Comma-separated. Overrides default."
@@ -62,16 +108,20 @@ impl Tool for WebSearchTool {
                 "description": "SearXNG safesearch level: 0 (off), 1 (moderate), 2 (strict). Optional."
             });
         }
+        let desc_suffix = if self.use_tavily() {
+            " Set TAVILY_API_KEY in .env. Optional: search_depth, topic, time_range, limit, include_answer."
+        } else if self.searxng_url.is_some() {
+            " Set SEARXNG_URL in .env to use SearXNG (supports categories, engines, time_range, language, limit, safesearch)."
+        } else {
+            " For reliable search, set TAVILY_API_KEY (Tavily) or SEARXNG_URL (SearXNG)."
+        };
         ToolDefinition {
             name: "web_search".into(),
             description: format!(
-                "Search the web using {}. Returns titles, URLs, and snippets. Set SEARXNG_URL in .env to use a SearXNG instance (supports categories, engines, time_range, language, limit, safesearch).",
+                "Search the web using {}. Returns titles, URLs, and snippets.{desc_suffix}",
                 backend
             ),
-            input_schema: schema_object(
-                schema,
-                &["query"],
-            ),
+            input_schema: schema_object(schema, &["query"]),
         }
     }
 
@@ -81,7 +131,10 @@ impl Tool for WebSearchTool {
             None => return ToolResult::error("Missing required parameter: query".into()),
         };
 
-        let result = if let Some(ref base) = self.searxng_url {
+        let result = if self.use_tavily() {
+            let key = self.tavily_api_key.as_deref().unwrap_or("").trim();
+            search_tavily(key, query, &input).await
+        } else if let Some(ref base) = self.searxng_url {
             let categories = input
                 .get("categories")
                 .and_then(|v| v.as_str())
@@ -117,10 +170,12 @@ impl Tool for WebSearchTool {
         match result {
             Ok(results) => {
                 if results.is_empty() {
-                    let msg = if self.searxng_url.is_some() {
+                    let msg = if self.use_tavily() {
+                        "No results found.".into()
+                    } else if self.searxng_url.is_some() {
                         "No results found.".into()
                     } else {
-                        "No results found. DuckDuckGo may be blocking or returning empty results. For reliable search, set SEARXNG_URL in .env to a SearXNG instance (e.g. your own or a public instance).".into()
+                        "No results found. DuckDuckGo may be blocking or returning empty results. For reliable search, set TAVILY_API_KEY (Tavily) or SEARXNG_URL in .env.".into()
                     };
                     ToolResult::success(msg)
                 } else {
@@ -135,7 +190,7 @@ impl Tool for WebSearchTool {
 fn build_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .use_rustls_tls()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|e| {
@@ -150,6 +205,154 @@ fn build_http_client() -> Result<reqwest::Client, String> {
                 format!("{msg}: {detail}")
             }
         })
+}
+
+async fn search_tavily(
+    api_key: &str,
+    query: &str,
+    input: &serde_json::Value,
+) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("TAVILY_API_KEY is empty".into());
+    }
+
+    let max_results = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.clamp(1, 20))
+        .unwrap_or(8);
+
+    let search_depth = input
+        .get("search_depth")
+        .and_then(|v| v.as_str())
+        .filter(|s| {
+            matches!(
+                s.to_ascii_lowercase().as_str(),
+                "advanced" | "basic" | "fast" | "ultra-fast"
+            )
+        })
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "basic".to_string());
+
+    let topic = if let Some(t) = input
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match t.to_ascii_lowercase().as_str() {
+            "general" | "news" | "finance" => t.to_ascii_lowercase(),
+            _ => "general".to_string(),
+        }
+    } else if let Some(cats) = input.get("categories").and_then(|v| v.as_str()) {
+        let lower = cats.to_ascii_lowercase();
+        if lower.contains("news") {
+            "news".to_string()
+        } else if lower.contains("finance") {
+            "finance".to_string()
+        } else {
+            "general".to_string()
+        }
+    } else {
+        "general".to_string()
+    };
+
+    let mut body = json!({
+        "api_key": api_key,
+        "query": query,
+        "max_results": max_results,
+        "search_depth": search_depth,
+        "topic": topic,
+    });
+
+    if let Some(tr) = input
+        .get("time_range")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let tr_norm = match tr.to_ascii_lowercase().as_str() {
+            "day" | "week" | "month" | "year" => tr.to_ascii_lowercase(),
+            "d" => "day".to_string(),
+            "w" => "week".to_string(),
+            "m" => "month".to_string(),
+            "y" => "year".to_string(),
+            _ => String::new(),
+        };
+        if !tr_norm.is_empty() {
+            body["time_range"] = json!(tr_norm);
+        }
+    }
+
+    if let Some(b) = input.get("include_answer").and_then(|v| v.as_bool()) {
+        body["include_answer"] = json!(b);
+    }
+
+    let client = build_http_client()?;
+
+    let resp = client
+        .post(TAVILY_SEARCH_URL)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let preview: String = text.chars().take(500).collect();
+        return Err(format!("Tavily returned HTTP {status}: {preview}"));
+    }
+
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let mut output = String::new();
+
+    if let Some(ans) = data.get("answer").and_then(|v| v.as_str()) {
+        if !ans.trim().is_empty() {
+            output.push_str("Answer: ");
+            output.push_str(ans.trim());
+            output.push_str("\n\n");
+        }
+    }
+
+    let results: &[serde_json::Value] = data
+        .get("results")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    for (i, item) in results.iter().enumerate() {
+        let title = item
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let url = item
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let content = item
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if url.is_empty() && title.is_empty() {
+            continue;
+        }
+        output.push_str(&format!(
+            "{}. {}\n   {}\n   {}\n\n",
+            i + 1,
+            title,
+            url,
+            content
+        ));
+    }
+
+    if output.trim().is_empty() {
+        return Ok("No results found.\nHint: try a shorter query, different topic (e.g. news), or search_depth basic.".to_string());
+    }
+
+    Ok(output)
 }
 
 async fn search_ddg(query: &str) -> Result<String, String> {
@@ -351,8 +554,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_web_search_definition() {
-        let tool = WebSearchTool::new(None);
+    fn test_web_search_definition_ddg() {
+        let tool = WebSearchTool::new(None, None);
         assert_eq!(tool.name(), "web_search");
         let def = tool.definition();
         assert_eq!(def.name, "web_search");
@@ -363,8 +566,18 @@ mod tests {
     }
 
     #[test]
+    fn test_web_search_definition_tavily_fields() {
+        let tool = WebSearchTool::new(Some("tvly-test".into()), None);
+        let def = tool.definition();
+        assert!(def.description.contains("Tavily"));
+        assert!(def.input_schema["properties"]["search_depth"].is_object());
+        assert!(def.input_schema["properties"]["topic"].is_object());
+        assert!(def.input_schema["properties"]["limit"].is_object());
+    }
+
+    #[test]
     fn test_web_search_definition_searxng_fields() {
-        let tool = WebSearchTool::new(Some("https://search.example.org".into()));
+        let tool = WebSearchTool::new(None, Some("https://search.example.org".into()));
         let def = tool.definition();
         assert!(def.description.contains("SearXNG"));
         assert!(def.input_schema["properties"]["categories"].is_object());
@@ -392,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_search_missing_query() {
-        let tool = WebSearchTool::new(None);
+        let tool = WebSearchTool::new(None, None);
         let result = tool.execute(json!({})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Missing required parameter: query"));
@@ -400,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_search_null_query() {
-        let tool = WebSearchTool::new(None);
+        let tool = WebSearchTool::new(None, None);
         let result = tool.execute(json!({"query": null})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Missing required parameter: query"));

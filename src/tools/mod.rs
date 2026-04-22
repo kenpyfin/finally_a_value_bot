@@ -262,16 +262,22 @@ pub fn resolve_tool_working_dir(base_working_dir: &Path) -> PathBuf {
     resolved
 }
 
-/// Auto-detect the vault search command from the built-in search-vault skill.
-/// Looks for `query_vault.py` in the skills directory and a Python venv at `shared/.venv-vault`.
+/// Auto-detect the vault search command from the search-vault skill.
+/// Prefers `workspace/skills/`; falls back to repository `builtin_skills/search-vault/`.
+/// Expects a Python venv at `shared/.venv-vault` when present.
 fn detect_vault_search_command(config: &Config) -> Option<String> {
     let workspace = config.workspace_root_absolute();
-    let skills_dir = workspace.join("skills");
-
-    let script = skills_dir.join("search-vault").join("query_vault.py");
-    if !script.exists() {
-        return None;
-    }
+    let ws_script = workspace
+        .join("skills")
+        .join("search-vault")
+        .join("query_vault.py");
+    let script = if ws_script.exists() {
+        ws_script
+    } else {
+        crate::builtin_skills::resolve_builtin_skills_dir(config)
+            .map(|b| b.join("search-vault").join("query_vault.py"))
+            .filter(|p| p.exists())?
+    };
 
     let venv_python = workspace
         .join("shared")
@@ -298,9 +304,6 @@ impl ToolRegistry {
             );
         }
         let skills_data_dir = config.skills_data_dir();
-        let workspace_root = config.workspace_root_absolute();
-        let primary_skills = workspace_root.join("skills");
-        let shared_skills = workspace_root.join("shared").join("skills");
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::BashTool::new_with_safety(
                 config.working_dir(),
@@ -309,6 +312,7 @@ impl ToolRegistry {
             )),
             Box::new(browser::BrowserTool::new(
                 &config.runtime_data_dir(),
+                config.working_dir(),
                 config.agent_browser_path.clone(),
             )),
             Box::new(read_file::ReadFileTool::new(config.working_dir())),
@@ -326,6 +330,7 @@ impl ToolRegistry {
             )),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool::new(
+                config.tavily_api_key.clone(),
                 config.web_search_searxng_url.clone(),
             )),
             Box::new(send_message::SendMessageTool::new_with_config(
@@ -355,10 +360,9 @@ impl ToolRegistry {
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
             Box::new(cursor_agent::CursorAgentSendTool::new(config)),
             Box::new(cursor_agent::BuildSkillTool::new(config, db.clone())),
-            Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
-                &primary_skills,
-                &shared_skills,
-            ])),
+            Box::new(activate_skill::ActivateSkillTool::new_with_dirs(
+                config.skill_discovery_dirs(),
+            )),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(tiered_memory::ReadTieredMemoryTool::new(
                 &config.runtime_data_dir(),

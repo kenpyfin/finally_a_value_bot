@@ -378,7 +378,10 @@ pub struct Config {
     /// Full path to the agent-browser CLI (npm). If set, the browser tool uses this instead of looking up "agent-browser" on PATH. Use when the process PATH doesn't include agent-browser (e.g. when run as a service).
     #[serde(default)]
     pub agent_browser_path: Option<String>,
-    /// Optional SearXNG instance URL for web_search (e.g. https://search.example.org). When set, web_search uses this instead of DuckDuckGo HTML. Env: SEARXNG_URL.
+    /// Optional Tavily API key for web_search. When set, web_search uses Tavily (https://api.tavily.com/search) instead of SearXNG or DuckDuckGo. Env: TAVILY_API_KEY.
+    #[serde(default)]
+    pub tavily_api_key: Option<String>,
+    /// Optional SearXNG instance URL for web_search (e.g. https://search.example.org). Used when Tavily is not configured. Env: SEARXNG_URL.
     #[serde(default)]
     pub web_search_searxng_url: Option<String>,
     /// Path to the cursor-agent CLI. Default: "cursor-agent" (or "cursor-agent.cmd" on Windows). Use when the process PATH doesn't include cursor-agent.
@@ -481,6 +484,17 @@ impl Config {
     /// Absolute path to the skills directory. Use this in the system prompt so the bot writes skill files to the real skills dir (file tools resolve relative paths from workspace_dir/shared).
     pub fn skills_data_dir_absolute(&self) -> std::path::PathBuf {
         self.workspace_root_absolute().join("skills")
+    }
+
+    /// Directories scanned for `SKILL.md` and skill resources, in merge order. The first path wins
+    /// when two skills share a name. Workspace and shared skills override built-ins with the same name.
+    pub fn skill_discovery_dirs(&self) -> Vec<PathBuf> {
+        let root = self.workspace_root_absolute();
+        let mut dirs = vec![root.join("skills"), root.join("shared").join("skills")];
+        if let Some(builtin) = crate::builtin_skills::resolve_builtin_skills_dir(self) {
+            dirs.push(builtin);
+        }
+        dirs
     }
 
     /// Absolute path to the workspace root (workspace_dir resolved to absolute).
@@ -754,6 +768,7 @@ impl Config {
                 }
             },
             agent_browser_path: Self::env("AGENT_BROWSER_PATH"),
+            tavily_api_key: Self::env("TAVILY_API_KEY"),
             web_search_searxng_url: Self::env("SEARXNG_URL"),
             cursor_agent_cli_path: Self::env("CURSOR_AGENT_CLI_PATH")
                 .unwrap_or_else(default_cursor_agent_cli_path),
@@ -1228,6 +1243,7 @@ pub fn test_config() -> Config {
             "package".into(),
         ],
         agent_browser_path: None,
+        tavily_api_key: None,
         web_search_searxng_url: None,
         cursor_agent_cli_path: default_cursor_agent_cli_path(),
         cursor_agent_model: String::new(),

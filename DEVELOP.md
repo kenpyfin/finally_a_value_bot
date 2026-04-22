@@ -62,7 +62,7 @@ src/
         glob.rs          # File pattern matching (glob crate)
         grep.rs          # Recursive regex search, directory traversal
         memory.rs        # read_memory / write_memory tools
-        web_search.rs    # DuckDuckGo HTML search, regex result parsing
+        web_search.rs    # Tavily (TAVILY_API_KEY), optional SearXNG (SEARXNG_URL), else DuckDuckGo HTML
         web_fetch.rs     # URL fetching, HTML tag stripping, 20KB limit
         send_message.rs  # Mid-conversation Telegram messaging
         schedule.rs      # 5 scheduling tools (create/list/pause/resume/cancel)

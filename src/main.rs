@@ -465,14 +465,19 @@ async fn main() -> anyhow::Result<()> {
 
     let data_root_dir = config.data_root_dir();
     let runtime_data_dir = config.runtime_data_dir();
-    let workspace_root = config.workspace_root_absolute();
     migrate_legacy_runtime_layout(&data_root_dir, Path::new(&runtime_data_dir));
     migrate_repo_shared_into_workspace(Path::new(config.working_dir()));
     migrate_agents_md_to_workspace_root(
         Path::new(config.working_dir()),
         Path::new(&runtime_data_dir),
     );
-    builtin_skills::ensure_builtin_skills(&data_root_dir)?;
+
+    match builtin_skills::resolve_builtin_skills_dir(&config) {
+        Some(p) => info!("Built-in skills directory: {}", p.display()),
+        None => tracing::warn!(
+            "Built-in skills directory not found; set FINALLY_A_VALUE_BOT_BUILTIN_SKILLS or keep `builtin_skills/` next to the workspace data root. Only skills under the workspace will be available until then."
+        ),
+    }
 
     if std::env::var("FINALLY_A_VALUE_BOT_GATEWAY").is_ok() {
         logging::init_logging(&runtime_data_dir)?;
@@ -509,11 +514,8 @@ async fn main() -> anyhow::Result<()> {
     );
     info!("Memory manager initialized");
 
-    // Use absolute paths and include workspace/shared/skills so skills created by any
-    // persona (even if written to shared workspace) are discoverable by all personas.
-    let primary_skills = workspace_root.join("skills");
-    let shared_skills = workspace_root.join("shared").join("skills");
-    let skill_manager = skills::SkillManager::from_skills_dirs([&primary_skills, &shared_skills]);
+    // Workspace + shared skills first (override names); then repository `builtin_skills/` when resolved.
+    let skill_manager = skills::SkillManager::from_skills_dirs(config.skill_discovery_dirs());
     let discovered = skill_manager.discover_skills();
     info!(
         "Skill manager initialized ({} skills discovered)",

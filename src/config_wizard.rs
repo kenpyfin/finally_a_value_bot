@@ -466,6 +466,7 @@ fn default_config() -> Config {
             "package".into(),
         ],
         agent_browser_path: None,
+        tavily_api_key: None,
         web_search_searxng_url: None,
         cursor_agent_cli_path: crate::config::default_cursor_agent_cli_path(),
         cursor_agent_model: String::new(),

@@ -267,10 +267,20 @@ fn seed_default_vault_maintenance_tasks(ctx: &ServiceContext) -> Result<()> {
     let persona_id = db.get_current_persona_id(chat_id)?;
 
     let workspace_root = cfg.workspace_root_absolute();
-    let index_script = workspace_root
+    let ws_index = workspace_root
         .join("skills")
         .join("index-vault")
         .join("index_vault.py");
+    let index_script = if ws_index.exists() {
+        ws_index
+    } else if let Some(p) = crate::builtin_skills::resolve_builtin_skills_dir(&cfg)
+        .map(|b| b.join("index-vault").join("index_vault.py"))
+        .filter(|p| p.exists())
+    {
+        p
+    } else {
+        ws_index
+    };
     let venv_python = workspace_root
         .join("shared")
         .join(".venv-vault")

@@ -18,6 +18,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-22 — Browser tool downloads now stay under workspace
+
+- **Area:** tools / browser / runtime paths
+- **Summary:** Updated `BrowserTool` to execute `agent-browser` with an explicit current working directory at `WORKSPACE_DIR/shared` instead of inheriting the process cwd. This keeps relative output paths (for example `screenshot foo.png`, `pdf out.pdf`, and browser-triggered downloads that honor process cwd) inside the workspace tree rather than the repository root.
+- **Rationale:** Users observed downloaded artifacts landing in the project root. The browser tool previously launched without `current_dir`, so Node inherited whatever directory the bot process was started from.
+- **Key files / symbols:** `src/tools/browser.rs` (`BrowserTool::new`, `command_working_dir`, command spawn `current_dir`), `src/tools/mod.rs` (pass `config.working_dir()` into `BrowserTool`), `tools::browser::tests::test_browser_command_working_dir_uses_workspace_shared`.
+
 ### 2026-04-20 — DB: remove unused `project_artifacts` table
 
 - **Area:** db / agent (Telegram tool loop)

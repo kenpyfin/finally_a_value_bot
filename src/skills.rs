@@ -59,9 +59,9 @@ impl SkillManager {
     }
 
     /// Create a SkillManager that scans multiple directories. Skills are merged and
-    /// deduped by name (earlier directories take precedence). Use this to include
-    /// both workspace/skills and workspace/shared/skills so all personas see skills
-    /// regardless of where they were created.
+    /// deduped by name (earlier directories take precedence). Typical order: workspace
+    /// `skills/`, `shared/skills/`, then repository `builtin_skills/` (see
+    /// [`Config::skill_discovery_dirs`](crate::config::Config::skill_discovery_dirs)).
     pub fn from_skills_dirs(dirs: impl IntoIterator<Item = impl AsRef<std::path::Path>>) -> Self {
         let skills_dirs: Vec<PathBuf> =
             dirs.into_iter().map(|p| p.as_ref().to_path_buf()).collect();

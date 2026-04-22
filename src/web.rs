@@ -3711,13 +3711,7 @@ mod tests {
             telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),
-            skills: {
-                let root = cfg.workspace_root_absolute();
-                SkillManager::from_skills_dirs([
-                    root.join("skills"),
-                    root.join("shared").join("skills"),
-                ])
-            },
+            skills: SkillManager::from_skills_dirs(cfg.skill_discovery_dirs()),
             llm,
             tools: ToolRegistry::new(&cfg, bot, db),
             discord_http: Arc::new(std::collections::HashMap::new()),

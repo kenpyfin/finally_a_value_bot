@@ -42,19 +42,17 @@ Then:
 
 ## Helper script
 
-From the **repository root**, examples use the workspace copy:
+From the **repository root**:
 
 ```bash
-python3 skills/schedule-job/schedule_helper.py cron "*/15 * * * *" --timezone "Asia/Bangkok"
-python3 skills/schedule-job/schedule_helper.py once "2026-03-14T09:30:00" --timezone "Asia/Bangkok"
+python3 builtin_skills/schedule-job/schedule_helper.py cron "*/15 * * * *" --timezone "Asia/Bangkok"
+python3 builtin_skills/schedule-job/schedule_helper.py once "2026-03-14T09:30:00" --timezone "Asia/Bangkok"
 ```
-
-The same files exist under `builtin_skills/schedule-job/` (packaged builtin); **keep them in sync** with `skills/schedule-job/` per project rules.
 
 If no timezone is known:
 
 ```bash
-python3 skills/schedule-job/schedule_helper.py cron "0 9 * * *"
+python3 builtin_skills/schedule-job/schedule_helper.py cron "0 9 * * *"
 ```
 
 The script prints JSON with normalized output and explicit timezone assumptions.

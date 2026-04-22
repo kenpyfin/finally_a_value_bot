@@ -50,6 +50,7 @@ fn filter_browser_stderr_for_output(stderr: &str, session_key: &str, exit_code: 
 
 pub struct BrowserTool {
     data_dir: PathBuf,
+    base_working_dir: PathBuf,
     /// If set, use this path for the agent-browser executable; otherwise use default from PATH.
     agent_browser_path: Option<String>,
 }
@@ -111,9 +112,10 @@ fn split_browser_command(command: &str) -> Result<Vec<String>, String> {
 
 impl BrowserTool {
     /// Create a browser tool. `agent_browser_path`: optional full path to agent-browser CLI from config.
-    pub fn new(data_dir: &str, agent_browser_path: Option<String>) -> Self {
+    pub fn new(data_dir: &str, working_dir: &str, agent_browser_path: Option<String>) -> Self {
         BrowserTool {
             data_dir: PathBuf::from(data_dir).join("groups"),
+            base_working_dir: PathBuf::from(working_dir),
             agent_browser_path,
         }
     }
@@ -131,6 +133,10 @@ impl BrowserTool {
             chat_id.to_string()
         };
         format!("finally_a_value_bot-chat-{normalized}")
+    }
+
+    fn command_working_dir(&self) -> PathBuf {
+        super::resolve_tool_working_dir(&self.base_working_dir)
     }
 }
 
@@ -235,6 +241,9 @@ impl Tool for BrowserTool {
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&args);
+        let working_dir = self.command_working_dir();
+        let _ = tokio::fs::create_dir_all(&working_dir).await;
+        cmd.current_dir(&working_dir);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
@@ -331,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_browser_tool_name_and_definition() {
-        let tool = BrowserTool::new("/tmp/test-data", None);
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
         assert_eq!(tool.name(), "browser");
         let def = tool.definition();
         assert_eq!(def.name, "browser");
@@ -345,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_browser_profile_path() {
-        let tool = BrowserTool::new("/tmp/test-data", None);
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
         let path = tool.profile_path(12345);
         assert_eq!(
             path,
@@ -362,6 +371,15 @@ mod tests {
         assert_eq!(
             BrowserTool::session_name_for_chat(-100987),
             "finally_a_value_bot-chat-neg100987"
+        );
+    }
+
+    #[test]
+    fn test_browser_command_working_dir_uses_workspace_shared() {
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
+        assert_eq!(
+            tool.command_working_dir(),
+            PathBuf::from("/tmp/workspace/shared")
         );
     }
 
@@ -387,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_browser_missing_command() {
-        let tool = BrowserTool::new("/tmp/test-data", None);
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
         let result = tool.execute(json!({})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Missing 'command'"));
