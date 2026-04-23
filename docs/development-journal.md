@@ -18,6 +18,20 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-23 — Cockpit bulletin layout + bookmark jump UX
+
+- **Area:** web UI / cockpit / chat thread
+- **Summary:** Moved bulletin rendering into the cockpit expand/collapse container and split it into two explicit sections: **Bot bulletin** (tool-driven updates) and **Bookmarks** (user-pinned bubbles). Bookmark chips in cockpit are now clickable and scroll to the original message in-thread with a short highlight animation.
+- **Rationale:** Operators requested updates to live with status/cockpit controls, clearer separation between bot-authored bulletin updates and user bookmarks, and fast navigation back to the source bubble.
+- **Key files / symbols:** `web/src/components/cockpit-bar.tsx` (`bulletinUpdates`, `bookmarks`, `onBookmarkClick` sections); `web/src/main.tsx` (`jumpToBookmarkedMessage`, cockpit props, removed inline bulletin callout); `web/src/components/thread-pane.tsx` (stable per-message anchor ids via `data-message-id` / `id`); `web/src/styles.css` (`mc-jump-highlight`, action-bar positioning tweak, bookmark/button spacing).
+
+### 2026-04-22 — Persona bulletin + message bookmarks with prompt injection
+
+- **Area:** db / agent loop / web API / web UI
+- **Summary:** Added per-persona bulletin events for memory/file updates, persona-scoped message bookmarks, and web bulletin/bookmark APIs + UI controls. Bookmarked bubbles now flow into `build_system_prompt` context each run as a dedicated “Bookmarked Conversation Context” section.
+- **Rationale:** Users need an at-a-glance persona update panel and a way to pin high-signal conversation bubbles so future turns keep that context without manually repeating it.
+- **Key files / symbols:** `src/db.rs` (`PersonaBulletinEvent`, `PersonaMessageBookmark`, `append_persona_bulletin_event`, `list_persona_bulletin_events`, `upsert_persona_message_bookmark`, `list_persona_message_bookmarks`); `src/channels/telegram.rs` (`bulletin_event_from_tool_use`, prompt bookmark section in `process_with_agent_with_events`); `src/web.rs` (`api_persona_bulletin_get`, `api_persona_bookmarks_get/post/delete` routes); `web/src/components/thread-pane.tsx` (bookmark toggle in user/assistant bubbles); `web/src/main.tsx` (`loadPersonaBulletin`, `toggleMessageBookmark`, bulletin callout); `web/src/types.ts` (bulletin/bookmark types).
+
 ### 2026-04-22 — Browser tool downloads now stay under workspace
 
 - **Area:** tools / browser / runtime paths

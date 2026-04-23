@@ -84,7 +84,41 @@ function MessageTimestamp({ align }: { align: 'left' | 'right' }) {
   )
 }
 
-function CustomAssistantMessage() {
+type MessageDecorProps = {
+  bookmarkedMessageIds?: Set<string>
+  onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
+}
+
+function MessageBookmarkButton({
+  role,
+  bookmarkedMessageIds,
+  onToggleBookmark,
+}: {
+  role: 'user' | 'assistant'
+  bookmarkedMessageIds?: Set<string>
+  onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
+}) {
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  const isBookmarked = useMessage((m) => {
+    const id = typeof m.id === 'string' ? m.id : ''
+    return id.length > 0 && (bookmarkedMessageIds?.has(id) ?? false)
+  })
+  if (!onToggleBookmark || !messageId) return null
+  return (
+    <button
+      type="button"
+      className="mc-bookmark-btn"
+      onClick={() => onToggleBookmark(messageId, role)}
+      title={isBookmarked ? 'Remove bookmark' : 'Bookmark this bubble'}
+      aria-label={isBookmarked ? 'Remove bookmark' : 'Bookmark message'}
+    >
+      {isBookmarked ? '★' : '☆'}
+    </button>
+  )
+}
+
+function CustomAssistantMessage({ bookmarkedMessageIds, onToggleBookmark }: MessageDecorProps) {
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   const hasRenderableContent = useMessage((m) =>
     Array.isArray(m.content)
       ? m.content.some((part) => {
@@ -95,7 +129,7 @@ function CustomAssistantMessage() {
   )
 
   return (
-    <AssistantMessage.Root>
+    <AssistantMessage.Root data-message-id={messageId || undefined}>
       <AssistantMessage.Avatar />
       {hasRenderableContent ? (
         <AssistantMessage.Content />
@@ -108,18 +142,33 @@ function CustomAssistantMessage() {
         </div>
       )}
       <BranchPicker />
-      <AssistantActionBar />
-      <MessageTimestamp align="left" />
+      <div className="mc-msg-meta-row">
+        <MessageBookmarkButton
+          role="assistant"
+          bookmarkedMessageIds={bookmarkedMessageIds}
+          onToggleBookmark={onToggleBookmark}
+        />
+        <AssistantActionBar />
+        <MessageTimestamp align="left" />
+      </div>
     </AssistantMessage.Root>
   )
 }
 
-function CustomUserMessage() {
+function CustomUserMessage({ bookmarkedMessageIds, onToggleBookmark }: MessageDecorProps) {
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   return (
-    <UserMessage.Root>
+    <UserMessage.Root data-message-id={messageId || undefined}>
       <UserMessage.Attachments />
       <MessagePrimitive.If hasContent>
-        <UserActionBar />
+        <div className="mc-msg-meta-row mc-msg-meta-row-user">
+          <MessageBookmarkButton
+            role="user"
+            bookmarkedMessageIds={bookmarkedMessageIds}
+            onToggleBookmark={onToggleBookmark}
+          />
+          <UserActionBar />
+        </div>
         <div className="mc-user-content-wrap">
           <UserMessage.Content />
           <MessageTimestamp align="right" />
@@ -168,10 +217,18 @@ export type ThreadPaneProps = {
   adapter: ChatModelAdapter
   initialMessages: ThreadMessageLike[]
   runtimeKey: string
+  bookmarkedMessageIds?: Set<string>
+  onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
 }
 
 /** Isolated from App re-renders (persona poll, queue lane, schedules, etc.). `useLocalRuntime` runs an effect after every render that touches options/load; re-rendering on unrelated parent state was resetting the composer and scroll. */
-export const ThreadPane = React.memo(function ThreadPane({ adapter, initialMessages, runtimeKey }: ThreadPaneProps) {
+export const ThreadPane = React.memo(function ThreadPane({
+  adapter,
+  initialMessages,
+  runtimeKey,
+  bookmarkedMessageIds,
+  onToggleBookmark,
+}: ThreadPaneProps) {
   const MarkdownText = makeMarkdownText({
     remarkPlugins: [remarkGfm],
     components: {
@@ -189,6 +246,24 @@ export const ThreadPane = React.memo(function ThreadPane({ adapter, initialMessa
       attachments: webAttachmentAdapter,
     },
   })
+  const AssistantMessageWithBookmarks = React.useCallback(
+    () => (
+      <CustomAssistantMessage
+        bookmarkedMessageIds={bookmarkedMessageIds}
+        onToggleBookmark={onToggleBookmark}
+      />
+    ),
+    [bookmarkedMessageIds, onToggleBookmark],
+  )
+  const UserMessageWithBookmarks = React.useCallback(
+    () => (
+      <CustomUserMessage
+        bookmarkedMessageIds={bookmarkedMessageIds}
+        onToggleBookmark={onToggleBookmark}
+      />
+    ),
+    [bookmarkedMessageIds, onToggleBookmark],
+  )
 
   return (
     <AssistantRuntimeProvider key={runtimeKey} runtime={runtime}>
@@ -208,8 +283,8 @@ export const ThreadPane = React.memo(function ThreadPane({ adapter, initialMessa
           userMessage={{ allowEdit: false }}
           composer={{ allowAttachments: true }}
           components={{
-            AssistantMessage: CustomAssistantMessage,
-            UserMessage: CustomUserMessage,
+            AssistantMessage: AssistantMessageWithBookmarks,
+            UserMessage: UserMessageWithBookmarks,
           }}
           strings={{
             composer: {

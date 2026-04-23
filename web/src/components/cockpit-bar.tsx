@@ -1,6 +1,15 @@
-import React, { useId, useState } from 'react'
-import { Flex, Text } from '@radix-ui/themes'
-import type { InstallationStatus, QueueLane } from '../types'
+import React, { useEffect, useId, useState } from 'react'
+import { Button, Dialog, Flex, Text } from '@radix-ui/themes'
+import remarkGfm from 'remark-gfm'
+import ReactMarkdown from 'react-markdown'
+import { api } from '../api/client'
+import type {
+  BackendMessage,
+  InstallationStatus,
+  PersonaBulletinUpdate,
+  PersonaMessageBookmark,
+  QueueLane,
+} from '../types'
 
 export type CockpitBarProps = {
   appearance: 'dark' | 'light'
@@ -9,6 +18,11 @@ export type CockpitBarProps = {
   backgroundActiveCount: number
   installationStatus: InstallationStatus | null
   onQueueClick: () => void
+  bulletinUpdates: PersonaBulletinUpdate[]
+  bookmarks: PersonaMessageBookmark[]
+  /** Used to load full message text for the bookmark reader. */
+  activePersonaId: number | null
+  floating?: boolean
 }
 
 /**
@@ -22,8 +36,16 @@ export function CockpitBar({
   backgroundActiveCount,
   installationStatus,
   onQueueClick,
+  bulletinUpdates,
+  bookmarks,
+  activePersonaId,
+  floating = false,
 }: CockpitBarProps) {
   const [expanded, setExpanded] = useState(false)
+  const [selectedBookmark, setSelectedBookmark] = useState<PersonaMessageBookmark | null>(null)
+  const [bookmarkMessage, setBookmarkMessage] = useState<BackendMessage | null>(null)
+  const [bookmarkMessageLoading, setBookmarkMessageLoading] = useState(false)
+  const [bookmarkMessageError, setBookmarkMessageError] = useState('')
   const panelId = useId()
   const toggleId = `${panelId}-toggle`
   const isDark = appearance === 'dark'
@@ -36,9 +58,55 @@ export function CockpitBar({
       ? `${pending} pending${oldestWaitMs > 0 ? ` · ${Math.round(oldestWaitMs / 1000)}s wait` : ''}${queueError ? ' (!)' : ''}`
       : `idle${queueError ? ' (!)' : ''}`
 
-  const stripClass = isDark
-    ? 'border-t border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/40'
-    : 'border-t border-slate-200/90 bg-slate-50/80'
+  useEffect(() => {
+    if (selectedBookmark == null) {
+      setBookmarkMessage(null)
+      setBookmarkMessageError('')
+      setBookmarkMessageLoading(false)
+      return
+    }
+    if (activePersonaId == null) {
+      setBookmarkMessage(null)
+      setBookmarkMessageError('No active persona')
+      setBookmarkMessageLoading(false)
+      return
+    }
+    let cancelled = false
+    const mid = selectedBookmark.message_id
+    setBookmarkMessage(null)
+    setBookmarkMessageError('')
+    setBookmarkMessageLoading(true)
+    void (async () => {
+      try {
+        const res = await api<{ message?: BackendMessage }>(
+          `/api/personas/${activePersonaId}/messages/${encodeURIComponent(mid)}`,
+        )
+        if (cancelled) return
+        const m = res.message
+        if (m && typeof m.content === 'string') {
+          setBookmarkMessage(m)
+        } else {
+          setBookmarkMessageError('Message not found')
+        }
+      } catch (e) {
+        if (cancelled) return
+        setBookmarkMessageError(e instanceof Error ? e.message : String(e))
+      } finally {
+        if (!cancelled) setBookmarkMessageLoading(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedBookmark, activePersonaId])
+
+  const stripClass = floating
+    ? isDark
+      ? 'rounded-xl border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/90 shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur'
+      : 'rounded-xl border border-slate-300/90 bg-white/95 shadow-[0_8px_24px_rgba(15,23,42,0.12)] backdrop-blur'
+    : isDark
+      ? 'border-t border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/40'
+      : 'border-t border-slate-200/90 bg-slate-50/80'
 
   const toggleBtnClass = isDark
     ? 'mx-auto flex h-7 w-10 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
@@ -77,17 +145,16 @@ export function CockpitBar({
       </div>
 
       {expanded ? (
-        <Flex
-          id={panelId}
-          align="center"
-          gap="3"
-          wrap="wrap"
-          className="min-h-[36px] text-[13px] leading-snug"
-          aria-labelledby={toggleId}
-        >
-          <Text size="1" color="gray" weight="medium" className="shrink-0">
-            {statusText}
-          </Text>
+        <div id={panelId} aria-labelledby={toggleId} className="space-y-2">
+          <Flex
+            align="center"
+            gap="3"
+            wrap="wrap"
+            className="min-h-[36px] text-[13px] leading-snug"
+          >
+            <Text size="1" color="gray" weight="medium" className="shrink-0">
+              {statusText}
+            </Text>
 
           <span className={isDark ? 'text-[color:var(--gray-8)]' : 'text-slate-300'} aria-hidden>
             ·
@@ -137,38 +204,156 @@ export function CockpitBar({
             </Text>
           </span>
 
-          {installationStatus ? (
-            <>
-              <span className={isDark ? 'text-[color:var(--gray-8)]' : 'text-slate-300'} aria-hidden>
-                ·
-              </span>
-              <Flex align="center" gap="2" wrap="wrap" className="min-w-0">
-                <Text size="1" color={installationStatus.llm_ready ? 'green' : 'orange'} weight="medium">
-                  LLM {installationStatus.llm_ready ? 'ready' : 'missing'}
-                </Text>
-                <Text size="1" color={installationStatus.channel_ready ? 'green' : 'orange'} weight="medium">
-                  Channels {installationStatus.channel_ready ? 'ready' : 'missing'}
-                </Text>
-                {(installationStatus.requires_restart_for_env_changes ??
-                  installationStatus.requires_restart_to_apply_runtime_settings) === true ? (
-                  <Text size="1" color="orange" weight="medium">
-                    Restart needed
+            {installationStatus ? (
+              <>
+                <span className={isDark ? 'text-[color:var(--gray-8)]' : 'text-slate-300'} aria-hidden>
+                  ·
+                </span>
+                <Flex align="center" gap="2" wrap="wrap" className="min-w-0">
+                  <Text size="1" color={installationStatus.llm_ready ? 'green' : 'orange'} weight="medium">
+                    LLM {installationStatus.llm_ready ? 'ready' : 'missing'}
                   </Text>
-                ) : null}
+                  <Text size="1" color={installationStatus.channel_ready ? 'green' : 'orange'} weight="medium">
+                    Channels {installationStatus.channel_ready ? 'ready' : 'missing'}
+                  </Text>
+                  {(installationStatus.requires_restart_for_env_changes ??
+                    installationStatus.requires_restart_to_apply_runtime_settings) === true ? (
+                    <Text size="1" color="orange" weight="medium">
+                      Restart needed
+                    </Text>
+                  ) : null}
+                </Flex>
+              </>
+            ) : (
+              <>
+                <span className={isDark ? 'text-[color:var(--gray-8)]' : 'text-slate-300'} aria-hidden>
+                  ·
+                </span>
+                <Text size="1" color="gray">
+                  Setup loading…
+                </Text>
+              </>
+            )}
+          </Flex>
+          <div className={isDark ? 'rounded-md border border-[color:var(--mc-border-soft)] p-2' : 'rounded-md border border-slate-300 p-2'}>
+            <Text size="1" weight="medium">Bot bulletin</Text>
+            <Text size="1" color="gray" className="block mt-1">
+              {bulletinUpdates.length > 0
+                ? bulletinUpdates.map((u) => `${u.title}${u.detail ? ` (${u.detail})` : ''}`).join(' · ')
+                : 'No recent bot updates yet.'}
+            </Text>
+          </div>
+          <div className={isDark ? 'rounded-md border border-[color:var(--mc-border-soft)] p-2' : 'rounded-md border border-slate-300 p-2'}>
+            <Text size="1" weight="medium">Bookmarks</Text>
+            {bookmarks.length > 0 ? (
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                {bookmarks.slice(0, 8).map((b) => (
+                  <button
+                    key={b.message_id}
+                    type="button"
+                    className={
+                      isDark
+                        ? 'rounded border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-left text-xs text-slate-200 hover:bg-white/5'
+                        : 'rounded border border-slate-300 bg-white px-2 py-1 text-left text-xs text-slate-700 hover:bg-slate-50'
+                    }
+                    onClick={() => {
+                      setBookmarkMessage(null)
+                      setBookmarkMessageError('')
+                      setBookmarkMessageLoading(true)
+                      setSelectedBookmark(b)
+                    }}
+                    title="Open bookmark details"
+                  >
+                    [{b.role}] {b.content_preview}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <Text size="1" color="gray" className="block mt-1">
+                No bookmarks yet.
+              </Text>
+            )}
+          </div>
+        </div>
+      ) : null}
+      <Dialog.Root open={selectedBookmark != null} onOpenChange={(open) => !open && setSelectedBookmark(null)}>
+        <Dialog.Content maxWidth="42rem" className="max-h-[min(85vh,720px)] flex flex-col gap-3">
+          <Dialog.Title>Bookmarked message</Dialog.Title>
+          {selectedBookmark ? (
+            <>
+              <Text size="1" color="gray" className="shrink-0">
+                {bookmarkMessage && typeof bookmarkMessage.is_from_bot === 'boolean'
+                  ? bookmarkMessage.is_from_bot
+                    ? 'ASSISTANT'
+                    : 'USER'
+                  : String(selectedBookmark.role).toUpperCase()}
+                {(() => {
+                  const ts =
+                    (bookmarkMessage?.timestamp && bookmarkMessage.timestamp.trim()) ||
+                    selectedBookmark.updated_at ||
+                    selectedBookmark.created_at
+                  if (!ts) return ''
+                  const d = Date.parse(ts)
+                  return Number.isFinite(d) ? ` · ${new Date(d).toLocaleString()}` : ''
+                })()}
+                {bookmarkMessage?.sender_name ? ` · ${bookmarkMessage.sender_name}` : ''}
+              </Text>
+              <div
+                className={`min-h-0 flex-1 overflow-y-auto rounded-md border p-3 text-sm leading-relaxed ${
+                  isDark
+                    ? 'border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]'
+                    : 'border-slate-200 bg-slate-50'
+                }`}
+              >
+                {bookmarkMessageLoading ? (
+                  <Text size="2" color="gray">
+                    Loading full message…
+                  </Text>
+                ) : (
+                  <div className="aui-md-root">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        table: ({ className, ...props }) => (
+                          <div className="mc-md-table-scroll">
+                            <table
+                              className={['aui-md-table', className].filter(Boolean).join(' ')}
+                              {...props}
+                            />
+                          </div>
+                        ),
+                      }}
+                    >
+                      {(() => {
+                        if (bookmarkMessage) {
+                          const c = bookmarkMessage.content ?? ''
+                          return c.trim() ? c : '_Empty message._'
+                        }
+                        if (bookmarkMessageError) {
+                          return `*Could not load full message (${bookmarkMessageError}). Showing saved preview:*\n\n${selectedBookmark.content_preview || '_No preview stored._'}`
+                        }
+                        return selectedBookmark.content_preview || '_Empty message._'
+                      })()}
+                    </ReactMarkdown>
+                  </div>
+                )}
+              </div>
+              {selectedBookmark.note ? (
+                <Text as="p" size="1" color="gray" className="shrink-0">
+                  Note: {selectedBookmark.note}
+                </Text>
+              ) : null}
+              <Flex justify="end" gap="2" className="shrink-0">
+                <Dialog.Close>
+                  <Button type="button" size="2" variant="soft">
+                    Close
+                  </Button>
+                </Dialog.Close>
               </Flex>
             </>
-          ) : (
-            <>
-              <span className={isDark ? 'text-[color:var(--gray-8)]' : 'text-slate-300'} aria-hidden>
-                ·
-              </span>
-              <Text size="1" color="gray">
-                Setup loading…
-              </Text>
-            </>
-          )}
-        </Flex>
-      ) : null}
+          ) : null}
+        </Dialog.Content>
+      </Dialog.Root>
     </div>
   )
 }

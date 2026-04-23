@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use base64::Engine;
 use include_dir::{include_dir, Dir};
@@ -2033,6 +2033,312 @@ struct PersonaMemoryPathParams {
     persona_id: i64,
 }
 
+#[derive(Deserialize)]
+struct PersonaBookmarkPathParams {
+    persona_id: i64,
+}
+
+#[derive(Deserialize)]
+struct PersonaBookmarkDeletePathParams {
+    persona_id: i64,
+    message_id: String,
+}
+
+#[derive(Deserialize)]
+struct PersonaMessagePathParams {
+    persona_id: i64,
+    message_id: String,
+}
+
+#[derive(Deserialize)]
+struct PersonaBookmarkUpsertBody {
+    message_id: String,
+    note: Option<String>,
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() > max_chars {
+        format!("{}...", input.chars().take(max_chars).collect::<String>())
+    } else {
+        input.to_string()
+    }
+}
+
+async fn api_persona_bulletin_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let pid2 = path.persona_id;
+    let updates = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_bulletin_events(chat_id, pid2, 3)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let pid3 = path.persona_id;
+    let bookmarks = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_message_bookmarks(chat_id, pid3, 20)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let updates_json: Vec<serde_json::Value> = updates
+        .into_iter()
+        .map(|u| {
+            json!({
+                "id": u.id,
+                "event_type": u.event_type,
+                "title": u.title,
+                "detail": u.detail,
+                "run_key": u.run_key,
+                "created_at": u.created_at,
+            })
+        })
+        .collect();
+    let bookmarks_json: Vec<serde_json::Value> = bookmarks
+        .into_iter()
+        .map(|b| {
+            json!({
+                "message_id": b.message_id,
+                "role": b.role,
+                "content_preview": b.content_preview,
+                "note": b.note,
+                "created_at": b.created_at,
+                "updated_at": b.updated_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "updates": updates_json,
+        "bookmarks": bookmarks_json,
+    })))
+}
+
+async fn api_persona_bookmarks_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let pid2 = path.persona_id;
+    let bookmarks = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_message_bookmarks(chat_id, pid2, 50)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let bookmarks_json: Vec<serde_json::Value> = bookmarks
+        .into_iter()
+        .map(|b| {
+            json!({
+                "message_id": b.message_id,
+                "role": b.role,
+                "content_preview": b.content_preview,
+                "note": b.note,
+                "created_at": b.created_at,
+                "updated_at": b.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "bookmarks": bookmarks_json,
+    })))
+}
+
+async fn api_persona_bookmarks_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+    Json(body): Json<PersonaBookmarkUpsertBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    if body.message_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let message_id = body.message_id.trim().to_string();
+    let pid_lookup = path.persona_id;
+    let message = call_blocking(state.app_state.db.clone(), {
+        let message_id = message_id.clone();
+        move |db| db.get_message_for_persona(chat_id, pid_lookup, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(message) = message else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "message not found for persona".into(),
+        ));
+    };
+    let role = if message.is_from_bot {
+        "assistant"
+    } else {
+        "user"
+    };
+    let preview = truncate_chars(message.content.trim(), 280);
+    let note_clean = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 180));
+    let pid_upsert = path.persona_id;
+    call_blocking(state.app_state.db.clone(), {
+        let note_clean = note_clean.clone();
+        let message_id = message_id.clone();
+        let preview = preview.clone();
+        move |db| {
+            db.upsert_persona_message_bookmark(
+                chat_id,
+                pid_upsert,
+                &message_id,
+                role,
+                &preview,
+                note_clean.as_deref(),
+            )
+        }
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "bookmark": {
+            "message_id": message_id,
+            "role": role,
+            "content_preview": preview,
+            "note": note_clean,
+        }
+    })))
+}
+
+async fn api_persona_bookmarks_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkDeletePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let message_id = path.message_id.trim().to_string();
+    if message_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+    let pid_delete = path.persona_id;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_persona_message_bookmark(chat_id, pid_delete, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "message_id": path.message_id,
+        "deleted": deleted,
+    })))
+}
+
+/// Full text of one message in the persona thread (used by web bookmark reader; bookmarks only store a short preview).
+async fn api_persona_message_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMessagePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let message_id = path.message_id.trim().to_string();
+    if message_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+
+    let pid_lookup = path.persona_id;
+    let cid = chat_id;
+    let message = call_blocking(state.app_state.db.clone(), {
+        let message_id = message_id.clone();
+        move |db| db.get_message_for_persona(cid, pid_lookup, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(m) = message else {
+        return Err((StatusCode::NOT_FOUND, "message not found".into()));
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "message": {
+            "id": m.id,
+            "sender_name": m.sender_name,
+            "content": m.content,
+            "is_from_bot": m.is_from_bot,
+            "timestamp": m.timestamp,
+        }
+    })))
+}
+
 fn ensure_persona_memory_file_exists_for_web(state: &AppState, chat_id: i64, persona_id: i64) {
     let path = state.memory.persona_memory_path(chat_id, persona_id);
     if path.exists() {
@@ -3528,6 +3834,22 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/personas/switch", post(api_personas_switch))
         .route("/api/personas/create", post(api_personas_create))
         .route("/api/personas/delete", post(api_personas_delete))
+        .route(
+            "/api/personas/:persona_id/bulletin",
+            get(api_persona_bulletin_get),
+        )
+        .route(
+            "/api/personas/:persona_id/bookmarks",
+            get(api_persona_bookmarks_get).post(api_persona_bookmarks_post),
+        )
+        .route(
+            "/api/personas/:persona_id/bookmarks/:message_id",
+            delete(api_persona_bookmarks_delete),
+        )
+        .route(
+            "/api/personas/:persona_id/messages/:message_id",
+            get(api_persona_message_get),
+        )
         .route(
             "/api/personas/:persona_id/memory",
             get(api_persona_memory_get).put(api_persona_memory_put),

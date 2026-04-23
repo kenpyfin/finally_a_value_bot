@@ -38,6 +38,8 @@ import type {
   ChannelBinding,
   InstallationStatus,
   Persona,
+  PersonaBulletinUpdate,
+  PersonaMessageBookmark,
   RuntimeSettingItem,
   ScheduleTask,
 } from './types'
@@ -392,6 +394,8 @@ function App() {
   const [authRequired, setAuthRequired] = useState<boolean>(false)
   const [authTokenInput, setAuthTokenInput] = useState<string>('')
   const [personas, setPersonas] = useState<Persona[]>([])
+  const [bulletinUpdates, setBulletinUpdates] = useState<PersonaBulletinUpdate[]>([])
+  const [personaBookmarks, setPersonaBookmarks] = useState<PersonaMessageBookmark[]>([])
   const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
   const [schedulesDialogOpen, setSchedulesDialogOpen] = useState<boolean>(false)
@@ -650,6 +654,7 @@ function App() {
     await loadPersonas(chatId)
     await loadHistory(chatId, p?.id ?? undefined, null, { force: true })
     if (p) markPersonaRead(p.id)
+    if (p) await loadPersonaBulletin(p.id)
     setRuntimeNonce((x) => x + 1)
   }
 
@@ -689,6 +694,50 @@ function App() {
         setHistorySeed(mapped)
         setRuntimeNonce((x) => x + 1)
       }
+    }
+  }
+
+  async function loadPersonaBulletin(pid: number): Promise<void> {
+    try {
+      const data = await api<{
+        updates?: PersonaBulletinUpdate[]
+        bookmarks?: PersonaMessageBookmark[]
+      }>(`/api/personas/${pid}/bulletin`)
+      setBulletinUpdates(Array.isArray(data.updates) ? data.updates : [])
+      setPersonaBookmarks(Array.isArray(data.bookmarks) ? data.bookmarks : [])
+    } catch {
+      setBulletinUpdates([])
+      setPersonaBookmarks([])
+    }
+  }
+
+  async function toggleMessageBookmark(messageId: string, role: 'user' | 'assistant'): Promise<void> {
+    if (activePersonaId == null) return
+    const alreadyBookmarked = personaBookmarks.some((b) => b.message_id === messageId)
+    try {
+      if (alreadyBookmarked) {
+        await api(`/api/personas/${activePersonaId}/bookmarks/${encodeURIComponent(messageId)}`, {
+          method: 'DELETE',
+        })
+        setPersonaBookmarks((prev) => prev.filter((b) => b.message_id !== messageId))
+        setStatusText('Bookmark removed')
+      } else {
+        const res = await api<{
+          bookmark?: PersonaMessageBookmark
+        }>(`/api/personas/${activePersonaId}/bookmarks`, {
+          method: 'POST',
+          body: JSON.stringify({ message_id: messageId }),
+        })
+        const next = res.bookmark
+        if (next) {
+          setPersonaBookmarks((prev) => [next, ...prev.filter((b) => b.message_id !== messageId)])
+        } else {
+          await loadPersonaBulletin(activePersonaId)
+        }
+        setStatusText(`Bookmarked ${role} message`)
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -883,6 +932,11 @@ function App() {
           loadSchedules(cid).catch(() => { })
           void invalidateOps(cid)
           await loadHistory(cid, chosen?.id ?? pid, null, { force: true })
+          if (chosen?.id != null) {
+            await loadPersonaBulletin(chosen.id)
+          } else if (pid != null) {
+            await loadPersonaBulletin(pid)
+          }
           const readId = chosen?.id ?? pid ?? null
           if (readId != null) markPersonaRead(readId)
         }
@@ -1245,6 +1299,9 @@ function App() {
       loadHistory(chatId, chosen?.id, null, { force: true }).catch((e) =>
         setError(e instanceof Error ? e.message : String(e)),
       )
+      if (chosen?.id != null) {
+        loadPersonaBulletin(chosen.id).catch(() => { })
+      }
     }
     init()
     return () => { cancelled = true }
@@ -1253,6 +1310,10 @@ function App() {
   useEffect(() => {
     if (activePersonaId != null && activePersonaId > 0) {
       setNewSchedulePersonaId((prev) => (prev == null ? activePersonaId : prev))
+      loadPersonaBulletin(activePersonaId).catch(() => { })
+    } else {
+      setBulletinUpdates([])
+      setPersonaBookmarks([])
     }
   }, [activePersonaId])
 
@@ -1280,6 +1341,9 @@ function App() {
         setPendingRunIds((prev) => prev.filter((id) => !completed.includes(id)))
         setStatusText('Done')
         void loadHistory(chatId, activePersonaId ?? undefined)
+        if (activePersonaId != null) {
+          void loadPersonaBulletin(activePersonaId)
+        }
         setHistoryPollUntilMs(Date.now() + 2 * 60 * 1000)
       })()
     }, 2500)
@@ -1307,6 +1371,10 @@ function App() {
   }, [chatId, activePersonaId, historyPollUntilMs])
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
+  const bookmarkedMessageIds = useMemo(
+    () => new Set(personaBookmarks.map((b) => b.message_id)),
+    [personaBookmarks],
+  )
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
 
   useEffect(() => {
@@ -2599,24 +2667,32 @@ function App() {
                 </Flex>
               </Flex>
               </div>
-              <CockpitBar
-                appearance={appearance}
-                statusText={statusText}
-                queueLane={queueLane}
-                backgroundActiveCount={backgroundActiveCount}
-                installationStatus={installationStatus}
-                onQueueClick={() => setQueueDialogOpen(true)}
-              />
             </header>
 
             <div
               className={
                 appearance === 'dark'
-                  ? 'flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]'
-                  : 'flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]'
+                  ? 'relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]'
+                  : 'relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]'
               }
             >
-              <div className="mx-auto w-full max-w-5xl px-3 pt-3">
+              <div className="pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2">
+                <div className="pointer-events-auto w-full max-w-5xl">
+                  <CockpitBar
+                    appearance={appearance}
+                    statusText={statusText}
+                    queueLane={queueLane}
+                    backgroundActiveCount={backgroundActiveCount}
+                    installationStatus={installationStatus}
+                    onQueueClick={() => setQueueDialogOpen(true)}
+                    bulletinUpdates={bulletinUpdates}
+                    bookmarks={personaBookmarks}
+                    activePersonaId={activePersonaId}
+                    floating
+                  />
+                </div>
+              </div>
+              <div className="mx-auto w-full max-w-5xl px-3 pt-14">
                 {installationStatus != null &&
                 !onboardingDismissed &&
                 (!installationStatus.llm_ready || !installationStatus.channel_ready) ? (
@@ -2660,14 +2736,15 @@ function App() {
               </div>
 
               <div className="flex min-h-0 min-w-0 flex-1 flex-col px-1 pb-1">
-                <Text size="1" color="gray" className="mb-1 hidden px-2 md:block">
-                  Tip: On Telegram/Discord you can prefix a message with <code className="text-xs">[PersonaName]</code> to target a persona for that message.
-                </Text>
-                <Text size="1" color="gray" className="mb-1 px-2 md:hidden">
-                  Tip: Prefix with <code className="text-xs">[PersonaName]</code> on Telegram/Discord.
-                </Text>
                 <div className="min-h-0 min-w-0 flex-1">
-                  <ThreadPane key={runtimeKey} adapter={adapter} initialMessages={historySeed} runtimeKey={runtimeKey} />
+                  <ThreadPane
+                    key={runtimeKey}
+                    adapter={adapter}
+                    initialMessages={historySeed}
+                    runtimeKey={runtimeKey}
+                    bookmarkedMessageIds={bookmarkedMessageIds}
+                    onToggleBookmark={toggleMessageBookmark}
+                  />
                 </div>
               </div>
             </div>

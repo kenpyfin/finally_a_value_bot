@@ -94,6 +94,25 @@ export type BackendMessage = {
   content?: string
   is_from_bot?: boolean
   timestamp?: string
+  is_bookmarked?: boolean
+}
+
+export type PersonaBulletinUpdate = {
+  id: number
+  event_type: string
+  title: string
+  detail?: string | null
+  run_key?: string | null
+  created_at: string
+}
+
+export type PersonaMessageBookmark = {
+  message_id: string
+  role: 'user' | 'assistant' | string
+  content_preview: string
+  note?: string | null
+  created_at?: string
+  updated_at?: string
 }
 
 export type QueueItem = {

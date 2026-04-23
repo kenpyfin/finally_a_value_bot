@@ -618,6 +618,43 @@ html:not(.dark) .aui-composer-send:hover {
   padding-right: 6px;
 }
 
+.mc-msg-meta-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.mc-msg-meta-row-user {
+  justify-content: flex-end;
+}
+
+.mc-bookmark-btn {
+  border: 0;
+  background: transparent;
+  color: var(--mc-accent);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  opacity: 0.8;
+  padding: 0 0.15rem;
+}
+
+.mc-bookmark-btn:hover {
+  opacity: 1;
+}
+
+.mc-msg-meta-row .aui-assistant-action-bar-root,
+.mc-msg-meta-row .aui-user-action-bar-root {
+  position: static;
+}
+
+.mc-cockpit button {
+  max-width: 20rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 html:not(.dark) .mc-msg-time {
   color: hsl(216 18% 46%);
 }

@@ -220,6 +220,30 @@ pub struct RunTimelineEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct PersonaBulletinEvent {
+    pub id: i64,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub run_key: Option<String>,
+    pub event_type: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonaMessageBookmark {
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub message_id: String,
+    pub role: String,
+    pub content_preview: String,
+    pub note: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
     pub chat_id: i64,
@@ -485,6 +509,7 @@ impl Database {
         Self::migrate_fts(&conn)?;
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
         Self::migrate_drop_project_artifacts(&conn)?;
+        Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -874,6 +899,40 @@ impl Database {
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_project_artifacts_project;
              DROP TABLE IF EXISTS project_artifacts;",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_persona_bulletin_and_bookmarks(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS persona_bulletin_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                run_key TEXT,
+                event_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_bulletin_events_persona_time
+                ON persona_bulletin_events(chat_id, persona_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS persona_message_bookmarks (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content_preview TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_message_bookmarks_persona_time
+                ON persona_message_bookmarks(chat_id, persona_id, updated_at DESC);",
         )?;
         Ok(())
     }
@@ -2637,6 +2696,186 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn append_persona_bulletin_event(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        run_key: Option<&str>,
+        event_type: &str,
+        title: &str,
+        detail: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_bulletin_events (chat_id, persona_id, run_key, event_type, title, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![chat_id, persona_id, run_key, event_type, title, detail, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_persona_bulletin_events(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PersonaBulletinEvent>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, run_key, event_type, title, detail, created_at
+             FROM persona_bulletin_events
+             WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let items = stmt
+            .query_map(params![chat_id, persona_id, limit as i64], |row| {
+                Ok(PersonaBulletinEvent {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    run_key: row.get(3)?,
+                    event_type: row.get(4)?,
+                    title: row.get(5)?,
+                    detail: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    pub fn upsert_persona_message_bookmark(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        role: &str,
+        content_preview: &str,
+        note: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_message_bookmarks (
+                chat_id, persona_id, message_id, role, content_preview, note, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(chat_id, persona_id, message_id) DO UPDATE SET
+                role = excluded.role,
+                content_preview = excluded.content_preview,
+                note = excluded.note,
+                updated_at = excluded.updated_at",
+            params![
+                chat_id,
+                persona_id,
+                message_id,
+                role,
+                content_preview,
+                note,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_persona_message_bookmark(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM persona_message_bookmarks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND message_id = ?3",
+            params![chat_id, persona_id, message_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn list_persona_message_bookmarks(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PersonaMessageBookmark>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chat_id, persona_id, message_id, role, content_preview, note, created_at, updated_at
+             FROM persona_message_bookmarks
+             WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY updated_at DESC
+             LIMIT ?3",
+        )?;
+        let items = stmt
+            .query_map(params![chat_id, persona_id, limit as i64], |row| {
+                Ok(PersonaMessageBookmark {
+                    chat_id: row.get(0)?,
+                    persona_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    role: row.get(3)?,
+                    content_preview: row.get(4)?,
+                    note: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    pub fn message_exists_in_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM messages
+                WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3
+            )",
+            params![chat_id, persona_id, message_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn get_message_for_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<Option<StoredMessage>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+             FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3
+             LIMIT 1",
+            params![chat_id, persona_id, message_id],
+            |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    sender_name: row.get(3)?,
+                    content: row.get(4)?,
+                    is_from_bot: row.get::<_, i64>(5)? != 0,
+                    timestamp: row.get(6)?,
+                })
+            },
+        );
+        match result {
+            Ok(msg) => Ok(Some(msg)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // --- Background jobs ---
 
     pub fn create_background_job(
@@ -3506,6 +3745,14 @@ impl Database {
             "DELETE FROM messages WHERE chat_id = ?1 AND persona_id = ?2",
             params![chat_id, persona_id],
         )?;
+        let _ = tx.execute(
+            "DELETE FROM persona_bulletin_events WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let _ = tx.execute(
+            "DELETE FROM persona_message_bookmarks WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
         let rows = tx.execute(
             "DELETE FROM personas WHERE id = ?1 AND chat_id = ?2",
             params![persona_id, chat_id],
@@ -4177,6 +4424,89 @@ mod tests {
         assert_eq!(msgs[0].content, "new msg 1");
         assert_eq!(msgs[1].content, "new msg 2");
 
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_bulletin_events_latest_first() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
+        db.append_persona_bulletin_event(
+            100,
+            pid,
+            Some("run:1"),
+            "memory_update",
+            "Updated memory",
+            Some("Tiered memory written"),
+        )
+        .unwrap();
+        db.append_persona_bulletin_event(
+            100,
+            pid,
+            Some("run:2"),
+            "file_update",
+            "Updated file",
+            Some("Edited src/main.rs"),
+        )
+        .unwrap();
+
+        let items = db.list_persona_bulletin_events(100, pid, 1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].event_type, "file_update");
+        assert_eq!(items[0].title, "Updated file");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_message_bookmark_crud() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
+        db.store_message(&StoredMessage {
+            id: "m-bookmark-1".into(),
+            chat_id: 100,
+            persona_id: pid,
+            sender_name: "alice".into(),
+            content: "bookmark me".into(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:01Z".into(),
+        })
+        .unwrap();
+        assert!(db
+            .message_exists_in_persona(100, pid, "m-bookmark-1")
+            .unwrap());
+        assert!(!db.message_exists_in_persona(100, pid, "missing").unwrap());
+
+        db.upsert_persona_message_bookmark(
+            100,
+            pid,
+            "m-bookmark-1",
+            "user",
+            "bookmark me",
+            Some("important"),
+        )
+        .unwrap();
+        db.upsert_persona_message_bookmark(
+            100,
+            pid,
+            "m-bookmark-1",
+            "user",
+            "bookmark me updated",
+            Some("still important"),
+        )
+        .unwrap();
+
+        let items = db.list_persona_message_bookmarks(100, pid, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message_id, "m-bookmark-1");
+        assert_eq!(items[0].content_preview, "bookmark me updated");
+        assert_eq!(items[0].note.as_deref(), Some("still important"));
+
+        assert!(db
+            .delete_persona_message_bookmark(100, pid, "m-bookmark-1")
+            .unwrap());
+        assert!(!db
+            .delete_persona_message_bookmark(100, pid, "m-bookmark-1")
+            .unwrap());
         cleanup(&dir);
     }
 }
