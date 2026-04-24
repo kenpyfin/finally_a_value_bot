@@ -22,6 +22,8 @@ export type CockpitBarProps = {
   bookmarks: PersonaMessageBookmark[]
   /** Used to load full message text for the bookmark reader. */
   activePersonaId: number | null
+  /** Persisted removal via DELETE bookmark; return true when the bookmark was removed. */
+  onRemoveBookmark?: (messageId: string) => Promise<boolean>
   floating?: boolean
 }
 
@@ -39,6 +41,7 @@ export function CockpitBar({
   bulletinUpdates,
   bookmarks,
   activePersonaId,
+  onRemoveBookmark,
   floating = false,
 }: CockpitBarProps) {
   const [expanded, setExpanded] = useState(false)
@@ -46,6 +49,8 @@ export function CockpitBar({
   const [bookmarkMessage, setBookmarkMessage] = useState<BackendMessage | null>(null)
   const [bookmarkMessageLoading, setBookmarkMessageLoading] = useState(false)
   const [bookmarkMessageError, setBookmarkMessageError] = useState('')
+  const [removeBookmarkBusy, setRemoveBookmarkBusy] = useState(false)
+  const [removeBookmarkError, setRemoveBookmarkError] = useState('')
   const panelId = useId()
   const toggleId = `${panelId}-toggle`
   const isDark = appearance === 'dark'
@@ -63,6 +68,8 @@ export function CockpitBar({
       setBookmarkMessage(null)
       setBookmarkMessageError('')
       setBookmarkMessageLoading(false)
+      setRemoveBookmarkBusy(false)
+      setRemoveBookmarkError('')
       return
     }
     if (activePersonaId == null) {
@@ -260,6 +267,7 @@ export function CockpitBar({
                       setBookmarkMessage(null)
                       setBookmarkMessageError('')
                       setBookmarkMessageLoading(true)
+                      setRemoveBookmarkError('')
                       setSelectedBookmark(b)
                     }}
                     title="Open bookmark details"
@@ -343,7 +351,39 @@ export function CockpitBar({
                   Note: {selectedBookmark.note}
                 </Text>
               ) : null}
-              <Flex justify="end" gap="2" className="shrink-0">
+              {removeBookmarkError ? (
+                <Text size="1" color="red" className="shrink-0">
+                  {removeBookmarkError}
+                </Text>
+              ) : null}
+              <Flex justify="between" gap="2" align="center" wrap="wrap" className="shrink-0">
+                {onRemoveBookmark && activePersonaId != null ? (
+                  <Button
+                    type="button"
+                    size="2"
+                    variant="solid"
+                    color="red"
+                    disabled={removeBookmarkBusy}
+                    onClick={() => {
+                      if (!selectedBookmark) return
+                      setRemoveBookmarkError('')
+                      setRemoveBookmarkBusy(true)
+                      void (async () => {
+                        try {
+                          const ok = await onRemoveBookmark(selectedBookmark.message_id)
+                          if (ok) setSelectedBookmark(null)
+                          else setRemoveBookmarkError('Could not remove bookmark.')
+                        } finally {
+                          setRemoveBookmarkBusy(false)
+                        }
+                      })()
+                    }}
+                  >
+                    {removeBookmarkBusy ? 'Removing…' : 'Remove bookmark'}
+                  </Button>
+                ) : (
+                  <span />
+                )}
                 <Dialog.Close>
                   <Button type="button" size="2" variant="soft">
                     Close

@@ -741,6 +741,22 @@ function App() {
     }
   }
 
+  /** Remove bookmark from server and local bulletin state; returns whether it succeeded. */
+  async function removePersonaBookmark(messageId: string): Promise<boolean> {
+    if (activePersonaId == null) return false
+    try {
+      await api(`/api/personas/${activePersonaId}/bookmarks/${encodeURIComponent(messageId)}`, {
+        method: 'DELETE',
+      })
+      setPersonaBookmarks((prev) => prev.filter((b) => b.message_id !== messageId))
+      setStatusText('Bookmark removed')
+      return true
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      return false
+    }
+  }
+
   async function loadPersonaMemory(pid: number): Promise<void> {
     setMemoryBusy(true)
     setMemoryError('')
@@ -2688,6 +2704,7 @@ function App() {
                     bulletinUpdates={bulletinUpdates}
                     bookmarks={personaBookmarks}
                     activePersonaId={activePersonaId}
+                    onRemoveBookmark={removePersonaBookmark}
                     floating
                   />
                 </div>
