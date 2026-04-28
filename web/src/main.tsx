@@ -38,7 +38,7 @@ import type {
   ChannelBinding,
   InstallationStatus,
   Persona,
-  PersonaBulletinUpdate,
+  PersonaBulletinFocus,
   PersonaMessageBookmark,
   RuntimeSettingItem,
   ScheduleTask,
@@ -108,6 +108,7 @@ const DESKTOP_SIDEBAR_DEFAULT_WIDTH = 320
 const DESKTOP_SIDEBAR_MIN_WIDTH = 260
 const DESKTOP_SIDEBAR_MAX_WIDTH = 520
 const DESKTOP_MAIN_PANEL_MIN_WIDTH = 480
+const HISTORY_PAGE_SIZE = 30
 
 function readDesktopSidebarOpen(): boolean {
   if (typeof window === 'undefined') return true
@@ -362,12 +363,18 @@ function artifactPreviewUrl(item: ArtifactItem): string {
   return item.url
 }
 
+function MarkdownExternalLink(props: React.ComponentPropsWithoutRef<'a'>) {
+  const mergedRel = [props.rel, 'noopener', 'noreferrer'].filter(Boolean).join(' ')
+  return <a {...props} target="_blank" rel={mergedRel} />
+}
+
 function AgentHistoryMarkdownBody({ markdown }: { markdown: string }) {
   return (
     <div className="aui-md-root text-sm leading-relaxed">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          a: (props) => <MarkdownExternalLink {...props} />,
           table: ({ className, ...props }) => (
             <div className="mc-md-table-scroll">
               <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
@@ -387,6 +394,9 @@ function App() {
   const [chatId, setChatId] = useState<number | null>(null)
   const [historySeed, setHistorySeed] = useState<ThreadMessageLike[]>([])
   const [historyByDay, setHistoryByDay] = useState<Record<string, ThreadMessageLike[]>>({})
+  const [historyVisibleLimit, setHistoryVisibleLimit] = useState<number>(HISTORY_PAGE_SIZE)
+  const [historyHasMore, setHistoryHasMore] = useState<boolean>(false)
+  const [historyLoadingMore, setHistoryLoadingMore] = useState<boolean>(false)
   const [runtimeNonce, setRuntimeNonce] = useState<number>(0)
   const [error, setError] = useState<string>('')
   const [statusText, setStatusText] = useState<string>('Idle')
@@ -394,7 +404,7 @@ function App() {
   const [authRequired, setAuthRequired] = useState<boolean>(false)
   const [authTokenInput, setAuthTokenInput] = useState<string>('')
   const [personas, setPersonas] = useState<Persona[]>([])
-  const [bulletinUpdates, setBulletinUpdates] = useState<PersonaBulletinUpdate[]>([])
+  const [bulletinFocus, setBulletinFocus] = useState<PersonaBulletinFocus | null>(null)
   const [personaBookmarks, setPersonaBookmarks] = useState<PersonaMessageBookmark[]>([])
   const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
@@ -522,11 +532,20 @@ function App() {
   })
 
   const historySeedRef = useRef<ThreadMessageLike[]>([])
+  const historyVisibleLimitRef = useRef<number>(historyVisibleLimit)
   const deferredHistoryRef = useRef<ThreadMessageLike[] | null>(null)
 
   useEffect(() => {
     historySeedRef.current = historySeed
   }, [historySeed])
+  useEffect(() => {
+    historyVisibleLimitRef.current = historyVisibleLimit
+  }, [historyVisibleLimit])
+
+  const resetHistoryPagination = useCallback(() => {
+    setHistoryVisibleLimit(HISTORY_PAGE_SIZE)
+    setHistoryHasMore(false)
+  }, [])
 
   const flushDeferredHistory = useCallback(() => {
     const pending = deferredHistoryRef.current
@@ -652,7 +671,8 @@ function App() {
     const p = personas.find((x) => x.name === personaName)
     if (p) writeStoredPersonaId(p.id)
     await loadPersonas(chatId)
-    await loadHistory(chatId, p?.id ?? undefined, null, { force: true })
+    resetHistoryPagination()
+    await loadHistory(chatId, p?.id ?? undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
     if (p) markPersonaRead(p.id)
     if (p) await loadPersonaBulletin(p.id)
     setRuntimeNonce((x) => x + 1)
@@ -662,14 +682,18 @@ function App() {
     cid: number | null = chatId,
     personaId?: number | null,
     day?: string | null,
-    opts?: { force?: boolean },
+    opts?: { force?: boolean; limitOverride?: number },
   ): Promise<void> {
     if (cid == null) return
     const force = opts?.force === true
     const query = new URLSearchParams({ chat_id: String(cid) })
     if (personaId != null && personaId > 0) query.set('persona_id', String(personaId))
     if (day) query.set('day', day)
-    else query.set('limit', '500')
+    else {
+      const visibleLimit = opts?.limitOverride ?? historyVisibleLimitRef.current
+      // Ask for one extra message so we can infer whether older history exists.
+      query.set('limit', String(visibleLimit + 1))
+    }
     const data = await api<{ messages?: BackendMessage[] }>(`/api/history?${query.toString()}`)
     const rawMessages = Array.isArray(data.messages) ? data.messages : []
     const mapped = mapBackendHistory(rawMessages)
@@ -678,35 +702,60 @@ function App() {
       const allDays = Object.keys(nextByDay).sort()
       const combined = allDays.flatMap((d) => (nextByDay[d] ?? []))
       setHistoryByDay(nextByDay)
+      setHistoryHasMore(false)
       if (!historiesEqual(historySeedRef.current, combined)) {
         deferredHistoryRef.current = null
         setHistorySeed(combined)
         setRuntimeNonce((x) => x + 1)
       }
     } else {
+      const visibleLimit = opts?.limitOverride ?? historyVisibleLimitRef.current
+      const hasMore = mapped.length > visibleLimit
+      const bounded = hasMore ? mapped.slice(mapped.length - visibleLimit) : mapped
       setHistoryByDay({})
-      if (!historiesEqual(historySeedRef.current, mapped)) {
+      setHistoryHasMore(hasMore)
+      if (!historiesEqual(historySeedRef.current, bounded)) {
         if (!force && shouldDeferHistoryRemount()) {
-          deferredHistoryRef.current = mapped
+          deferredHistoryRef.current = bounded
           return
         }
         deferredHistoryRef.current = null
-        setHistorySeed(mapped)
+        setHistorySeed(bounded)
         setRuntimeNonce((x) => x + 1)
       }
     }
   }
 
+  const loadMoreHistory = useCallback(async () => {
+    if (chatId == null) return
+    if (historyLoadingMore) return
+    const previousLimit = historyVisibleLimitRef.current
+    const nextLimit = previousLimit + HISTORY_PAGE_SIZE
+    setHistoryLoadingMore(true)
+    setHistoryVisibleLimit(nextLimit)
+    try {
+      await loadHistory(chatId, activePersonaId ?? undefined, null, {
+        force: true,
+        limitOverride: nextLimit,
+      })
+    } catch (e) {
+      setHistoryVisibleLimit(previousLimit)
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setHistoryLoadingMore(false)
+    }
+  }, [activePersonaId, chatId, historyLoadingMore])
+
   async function loadPersonaBulletin(pid: number): Promise<void> {
     try {
       const data = await api<{
-        updates?: PersonaBulletinUpdate[]
+        focus?: PersonaBulletinFocus | null
         bookmarks?: PersonaMessageBookmark[]
       }>(`/api/personas/${pid}/bulletin`)
-      setBulletinUpdates(Array.isArray(data.updates) ? data.updates : [])
+      setBulletinFocus(data.focus ?? null)
       setPersonaBookmarks(Array.isArray(data.bookmarks) ? data.bookmarks : [])
     } catch {
-      setBulletinUpdates([])
+      setBulletinFocus(null)
       setPersonaBookmarks([])
     }
   }
@@ -915,7 +964,10 @@ function App() {
         body: JSON.stringify({ chat_id: chatId, persona_id: personaId }),
       })
       await loadPersonas(chatId)
-      if (activePersonaId === personaId) await loadHistory(chatId, undefined, null, { force: true })
+      if (activePersonaId === personaId) {
+        resetHistoryPagination()
+        await loadHistory(chatId, undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
+      }
       setStatusText('Persona deleted')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -947,7 +999,8 @@ function App() {
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
           void invalidateOps(cid)
-          await loadHistory(cid, chosen?.id ?? pid, null, { force: true })
+          resetHistoryPagination()
+          await loadHistory(cid, chosen?.id ?? pid, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
           if (chosen?.id != null) {
             await loadPersonaBulletin(chosen.id)
           } else if (pid != null) {
@@ -1195,7 +1248,8 @@ function App() {
       body: JSON.stringify({ contact_chat_id: contactChatId }),
     })
     await loadBindings(chatId)
-    await loadHistory(chatId, undefined, null, { force: true })
+    resetHistoryPagination()
+    await loadHistory(chatId, undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
     setRuntimeNonce((x) => x + 1)
   }
 
@@ -1312,7 +1366,8 @@ function App() {
           // ignore; we still load history for the chosen persona
         }
       }
-      loadHistory(chatId, chosen?.id, null, { force: true }).catch((e) =>
+      resetHistoryPagination()
+      loadHistory(chatId, chosen?.id, null, { force: true, limitOverride: HISTORY_PAGE_SIZE }).catch((e) =>
         setError(e instanceof Error ? e.message : String(e)),
       )
       if (chosen?.id != null) {
@@ -1321,14 +1376,14 @@ function App() {
     }
     init()
     return () => { cancelled = true }
-  }, [chatId, invalidateOps])
+  }, [chatId, invalidateOps, resetHistoryPagination])
 
   useEffect(() => {
     if (activePersonaId != null && activePersonaId > 0) {
       setNewSchedulePersonaId((prev) => (prev == null ? activePersonaId : prev))
       loadPersonaBulletin(activePersonaId).catch(() => { })
     } else {
-      setBulletinUpdates([])
+      setBulletinFocus(null)
       setPersonaBookmarks([])
     }
   }, [activePersonaId])
@@ -2427,7 +2482,12 @@ function App() {
                                   </Callout.Root>
                                 ) : (
                                   <div className="aui-md-root max-h-[56vh] overflow-auto text-sm leading-relaxed">
-                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                    <ReactMarkdown
+                                      remarkPlugins={[remarkGfm]}
+                                      components={{
+                                        a: (props) => <MarkdownExternalLink {...props} />,
+                                      }}
+                                    >
                                       {artifactTextPreview}
                                     </ReactMarkdown>
                                   </div>
@@ -2701,7 +2761,7 @@ function App() {
                     backgroundActiveCount={backgroundActiveCount}
                     installationStatus={installationStatus}
                     onQueueClick={() => setQueueDialogOpen(true)}
-                    bulletinUpdates={bulletinUpdates}
+                    bulletinFocus={bulletinFocus}
                     bookmarks={personaBookmarks}
                     activePersonaId={activePersonaId}
                     onRemoveBookmark={removePersonaBookmark}
@@ -2749,6 +2809,22 @@ function App() {
                   <Callout.Root color="red" size="1" variant="soft" className={replayNotice ? 'mt-2' : ''}>
                     <Callout.Text>{error}</Callout.Text>
                   </Callout.Root>
+                ) : null}
+                {historyHasMore ? (
+                  <Flex justify="center" className="pt-2">
+                    <Button
+                      size="1"
+                      variant="soft"
+                      onClick={() => {
+                        void loadMoreHistory()
+                      }}
+                      disabled={historyLoadingMore}
+                    >
+                      {historyLoadingMore
+                        ? 'Loading older messages...'
+                        : `Load ${HISTORY_PAGE_SIZE} older messages`}
+                    </Button>
+                  </Flex>
                 ) : null}
               </div>
 

@@ -2,6 +2,7 @@ pub mod activate_skill;
 pub mod agent_history;
 pub mod bash;
 pub mod browser;
+pub mod bulletin;
 pub mod command_runner;
 pub mod cursor_agent;
 pub mod edit_file;
@@ -106,6 +107,7 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "edit_file"
         | "write_memory"
         | "write_tiered_memory"
+        | "update_bulletin_focus"
         | "add_vault_item"
         | "send_message"
         | "sync_skills"
@@ -370,6 +372,7 @@ impl ToolRegistry {
             Box::new(tiered_memory::WriteTieredMemoryTool::new(
                 &config.runtime_data_dir(),
             )),
+            Box::new(bulletin::UpdateBulletinFocusTool::new(db.clone())),
             Box::new(search_history::SearchHistoryTool::new(db.clone())),
             Box::new(agent_history::ReadAgentHistoryTool::new(
                 &config.runtime_data_dir(),

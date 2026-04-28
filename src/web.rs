@@ -2084,8 +2084,8 @@ async fn api_persona_bulletin_get(
     }
 
     let pid2 = path.persona_id;
-    let updates = call_blocking(state.app_state.db.clone(), move |db| {
-        db.list_persona_bulletin_events(chat_id, pid2, 3)
+    let focus = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_persona_bulletin_focus(chat_id, pid2)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2096,19 +2096,13 @@ async fn api_persona_bulletin_get(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let updates_json: Vec<serde_json::Value> = updates
-        .into_iter()
-        .map(|u| {
-            json!({
-                "id": u.id,
-                "event_type": u.event_type,
-                "title": u.title,
-                "detail": u.detail,
-                "run_key": u.run_key,
-                "created_at": u.created_at,
-            })
+    let focus_json = focus.map(|f| {
+        json!({
+            "title": f.title,
+            "content": f.content,
+            "updated_at": f.updated_at,
         })
-        .collect();
+    });
     let bookmarks_json: Vec<serde_json::Value> = bookmarks
         .into_iter()
         .map(|b| {
@@ -2126,7 +2120,7 @@ async fn api_persona_bulletin_get(
     Ok(Json(json!({
         "ok": true,
         "persona_id": path.persona_id,
-        "updates": updates_json,
+        "focus": focus_json,
         "bookmarks": bookmarks_json,
     })))
 }

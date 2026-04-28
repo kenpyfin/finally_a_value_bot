@@ -354,6 +354,7 @@ async fn resolve_canonical_chat_id_for_telegram(
 async fn build_persona_menu_payload(
     state: Arc<AppState>,
     canonical_chat_id: i64,
+    locked_persona_id: Option<i64>,
 ) -> Result<(String, InlineKeyboardMarkup), String> {
     let _ = call_blocking(state.db.clone(), move |db| {
         db.get_or_create_default_persona(canonical_chat_id)
@@ -366,6 +367,14 @@ async fn build_persona_menu_payload(
     })
     .await
     .map_err(|e| format!("list personas: {e}"))?;
+    let filtered_personas = if let Some(locked_id) = locked_persona_id {
+        personas
+            .into_iter()
+            .filter(|p| p.id == locked_id)
+            .collect::<Vec<_>>()
+    } else {
+        personas
+    };
     let active_id = call_blocking(state.db.clone(), move |db| {
         db.get_active_persona_id(canonical_chat_id)
     })
@@ -373,14 +382,20 @@ async fn build_persona_menu_payload(
     .map_err(|e| format!("get active persona: {e}"))?
     .unwrap_or(0);
 
-    if personas.is_empty() {
+    if filtered_personas.is_empty() {
+        let text = if locked_persona_id.is_some() {
+            "Single-persona mode is enabled for Telegram, but the configured persona was not found."
+                .to_string()
+        } else {
+            "No personas found. Use /persona new <name> to create one.".to_string()
+        };
         return Ok((
-            "No personas found. Use /persona new <name> to create one.".to_string(),
+            text,
             InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()),
         ));
     }
 
-    let names: Vec<String> = personas
+    let names: Vec<String> = filtered_personas
         .iter()
         .map(|p| {
             if p.id == active_id {
@@ -390,25 +405,36 @@ async fn build_persona_menu_payload(
             }
         })
         .collect();
-    let text = format!(
-        "Personas: {}.\nTap a persona below to switch, or use /persona new <name> to create.",
-        names.join(", ")
-    );
+    let text = if locked_persona_id.is_some() {
+        format!(
+            "Telegram is in single-persona mode.\nAllowed persona: {}.",
+            names.join(", ")
+        )
+    } else {
+        format!(
+            "Personas: {}.\nTap a persona below to switch, or use /persona new <name> to create.",
+            names.join(", ")
+        )
+    };
 
-    let rows: Vec<Vec<InlineKeyboardButton>> = personas
-        .iter()
-        .map(|p| {
-            let label = if p.id == active_id {
-                format!("✅ {}", p.name)
-            } else {
-                p.name.clone()
-            };
-            vec![InlineKeyboardButton::callback(
-                label,
-                format!("{PERSONA_SWITCH_CALLBACK_PREFIX}{}", p.id),
-            )]
-        })
-        .collect();
+    let rows: Vec<Vec<InlineKeyboardButton>> = if locked_persona_id.is_some() {
+        Vec::new()
+    } else {
+        filtered_personas
+            .iter()
+            .map(|p| {
+                let label = if p.id == active_id {
+                    format!("✅ {}", p.name)
+                } else {
+                    p.name.clone()
+                };
+                vec![InlineKeyboardButton::callback(
+                    label,
+                    format!("{PERSONA_SWITCH_CALLBACK_PREFIX}{}", p.id),
+                )]
+            })
+            .collect()
+    };
 
     Ok((text, InlineKeyboardMarkup::new(rows)))
 }
@@ -427,20 +453,14 @@ async fn send_persona_menu(
     .await
     .ok()
     .flatten();
-    if let Some(policy) = policy {
-        if policy.mode == crate::db::ChannelPersonaMode::Single {
-            let _ = send_response_plain(
-                bot,
-                chat_id,
-                "Persona switching is locked for Telegram in Web UI (single-persona mode).",
-                thread_id,
-                None,
-            )
-            .await;
-            return;
+    let locked_persona_id = policy.and_then(|p| {
+        if p.mode == crate::db::ChannelPersonaMode::Single {
+            p.persona_id
+        } else {
+            None
         }
-    }
-    match build_persona_menu_payload(state, canonical_chat_id).await {
+    });
+    match build_persona_menu_payload(state, canonical_chat_id, locked_persona_id).await {
         Ok((text, keyboard)) => {
             let mut req = bot.send_message(chat_id, text).reply_markup(keyboard);
             if let Some(tid) = thread_id {
@@ -2347,24 +2367,6 @@ pub async fn process_with_agent_with_events(
                         }
                     })
                     .await;
-                    if let Some((event_type, title, detail)) =
-                        bulletin_event_from_tool_use(name, input, result.is_error)
-                    {
-                        let _ = call_blocking(state.db.clone(), {
-                            let run_key = run_key.clone();
-                            move |db| {
-                                db.append_persona_bulletin_event(
-                                    chat_id,
-                                    persona_id,
-                                    Some(&run_key),
-                                    event_type,
-                                    title,
-                                    detail.as_deref(),
-                                )
-                            }
-                        })
-                        .await;
-                    }
                     history_tool_calls.push(ToolCallRecord {
                         name: name.clone(),
                         input_preview: truncate_preview(
@@ -2848,65 +2850,6 @@ fn sanitize_bulletin_text_for_prompt(input: &str, max_chars: usize) -> String {
     }
 }
 
-fn bulletin_event_from_tool_use(
-    tool_name: &str,
-    input: &serde_json::Value,
-    is_error: bool,
-) -> Option<(&'static str, &'static str, Option<String>)> {
-    if is_error {
-        return None;
-    }
-    match tool_name {
-        "write_memory" => {
-            let scope = input
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("chat")
-                .to_string();
-            Some((
-                "memory_update",
-                "Memory updated",
-                Some(format!("scope={scope}")),
-            ))
-        }
-        "write_tiered_memory" => {
-            let tier = input
-                .get("tier")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            Some((
-                "memory_update",
-                "Tiered memory updated",
-                Some(format!("tier={tier}")),
-            ))
-        }
-        "write_file" => {
-            let path = input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown path)");
-            Some((
-                "file_update",
-                "File written",
-                Some(sanitize_bulletin_text_for_prompt(path, 180)),
-            ))
-        }
-        "edit_file" => {
-            let path = input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown path)");
-            Some((
-                "file_update",
-                "File edited",
-                Some(sanitize_bulletin_text_for_prompt(path, 180)),
-            ))
-        }
-        _ => None,
-    }
-}
-
 fn normalize_intent_signature(input: &str) -> String {
     let lowered = input.to_ascii_lowercase();
     let words: Vec<&str> = lowered
@@ -3207,6 +3150,7 @@ fn build_system_prompt(
 - Activate agent skills (activate_skill) for specialized tasks. **To create or update a skill, use the build_skill tool only** — do not use write_file or edit_file under the skills directory. build_skill runs cursor-agent (in tmux when available) to create the skill folder and SKILL.md. Store credentials in the skill folder (e.g. .env there). Do not add on-demand tools only in your workspace or TOOLS.md — skills are the only way to add on-demand tools.
 - For long-running or queue-bound tasks, activate and follow the `background-handoff` skill before delegating user asks/subtasks to background execution.
 - Read and update tiered memory (read_tiered_memory, write_tiered_memory) — per-persona MEMORY.md with Tier 1 (long-term principles-like), Tier 2 (active projects), Tier 3 (recent focus/mood — passive context only, never act on it proactively); evaluate conversation flow and update tiers when appropriate; Tier 1 only on explicit user ask, Tier 3 often (e.g. daily). Not a todo list and not a task queue — do not resume or continue work mentioned in memory unless the user explicitly asks.
+- Update Bulletin focus (update_bulletin_focus) — write a concise, durable per-persona highlight card shown in the web cockpit Bulletin area when long-term focus/status should be communicated.
 - Review agent run history (read_agent_history) — detailed per-run traces including iterations, tool calls, durations, and outcomes. Use this when asked to optimize your workflow or review past behavior; identify patterns and persist learnings via write_tiered_memory (Tier 1 for long-term workflow principles).
 
 ## Conversation Memory

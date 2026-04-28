@@ -18,6 +18,20 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-04-24 — Web chat history pagination restored in hero area
+
+- **Area:** web UI / chat history loading
+- **Summary:** Replaced fixed-window history loading with segmented pagination in the chat hero area. The web app now loads the newest page first and shows a **Load older messages** button to progressively pull more history in fixed-size increments.
+- **Rationale:** Loading large chats in one pass is wasteful and can hurt responsiveness; progressive loading restores the previous “load more” UX while keeping default polling/history sync lighter.
+- **Key files / symbols:** `web/src/main.tsx` (`HISTORY_PAGE_SIZE`, `historyVisibleLimit`, `historyHasMore`, `loadHistory(..., { limitOverride })`, `loadMoreHistory`, hero-area load-more `Button`).
+
+### 2026-04-23 — Bulletin converted to bot-authored focus card
+
+- **Area:** db / tools / web API / web UI / prompt guidance
+- **Summary:** Reworked Bulletin from auto-generated memory/file event snippets into a single per-persona focus card authored intentionally by the bot via new `update_bulletin_focus` tool. `GET /api/personas/:persona_id/bulletin` now returns `focus` + bookmarks, and cockpit renders **Bulletin** content as multiline long-term highlights.
+- **Rationale:** Users wanted Bulletin to communicate durable current focus rather than noisy tool event traces, while keeping bookmarks as a separate navigation feature.
+- **Key files / symbols:** `src/db.rs` (`PersonaBulletinFocus`, `upsert_persona_bulletin_focus`, `get_persona_bulletin_focus`); `src/tools/bulletin.rs` (`UpdateBulletinFocusTool`); `src/tools/mod.rs` (tool registration + risk); `src/channels/telegram.rs` (removed auto bulletin event writes, added capability instruction for `update_bulletin_focus`); `src/web.rs` (`api_persona_bulletin_get` now returns `focus`); `web/src/types.ts` (`PersonaBulletinFocus`); `web/src/main.tsx` (`bulletinFocus` state); `web/src/components/cockpit-bar.tsx` (label renamed to `Bulletin` and focus rendering).
+
 ### 2026-04-23 — Cockpit bulletin layout + bookmark jump UX
 
 - **Area:** web UI / cockpit / chat thread

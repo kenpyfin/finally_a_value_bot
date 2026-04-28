@@ -270,7 +270,7 @@ export const ThreadPane = React.memo(function ThreadPane({
       <div className="aui-root h-full min-h-0 min-w-0">
         <Thread
           assistantMessage={{
-            allowCopy: true,
+            allowCopy: false,
             allowReload: false,
             allowSpeak: false,
             allowFeedbackNegative: false,

@@ -97,13 +97,10 @@ export type BackendMessage = {
   is_bookmarked?: boolean
 }
 
-export type PersonaBulletinUpdate = {
-  id: number
-  event_type: string
-  title: string
-  detail?: string | null
-  run_key?: string | null
-  created_at: string
+export type PersonaBulletinFocus = {
+  title?: string | null
+  content: string
+  updated_at: string
 }
 
 export type PersonaMessageBookmark = {

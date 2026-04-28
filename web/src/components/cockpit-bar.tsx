@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useState } from 'react'
+import React, { useEffect, useId, useRef, useState } from 'react'
 import { Button, Dialog, Flex, Text } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
@@ -6,7 +6,7 @@ import { api } from '../api/client'
 import type {
   BackendMessage,
   InstallationStatus,
-  PersonaBulletinUpdate,
+  PersonaBulletinFocus,
   PersonaMessageBookmark,
   QueueLane,
 } from '../types'
@@ -18,7 +18,7 @@ export type CockpitBarProps = {
   backgroundActiveCount: number
   installationStatus: InstallationStatus | null
   onQueueClick: () => void
-  bulletinUpdates: PersonaBulletinUpdate[]
+  bulletinFocus: PersonaBulletinFocus | null
   bookmarks: PersonaMessageBookmark[]
   /** Used to load full message text for the bookmark reader. */
   activePersonaId: number | null
@@ -38,7 +38,7 @@ export function CockpitBar({
   backgroundActiveCount,
   installationStatus,
   onQueueClick,
-  bulletinUpdates,
+  bulletinFocus,
   bookmarks,
   activePersonaId,
   onRemoveBookmark,
@@ -51,6 +51,7 @@ export function CockpitBar({
   const [bookmarkMessageError, setBookmarkMessageError] = useState('')
   const [removeBookmarkBusy, setRemoveBookmarkBusy] = useState(false)
   const [removeBookmarkError, setRemoveBookmarkError] = useState('')
+  const expandedRootRef = useRef<HTMLDivElement | null>(null)
   const panelId = useId()
   const toggleId = `${panelId}-toggle`
   const isDark = appearance === 'dark'
@@ -107,6 +108,20 @@ export function CockpitBar({
     }
   }, [selectedBookmark, activePersonaId])
 
+  useEffect(() => {
+    if (!expanded) return
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null
+      if (!target) return
+      if (expandedRootRef.current?.contains(target)) return
+      setExpanded(false)
+    }
+    window.addEventListener('pointerdown', onPointerDown)
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown)
+    }
+  }, [expanded])
+
   const stripClass = floating
     ? isDark
       ? 'rounded-xl border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/90 shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur'
@@ -116,16 +131,53 @@ export function CockpitBar({
       : 'border-t border-slate-200/90 bg-slate-50/80'
 
   const toggleBtnClass = isDark
-    ? 'mx-auto flex h-7 w-10 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
-    : 'mx-auto flex h-7 w-10 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-500 transition-colors hover:bg-slate-200/60 hover:text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400'
+    ? 'mx-auto flex h-7 w-full cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
+    : 'mx-auto flex h-7 w-full cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-500 transition-colors hover:bg-slate-200/60 hover:text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400'
+
+  if (!expanded) {
+    return (
+      <button
+        id={toggleId}
+        type="button"
+        className={`mc-cockpit w-full px-4 py-1 ${stripClass} ${
+          isDark
+            ? 'cursor-pointer text-slate-400 transition-colors hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
+            : 'cursor-pointer text-slate-500 transition-colors hover:text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400'
+        }`}
+        aria-expanded={false}
+        aria-controls={panelId}
+        title="Show session status"
+        onClick={() => setExpanded(true)}
+      >
+        <span className="sr-only">Show session status</span>
+        <div className="flex">
+          <span className="mx-auto flex h-7 w-full items-center justify-center rounded-md">
+            <svg
+              className="size-3.5 shrink-0 transition-transform duration-150"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </span>
+        </div>
+      </button>
+    )
+  }
 
   return (
     <div
-      className={`mc-cockpit px-4 ${expanded ? 'py-2' : 'py-1'} ${stripClass}`}
+      ref={expandedRootRef}
+      className={`mc-cockpit px-4 py-2 ${stripClass}`}
       role="region"
       aria-label="Session status"
     >
-      <div className="flex justify-center">
+      <div className="flex">
         <button
           id={toggleId}
           type="button"
@@ -243,12 +295,12 @@ export function CockpitBar({
             )}
           </Flex>
           <div className={isDark ? 'rounded-md border border-[color:var(--mc-border-soft)] p-2' : 'rounded-md border border-slate-300 p-2'}>
-            <Text size="1" weight="medium">Bot bulletin</Text>
-            <Text size="1" color="gray" className="block mt-1">
-              {bulletinUpdates.length > 0
-                ? bulletinUpdates.map((u) => `${u.title}${u.detail ? ` (${u.detail})` : ''}`).join(' · ')
-                : 'No recent bot updates yet.'}
-            </Text>
+            <Text size="1" weight="medium">Bulletin</Text>
+            <div className="mt-1 whitespace-pre-wrap text-xs text-[color:var(--gray-11)]">
+              {bulletinFocus
+                ? `${bulletinFocus.title ? `${bulletinFocus.title}\n` : ''}${bulletinFocus.content}`
+                : 'No bulletin focus yet.'}
+            </div>
           </div>
           <div className={isDark ? 'rounded-md border border-[color:var(--mc-border-soft)] p-2' : 'rounded-md border border-slate-300 p-2'}>
             <Text size="1" weight="medium">Bookmarks</Text>

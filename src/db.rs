@@ -232,6 +232,15 @@ pub struct PersonaBulletinEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct PersonaBulletinFocus {
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub title: Option<String>,
+    pub content: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PersonaMessageBookmark {
     pub chat_id: i64,
     pub persona_id: i64,
@@ -919,6 +928,15 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_persona_bulletin_events_persona_time
                 ON persona_bulletin_events(chat_id, persona_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS persona_bulletin_focus (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                title TEXT,
+                content TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
 
             CREATE TABLE IF NOT EXISTS persona_message_bookmarks (
                 chat_id INTEGER NOT NULL,
@@ -2715,6 +2733,55 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_persona_bulletin_focus(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        title: Option<&str>,
+        content: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_bulletin_focus (chat_id, persona_id, title, content, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, persona_id) DO UPDATE SET
+               title = excluded.title,
+               content = excluded.content,
+               updated_at = excluded.updated_at",
+            params![chat_id, persona_id, title, content, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_persona_bulletin_focus(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Option<PersonaBulletinFocus>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT chat_id, persona_id, title, content, updated_at
+             FROM persona_bulletin_focus
+             WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+            |row| {
+                Ok(PersonaBulletinFocus {
+                    chat_id: row.get(0)?,
+                    persona_id: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        );
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn list_persona_bulletin_events(
         &self,
         chat_id: i64,
@@ -3750,6 +3817,10 @@ impl Database {
             params![chat_id, persona_id],
         )?;
         let _ = tx.execute(
+            "DELETE FROM persona_bulletin_focus WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let _ = tx.execute(
             "DELETE FROM persona_message_bookmarks WHERE chat_id = ?1 AND persona_id = ?2",
             params![chat_id, persona_id],
         )?;
@@ -4454,6 +4525,28 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].event_type, "file_update");
         assert_eq!(items[0].title, "Updated file");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_bulletin_focus_upsert_and_get() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
+        db.upsert_persona_bulletin_focus(
+            100,
+            pid,
+            Some("Current focus"),
+            "Wing: origin\nRooms: 19",
+        )
+        .unwrap();
+        db.upsert_persona_bulletin_focus(100, pid, None, "Updated focus content")
+            .unwrap();
+        let focus = db.get_persona_bulletin_focus(100, pid).unwrap().unwrap();
+        assert_eq!(focus.chat_id, 100);
+        assert_eq!(focus.persona_id, pid);
+        assert_eq!(focus.title, None);
+        assert_eq!(focus.content, "Updated focus content");
+        assert!(!focus.updated_at.is_empty());
         cleanup(&dir);
     }
 
