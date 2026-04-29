@@ -8,6 +8,9 @@ fn default_telegram_bot_token() -> String {
 fn default_bot_username() -> String {
     String::new()
 }
+fn default_agent_display_name() -> String {
+    String::new()
+}
 fn default_llm_provider() -> String {
     "anthropic".into()
 }
@@ -287,6 +290,10 @@ pub struct Config {
     pub telegram_bot_token: String,
     #[serde(default = "default_bot_username")]
     pub bot_username: String,
+    /// Optional friendly identity label used in canonical persona memory identity seeding.
+    /// This is not hardcoded into static system prompt text.
+    #[serde(default = "default_agent_display_name")]
+    pub agent_display_name: String,
     #[serde(default = "default_llm_provider")]
     pub llm_provider: String,
     #[serde(default = "default_api_key")]
@@ -681,6 +688,7 @@ impl Config {
         Config {
             telegram_bot_token: Self::env("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
             bot_username: Self::env("BOT_USERNAME").unwrap_or_default(),
+            agent_display_name: Self::env("AGENT_DISPLAY_NAME").unwrap_or_default(),
             llm_provider: Self::env("LLM_PROVIDER").unwrap_or_else(default_llm_provider),
             api_key: Self::env("LLM_API_KEY").unwrap_or_else(default_api_key),
             model: Self::env("LLM_MODEL").unwrap_or_default(),
@@ -1058,6 +1066,10 @@ impl Config {
             esc(&self.telegram_bot_token)
         ));
         lines.push(format!("BOT_USERNAME={}", esc(&self.bot_username)));
+        lines.push(format!(
+            "AGENT_DISPLAY_NAME={}",
+            esc(&self.agent_display_name)
+        ));
         lines.push("".into());
         lines.push("# LLM".into());
         lines.push(format!("LLM_PROVIDER={}", esc(&self.llm_provider)));
@@ -1197,6 +1209,7 @@ pub fn test_config() -> Config {
     Config {
         telegram_bot_token: "tok".into(),
         bot_username: "bot".into(),
+        agent_display_name: "bot".into(),
         llm_provider: "anthropic".into(),
         api_key: "key".into(),
         model: "claude-sonnet-4-5-20250929".into(),

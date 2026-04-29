@@ -6,7 +6,7 @@ This document describes **auto-learned workflows**: rows in SQLite that record w
 
 | | |
 | --- | --- |
-| **Is** | Per-chat, per-intent **memory of tool-call order** (tool names only), learned after agent runs that used tools. |
+| **Is** | Per-chat, per-intent **memory of approach patterns** (tool order + structured step traces + outcome metadata), learned after agent runs that used tools. |
 | **Is** | A **soft hint** appended to the system prompt when confidence is high enough. |
 | **Is not** | A user-authored workflow file in the workspace, a skill, or a deterministic executor that forces tool order. |
 | **Is not** | Updated by parsing the system prompt; learning uses **post-run facts** from the agent trace. |
@@ -20,7 +20,11 @@ All channels that use `process_with_agent` / `process_with_agent_with_events` in
   - **`workflows`** — one row per `(owner_chat_id, intent_signature)` with `steps_json`, `confidence`, `version`, counts, timestamps.
   - **`workflow_executions`** — audit log when a workflow row was **selected** for a run (`workflow_id`, `run_key`, outcome, score).
 
-`steps_json` is a JSON array of **strings**: tool names in order, taken from all iterations of the completed run (see `save_run_history!` in `telegram.rs`).
+`steps_json` remains a JSON array of tool names for compatibility. Newer rows also persist:
+- `step_trace_json`: structured per-call trace (iteration/tool/duration/error/input preview).
+- `approach_summary`: concise reusable approach text.
+- `last_outcome` + `failure_reason`: latest outcome classification.
+- `evidence_json`: evidence refs (e.g. run keys) used to justify pattern retention.
 
 ## Intent signature
 
@@ -32,14 +36,12 @@ The same string is used for **lookup** and for **learning** on that run.
 
 1. `get_best_workflow_for_intent(owner_chat_id, intent_signature, min_confidence)` reads from `workflows`.
 2. Call sites use **`min_confidence = 0.6`** (hardcoded in `telegram.rs` next to workflow selection).
-3. If a row is returned, the system prompt gains:
-
-   ```text
-   # Learned Workflow Hint
-
-   Use this learned workflow as a starting point (adapt as needed):
-   <steps_json>
-   ```
+3. If a row is returned, the system prompt gains a structured hint with:
+- intent signature
+- confidence
+- approach summary
+- tool-order memory
+- recent outcome/failure reason (when available)
 
 If confidence is below the threshold, **no hint** is added (table may still be updated by learning on tool-using runs).
 
@@ -49,7 +51,7 @@ In `save_run_history!`, after writing agent history to disk:
 
 - **Gated by** `workflow_auto_learn` (`WORKFLOW_AUTO_LEARN`, default in config/wizard).
 - **Requires** at least one tool call in the run (`tool_names` non-empty).
-- **Calls** `upsert_workflow_learning(chat_id, intent_signature, steps_json, success, score)` with `score = 1.0` on success and `0.0` on failure (success is derived from `stop_reason` matching `end_turn` / `pte_complete` / `unknown_stop_reason`).
+- **Calls** `upsert_workflow_learning(...)` with compatibility fields (`steps_json`) plus richer metadata (`step_trace_json`, `approach_summary`, `last_outcome`, `failure_reason`, `evidence_json`) and `score = 1.0` on success / `0.0` on failure.
 
 The system prompt text does **not** drive `upsert_workflow_learning`; only the **observed tool sequence** and **stop reason** do.
 
@@ -62,7 +64,7 @@ The system prompt text does **not** drive `upsert_workflow_learning`; only the *
   - **Success:** `new = old * 0.7 + score * 0.3` (with `score` 1.0 from caller).
   - **Failure:** `new = old * 0.7` (no positive addition).
 
-**`steps_json` on update:** always **replaced** with the **latest** run’s tool-name list (not merged across runs). **`version`** increments on each upsert conflict.
+**Latest-run overwrite behavior:** compatibility `steps_json` and richer payload fields are replaced by latest run evidence on upsert conflict. **`version`** increments on each upsert conflict.
 
 **`workflow_min_success_repetitions`** (`WORKFLOW_MIN_SUCCESS_REPETITIONS`) is defined in config but **not** applied inside `upsert_workflow_learning` or selection today; promotion is entirely the formula above plus the **0.6** hint threshold.
 

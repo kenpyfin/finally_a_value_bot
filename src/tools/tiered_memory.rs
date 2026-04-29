@@ -1,91 +1,73 @@
-//! Per-persona tiered memory (MEMORY.md) with Tier 1 (long-term), Tier 2 (mid-term), Tier 3 (short-term).
+//! Per-persona tiered memory backed by canonical memory_state.json.
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::claude::ToolDefinition;
+use crate::memory::{ActiveProjectMemory, MemoryManager, PersonaMemoryState};
 
 use super::{
     auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult,
 };
 
-const TIER_HEADERS: [(u8, &str); 3] = [
-    (1, "## Tier 1 — Long term"),
-    (2, "## Tier 2 — Mid term"),
-    (3, "## Tier 3 — Short term"),
-];
-
-fn memory_path(groups_dir: &Path, chat_id: i64, persona_id: i64) -> PathBuf {
-    groups_dir
-        .join(chat_id.to_string())
-        .join(persona_id.to_string())
-        .join("MEMORY.md")
-}
-
-/// Parse MEMORY.md and extract one tier's content (between its header and the next ## or EOF).
-fn extract_tier_sections(full: &str) -> [String; 3] {
-    let mut sections = [String::new(), String::new(), String::new()];
-    let mut current_tier: Option<usize> = None;
-    let mut current_lines: Vec<&str> = Vec::new();
-
-    let mut flush_current = |tier_idx: usize, lines: &mut Vec<&str>| {
-        let block = lines.join("\n").trim().to_string();
-        lines.clear();
-        if block.is_empty() {
-            return;
-        }
-        if sections[tier_idx].is_empty() {
-            sections[tier_idx] = block;
-        } else {
-            // If duplicate tier headers exist, preserve content by merging
-            // and canonicalize into a single section on write.
-            sections[tier_idx].push_str("\n\n");
-            sections[tier_idx].push_str(&block);
-        }
-    };
-
-    for line in full.lines() {
-        if line.starts_with("## ") {
-            if let Some(prev_idx) = current_tier {
-                flush_current(prev_idx, &mut current_lines);
+fn parse_tier_content(state: &PersonaMemoryState, tier: u8) -> String {
+    match tier {
+        1 => {
+            let mut lines = Vec::new();
+            if !state.identity.display_name.trim().is_empty() {
+                lines.push(format!(
+                    "- Identity|display_name={}",
+                    state.identity.display_name.trim()
+                ));
             }
-            current_tier = TIER_HEADERS.iter().position(|(_, h)| line.trim() == *h);
-            continue;
+            if !state.identity.self_model.trim().is_empty() {
+                lines.push(format!(
+                    "- Identity|self_model={}",
+                    state.identity.self_model.trim()
+                ));
+            }
+            if !state.identity.voice_style.trim().is_empty() {
+                lines.push(format!(
+                    "- Identity|voice_style={}",
+                    state.identity.voice_style.trim()
+                ));
+            }
+            lines.extend(
+                state
+                    .identity
+                    .non_negotiables
+                    .iter()
+                    .map(|v| format!("- IdentityConstraint|{v}")),
+            );
+            lines.extend(state.tier1.stable_facts.clone());
+            lines.extend(
+                state
+                    .tier1
+                    .workflow_principles
+                    .iter()
+                    .map(|v| format!("- WorkflowPrinciple|{v}")),
+            );
+            lines.join("\n").trim().to_string()
         }
-        if current_tier.is_some() {
-            current_lines.push(line);
-        }
+        2 => state
+            .tier2
+            .active_projects
+            .iter()
+            .map(|p| {
+                format!(
+                    "- ProjectState|id={}|status={}|updated={}|summary={}",
+                    p.id, p.status, p.updated_at, p.summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        3 => state.tier3.recent_focus.join("\n").trim().to_string(),
+        _ => String::new(),
     }
-    if let Some(prev_idx) = current_tier {
-        flush_current(prev_idx, &mut current_lines);
-    }
-
-    sections
-}
-
-fn parse_tier_content(full: &str, tier: u8) -> String {
-    if !(1..=3).contains(&tier) {
-        return String::new();
-    }
-    let sections = extract_tier_sections(full);
-    sections[(tier - 1) as usize].clone()
-}
-
-fn render_memory_document(sections: &[String; 3]) -> String {
-    let mut out = String::from("# Memory\n\n");
-    for (idx, (_, header)) in TIER_HEADERS.iter().enumerate() {
-        out.push_str(header);
-        out.push_str("\n\n");
-        if !sections[idx].trim().is_empty() {
-            out.push_str(sections[idx].trim());
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-    out
 }
 
 fn normalize_tier2_task_states(content: &str) -> String {
@@ -136,7 +118,7 @@ fn normalize_tier2_task_states(content: &str) -> String {
     out.join("\n")
 }
 
-fn normalize_tier3_recent_focus(content: &str) -> String {
+fn normalize_tier3_recent_focus(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for raw_line in content.lines() {
@@ -144,33 +126,116 @@ fn normalize_tier3_recent_focus(content: &str) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        // Keep only one monitoring reference per unique normalized sentence.
         let key = trimmed.to_ascii_lowercase();
         if seen.insert(key) {
             out.push(trimmed.to_string());
         }
     }
-    out.join("\n")
+    out.into_iter().take(15).collect()
 }
 
-/// Replace content for one tier in the full markdown; preserve others. Creates template if needed.
-fn replace_tier_content(full: &str, tier: u8, new_content: &str) -> String {
-    if !(1..=3).contains(&tier) {
-        return full.to_string();
+fn parse_project_state_line(line: &str) -> Option<ActiveProjectMemory> {
+    let rest = line.strip_prefix("- ProjectState|")?;
+    let mut id = String::new();
+    let mut status = String::new();
+    let mut updated_at = String::new();
+    let mut summary = String::new();
+    for part in rest.split('|') {
+        let mut kv = part.splitn(2, '=');
+        let key = kv.next()?.trim();
+        let value = kv.next().unwrap_or("").trim();
+        match key {
+            "id" => id = value.to_string(),
+            "status" => status = value.to_string(),
+            "updated" => updated_at = value.to_string(),
+            "summary" => summary = value.to_string(),
+            _ => {}
+        }
     }
-    let mut sections = extract_tier_sections(full);
-    sections[(tier - 1) as usize] = new_content.trim().to_string();
-    render_memory_document(&sections)
+    if summary.is_empty() {
+        return None;
+    }
+    Some(ActiveProjectMemory {
+        id,
+        status,
+        summary,
+        updated_at,
+    })
+}
+
+fn apply_tier_write(state: &mut PersonaMemoryState, tier: u8, content: &str) {
+    match tier {
+        1 => {
+            let mut stable_facts = Vec::new();
+            let mut workflow_principles = Vec::new();
+            let mut identity_constraints = Vec::new();
+            for raw_line in content.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(v) = line.strip_prefix("- Identity|display_name=") {
+                    state.identity.display_name = v.trim().to_string();
+                    continue;
+                }
+                if let Some(v) = line.strip_prefix("- Identity|self_model=") {
+                    state.identity.self_model = v.trim().to_string();
+                    continue;
+                }
+                if let Some(v) = line.strip_prefix("- Identity|voice_style=") {
+                    state.identity.voice_style = v.trim().to_string();
+                    continue;
+                }
+                if let Some(v) = line.strip_prefix("- IdentityConstraint|") {
+                    identity_constraints.push(v.trim().to_string());
+                    continue;
+                }
+                if let Some(v) = line.strip_prefix("- WorkflowPrinciple|") {
+                    workflow_principles.push(v.trim().to_string());
+                    continue;
+                }
+                stable_facts.push(line.to_string());
+            }
+            state.identity.non_negotiables = identity_constraints;
+            state.tier1.stable_facts = stable_facts;
+            state.tier1.workflow_principles = workflow_principles;
+        }
+        2 => {
+            let normalized = normalize_tier2_task_states(content);
+            let mut projects = Vec::new();
+            for raw_line in normalized.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(project) = parse_project_state_line(line) {
+                    projects.push(project);
+                } else {
+                    projects.push(ActiveProjectMemory {
+                        id: String::new(),
+                        status: "active".to_string(),
+                        summary: line.to_string(),
+                        updated_at: String::new(),
+                    });
+                }
+            }
+            state.tier2.active_projects = projects;
+        }
+        3 => {
+            state.tier3.recent_focus = normalize_tier3_recent_focus(content);
+        }
+        _ => {}
+    }
 }
 
 pub struct ReadTieredMemoryTool {
-    groups_dir: PathBuf,
+    memory: MemoryManager,
 }
 
 impl ReadTieredMemoryTool {
     pub fn new(data_dir: &str) -> Self {
         ReadTieredMemoryTool {
-            groups_dir: PathBuf::from(data_dir).join("groups"),
+            memory: MemoryManager::new(data_dir, data_dir),
         }
     }
 }
@@ -184,7 +249,7 @@ impl Tool for ReadTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_tiered_memory".into(),
-            description: "Read this persona's tiered memory (MEMORY.md). Optional tier (1, 2, or 3) returns only that section. Tier 1 = long-term principles-like; Tier 2 = active projects; Tier 3 = recent focus/mood.".into(),
+            description: "Read this persona's tiered memory from canonical memory_state.json (legacy MEMORY.md auto-migrates). Optional tier (1, 2, or 3) returns only that section.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -222,31 +287,33 @@ impl Tool for ReadTieredMemoryTool {
             return ToolResult::error(e);
         }
 
-        let path = memory_path(&self.groups_dir, chat_id, persona_id);
-        info!("Reading tiered memory: {}", path.display());
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return ToolResult::success("No memory file found (not yet created).".into()),
+        let state = match self
+            .memory
+            .read_or_migrate_persona_memory_state(chat_id, persona_id)
+        {
+            Some(s) => s,
+            None => {
+                return ToolResult::success(
+                    "No canonical memory state found (not yet created).".into(),
+                )
+            }
         };
+        let state_path = self.memory.persona_memory_state_path(chat_id, persona_id);
+        info!("Reading tiered memory: {}", state_path.display());
 
         let tier_opt = input.get("tier").and_then(|v| v.as_i64()).map(|n| n as u8);
         let result = if let Some(t) = tier_opt {
             if !(1..=3).contains(&t) {
                 return ToolResult::error("tier must be 1, 2, or 3".into());
             }
-            let section = parse_tier_content(&content, t);
+            let section = parse_tier_content(&state, t);
             if section.is_empty() {
                 format!("(Tier {} is empty.)", t)
             } else {
                 section
             }
         } else {
-            if content.trim().is_empty() {
-                "Memory file is empty.".to_string()
-            } else {
-                content
-            }
+            crate::memory::render_memory_markdown(&state)
         };
 
         ToolResult::success(result)
@@ -254,13 +321,13 @@ impl Tool for ReadTieredMemoryTool {
 }
 
 pub struct WriteTieredMemoryTool {
-    groups_dir: PathBuf,
+    memory: MemoryManager,
 }
 
 impl WriteTieredMemoryTool {
     pub fn new(data_dir: &str) -> Self {
         WriteTieredMemoryTool {
-            groups_dir: PathBuf::from(data_dir).join("groups"),
+            memory: MemoryManager::new(data_dir, data_dir),
         }
     }
 }
@@ -274,7 +341,7 @@ impl Tool for WriteTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_tiered_memory".into(),
-            description: "Write one tier of this persona's MEMORY.md. Tier 1 = long-term (only on explicit user ask); Tier 2 = active projects; Tier 3 = recent focus/mood (update often; use past-tense status language, never 'awaiting/finalizing/TODO' — memory is context, not a task queue). Replaces that tier's section; other tiers are preserved.".into(),
+            description: "Write one tier of canonical memory_state.json. Tier 1 = long-term (only on explicit user ask); Tier 2 = active projects; Tier 3 = recent focus/mood. Replaces only that tier's section.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -292,7 +359,7 @@ impl Tool for WriteTieredMemoryTool {
                     },
                     "content": {
                         "type": "string",
-                        "description": "Markdown content for this tier (replaces existing)"
+                        "description": "Text content for this tier (replaces existing content in that tier)"
                     }
                 }),
                 &["tier", "content"],
@@ -329,26 +396,35 @@ impl Tool for WriteTieredMemoryTool {
             return ToolResult::error(e);
         }
 
-        let path = memory_path(&self.groups_dir, chat_id, persona_id);
-        info!("Writing tiered memory tier {}: {}", tier, path.display());
-
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let normalized = match tier {
-            2 => normalize_tier2_task_states(content),
-            3 => normalize_tier3_recent_focus(content),
-            _ => content.trim().to_string(),
-        };
-        let new_content = replace_tier_content(&existing, tier, &normalized);
-
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return ToolResult::error(format!("Failed to create directory: {e}"));
+        let mut state = self
+            .memory
+            .read_or_migrate_persona_memory_state(chat_id, persona_id)
+            .unwrap_or_default();
+        apply_tier_write(&mut state, tier, content);
+        let state_path = self.memory.persona_memory_state_path(chat_id, persona_id);
+        info!(
+            "Writing tiered memory tier {} to canonical JSON: {}",
+            tier,
+            state_path.display()
+        );
+        match self
+            .memory
+            .write_persona_memory_state(chat_id, persona_id, state)
+        {
+            Ok(()) => {
+                let _ = self.memory.append_persona_memory_event(
+                    chat_id,
+                    persona_id,
+                    "tier_write",
+                    "agent_auto",
+                    json!({
+                        "tier": tier,
+                        "state_path": state_path.to_string_lossy().to_string(),
+                    }),
+                );
+                ToolResult::success(format!("Tier {} updated in canonical memory state.", tier))
             }
-        }
-
-        match std::fs::write(&path, new_content) {
-            Ok(()) => ToolResult::success(format!("Tier {} updated.", tier)),
-            Err(e) => ToolResult::error(format!("Failed to write memory: {e}")),
+            Err(e) => ToolResult::error(format!("Failed to write canonical memory state: {e}")),
         }
     }
 }
@@ -358,63 +434,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_tier_content() {
-        let md = r#"# Memory
-
-## Tier 1 — Long term
-One line.
-
-## Tier 2 — Mid term
-Two
-lines.
-
-## Tier 3 — Short term
-Three."#;
-        assert_eq!(parse_tier_content(md, 1), "One line.");
-        assert_eq!(parse_tier_content(md, 2), "Two\nlines.");
-        assert_eq!(parse_tier_content(md, 3), "Three.");
+    fn test_parse_tier_content_from_state() {
+        let mut state = PersonaMemoryState::default();
+        state.identity.display_name = "Nova".into();
+        state.tier1.stable_facts = vec!["- stable fact".into()];
+        state.tier2.active_projects = vec![ActiveProjectMemory {
+            id: "project-1".into(),
+            status: "active".into(),
+            summary: "Build memory model".into(),
+            updated_at: "2026-04-27T00:00:00Z".into(),
+        }];
+        state.tier3.recent_focus = vec!["- recent".into()];
+        assert!(parse_tier_content(&state, 1).contains("Identity|display_name=Nova"));
+        assert!(parse_tier_content(&state, 2).contains("Build memory model"));
+        assert_eq!(parse_tier_content(&state, 3), "- recent");
     }
 
     #[test]
-    fn test_replace_tier_preserves_others() {
-        let md = r#"# Memory
-
-## Tier 1 — Long term
-Old T1
-
-## Tier 2 — Mid term
-Old T2
-
-## Tier 3 — Short term
-Old T3"#;
-        let new = replace_tier_content(md, 2, "New T2 content");
-        assert!(new.contains("Old T1"));
-        assert!(new.contains("New T2 content"));
-        assert!(new.contains("Old T3"));
-    }
-
-    #[test]
-    fn test_replace_tier_canonicalizes_duplicate_headers() {
-        let md = r#"# Memory
-
-## Tier 1 — Long term
-T1 first
-
-## Tier 2 — Mid term
-T2 first
-
-## Tier 2 — Mid term
-T2 second
-
-## Tier 3 — Short term
-T3 first"#;
-        let new = replace_tier_content(md, 3, "Updated T3");
-        assert_eq!(new.matches("## Tier 1 — Long term").count(), 1);
-        assert_eq!(new.matches("## Tier 2 — Mid term").count(), 1);
-        assert_eq!(new.matches("## Tier 3 — Short term").count(), 1);
-        assert!(new.contains("T2 first"));
-        assert!(new.contains("T2 second"));
-        assert!(new.contains("Updated T3"));
+    fn test_apply_tier_write_identity_and_principles() {
+        let mut state = PersonaMemoryState::default();
+        let content = "\
+- Identity|display_name=KenAssistant
+- Identity|voice_style=concise
+- IdentityConstraint|Do not hallucinate
+- WorkflowPrinciple|Check run history before claiming no memory
+- Stable fact line";
+        apply_tier_write(&mut state, 1, content);
+        assert_eq!(state.identity.display_name, "KenAssistant");
+        assert_eq!(state.identity.voice_style, "concise");
+        assert_eq!(state.identity.non_negotiables.len(), 1);
+        assert_eq!(state.tier1.workflow_principles.len(), 1);
+        assert_eq!(state.tier1.stable_facts.len(), 1);
     }
 
     #[test]
@@ -442,7 +492,24 @@ T3 first"#;
 - checking output
 "#;
         let out = normalize_tier3_recent_focus(input);
-        assert_eq!(out.matches("monitoring queue").count(), 1);
-        assert_eq!(out.matches("checking output").count(), 1);
+        assert_eq!(
+            out.iter()
+                .filter(|l| l.contains("monitoring queue"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.iter().filter(|l| l.contains("checking output")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_parse_project_state_line() {
+        let line = "- ProjectState|id=proj-a|status=running|updated=2026-04-27T00:00:00Z|summary=Ship migration";
+        let project = parse_project_state_line(line).unwrap();
+        assert_eq!(project.id, "proj-a");
+        assert_eq!(project.status, "running");
+        assert_eq!(project.summary, "Ship migration");
     }
 }

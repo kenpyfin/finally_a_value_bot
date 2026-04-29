@@ -370,6 +370,10 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Fina
         "BOT_USERNAME={}",
         escape_env_val(&config.bot_username)
     ));
+    lines.push(format!(
+        "AGENT_DISPLAY_NAME={}",
+        escape_env_val(&config.agent_display_name)
+    ));
     lines.push("".into());
     lines.push("# LLM".into());
     lines.push(format!(
@@ -420,6 +424,7 @@ fn default_config() -> Config {
     Config {
         telegram_bot_token: String::new(),
         bot_username: String::new(),
+        agent_display_name: String::new(),
         llm_provider: "anthropic".into(),
         api_key: String::new(),
         model: "claude-sonnet-4-5-20250929".into(),
@@ -516,6 +521,14 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
         true,
     )? {
         Some(v) => v.trim_start_matches('@').to_string(),
+        None => return Ok(false),
+    };
+    let agent_display_name = match prompt_line(
+        "Agent display name (used to seed identity memory)",
+        Some(&existing.agent_display_name),
+        false,
+    )? {
+        Some(v) => v,
         None => return Ok(false),
     };
 
@@ -617,6 +630,7 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
     let mut out = existing.clone();
     out.telegram_bot_token = telegram_bot_token;
     out.bot_username = bot_username;
+    out.agent_display_name = agent_display_name;
     out.llm_provider = provider;
     out.api_key = api_key;
     out.model = model;

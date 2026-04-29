@@ -40,7 +40,6 @@ import type {
   Persona,
   PersonaBulletinFocus,
   PersonaMessageBookmark,
-  RuntimeSettingItem,
   ScheduleTask,
 } from './types'
 
@@ -455,9 +454,7 @@ function App() {
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
-  const [settingsBusy, setSettingsBusy] = useState(false)
   const [settingsError, setSettingsError] = useState('')
-  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingItem[]>([])
   const [installationStatus, setInstallationStatus] = useState<InstallationStatus | null>(null)
   const [botInstances, setBotInstances] = useState<BotInstanceRow[]>([])
   const [restartBusy, setRestartBusy] = useState(false)
@@ -1124,22 +1121,15 @@ function App() {
   }
 
   async function loadSettings(): Promise<void> {
-    setSettingsBusy(true)
     setSettingsError('')
     try {
       const data = await api<{
-        settings?: RuntimeSettingItem[]
         installation_status?: InstallationStatus
       }>('/api/settings')
-      const items = Array.isArray(data.settings) ? data.settings : []
-      setRuntimeSettings(items)
       setInstallationStatus(data.installation_status ?? null)
     } catch (e) {
       setSettingsError(e instanceof Error ? e.message : String(e))
-      setRuntimeSettings([])
       setInstallationStatus(null)
-    } finally {
-      setSettingsBusy(false)
     }
   }
 
@@ -1720,7 +1710,6 @@ function App() {
                           <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
                           <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
                           <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
-                          <Tabs.Trigger value="legacy">Legacy</Tabs.Trigger>
                         </Tabs.List>
                         <Tabs.Content value="overview">
                           {installationStatus ? (
@@ -1759,27 +1748,6 @@ function App() {
                               Loading installation status…
                             </Text>
                           )}
-                        </Tabs.Content>
-                        <Tabs.Content value="legacy">
-                      <div
-                        className="rounded-md border p-3"
-                        style={appearance === 'dark'
-                          ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
-                          : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
-                      >
-                        <Text size="2" weight="bold" className="mb-1">Legacy app_settings (read-only)</Text>
-                        <Text size="1" color="gray" className="mb-2 block">
-                          Rows are not merged into process env at startup. Use <code className="text-xs">.env</code> for configuration. LLM keys are not stored here.
-                        </Text>
-                        <Flex justify="between" align="center" gap="2" wrap="wrap">
-                          <Text size="1" color="gray">
-                            Rows: {runtimeSettings.length}
-                          </Text>
-                          <Button size="1" variant="soft" onClick={() => void loadSettings()} disabled={settingsBusy}>
-                            Reload
-                          </Button>
-                        </Flex>
-                      </div>
                         </Tabs.Content>
                         <Tabs.Content value="integrations">
                       <div

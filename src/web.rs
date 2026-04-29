@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,8 +14,9 @@ use base64::Engine;
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::channel::deliver_to_contact;
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
@@ -1718,7 +1719,7 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let response = process_with_agent_with_events(
+    let mut response = process_with_agent_with_events(
         &state.app_state,
         AgentRequestContext {
             caller_channel: "web",
@@ -1738,6 +1739,7 @@ async fn send_and_store_response_with_events(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if !response.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
+        response = materialize_response_file_links(&state, chat_id, &response).await?;
         deliver_to_contact(
             state.app_state.db.clone(),
             state.app_state.telegram_bots.as_ref(),
@@ -1759,6 +1761,171 @@ async fn send_and_store_response_with_events(
         "prompt": raw_text,
         "response": response,
     })))
+}
+
+fn resolve_response_local_file_path(state: &WebState, raw: &str) -> Option<PathBuf> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
+    if trimmed.is_empty()
+        || trimmed.starts_with("/api/uploads/")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+        || trimmed.starts_with("mailto:")
+        || trimmed.starts_with('#')
+    {
+        return None;
+    }
+
+    let workspace_root = state.app_state.config.workspace_root_absolute();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let as_path = PathBuf::from(trimmed);
+    if as_path.is_absolute() {
+        candidates.push(as_path);
+    } else {
+        candidates.push(workspace_root.join(trimmed));
+        candidates.push(workspace_root.join("shared").join(trimmed));
+
+        if let Some(stripped) = trimmed.strip_prefix("./") {
+            candidates.push(workspace_root.join(stripped));
+            candidates.push(workspace_root.join("shared").join(stripped));
+        }
+        if let Some(stripped) = trimmed.strip_prefix("shared/") {
+            candidates.push(workspace_root.join("shared").join(stripped));
+        }
+        if let Some(repo_root) = workspace_root.parent() {
+            candidates.push(repo_root.join(trimmed));
+            if let Some(stripped) = trimmed.strip_prefix("workspace/") {
+                candidates.push(repo_root.join(stripped));
+            }
+        }
+    }
+
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn upload_rel_url_exists(state: &WebState, rel_url: &str) -> bool {
+    let Some(rel) = rel_url.strip_prefix("/api/uploads/") else {
+        return true;
+    };
+    let shared_path = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
+        .join(rel);
+    if shared_path.is_file() {
+        return true;
+    }
+    let legacy_path = FsPath::new(state.app_state.config.working_dir())
+        .join("uploads")
+        .join(rel);
+    legacy_path.is_file()
+}
+
+async fn persist_file_for_web_delivery(
+    state: &WebState,
+    chat_id: i64,
+    source_path: &FsPath,
+) -> Result<String, (StatusCode, String)> {
+    let filename = source_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    let bytes = tokio::fs::read(source_path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let uploads_dir = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
+        .join("web")
+        .join(chat_id.to_string());
+    tokio::fs::create_dir_all(&uploads_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let safe_name = sanitize_upload_filename(&filename);
+    let stored_name = format!("{}-bot-{}", ts, safe_name);
+    let saved_path = uploads_dir.join(&stored_name);
+    tokio::fs::write(&saved_path, &bytes)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(format!("/api/uploads/web/{chat_id}/{stored_name}"))
+}
+
+async fn materialize_response_file_links(
+    state: &WebState,
+    chat_id: i64,
+    response: &str,
+) -> Result<String, (StatusCode, String)> {
+    let Some(markdown_link_re) = regex::Regex::new(r#"\]\(([^)\n]+)\)"#).ok() else {
+        return Ok(response.to_string());
+    };
+    let Some(parenthesized_target_re) = regex::Regex::new(r#"\(([^()\n]+)\)"#).ok() else {
+        return Ok(response.to_string());
+    };
+    let mut rewrites: HashMap<String, String> = HashMap::new();
+    for caps in markdown_link_re.captures_iter(response) {
+        let Some(target) = caps.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        if rewrites.contains_key(&target) {
+            continue;
+        }
+        if let Some(local_path) = resolve_response_local_file_path(state, &target) {
+            let rel = persist_file_for_web_delivery(state, chat_id, &local_path).await?;
+            rewrites.insert(target, rel);
+        }
+    }
+    for caps in parenthesized_target_re.captures_iter(response) {
+        let Some(target) = caps.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        if rewrites.contains_key(&target) {
+            continue;
+        }
+        if let Some(local_path) = resolve_response_local_file_path(state, &target) {
+            let rel = persist_file_for_web_delivery(state, chat_id, &local_path).await?;
+            rewrites.insert(target, rel);
+        }
+    }
+
+    let mut updated = response.to_string();
+    for (target, rel) in &rewrites {
+        updated = updated.replace(&format!("({target})"), &format!("({rel})"));
+    }
+
+    let upload_urls = extract_upload_urls_from_text(&updated);
+    for url in upload_urls {
+        if upload_rel_url_exists(state, &url) {
+            continue;
+        }
+        let fallback_name = url.rsplit('/').next().unwrap_or_default();
+        if fallback_name.is_empty() {
+            warn!(target: "web", url = %url, "assistant response referenced missing upload URL");
+            continue;
+        }
+        let fallback_local = state
+            .app_state
+            .config
+            .workspace_root_absolute()
+            .join("shared")
+            .join(fallback_name);
+        if fallback_local.is_file() {
+            let rel = persist_file_for_web_delivery(state, chat_id, &fallback_local).await?;
+            updated = updated.replace(&url, &rel);
+        } else {
+            warn!(target: "web", url = %url, "assistant response referenced missing upload URL");
+        }
+    }
+
+    Ok(updated)
 }
 
 async fn process_web_attachments(
@@ -1816,9 +1983,9 @@ async fn process_web_attachments(
             continue;
         }
 
-        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let safe_name = sanitize_upload_filename(&filename);
-        let path = dir.join(format!("{}-{}-{}", ts, idx + 1, safe_name));
+        let stable_name = stable_upload_filename(&safe_name, &bytes, idx + 1);
+        let path = dir.join(stable_name);
         tokio::fs::write(&path, &bytes)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1877,6 +2044,20 @@ fn sanitize_upload_filename(name: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn stable_upload_filename(safe_name: &str, bytes: &[u8], fallback_index: usize) -> String {
+    let final_name = if safe_name.is_empty() {
+        format!("web-attachment-{}.bin", fallback_index)
+    } else {
+        safe_name.to_string()
+    };
+    let digest = Sha256::digest(bytes);
+    let hash = digest[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    format!("{hash}-{final_name}")
 }
 
 /// Clear context: delete only the current persona's session for this contact (per-persona reset).
@@ -2334,16 +2515,18 @@ async fn api_persona_message_get(
 }
 
 fn ensure_persona_memory_file_exists_for_web(state: &AppState, chat_id: i64, persona_id: i64) {
-    let path = state.memory.persona_memory_path(chat_id, persona_id);
+    let path = state.memory.persona_memory_state_path(chat_id, persona_id);
     if path.exists() {
         return;
     }
-    let template =
-        "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, template);
+    let display_name = if !state.config.agent_display_name.trim().is_empty() {
+        Some(state.config.agent_display_name.as_str())
+    } else {
+        None
+    };
+    let _ = state
+        .memory
+        .ensure_persona_memory_state_exists(chat_id, persona_id, display_name);
 }
 
 fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
@@ -2373,8 +2556,16 @@ async fn api_persona_memory_get(
     }
 
     ensure_persona_memory_file_exists_for_web(&state.app_state, chat_id, pid);
-    let mem_path = state.app_state.memory.persona_memory_path(chat_id, pid);
-    let content = std::fs::read_to_string(&mem_path).unwrap_or_default();
+    let mem_path = state
+        .app_state
+        .memory
+        .persona_memory_state_path(chat_id, pid);
+    let memory_state = state
+        .app_state
+        .memory
+        .read_or_migrate_persona_memory_state(chat_id, pid)
+        .unwrap_or_default();
+    let content = serde_json::to_string_pretty(&memory_state).unwrap_or_else(|_| "{}".to_string());
     let mtime_ms = file_mtime_ms(&mem_path).unwrap_or(0);
     Ok(Json(json!({
         "ok": true,
@@ -2419,7 +2610,10 @@ async fn api_persona_memory_put(
     }
 
     ensure_persona_memory_file_exists_for_web(&state.app_state, chat_id, pid);
-    let mem_path = state.app_state.memory.persona_memory_path(chat_id, pid);
+    let mem_path = state
+        .app_state
+        .memory
+        .persona_memory_state_path(chat_id, pid);
     let current_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
     if let Some(expected) = body.if_match_mtime_ms {
         if expected != current_mtime {
@@ -2430,12 +2624,31 @@ async fn api_persona_memory_put(
         }
     }
 
-    if let Some(parent) = mem_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    std::fs::write(&mem_path, body.content)
+    let mut state_payload: crate::memory::PersonaMemoryState = serde_json::from_str(&body.content)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid memory_state JSON: {e}"),
+            )
+        })?;
+    state_payload.normalize();
+    state
+        .app_state
+        .memory
+        .validate_memory_state(&state_payload)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    state
+        .app_state
+        .memory
+        .write_persona_memory_state(chat_id, pid, state_payload)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = state.app_state.memory.append_persona_memory_event(
+        chat_id,
+        pid,
+        "web_memory_state_put",
+        "user_manual",
+        json!({"path": mem_path.to_string_lossy().to_string()}),
+    );
 
     let new_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
     Ok(Json(json!({
@@ -3911,6 +4124,70 @@ mod tests {
         let urls = extract_upload_urls_from_text(text);
         assert!(urls.iter().any(|u| u == "/api/uploads/web/1/file.md"));
         assert!(urls.iter().any(|u| u == "/api/uploads/web/1/img.png"));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_response_file_links_rewrites_local_markdown_target() {
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let chat_id = 997894126_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let shared_dir = workspace_root.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        let local = shared_dir.join("report.pdf");
+        std::fs::write(&local, b"pdf").unwrap();
+
+        let input = "[Download](shared/report.pdf)";
+        let output = materialize_response_file_links(&web_state, chat_id, input)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/"));
+        assert!(!output.contains("(shared/report.pdf)"));
+
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_response_file_links_repairs_missing_upload_url() {
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let chat_id = 997894126_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let shared_dir = workspace_root.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        std::fs::write(shared_dir.join("report.pdf"), b"pdf").unwrap();
+
+        let input = "[Download](/api/uploads/web/997894126/report.pdf)";
+        let output = materialize_response_file_links(&web_state, chat_id, input)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/"));
+        assert_ne!(input, output);
+
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_response_file_links_rewrites_parenthesized_local_path() {
+        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let chat_id = 997894126_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let shared_dir = workspace_root.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        std::fs::write(shared_dir.join("report.pdf"), b"pdf").unwrap();
+
+        let input = "(shared/report.pdf)";
+        let output = materialize_response_file_links(&web_state, chat_id, input)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/"));
+        assert!(!output.contains("(shared/report.pdf)"));
+
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
     }
 
     struct DummyLlm;

@@ -6,23 +6,23 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
+use crate::memory::MemoryManager;
 
 use super::{
     auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult,
 };
 
 pub struct ReadMemoryTool {
-    groups_dir: PathBuf,
+    memory: MemoryManager,
     /// Principles file: workspace_dir/AGENTS.md (read-only for "global" scope).
     workspace_agents_path: PathBuf,
 }
 
 impl ReadMemoryTool {
     pub fn new(data_dir: &str, working_dir: &str) -> Self {
-        let groups_dir = PathBuf::from(data_dir).join("groups");
         ReadMemoryTool {
             workspace_agents_path: PathBuf::from(working_dir).join("AGENTS.md"),
-            groups_dir,
+            memory: MemoryManager::new(data_dir, working_dir),
         }
     }
 }
@@ -36,12 +36,12 @@ impl Tool for ReadMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_memory".into(),
-            description: "Read memory. Use scope 'global' to read principles (AGENTS.md at workspace root, read-only), or 'chat' to read this persona's full MEMORY.md. For tiered read/write use read_tiered_memory and write_tiered_memory.".into(),
+            description: "Read memory. Use scope 'global' to read principles (AGENTS.md at workspace root, read-only), or 'chat' to read this persona's canonical memory_state.json. For tiered operations use read_tiered_memory/write_tiered_memory.".into(),
             input_schema: schema_object(
                 json!({
                     "scope": {
                         "type": "string",
-                        "description": "Memory scope: 'global' (principles) or 'chat' (persona MEMORY.md)",
+                        "description": "Memory scope: 'global' (principles) or 'chat' (persona memory_state.json)",
                         "enum": ["global", "chat"]
                     },
                     "chat_id": {
@@ -82,24 +82,40 @@ impl Tool for ReadMemoryTool {
                 if let Err(e) = authorize_chat_persona_access(&input, chat_id, persona_id) {
                     return ToolResult::error(e);
                 }
-                self.groups_dir
-                    .join(chat_id.to_string())
-                    .join(persona_id.to_string())
-                    .join("MEMORY.md")
+                self.memory.persona_memory_state_path(chat_id, persona_id)
             }
             _ => return ToolResult::error("scope must be 'global' or 'chat'".into()),
         };
 
         info!("Reading memory: {}", path.display());
 
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                if content.trim().is_empty() {
-                    ToolResult::success("Memory file is empty.".into())
-                } else {
-                    ToolResult::success(content)
-                }
+        if scope == "chat" {
+            let auth = auth_context_from_input(&input).unwrap();
+            let chat_id = input
+                .get("chat_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(auth.caller_chat_id);
+            let persona_id = input
+                .get("persona_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(auth.caller_persona_id);
+            if let Some(state) = self
+                .memory
+                .read_or_migrate_persona_memory_state(chat_id, persona_id)
+            {
+                return match serde_json::to_string_pretty(&state) {
+                    Ok(serialized) => ToolResult::success(serialized),
+                    Err(e) => ToolResult::error(format!("Failed to serialize memory state: {e}")),
+                };
             }
+            return ToolResult::success("No memory state found (not yet created).".into());
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) if content.trim().is_empty() => {
+                ToolResult::success("Memory file is empty.".into())
+            }
+            Ok(content) => ToolResult::success(content),
             Err(_) => ToolResult::success("No memory file found (not yet created).".into()),
         }
     }
@@ -126,7 +142,7 @@ impl Tool for WriteMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_memory".into(),
-            description: "Write memory daily log only. Use scope 'chat_daily' to append a note to groups/{chat_id}/{persona_id}/memory/YYYY-MM-DD.md. For tiered MEMORY.md updates use write_tiered_memory.".into(),
+            description: "Write memory daily log only. Use scope 'chat_daily' to append a note to groups/{chat_id}/{persona_id}/memory/YYYY-MM-DD.md. For tiered state updates use write_tiered_memory.".into(),
             input_schema: schema_object(
                 json!({
                     "scope": {
@@ -163,7 +179,7 @@ impl Tool for WriteMemoryTool {
         };
         if scope != "chat_daily" {
             return ToolResult::error(
-                "scope must be 'chat_daily'. Use write_tiered_memory to update MEMORY.md tiers."
+                "scope must be 'chat_daily'. Use write_tiered_memory to update canonical memory tiers."
                     .into(),
             );
         }

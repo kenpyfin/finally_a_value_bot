@@ -122,6 +122,14 @@ export function CockpitBar({
     }
   }, [expanded])
 
+  const onExpandedStripClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null
+    if (!target) return
+    // Keep native controls working; collapse only on non-interactive strip clicks.
+    if (target.closest('button, a, input, textarea, select, option, [role="button"], [role="menuitem"]')) return
+    setExpanded(false)
+  }
+
   const stripClass = floating
     ? isDark
       ? 'rounded-xl border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/90 shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur'
@@ -176,6 +184,7 @@ export function CockpitBar({
       className={`mc-cockpit px-4 py-2 ${stripClass}`}
       role="region"
       aria-label="Session status"
+      onClick={onExpandedStripClick}
     >
       <div className="flex">
         <button

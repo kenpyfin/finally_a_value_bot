@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use teloxide::prelude::*;
 use teloxide::types::InputFile;
 
@@ -279,9 +280,8 @@ impl SendMessageTool {
         tokio::fs::create_dir_all(&uploads_dir)
             .await
             .map_err(|e| format!("Failed to create web uploads directory: {e}"))?;
-        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let safe_name = sanitize_upload_filename(&filename);
-        let stored_name = format!("{}-bot-{}", ts, safe_name);
+        let stored_name = stable_upload_filename(&safe_name, &bytes);
         let saved_path = uploads_dir.join(&stored_name);
         tokio::fs::write(&saved_path, &bytes)
             .await
@@ -372,6 +372,15 @@ fn sanitize_upload_filename(name: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn stable_upload_filename(safe_name: &str, bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let hash = digest[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    format!("{hash}-{safe_name}")
 }
 
 fn is_image_file(path: &Path, bytes: &[u8]) -> bool {
@@ -616,6 +625,7 @@ impl Tool for SendMessageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_config;
     use serde_json::json;
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
@@ -870,6 +880,67 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("active channels"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_send_attachment_web_uploads_and_stores_message() {
+        let (db, dir) = test_db();
+        db.upsert_chat(999, Some("web-main"), "web").unwrap();
+
+        let workspace_dir = dir.join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("shared")).unwrap();
+        let attachment = workspace_dir.join("sample.pdf");
+        std::fs::write(&attachment, b"pdf-bytes").unwrap();
+
+        let mut cfg = test_config();
+        cfg.workspace_dir = workspace_dir.to_string_lossy().to_string();
+        let tool = SendMessageTool::new_with_config(
+            Bot::new("123456:TEST_TOKEN"),
+            db.clone(),
+            "bot".into(),
+            cfg,
+        );
+
+        let result = tool
+            .execute(json!({
+                "chat_id": 999,
+                "attachment_path": attachment.to_string_lossy(),
+                "caption": "Generated PDF",
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 999,
+                    "caller_channel": "web",
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let pid = db.get_or_create_default_persona(999).unwrap();
+        let msgs = db.get_all_messages(999, pid).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let content = &msgs[0].content;
+        assert!(content.contains("Generated PDF"));
+        assert!(content.contains("/api/uploads/web/999/"));
+
+        let url = content
+            .split('(')
+            .nth(1)
+            .and_then(|s| s.strip_suffix(')'))
+            .expect("expected markdown link URL");
+        let saved_name = url.rsplit('/').next().unwrap_or_default();
+        let saved_path = workspace_dir
+            .join("shared")
+            .join("upload")
+            .join("web")
+            .join("999")
+            .join(saved_name);
+        assert!(
+            saved_path.is_file(),
+            "expected saved upload at {}",
+            saved_path.display()
+        );
+
         cleanup(&dir);
     }
 }

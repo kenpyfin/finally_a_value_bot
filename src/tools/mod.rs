@@ -11,6 +11,7 @@ pub mod glob;
 pub mod grep;
 pub mod mcp;
 pub mod memory;
+pub mod memory_state;
 pub mod path_guard;
 pub mod read_file;
 pub mod schedule;
@@ -107,6 +108,8 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "edit_file"
         | "write_memory"
         | "write_tiered_memory"
+        | "write_memory_state"
+        | "patch_memory_state"
         | "update_bulletin_focus"
         | "add_vault_item"
         | "send_message"
@@ -330,6 +333,22 @@ impl ToolRegistry {
                 &config.runtime_data_dir(),
                 config.working_dir(),
             )),
+            Box::new(memory_state::ReadMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
+            Box::new(memory_state::ValidateMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
+            Box::new(memory_state::WriteMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
+            Box::new(memory_state::PatchMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool::new(
                 config.tavily_api_key.clone(),
@@ -475,6 +494,8 @@ impl ToolRegistry {
                         | "glob"
                         | "grep"
                         | "read_memory"
+                        | "read_memory_state"
+                        | "validate_memory_state"
                         | "read_tiered_memory"
                         | "search_chat_history"
                         | "search_vault"

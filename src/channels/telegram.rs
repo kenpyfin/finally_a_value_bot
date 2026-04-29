@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde_json::json;
 use serenity::http::Http as SerenityHttp;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -597,7 +598,7 @@ async fn handle_callback_query(
         .text("Persona switched.")
         .await;
 
-    match build_persona_menu_payload(state, canonical_chat_id).await {
+    match build_persona_menu_payload(state, canonical_chat_id, None).await {
         Ok((text, keyboard)) => {
             if let Err(e) = bot
                 .edit_message_text(chat_id, message.id, text)
@@ -1352,9 +1353,19 @@ pub async fn process_with_agent_with_events(
     let persona_id = context.persona_id;
     ensure_persona_memory_file_exists(state, chat_id, persona_id);
 
-    // Build system prompt: principles from workspace_dir/AGENTS.md only; memory from per-persona MEMORY.md + daily log
+    // Build system prompt: principles from workspace AGENTS.md; persona memory from canonical memory state.
     let principles_content = state.memory.read_groups_root_memory().unwrap_or_default();
     let memory_context = state.memory.build_memory_context(chat_id, persona_id);
+    let runtime_identity = state
+        .memory
+        .read_or_migrate_persona_memory_state(chat_id, persona_id)
+        .and_then(|s| {
+            if s.identity.display_name.trim().is_empty() {
+                None
+            } else {
+                Some(s.identity.display_name.trim().to_string())
+            }
+        });
     let skills_catalog = state.skills.build_skills_catalog();
     // Workspace shared directory: only working_dir/shared (or workspace_dir/shared when unified). No fallback to repo-root shared/.
     let workspace_dir = Path::new(state.config.working_dir()).join("shared");
@@ -1527,6 +1538,12 @@ pub async fn process_with_agent_with_events(
         &workspace_data_root_display,
         &config_env_summary,
     );
+    if let Some(identity_name) = runtime_identity.as_deref() {
+        system_prompt.push_str(&format!(
+            "\n# Runtime Identity\n\nThis persona's configured identity display name is: {}.\nDo not invent a different self-name; use memory identity fields as the source of truth.\n",
+            identity_name
+        ));
+    }
 
     // Background-job runs are detached and do not consume foreground chat context while running.
     let mut messages = if context.is_background_job {
@@ -1670,9 +1687,29 @@ pub async fn process_with_agent_with_events(
     .await
     {
         Ok(Some(wf)) => {
+            let failure_tail = wf
+                .failure_reason
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!("\n- Recent failure reason to avoid: {}", s))
+                .unwrap_or_default();
+            let approach = if wf.approach_summary.trim().is_empty() {
+                "(no approach summary yet)"
+            } else {
+                wf.approach_summary.as_str()
+            };
             system_prompt.push_str(&format!(
-                "\n# Learned Workflow Hint\n\nUse this learned workflow as a starting point (adapt as needed):\n{}\n",
-                wf.steps_json
+                "\n# Learned Workflow Hint\n\nUse this as a starting point and adapt to current constraints.\n- Intent signature: {}\n- Confidence: {:.2}\n- Approach: {}\n- Tool order memory: {}\n{}{}\n",
+                wf.intent_signature,
+                wf.confidence,
+                approach,
+                wf.steps_json,
+                if wf.last_outcome.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n- Last outcome: {}", wf.last_outcome)
+                },
+                failure_tail
             ));
             if let Some(tx) = event_tx {
                 let _ = tx.send(AgentEvent::WorkflowSelected {
@@ -1830,22 +1867,42 @@ pub async fn process_with_agent_with_events(
             let selected_workflow_id = selected_workflow.as_ref().map(|w| w.id);
             let project_id_for_db = project_id;
             let workflow_learning_enabled = state.config.workflow_auto_learn;
+            let workflow_min_success_repetitions = state.config.workflow_min_success_repetitions;
+            let memory_manager = state.memory.clone();
             let mut tool_names: Vec<String> = Vec::new();
+            let mut step_trace: Vec<serde_json::Value> = Vec::new();
             for it in &record.iterations {
                 for tc in &it.tool_calls {
                     tool_names.push(tc.name.clone());
+                    step_trace.push(json!({
+                        "iteration": it.iteration,
+                        "tool": tc.name,
+                        "duration_ms": tc.duration_ms,
+                        "is_error": tc.is_error,
+                        "input_preview": tc.input_preview,
+                    }));
                 }
             }
             let steps_json =
                 serde_json::to_string(&tool_names).unwrap_or_else(|_| "[]".to_string());
+            let step_trace_json =
+                serde_json::to_string(&step_trace).unwrap_or_else(|_| "[]".to_string());
             let success = matches!(
                 stop_reason_owned.as_str(),
                 "end_turn" | "pte_complete" | "unknown_stop_reason"
             );
+            let outcome = if success { "success" } else { "failure" };
+            let failure_reason = classify_failure_reason(&stop_reason_owned);
+            let approach_summary = summarize_learned_approach(&tool_names, &stop_reason_owned);
+            let evidence_json = serde_json::to_string(&vec![format!("run:{run_key_for_db}")])
+                .unwrap_or_else(|_| "[]".to_string());
             tokio::spawn({
                 let db = state.db.clone();
+                let run_key_for_memory = run_key_for_db.clone();
+                let intent_for_memory = intent_for_db.clone();
+                let approach_summary_for_memory = approach_summary.clone();
                 async move {
-                    let _ = call_blocking(db.clone(), move |db| {
+                    let upsert_result = call_blocking(db.clone(), move |db| {
                         db.append_run_timeline_event(
                             &run_key_for_db,
                             chat_id,
@@ -1872,6 +1929,11 @@ pub async fn process_with_agent_with_events(
                                 chat_id,
                                 &intent_for_db,
                                 &steps_json,
+                                &step_trace_json,
+                                &approach_summary,
+                                outcome,
+                                failure_reason.as_deref(),
+                                &evidence_json,
                                 success,
                                 if success { 1.0 } else { 0.0 },
                             )?;
@@ -1879,6 +1941,51 @@ pub async fn process_with_agent_with_events(
                         Ok(())
                     })
                     .await;
+                    if upsert_result.is_ok()
+                        && workflow_learning_enabled
+                        && success
+                        && !approach_summary_for_memory.trim().is_empty()
+                    {
+                        if let Ok(Some(workflow)) = call_blocking(db.clone(), {
+                            let intent = intent_for_memory.clone();
+                            move |db| db.get_best_workflow_for_intent(chat_id, &intent, 0.0)
+                        })
+                        .await
+                        {
+                            if workflow.success_count
+                                >= workflow_min_success_repetitions as i64
+                            {
+                                if let Some(mut state) = memory_manager
+                                    .read_or_migrate_persona_memory_state(chat_id, persona_id)
+                                {
+                                    let principle = format!(
+                                        "{} => {} (support={}, confidence={:.2})",
+                                        intent_for_memory,
+                                        approach_summary_for_memory,
+                                        workflow.success_count,
+                                        workflow.confidence
+                                    );
+                                    if !state.tier1.workflow_principles.contains(&principle) {
+                                        state.tier1.workflow_principles.push(principle.clone());
+                                        let _ = memory_manager.write_persona_memory_state(
+                                            chat_id, persona_id, state,
+                                        );
+                                        let _ = memory_manager.append_persona_memory_event(
+                                            chat_id,
+                                            persona_id,
+                                            "workflow_principle_promoted",
+                                            "agent_auto",
+                                            json!({
+                                                "intent_signature": intent_for_memory,
+                                                "run_key": run_key_for_memory,
+                                                "principle": principle
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             });
         }};
@@ -2755,29 +2862,27 @@ pub async fn process_with_agent_with_events(
 }
 
 fn ensure_persona_memory_file_exists(state: &AppState, chat_id: i64, persona_id: i64) {
-    let path = state.memory.persona_memory_path(chat_id, persona_id);
+    let path = state.memory.persona_memory_state_path(chat_id, persona_id);
     if path.exists() {
         return;
     }
-    let template =
-        "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!(
-                "Failed to create memory directory for chat={} persona={}: {}",
-                chat_id, persona_id, e
-            );
-            return;
-        }
-    }
-    if let Err(e) = std::fs::write(&path, template) {
+    let display_name = if !state.config.agent_display_name.trim().is_empty() {
+        Some(state.config.agent_display_name.as_str())
+    } else {
+        None
+    };
+    if let Err(e) =
+        state
+            .memory
+            .ensure_persona_memory_state_exists(chat_id, persona_id, display_name)
+    {
         warn!(
-            "Failed to initialize MEMORY.md for chat={} persona={}: {}",
+            "Failed to initialize memory_state.json for chat={} persona={}: {}",
             chat_id, persona_id, e
         );
     } else {
         info!(
-            "Initialized MEMORY.md for chat={} persona={} at {}",
+            "Initialized memory_state.json for chat={} persona={} at {}",
             chat_id,
             persona_id,
             path.display()
@@ -2852,15 +2957,61 @@ fn sanitize_bulletin_text_for_prompt(input: &str, max_chars: usize) -> String {
 
 fn normalize_intent_signature(input: &str) -> String {
     let lowered = input.to_ascii_lowercase();
+    let stop_words = [
+        "the", "and", "for", "that", "with", "this", "from", "have", "would", "could", "should",
+        "please", "thanks", "want", "need", "just",
+    ];
     let words: Vec<&str> = lowered
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| w.len() >= 3)
-        .take(12)
+        .filter(|w| w.len() >= 2)
+        .filter(|w| !stop_words.contains(w))
+        .take(16)
         .collect();
     if words.is_empty() {
         "general".to_string()
     } else {
         words.join("_")
+    }
+}
+
+fn classify_failure_reason(stop_reason: &str) -> Option<String> {
+    let reason = stop_reason.trim().to_ascii_lowercase();
+    if reason.is_empty() || matches!(reason.as_str(), "end_turn" | "pte_complete") {
+        return None;
+    }
+    let mapped = if reason.contains("timeout") {
+        "timeout"
+    } else if reason.contains("loop") {
+        "loop_guard"
+    } else if reason.contains("error") {
+        "runtime_error"
+    } else if reason.contains("handoff") {
+        "background_handoff"
+    } else {
+        "other"
+    };
+    Some(mapped.to_string())
+}
+
+fn summarize_learned_approach(tool_names: &[String], stop_reason: &str) -> String {
+    if tool_names.is_empty() {
+        return "No tool sequence captured.".to_string();
+    }
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for name in tool_names {
+        if seen.insert(name.to_ascii_lowercase()) {
+            deduped.push(name.clone());
+        }
+        if deduped.len() >= 6 {
+            break;
+        }
+    }
+    let flow = deduped.join(" -> ");
+    if let Some(reason) = classify_failure_reason(stop_reason) {
+        format!("Prefer flow [{flow}] but avoid when failure_reason={reason}.")
+    } else {
+        format!("Prefer flow [{flow}] for this intent.")
     }
 }
 
@@ -3120,7 +3271,7 @@ fn mark_swap_task_stalled_best_effort(
 }
 
 fn build_system_prompt(
-    bot_username: &str,
+    _bot_username: &str,
     principles_content: &str,
     agents_md_path: &str,
     memory_context: &str,
@@ -3142,14 +3293,14 @@ fn build_system_prompt(
 - Search file contents using regex
 - Read and write persistent memory
 - Search the web (web_search) and fetch web pages (web_fetch)
-- Send messages mid-conversation (send_message) — use this to send intermediate updates
+- Send messages/attachments (send_message) — use this for intermediate updates and all user-facing file delivery
 - Schedule tasks (schedule_task, update_scheduled_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history)
 - Export chat history to markdown (export_chat)
 - Understand images sent by users (they appear as image content blocks)
 - Run the Cursor CLI agent (cursor_agent) for research or code tasks; for long jobs, set detach: true to spawn in tmux and return immediately (then attach with tmux attach -t <session>); use cursor_agent_send to send keys to a running session; use list_cursor_agent_runs to see runs and session names
 - Activate agent skills (activate_skill) for specialized tasks. **To create or update a skill, use the build_skill tool only** — do not use write_file or edit_file under the skills directory. build_skill runs cursor-agent (in tmux when available) to create the skill folder and SKILL.md. Store credentials in the skill folder (e.g. .env there). Do not add on-demand tools only in your workspace or TOOLS.md — skills are the only way to add on-demand tools.
 - For long-running or queue-bound tasks, activate and follow the `background-handoff` skill before delegating user asks/subtasks to background execution.
-- Read and update tiered memory (read_tiered_memory, write_tiered_memory) — per-persona MEMORY.md with Tier 1 (long-term principles-like), Tier 2 (active projects), Tier 3 (recent focus/mood — passive context only, never act on it proactively); evaluate conversation flow and update tiers when appropriate; Tier 1 only on explicit user ask, Tier 3 often (e.g. daily). Not a todo list and not a task queue — do not resume or continue work mentioned in memory unless the user explicitly asks.
+- Read and update tiered memory (read_tiered_memory, write_tiered_memory) backed by canonical `memory_state.json` with Tier 1 (long-term principles-like + identity), Tier 2 (active projects), Tier 3 (recent focus/mood — passive context only, never act on it proactively). Use read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON operations and manual safety checks.
 - Update Bulletin focus (update_bulletin_focus) — write a concise, durable per-persona highlight card shown in the web cockpit Bulletin area when long-term focus/status should be communicated.
 - Review agent run history (read_agent_history) — detailed per-run traces including iterations, tool calls, durations, and outcomes. Use this when asked to optimize your workflow or review past behavior; identify patterns and persist learnings via write_tiered_memory (Tier 1 for long-term workflow principles).
 
@@ -3161,7 +3312,7 @@ fn build_system_prompt(
         skills_dir_display = skills_dir_display
     );
     let mut prompt = format!(
-        r#"You are {bot_username}, a helpful smart assistant. You can execute tools to help users with tasks.
+        r#"You are a helpful smart assistant. You can execute tools to help users with tasks.
 
 **Time and timezone (prioritize this):** Your configured timezone is **{timezone}**. The current runtime date/time is provided in a dedicated system runtime context message. Always interpret "now", "today", "tomorrow", and any relative or scheduled times in this timezone unless the user explicitly specifies another. Use this timezone for schedule_task (it defaults to this) and when answering questions about current time or date.
 
@@ -3170,7 +3321,12 @@ You have access to the following capabilities:
 
 The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when calling send_message, schedule, export_chat, tiered memory, or memory(chat_daily) tools.
 
-When using memory: this persona's tiered memory is in groups/{{chat_id}}/{{persona_id}}/MEMORY.md (Tier 1 = long-term principles-like, Tier 2 = active projects, Tier 3 = recent focus/mood). Use read_tiered_memory and write_tiered_memory to read/update by tier. Update based on conversation flow: Tier 1 only on explicit user ask or long-term pattern; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
+For serving files to users:
+- For any generated artifact that users should open/download (PDF, image, markdown, zip, etc.), call `send_message` with `attachment_path` using an absolute local file path.
+- Never fabricate `/api/uploads/...` links in plain text. The upload URL must come from the attachment flow.
+- If your final response references a file, send the attachment first so the returned URL is valid immediately.
+
+When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. Use read_tiered_memory/write_tiered_memory for tier-level edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits and conflict-safe updates. Tier 1 only on explicit user ask or strong long-term patterns; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
 
 For scheduling:
 - Always activate `schedule-job` skill before calling `schedule_task` or `update_scheduled_task`
@@ -3228,7 +3384,7 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         prompt.push_str("\n\n");
     }
 
-    // Principles (workspace_dir/AGENTS.md): rules and identity
+    // Principles (workspace_dir/AGENTS.md): durable workspace rules
     if !principles_content.trim().is_empty() {
         prompt.push_str("\n# Principles\n\nThe following is loaded from the file **");
         prompt.push_str(agents_md_path);
@@ -3237,9 +3393,9 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         prompt.push_str("\n\n");
     }
 
-    // Memory (this persona): tiered MEMORY.md + recent daily log
+    // Memory (this persona): canonical state projection + JSON payload
     if !memory_context.is_empty() {
-        prompt.push_str("\n# Memory (this persona)\n\nThe following is this persona's tiered memory and recent daily log. Use it as context; principles above take precedence.\n\n");
+        prompt.push_str("\n# Memory (this persona)\n\nThe following is this persona's canonical memory projection plus JSON state. Use it as context; principles above take precedence.\n\n");
         prompt.push_str(memory_context);
         prompt.push_str("\n\n");
     }
@@ -5168,6 +5324,28 @@ mod tests {
         );
         assert!(prompt.contains("Time and timezone"));
         assert!(prompt.contains("US/Eastern"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_includes_file_delivery_rules() {
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            "",
+            42,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp/.env",
+        );
+        assert!(prompt.contains("For serving files to users:"));
+        assert!(prompt.contains("Never fabricate `/api/uploads/...` links"));
+        assert!(prompt.contains("attachment_path"));
     }
 
     #[test]

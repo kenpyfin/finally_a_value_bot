@@ -53,6 +53,7 @@ include_dir = "0.7"
 async-stream = "0.3"
 futures-util = "0.3"
 html-escape = "0.2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = "0.5"

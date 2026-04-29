@@ -494,10 +494,18 @@ async fn main() -> anyhow::Result<()> {
     if is_llm_ready(&config) && has_any_realtime_channel(&config) {
         let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
         let seed_persona_id = db.get_current_persona_id(seed_chat_id)?;
+        let intro_name = if config.agent_display_name.trim().is_empty() {
+            "your assistant".to_string()
+        } else {
+            config.agent_display_name.trim().to_string()
+        };
         if let Err(e) = db.ensure_onboarding_task(
             seed_chat_id,
             seed_persona_id,
-            "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track."
+            &format!(
+                "Hello! I am {}, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track.",
+                intro_name
+            )
         ) {
             tracing::warn!("Failed to seed onboarding task: {}", e);
         }

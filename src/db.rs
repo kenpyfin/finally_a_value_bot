@@ -200,6 +200,11 @@ pub struct WorkflowRecord {
     pub owner_chat_id: i64,
     pub intent_signature: String,
     pub steps_json: String,
+    pub step_trace_json: String,
+    pub approach_summary: String,
+    pub last_outcome: String,
+    pub failure_reason: Option<String>,
+    pub evidence_json: String,
     pub confidence: f64,
     pub version: i64,
     pub success_count: i64,
@@ -447,6 +452,11 @@ impl Database {
                 owner_chat_id INTEGER NOT NULL,
                 intent_signature TEXT NOT NULL,
                 steps_json TEXT NOT NULL,
+                step_trace_json TEXT NOT NULL DEFAULT '[]',
+                approach_summary TEXT NOT NULL DEFAULT '',
+                last_outcome TEXT NOT NULL DEFAULT 'unknown',
+                failure_reason TEXT,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.0,
                 version INTEGER NOT NULL DEFAULT 1,
                 success_count INTEGER NOT NULL DEFAULT 0,
@@ -519,6 +529,7 @@ impl Database {
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
         Self::migrate_drop_project_artifacts(&conn)?;
         Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
+        Self::migrate_workflow_learning_schema(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -909,6 +920,37 @@ impl Database {
             "DROP INDEX IF EXISTS idx_project_artifacts_project;
              DROP TABLE IF EXISTS project_artifacts;",
         )?;
+        Ok(())
+    }
+
+    fn migrate_workflow_learning_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "workflows", "step_trace_json")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN step_trace_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "workflows", "approach_summary")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN approach_summary TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "workflows", "last_outcome")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN last_outcome TEXT NOT NULL DEFAULT 'unknown'",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "workflows", "failure_reason")? {
+            conn.execute("ALTER TABLE workflows ADD COLUMN failure_reason TEXT", [])?;
+        }
+        if !Self::column_exists(conn, "workflows", "evidence_json")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -2567,7 +2609,7 @@ impl Database {
     ) -> Result<Option<WorkflowRecord>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
+            "SELECT id, owner_chat_id, intent_signature, steps_json, step_trace_json, approach_summary, last_outcome, failure_reason, evidence_json, confidence, version, success_count, failure_count, last_used_at, updated_at
              FROM workflows
              WHERE owner_chat_id = ?1
                AND intent_signature = ?2
@@ -2581,12 +2623,17 @@ impl Database {
                     owner_chat_id: row.get(1)?,
                     intent_signature: row.get(2)?,
                     steps_json: row.get(3)?,
-                    confidence: row.get(4)?,
-                    version: row.get(5)?,
-                    success_count: row.get(6)?,
-                    failure_count: row.get(7)?,
-                    last_used_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    step_trace_json: row.get(4)?,
+                    approach_summary: row.get(5)?,
+                    last_outcome: row.get(6)?,
+                    failure_reason: row.get(7)?,
+                    evidence_json: row.get(8)?,
+                    confidence: row.get(9)?,
+                    version: row.get(10)?,
+                    success_count: row.get(11)?,
+                    failure_count: row.get(12)?,
+                    last_used_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             },
         );
@@ -2602,6 +2649,11 @@ impl Database {
         owner_chat_id: i64,
         intent_signature: &str,
         steps_json: &str,
+        step_trace_json: &str,
+        approach_summary: &str,
+        outcome: &str,
+        failure_reason: Option<&str>,
+        evidence_json: &str,
         success: bool,
         score: f64,
     ) -> Result<i64, FinallyAValueBotError> {
@@ -2609,27 +2661,44 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO workflows (
-                owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
+                owner_chat_id, intent_signature, steps_json, step_trace_json, approach_summary, last_outcome, failure_reason, evidence_json, confidence, version, success_count, failure_count, last_used_at, updated_at
              ) VALUES (
-                ?1, ?2, ?3, CASE WHEN ?4 THEN ?5 ELSE 0.0 END, 1,
-                CASE WHEN ?4 THEN 1 ELSE 0 END,
-                CASE WHEN ?4 THEN 0 ELSE 1 END,
-                ?6, ?6
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CASE WHEN ?9 THEN ?10 ELSE 0.0 END, 1,
+                CASE WHEN ?9 THEN 1 ELSE 0 END,
+                CASE WHEN ?9 THEN 0 ELSE 1 END,
+                ?11, ?11
              )
              ON CONFLICT(owner_chat_id, intent_signature) DO UPDATE SET
                steps_json = excluded.steps_json,
-               success_count = workflows.success_count + CASE WHEN ?4 THEN 1 ELSE 0 END,
-               failure_count = workflows.failure_count + CASE WHEN ?4 THEN 0 ELSE 1 END,
+               step_trace_json = excluded.step_trace_json,
+               approach_summary = excluded.approach_summary,
+               last_outcome = excluded.last_outcome,
+               failure_reason = excluded.failure_reason,
+               evidence_json = excluded.evidence_json,
+               success_count = workflows.success_count + CASE WHEN ?9 THEN 1 ELSE 0 END,
+               failure_count = workflows.failure_count + CASE WHEN ?9 THEN 0 ELSE 1 END,
                confidence = MIN(
                    1.0,
                    MAX(
                        0.0,
-                       (workflows.confidence * 0.7) + (CASE WHEN ?4 THEN ?5 ELSE 0.0 END * 0.3)
+                       (workflows.confidence * 0.7) + (CASE WHEN ?9 THEN ?10 ELSE 0.0 END * 0.3)
                    )
                ),
                version = workflows.version + 1,
                updated_at = excluded.updated_at",
-            params![owner_chat_id, intent_signature, steps_json, success, score, now],
+            params![
+                owner_chat_id,
+                intent_signature,
+                steps_json,
+                step_trace_json,
+                approach_summary,
+                outcome,
+                failure_reason,
+                evidence_json,
+                success,
+                score,
+                now
+            ],
         )?;
         let id = conn.query_row(
             "SELECT id FROM workflows WHERE owner_chat_id = ?1 AND intent_signature = ?2",
