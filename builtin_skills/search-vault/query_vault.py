@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/ken/big_storage/projects/finally-a-value-bot/workspace/shared/.venv-vault/bin/python3
 """Built-in vault query script. Semantically search the ORIGIN vault via ChromaDB."""
 import os
 import sys
@@ -31,11 +31,22 @@ COLLECTION = os.environ.get("VAULT_VECTOR_DB_COLLECTION", "origin_vault")
 import chromadb
 from chromadb.utils import embedding_functions
 
-llama_ef = embedding_functions.OpenAIEmbeddingFunction(
-    api_key="sk-no-key-required",
-    api_base=EMBED_URL,
-    model_name="ignored",
-)
+class CustomLlamaEF(chromadb.EmbeddingFunction):
+    def __init__(self, embed_url: str):
+        self.embed_url = embed_url.rstrip("/") + "/embeddings"
+
+    def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
+        import requests
+        payload = {
+            "model": "ignored",
+            "input": input
+        }
+        response = requests.post(self.embed_url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return [d["embedding"] for d in data["data"]]
+
+llama_ef = CustomLlamaEF(embed_url=EMBED_URL)
 
 client = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_or_create_collection(name=COLLECTION, embedding_function=llama_ef)
@@ -50,7 +61,7 @@ def query(text: str, n: int = 5) -> None:
         for i, doc in enumerate(results["documents"][0]):
             meta = results["metadatas"][0][i] if results["metadatas"] else {}
             path = meta.get("path", meta.get("source", "unknown"))
-            excerpt = doc[:500] + "..." if len(doc) > 500 else doc
+            excerpt = doc[:2000] + "..." if len(doc) > 2000 else doc
             print(f"--- Result {i + 1} (Source: {path}) ---")
             print(excerpt)
             print()

@@ -648,7 +648,7 @@ html:not(.dark) .aui-composer-send:hover {
   position: static;
 }
 
-.mc-cockpit button {
+.mc-cockpit .mc-cockpit-bookmark-btn {
   max-width: 20rem;
   overflow: hidden;
   text-overflow: ellipsis;

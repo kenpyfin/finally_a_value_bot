@@ -111,6 +111,7 @@ export function CockpitBar({
   useEffect(() => {
     if (!expanded) return
     const onPointerDown = (event: PointerEvent) => {
+      if (selectedBookmark != null) return
       const target = event.target as Node | null
       if (!target) return
       if (expandedRootRef.current?.contains(target)) return
@@ -120,15 +121,7 @@ export function CockpitBar({
     return () => {
       window.removeEventListener('pointerdown', onPointerDown)
     }
-  }, [expanded])
-
-  const onExpandedStripClick = (event: React.MouseEvent<HTMLDivElement>) => {
-    const target = event.target as HTMLElement | null
-    if (!target) return
-    // Keep native controls working; collapse only on non-interactive strip clicks.
-    if (target.closest('button, a, input, textarea, select, option, [role="button"], [role="menuitem"]')) return
-    setExpanded(false)
-  }
+  }, [expanded, selectedBookmark])
 
   const stripClass = floating
     ? isDark
@@ -137,10 +130,6 @@ export function CockpitBar({
     : isDark
       ? 'border-t border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/40'
       : 'border-t border-slate-200/90 bg-slate-50/80'
-
-  const toggleBtnClass = isDark
-    ? 'mx-auto flex h-7 w-full cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
-    : 'mx-auto flex h-7 w-full cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-500 transition-colors hover:bg-slate-200/60 hover:text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400'
 
   if (!expanded) {
     return (
@@ -181,31 +170,33 @@ export function CockpitBar({
   return (
     <div
       ref={expandedRootRef}
-      className={`mc-cockpit px-4 py-2 ${stripClass}`}
+      className={`mc-cockpit py-2 ${stripClass}`}
       role="region"
       aria-label="Session status"
-      onClick={onExpandedStripClick}
     >
       <div className="flex">
         <button
           id={toggleId}
           type="button"
-          className={toggleBtnClass}
+          className={`flex h-7 w-full cursor-pointer items-center justify-center border-0 bg-transparent px-4 transition-colors ${
+            isDark
+              ? 'text-slate-400 hover:bg-white/5 hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
+              : 'text-slate-500 hover:bg-slate-200/60 hover:text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400'
+          }`}
           aria-expanded={expanded}
           aria-controls={panelId}
-          title={expanded ? 'Hide session status' : 'Show session status'}
-          onClick={() => setExpanded((v) => !v)}
+          title="Hide session status"
+          onClick={() => setExpanded(false)}
         >
-          <span className="sr-only">{expanded ? 'Hide session status' : 'Show session status'}</span>
+          <span className="sr-only">Hide session status</span>
           <svg
-            className={`size-3.5 shrink-0 transition-transform duration-150 ${expanded ? '-rotate-180' : ''}`}
+            className="size-3.5 shrink-0 -rotate-180 transition-transform duration-150"
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
             strokeWidth="2"
             strokeLinecap="round"
             strokeLinejoin="round"
-            aria-hidden
           >
             <path d="M6 9l6 6 6-6" />
           </svg>
@@ -213,7 +204,7 @@ export function CockpitBar({
       </div>
 
       {expanded ? (
-        <div id={panelId} aria-labelledby={toggleId} className="space-y-2">
+        <div id={panelId} aria-labelledby={toggleId} className="space-y-2 px-4">
           <Flex
             align="center"
             gap="3"
@@ -321,8 +312,8 @@ export function CockpitBar({
                     type="button"
                     className={
                       isDark
-                        ? 'rounded border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-left text-xs text-slate-200 hover:bg-white/5'
-                        : 'rounded border border-slate-300 bg-white px-2 py-1 text-left text-xs text-slate-700 hover:bg-slate-50'
+                        ? 'mc-cockpit-bookmark-btn rounded border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-left text-xs text-slate-200 hover:bg-white/5'
+                        : 'mc-cockpit-bookmark-btn rounded border border-slate-300 bg-white px-2 py-1 text-left text-xs text-slate-700 hover:bg-slate-50'
                     }
                     onClick={() => {
                       setBookmarkMessage(null)

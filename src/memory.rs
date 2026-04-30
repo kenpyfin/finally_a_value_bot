@@ -426,10 +426,44 @@ impl MemoryManager {
         persona_id: i64,
     ) -> Option<PersonaMemoryState> {
         let path = self.persona_memory_state_path(chat_id, persona_id);
-        let content = std::fs::read_to_string(path).ok()?;
-        let mut state: PersonaMemoryState = serde_json::from_str(&content).ok()?;
-        state.normalize();
-        Some(state)
+        let content = std::fs::read_to_string(&path).ok()?;
+        match self.parse_and_validate_state(&content) {
+            Ok(state) => Some(state),
+            Err(primary_err) => {
+                let backup_path = path.with_extension("json.bak");
+                let recovered = std::fs::read_to_string(&backup_path)
+                    .ok()
+                    .and_then(|backup_content| self.parse_and_validate_state(&backup_content).ok());
+                if let Some(state) = recovered {
+                    let _ = std::fs::copy(&backup_path, &path);
+                    let _ = self.append_persona_memory_event(
+                        chat_id,
+                        persona_id,
+                        "memory_parse_error_recovered",
+                        "system",
+                        json!({
+                            "path": path.to_string_lossy().to_string(),
+                            "backup_path": backup_path.to_string_lossy().to_string(),
+                            "error": primary_err,
+                        }),
+                    );
+                    Some(state)
+                } else {
+                    let _ = self.append_persona_memory_event(
+                        chat_id,
+                        persona_id,
+                        "memory_parse_error",
+                        "system",
+                        json!({
+                            "path": path.to_string_lossy().to_string(),
+                            "backup_path": backup_path.to_string_lossy().to_string(),
+                            "error": primary_err,
+                        }),
+                    );
+                    None
+                }
+            }
+        }
     }
 
     pub fn validate_memory_state(&self, state: &PersonaMemoryState) -> Result<(), String> {
@@ -566,6 +600,15 @@ impl MemoryManager {
             json!({ "schema_version": MEMORY_SCHEMA_VERSION }),
         )?;
         Ok(())
+    }
+
+    fn parse_and_validate_state(&self, content: &str) -> Result<PersonaMemoryState, String> {
+        let mut state: PersonaMemoryState =
+            serde_json::from_str(content).map_err(|e| format!("invalid_json: {e}"))?;
+        state.normalize();
+        self.validate_memory_state(&state)
+            .map_err(|e| format!("invalid_state: {e}"))?;
+        Ok(state)
     }
 
     fn write_origin_snapshot(
@@ -973,6 +1016,48 @@ mod tests {
         let read_back = mm.read_persona_memory_state(10, 3).unwrap();
         assert_eq!(read_back.identity.display_name, "Assistant");
         assert_eq!(read_back.tier3.recent_focus.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_read_persona_memory_state_recovers_from_backup_on_parse_error() {
+        let (mm, dir) = test_memory_manager();
+        let mut valid = PersonaMemoryState::default();
+        valid.identity.display_name = "Recovered".into();
+        mm.write_persona_memory_state(22, 4, valid).unwrap();
+
+        let path = mm.persona_memory_state_path(22, 4);
+        let backup_path = path.with_extension("json.bak");
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&backup_path, &original).unwrap();
+        std::fs::write(&path, "{ invalid json").unwrap();
+
+        let recovered = mm.read_persona_memory_state(22, 4).unwrap();
+        assert_eq!(recovered.identity.display_name, "Recovered");
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(repaired.contains("\"display_name\": \"Recovered\""));
+
+        let events_path = mm.persona_memory_events_path(22, 4);
+        let events = std::fs::read_to_string(events_path).unwrap();
+        assert!(events.contains("\"event_type\":\"memory_parse_error_recovered\""));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_read_persona_memory_state_reports_parse_error_without_backup() {
+        let (mm, dir) = test_memory_manager();
+        let path = mm.persona_memory_state_path(22, 5);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, "{ bad json").unwrap();
+
+        let state = mm.read_persona_memory_state(22, 5);
+        assert!(state.is_none());
+
+        let events_path = mm.persona_memory_events_path(22, 5);
+        let events = std::fs::read_to_string(events_path).unwrap();
+        assert!(events.contains("\"event_type\":\"memory_parse_error\""));
         cleanup(&dir);
     }
 

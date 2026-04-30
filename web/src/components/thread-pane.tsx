@@ -5,6 +5,8 @@ import {
   MessagePrimitive,
   SimpleImageAttachmentAdapter,
   SimpleTextAttachmentAdapter,
+  useAui,
+  useAuiState,
   useMessage,
   useLocalRuntime,
   type AttachmentAdapter,
@@ -18,6 +20,7 @@ import {
   AssistantActionBar,
   AssistantMessage,
   BranchPicker,
+  Composer,
   Thread,
   UserActionBar,
   UserMessage,
@@ -84,20 +87,26 @@ function MessageTimestamp({ align }: { align: 'left' | 'right' }) {
   )
 }
 
-type MessageDecorProps = {
+type ThreadPaneUiContextValue = {
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
+  draftText: string
+  onDraftTextChange?: (text: string) => void
 }
+
+const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
+  bookmarkedMessageIds: undefined,
+  onToggleBookmark: undefined,
+  draftText: '',
+  onDraftTextChange: undefined,
+})
 
 function MessageBookmarkButton({
   role,
-  bookmarkedMessageIds,
-  onToggleBookmark,
 }: {
   role: 'user' | 'assistant'
-  bookmarkedMessageIds?: Set<string>
-  onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
 }) {
+  const { bookmarkedMessageIds, onToggleBookmark } = React.useContext(ThreadPaneUiContext)
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   const isBookmarked = useMessage((m) => {
     const id = typeof m.id === 'string' ? m.id : ''
@@ -117,7 +126,7 @@ function MessageBookmarkButton({
   )
 }
 
-function CustomAssistantMessage({ bookmarkedMessageIds, onToggleBookmark }: MessageDecorProps) {
+function CustomAssistantMessage() {
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   const hasRenderableContent = useMessage((m) =>
     Array.isArray(m.content)
@@ -143,11 +152,7 @@ function CustomAssistantMessage({ bookmarkedMessageIds, onToggleBookmark }: Mess
       )}
       <BranchPicker />
       <div className="mc-msg-meta-row">
-        <MessageBookmarkButton
-          role="assistant"
-          bookmarkedMessageIds={bookmarkedMessageIds}
-          onToggleBookmark={onToggleBookmark}
-        />
+        <MessageBookmarkButton role="assistant" />
         <AssistantActionBar />
         <MessageTimestamp align="left" />
       </div>
@@ -155,18 +160,14 @@ function CustomAssistantMessage({ bookmarkedMessageIds, onToggleBookmark }: Mess
   )
 }
 
-function CustomUserMessage({ bookmarkedMessageIds, onToggleBookmark }: MessageDecorProps) {
+function CustomUserMessage() {
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   return (
     <UserMessage.Root data-message-id={messageId || undefined}>
       <UserMessage.Attachments />
       <MessagePrimitive.If hasContent>
         <div className="mc-msg-meta-row mc-msg-meta-row-user">
-          <MessageBookmarkButton
-            role="user"
-            bookmarkedMessageIds={bookmarkedMessageIds}
-            onToggleBookmark={onToggleBookmark}
-          />
+          <MessageBookmarkButton role="user" />
           <UserActionBar />
         </div>
         <div className="mc-user-content-wrap">
@@ -217,8 +218,29 @@ export type ThreadPaneProps = {
   adapter: ChatModelAdapter
   initialMessages: ThreadMessageLike[]
   runtimeKey: string
+  draftText: string
+  onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
+}
+
+function DraftAwareComposer() {
+  const { draftText, onDraftTextChange } = React.useContext(ThreadPaneUiContext)
+  const aui = useAui()
+  const composerText = useAuiState(({ composer }) => composer.text)
+  const lastAppliedDraftRef = React.useRef<string | null>(null)
+
+  React.useEffect(() => {
+    if (lastAppliedDraftRef.current === draftText) return
+    aui.composer().setText(draftText)
+    lastAppliedDraftRef.current = draftText
+  }, [aui, draftText])
+
+  React.useEffect(() => {
+    onDraftTextChange?.(composerText)
+  }, [composerText, onDraftTextChange])
+
+  return <Composer />
 }
 
 /** Isolated from App re-renders (persona poll, queue lane, schedules, etc.). `useLocalRuntime` runs an effect after every render that touches options/load; re-rendering on unrelated parent state was resetting the composer and scroll. */
@@ -226,6 +248,8 @@ export const ThreadPane = React.memo(function ThreadPane({
   adapter,
   initialMessages,
   runtimeKey,
+  draftText,
+  onDraftTextChange,
   bookmarkedMessageIds,
   onToggleBookmark,
 }: ThreadPaneProps) {
@@ -246,54 +270,54 @@ export const ThreadPane = React.memo(function ThreadPane({
       attachments: webAttachmentAdapter,
     },
   })
-  const AssistantMessageWithBookmarks = React.useCallback(
-    () => (
-      <CustomAssistantMessage
-        bookmarkedMessageIds={bookmarkedMessageIds}
-        onToggleBookmark={onToggleBookmark}
-      />
-    ),
-    [bookmarkedMessageIds, onToggleBookmark],
-  )
-  const UserMessageWithBookmarks = React.useCallback(
-    () => (
-      <CustomUserMessage
-        bookmarkedMessageIds={bookmarkedMessageIds}
-        onToggleBookmark={onToggleBookmark}
-      />
-    ),
-    [bookmarkedMessageIds, onToggleBookmark],
+  const lastInitialMessagesRef = React.useRef<ThreadMessageLike[]>(initialMessages)
+  React.useEffect(() => {
+    if (lastInitialMessagesRef.current === initialMessages) return
+    runtime.thread.reset(initialMessages)
+    lastInitialMessagesRef.current = initialMessages
+  }, [initialMessages, runtime])
+  const uiContextValue = React.useMemo<ThreadPaneUiContextValue>(
+    () => ({
+      bookmarkedMessageIds,
+      onToggleBookmark,
+      draftText,
+      onDraftTextChange,
+    }),
+    [bookmarkedMessageIds, draftText, onDraftTextChange, onToggleBookmark],
   )
 
   return (
-    <AssistantRuntimeProvider key={runtimeKey} runtime={runtime}>
-      <div className="aui-root h-full min-h-0 min-w-0">
-        <Thread
-          assistantMessage={{
-            allowCopy: false,
-            allowReload: false,
-            allowSpeak: false,
-            allowFeedbackNegative: false,
-            allowFeedbackPositive: false,
-            components: {
-              Text: MarkdownText,
-              ToolFallback: ToolCallCard,
-            },
-          }}
-          userMessage={{ allowEdit: false }}
-          composer={{ allowAttachments: true }}
-          components={{
-            AssistantMessage: AssistantMessageWithBookmarks,
-            UserMessage: UserMessageWithBookmarks,
-          }}
-          strings={{
-            composer: {
-              input: { placeholder: 'Message FinallyAValueBot...' },
-            },
-          }}
-          assistantAvatar={{ fallback: 'M' }}
-        />
-      </div>
-    </AssistantRuntimeProvider>
+    <ThreadPaneUiContext.Provider value={uiContextValue}>
+      <AssistantRuntimeProvider key={runtimeKey} runtime={runtime}>
+        <div className="aui-root h-full min-h-0 min-w-0">
+          <Thread
+            assistantMessage={{
+              allowCopy: false,
+              allowReload: false,
+              allowSpeak: false,
+              allowFeedbackNegative: false,
+              allowFeedbackPositive: false,
+              components: {
+                Text: MarkdownText,
+                ToolFallback: ToolCallCard,
+              },
+            }}
+            userMessage={{ allowEdit: false }}
+            composer={{ allowAttachments: true }}
+            components={{
+              Composer: DraftAwareComposer,
+              AssistantMessage: CustomAssistantMessage,
+              UserMessage: CustomUserMessage,
+            }}
+            strings={{
+              composer: {
+                input: { placeholder: 'Message FinallyAValueBot...' },
+              },
+            }}
+            assistantAvatar={{ fallback: 'M' }}
+          />
+        </div>
+      </AssistantRuntimeProvider>
+    </ThreadPaneUiContext.Provider>
   )
 })

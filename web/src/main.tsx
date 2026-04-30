@@ -29,7 +29,7 @@ import { ThreadPane } from './components/thread-pane'
 import { useDocumentVisible } from './hooks/use-document-visible'
 import { useOpsPoll } from './hooks/use-ops-poll'
 import { queryClient } from './query-client'
-import { historiesEqual, mapBackendHistory, shouldDeferHistoryRemount } from './lib/history-sync'
+import { historiesEqual, mapBackendHistory } from './lib/history-sync'
 import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
 import type {
   ArtifactItem,
@@ -396,7 +396,6 @@ function App() {
   const [historyVisibleLimit, setHistoryVisibleLimit] = useState<number>(HISTORY_PAGE_SIZE)
   const [historyHasMore, setHistoryHasMore] = useState<boolean>(false)
   const [historyLoadingMore, setHistoryLoadingMore] = useState<boolean>(false)
-  const [runtimeNonce, setRuntimeNonce] = useState<number>(0)
   const [error, setError] = useState<string>('')
   const [statusText, setStatusText] = useState<string>('Idle')
   const [replayNotice, setReplayNotice] = useState<string>('')
@@ -453,6 +452,7 @@ function App() {
   const [agentsMdError, setAgentsMdError] = useState('')
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
+  const [draftByThreadKey, setDraftByThreadKey] = useState<Record<string, string>>({})
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [settingsError, setSettingsError] = useState('')
   const [installationStatus, setInstallationStatus] = useState<InstallationStatus | null>(null)
@@ -530,7 +530,6 @@ function App() {
 
   const historySeedRef = useRef<ThreadMessageLike[]>([])
   const historyVisibleLimitRef = useRef<number>(historyVisibleLimit)
-  const deferredHistoryRef = useRef<ThreadMessageLike[] | null>(null)
 
   useEffect(() => {
     historySeedRef.current = historySeed
@@ -542,15 +541,6 @@ function App() {
   const resetHistoryPagination = useCallback(() => {
     setHistoryVisibleLimit(HISTORY_PAGE_SIZE)
     setHistoryHasMore(false)
-  }, [])
-
-  const flushDeferredHistory = useCallback(() => {
-    const pending = deferredHistoryRef.current
-    if (!pending) return
-    deferredHistoryRef.current = null
-    if (historiesEqual(historySeedRef.current, pending)) return
-    setHistorySeed(pending)
-    setRuntimeNonce((x) => x + 1)
   }, [])
 
   const schedulesFiltered = useMemo(() => {
@@ -672,7 +662,6 @@ function App() {
     await loadHistory(chatId, p?.id ?? undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
     if (p) markPersonaRead(p.id)
     if (p) await loadPersonaBulletin(p.id)
-    setRuntimeNonce((x) => x + 1)
   }
 
   async function loadHistory(
@@ -682,7 +671,6 @@ function App() {
     opts?: { force?: boolean; limitOverride?: number },
   ): Promise<void> {
     if (cid == null) return
-    const force = opts?.force === true
     const query = new URLSearchParams({ chat_id: String(cid) })
     if (personaId != null && personaId > 0) query.set('persona_id', String(personaId))
     if (day) query.set('day', day)
@@ -701,9 +689,7 @@ function App() {
       setHistoryByDay(nextByDay)
       setHistoryHasMore(false)
       if (!historiesEqual(historySeedRef.current, combined)) {
-        deferredHistoryRef.current = null
         setHistorySeed(combined)
-        setRuntimeNonce((x) => x + 1)
       }
     } else {
       const visibleLimit = opts?.limitOverride ?? historyVisibleLimitRef.current
@@ -712,13 +698,7 @@ function App() {
       setHistoryByDay({})
       setHistoryHasMore(hasMore)
       if (!historiesEqual(historySeedRef.current, bounded)) {
-        if (!force && shouldDeferHistoryRemount()) {
-          deferredHistoryRef.current = bounded
-          return
-        }
-        deferredHistoryRef.current = null
         setHistorySeed(bounded)
-        setRuntimeNonce((x) => x + 1)
       }
     }
   }
@@ -757,7 +737,7 @@ function App() {
     }
   }
 
-  async function toggleMessageBookmark(messageId: string, role: 'user' | 'assistant'): Promise<void> {
+  const toggleMessageBookmark = useCallback(async (messageId: string, role: 'user' | 'assistant'): Promise<void> => {
     if (activePersonaId == null) return
     const alreadyBookmarked = personaBookmarks.some((b) => b.message_id === messageId)
     try {
@@ -785,7 +765,7 @@ function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }
+  }, [activePersonaId, personaBookmarks])
 
   /** Remove bookmark from server and local bulletin state; returns whether it succeeded. */
   async function removePersonaBookmark(messageId: string): Promise<boolean> {
@@ -912,6 +892,11 @@ function App() {
           if (!runId) {
             throw new Error('missing run_id')
           }
+          const threadKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
+          setDraftByThreadKey((prev) => {
+            if (!prev[threadKey]) return prev
+            return { ...prev, [threadKey]: '' }
+          })
           setPendingRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId]))
           setStatusText('Queued')
           // A background-handoff run can finish quickly while its final reply arrives later.
@@ -1240,7 +1225,6 @@ function App() {
     await loadBindings(chatId)
     resetHistoryPagination()
     await loadHistory(chatId, undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
-    setRuntimeNonce((x) => x + 1)
   }
 
   async function unlinkContact(): Promise<void> {
@@ -1431,38 +1415,21 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId, activePersonaId, historyPollUntilMs])
 
-  const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}-${runtimeNonce}`
+  const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}`
+  const activeDraftKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
+  const activeDraftText = draftByThreadKey[activeDraftKey] ?? ''
+  const handleDraftTextChange = useCallback((nextText: string) => {
+    setDraftByThreadKey((prev) => {
+      const current = prev[activeDraftKey] ?? ''
+      if (current === nextText) return prev
+      return { ...prev, [activeDraftKey]: nextText }
+    })
+  }, [activeDraftKey])
   const bookmarkedMessageIds = useMemo(
     () => new Set(personaBookmarks.map((b) => b.message_id)),
     [personaBookmarks],
   )
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
-
-  useEffect(() => {
-    const onFocusOut = (e: FocusEvent) => {
-      const t = e.target as HTMLElement | null
-      if (!t?.closest?.('.aui-composer-root')) return
-      const rt = e.relatedTarget as HTMLElement | null
-      if (!rt?.closest?.('.aui-composer-root')) {
-        flushDeferredHistory()
-      }
-    }
-    document.addEventListener('focusout', onFocusOut, true)
-    return () => document.removeEventListener('focusout', onFocusOut, true)
-  }, [flushDeferredHistory])
-
-  useEffect(() => {
-    const vp = document.querySelector('.aui-thread-viewport')
-    if (!vp) return
-    const onScroll = () => {
-      const el = vp as HTMLElement
-      if (el.scrollHeight - el.scrollTop - el.clientHeight <= 100) {
-        flushDeferredHistory()
-      }
-    }
-    vp.addEventListener('scroll', onScroll, { passive: true })
-    return () => vp.removeEventListener('scroll', onScroll)
-  }, [flushDeferredHistory, runtimeNonce])
 
   function submitAuthToken() {
     const token = sanitizeHttpHeaderValue(authTokenInput)
@@ -2803,6 +2770,8 @@ function App() {
                     adapter={adapter}
                     initialMessages={historySeed}
                     runtimeKey={runtimeKey}
+                    draftText={activeDraftText}
+                    onDraftTextChange={handleDraftTextChange}
                     bookmarkedMessageIds={bookmarkedMessageIds}
                     onToggleBookmark={toggleMessageBookmark}
                   />

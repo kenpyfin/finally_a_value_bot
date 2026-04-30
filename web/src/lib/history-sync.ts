@@ -22,14 +22,3 @@ export function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): 
   }
   return true
 }
-
-export function shouldDeferHistoryRemount(): boolean {
-  if (typeof document === 'undefined') return false
-  const inComposer = Boolean(document.activeElement?.closest?.('.aui-composer-root'))
-  const vp = document.querySelector('.aui-thread-viewport')
-  if (!vp) return inComposer
-  const el = vp as HTMLElement
-  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
-  const scrolledAwayFromBottom = gap > 100
-  return inComposer || scrolledAwayFromBottom
-}
