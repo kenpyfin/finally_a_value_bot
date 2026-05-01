@@ -134,3 +134,29 @@ export type QueueLane = {
   workflow_id?: number | null
   items?: QueueItem[]
 }
+
+export type BackgroundJobHeartbeat = {
+  run_key: string
+  chat_id: number
+  persona_id: number
+  job_type: string
+  stage: string
+  message: string
+  active: boolean
+  updated_at: string
+}
+
+export type BackgroundJobItem = {
+  id: string
+  chat_id: number
+  persona_id: number
+  prompt: string
+  status: string
+  trigger_reason: string
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  result_preview?: string | null
+  error_text?: string | null
+  heartbeat?: BackgroundJobHeartbeat | null
+}

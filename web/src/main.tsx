@@ -33,6 +33,7 @@ import { historiesEqual, mapBackendHistory } from './lib/history-sync'
 import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
 import type {
   ArtifactItem,
+  BackgroundJobItem,
   BackendMessage,
   BotInstanceRow,
   ChannelBinding,
@@ -438,6 +439,8 @@ function App() {
   const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
   const [pendingRunIds, setPendingRunIds] = useState<string[]>([])
+  const [stoppingRunIds, setStoppingRunIds] = useState<string[]>([])
+  const [stoppingBackgroundJobIds, setStoppingBackgroundJobIds] = useState<string[]>([])
   const [queueDialogOpen, setQueueDialogOpen] = useState(false)
   const [scheduleDetailTask, setScheduleDetailTask] = useState<ScheduleTask | null>(null)
   const [scheduleDetailPrompt, setScheduleDetailPrompt] = useState('')
@@ -521,7 +524,7 @@ function App() {
   }, [desktopSidebarWidth])
 
   const docVisible = useDocumentVisible()
-  const { queueLane, backgroundActiveCount, invalidateOps } = useOpsPoll({
+  const { queueLane, backgroundActiveCount, backgroundJobs, invalidateOps } = useOpsPoll({
     chatId,
     docVisible,
     pendingRunIdsLength: pendingRunIds.length,
@@ -547,6 +550,17 @@ function App() {
     if (schedulesShowArchived) return schedules
     return schedules.filter((t) => t.status !== 'completed' && t.status !== 'cancelled')
   }, [schedules, schedulesShowArchived])
+
+  const backgroundJobsVisible = useMemo<BackgroundJobItem[]>(() => backgroundJobs.slice(0, 20), [backgroundJobs])
+
+  function isActiveBackgroundJobStatus(status: string): boolean {
+    return (
+      status === 'pending'
+      || status === 'running'
+      || status === 'completed_raw'
+      || status === 'main_agent_processing'
+    )
+  }
 
   const personaHasNew = useMemo<Record<number, boolean>>(() => {
     if (chatId == null) return {}
@@ -1280,6 +1294,44 @@ function App() {
     await loadQueueDiagnostics(chatId)
   }
 
+  async function handleQueueStop(runId: string): Promise<void> {
+    const id = runId.trim()
+    if (!id) return
+    if (stoppingRunIds.includes(id)) return
+    setStoppingRunIds((prev) => (prev.includes(id) ? prev : [...prev, id]))
+    try {
+      await cancelQueueRun(id)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setStoppingRunIds((prev) => prev.filter((x) => x !== id))
+      await loadQueueDiagnostics(chatId)
+    }
+  }
+
+  async function cancelBackgroundJob(jobId: string): Promise<void> {
+    await api('/api/background_jobs/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ job_id: jobId, chat_id: chatId ?? undefined }),
+    })
+    await loadBackgroundVisibility(chatId)
+  }
+
+  async function handleBackgroundJobStop(jobId: string): Promise<void> {
+    const id = jobId.trim()
+    if (!id) return
+    if (stoppingBackgroundJobIds.includes(id)) return
+    setStoppingBackgroundJobIds((prev) => (prev.includes(id) ? prev : [...prev, id]))
+    try {
+      await cancelBackgroundJob(id)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setStoppingBackgroundJobIds((prev) => prev.filter((x) => x !== id))
+      await loadBackgroundVisibility(chatId)
+    }
+  }
+
   async function loadWorkspaceAgentsMd(): Promise<void> {
     setAgentsMdError('')
     setAgentsMdBusy(true)
@@ -1900,63 +1952,169 @@ function App() {
                                 </tr>
                               </thead>
                               <tbody>
-                                {(queueLane?.items ?? []).map((it) => (
-                                  <tr key={it.run_id} className="border-t border-[color:var(--gray-6)] align-top">
-                                    <td className="p-1 pr-2 font-mono text-xs">{it.position}</td>
-                                    <td className="p-1 pr-2">{it.state}</td>
-                                    <td className="p-1 pr-2">{it.persona_name}</td>
-                                    <td className="p-1 pr-2">{it.source}</td>
-                                    <td className="p-1 max-w-[280px] break-words" title={it.label}>{it.label || '—'}</td>
-                                    <td className="p-1 pr-2 font-mono text-xs">{it.project_id ?? '—'}</td>
-                                    <td className="p-1 pr-2 font-mono text-xs">{it.workflow_id ?? '—'}</td>
-                                    <td className="p-1 text-right">
+                                {(queueLane?.items ?? []).map((it) => {
+                                  const isStopping = stoppingRunIds.includes(it.run_id)
+                                  return (
+                                    <tr key={it.run_id} className="border-t border-[color:var(--gray-6)] align-top">
+                                      <td className="p-1 pr-2 font-mono text-xs">{it.position}</td>
+                                      <td className="p-1 pr-2">{it.state}</td>
+                                      <td className="p-1 pr-2">{it.persona_name}</td>
+                                      <td className="p-1 pr-2">{it.source}</td>
+                                      <td className="p-1 max-w-[280px] break-words" title={it.label}>{it.label || '—'}</td>
+                                      <td className="p-1 pr-2 font-mono text-xs">{it.project_id ?? '—'}</td>
+                                      <td className="p-1 pr-2 font-mono text-xs">{it.workflow_id ?? '—'}</td>
+                                      <td className="p-1 text-right">
+                                        <Button
+                                          size="1"
+                                          variant="soft"
+                                          color="red"
+                                          disabled={isStopping}
+                                          onClick={() => void handleQueueStop(it.run_id)}
+                                        >
+                                          {isStopping ? 'Stopping...' : 'Stop'}
+                                        </Button>
+                                      </td>
+                                    </tr>
+                                  )
+                                })}
+                              </tbody>
+                            </table>
+                            <div className="flex flex-col gap-2 md:hidden">
+                              {(queueLane?.items ?? []).map((it) => {
+                                const isStopping = stoppingRunIds.includes(it.run_id)
+                                return (
+                                  <div
+                                    key={it.run_id}
+                                    className={
+                                      appearance === 'dark'
+                                        ? 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
+                                        : 'rounded-lg border border-slate-200 p-3 text-sm'
+                                    }
+                                  >
+                                    <Flex justify="between" align="start" gap="2" mb="2">
+                                      <Text size="2" weight="bold">
+                                        #{it.position} · {it.state}
+                                      </Text>
                                       <Button
                                         size="1"
                                         variant="soft"
                                         color="red"
-                                        onClick={() => void cancelQueueRun(it.run_id)}
+                                        disabled={isStopping}
+                                        onClick={() => void handleQueueStop(it.run_id)}
                                       >
-                                        Stop
+                                        {isStopping ? 'Stopping...' : 'Stop'}
                                       </Button>
-                                    </td>
-                                  </tr>
-                                ))}
+                                    </Flex>
+                                    <Text size="1" color="gray" className="mb-1 block">
+                                      {it.persona_name} · {it.source}
+                                    </Text>
+                                    <Text size="1" className="break-words">
+                                      {it.label || '—'}
+                                    </Text>
+                                    <Text size="1" color="gray" className="mt-1 block font-mono">
+                                      project {it.project_id ?? '—'} · workflow {it.workflow_id ?? '—'}
+                                    </Text>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      <Text size="2" mt="3" mb="1" weight="medium">
+                        Background jobs
+                      </Text>
+                      <Text size="1" color="gray" mb="2">
+                        Recent background jobs for this chat. Stop requests cooperative cancellation.
+                      </Text>
+                      <div className="max-h-[min(320px,45vh)] overflow-auto rounded-md border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
+                        {backgroundJobsVisible.length === 0 ? (
+                          <Text size="2" color="gray">No background jobs found for this chat.</Text>
+                        ) : (
+                          <>
+                            <table className="hidden w-full border-collapse text-left text-sm md:table">
+                              <thead>
+                                <tr className={appearance === 'dark' ? 'text-slate-400' : 'text-slate-600'}>
+                                  <th className="p-1 pr-2">Status</th>
+                                  <th className="p-1 pr-2">ID</th>
+                                  <th className="p-1 pr-2">Prompt</th>
+                                  <th className="p-1 pr-2">Updated</th>
+                                  <th className="p-1 text-right"> </th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {backgroundJobsVisible.map((job) => {
+                                  const isActive = isActiveBackgroundJobStatus(job.status)
+                                  const isStopping = stoppingBackgroundJobIds.includes(job.id)
+                                  const updatedAt = job.finished_at || job.started_at || job.created_at
+                                  return (
+                                    <tr key={job.id} className="border-t border-[color:var(--gray-6)] align-top">
+                                      <td className="p-1 pr-2">{job.status}</td>
+                                      <td className="p-1 pr-2 font-mono text-xs">{job.id}</td>
+                                      <td className="p-1 pr-2 max-w-[260px] break-words" title={job.prompt}>{job.prompt || '—'}</td>
+                                      <td className="p-1 pr-2 text-xs">{updatedAt ? new Date(updatedAt).toLocaleString() : '—'}</td>
+                                      <td className="p-1 text-right">
+                                        {isActive ? (
+                                          <Button
+                                            size="1"
+                                            variant="soft"
+                                            color="red"
+                                            disabled={isStopping}
+                                            onClick={() => void handleBackgroundJobStop(job.id)}
+                                          >
+                                            {isStopping ? 'Stopping...' : 'Stop'}
+                                          </Button>
+                                        ) : (
+                                          <Text size="1" color="gray">—</Text>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  )
+                                })}
                               </tbody>
                             </table>
                             <div className="flex flex-col gap-2 md:hidden">
-                              {(queueLane?.items ?? []).map((it) => (
-                                <div
-                                  key={it.run_id}
-                                  className={
-                                    appearance === 'dark'
-                                      ? 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
-                                      : 'rounded-lg border border-slate-200 p-3 text-sm'
-                                  }
-                                >
-                                  <Flex justify="between" align="start" gap="2" mb="2">
-                                    <Text size="2" weight="bold">
-                                      #{it.position} · {it.state}
+                              {backgroundJobsVisible.map((job) => {
+                                const isActive = isActiveBackgroundJobStatus(job.status)
+                                const isStopping = stoppingBackgroundJobIds.includes(job.id)
+                                const updatedAt = job.finished_at || job.started_at || job.created_at
+                                return (
+                                  <div
+                                    key={job.id}
+                                    className={
+                                      appearance === 'dark'
+                                        ? 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
+                                        : 'rounded-lg border border-slate-200 p-3 text-sm'
+                                    }
+                                  >
+                                    <Flex justify="between" align="start" gap="2" mb="2">
+                                      <Text size="2" weight="bold">
+                                        {job.status}
+                                      </Text>
+                                      {isActive ? (
+                                        <Button
+                                          size="1"
+                                          variant="soft"
+                                          color="red"
+                                          disabled={isStopping}
+                                          onClick={() => void handleBackgroundJobStop(job.id)}
+                                        >
+                                          {isStopping ? 'Stopping...' : 'Stop'}
+                                        </Button>
+                                      ) : null}
+                                    </Flex>
+                                    <Text size="1" color="gray" className="mb-1 block font-mono">
+                                      {job.id}
                                     </Text>
-                                    <Button
-                                      size="1"
-                                      variant="soft"
-                                      color="red"
-                                      onClick={() => void cancelQueueRun(it.run_id)}
-                                    >
-                                      Stop
-                                    </Button>
-                                  </Flex>
-                                  <Text size="1" color="gray" className="mb-1 block">
-                                    {it.persona_name} · {it.source}
-                                  </Text>
-                                  <Text size="1" className="break-words">
-                                    {it.label || '—'}
-                                  </Text>
-                                  <Text size="1" color="gray" className="mt-1 block font-mono">
-                                    project {it.project_id ?? '—'} · workflow {it.workflow_id ?? '—'}
-                                  </Text>
-                                </div>
-                              ))}
+                                    <Text size="1" className="break-words">
+                                      {job.prompt || '—'}
+                                    </Text>
+                                    <Text size="1" color="gray" className="mt-1 block">
+                                      {updatedAt ? new Date(updatedAt).toLocaleString() : '—'}
+                                    </Text>
+                                  </div>
+                                )
+                              })}
                             </div>
                           </>
                         )}

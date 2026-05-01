@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect } from 'react'
-import type { Persona, QueueLane } from '../types'
+import type { BackgroundJobItem, Persona, QueueLane } from '../types'
 import { fetchOpsPollBundle, type OpsPollBundle } from '../api/ops-fetch'
 
 type UseOpsPollArgs = {
@@ -22,6 +22,7 @@ export function useOpsPoll({
 }: UseOpsPollArgs): {
   queueLane: QueueLane | null
   backgroundActiveCount: number
+  backgroundJobs: BackgroundJobItem[]
   invalidateOps: (chatIdOverride?: number | null) => Promise<void>
 } {
   const queryClient = useQueryClient()
@@ -55,6 +56,7 @@ export function useOpsPoll({
 
   const queueLane = query.data?.queueLane ?? null
   const backgroundActiveCount = query.data?.backgroundActiveCount ?? 0
+  const backgroundJobs = query.data?.backgroundJobs ?? []
 
   const invalidateOps = useCallback(
     async (chatIdOverride?: number | null) => {
@@ -65,5 +67,5 @@ export function useOpsPoll({
     [chatId, queryClient],
   )
 
-  return { queueLane, backgroundActiveCount, invalidateOps }
+  return { queueLane, backgroundActiveCount, backgroundJobs, invalidateOps }
 }

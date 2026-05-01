@@ -256,6 +256,10 @@ export const ThreadPane = React.memo(function ThreadPane({
   const MarkdownText = makeMarkdownText({
     remarkPlugins: [remarkGfm],
     components: {
+      a: (props) => {
+        const mergedRel = [props.rel, 'noopener', 'noreferrer'].filter(Boolean).join(' ')
+        return <a {...props} target="_blank" rel={mergedRel} />
+      },
       table: ({ className, ...props }) => (
         <div className="mc-md-table-scroll">
           <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />

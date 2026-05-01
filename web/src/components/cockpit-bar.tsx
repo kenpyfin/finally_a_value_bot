@@ -249,19 +249,31 @@ export function CockpitBar({
             ·
           </span>
 
-          <span className="shrink-0">
-            <Text size="1" color="gray" weight="medium" as="span">
-              Background{' '}
-            </Text>
-            <Text
-              size="1"
-              weight="medium"
-              as="span"
-              color={(backgroundActiveCount > 0 ? 'blue' : 'gray') as never}
+          <button
+            type="button"
+            className={
+              isDark
+                ? 'm-0 inline-flex cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left font-inherit text-[13px] text-slate-200 underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
+                : 'm-0 inline-flex cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left font-inherit text-[13px] text-slate-800 underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400'
+            }
+            title="Open run queue and background jobs"
+            onClick={onQueueClick}
+          >
+            <span className={isDark ? 'text-slate-400' : 'text-slate-500'}>Background</span>
+            <span
+              className={
+                backgroundActiveCount > 0
+                  ? isDark
+                    ? 'font-medium text-blue-300'
+                    : 'font-medium text-blue-900'
+                  : isDark
+                    ? 'font-medium text-slate-400'
+                    : 'font-medium text-slate-500'
+              }
             >
               {backgroundActiveCount > 0 ? `${backgroundActiveCount} active` : 'none'}
-            </Text>
-          </span>
+            </span>
+          </button>
 
             {installationStatus ? (
               <>

@@ -161,7 +161,7 @@ pub struct BackgroundJob {
     pub chat_id: i64,
     pub persona_id: i64,
     pub prompt: String,
-    pub status: String, // "pending", "running", "completed_raw", "main_agent_processing", "done", "failed"
+    pub status: String, // "pending", "running", "completed_raw", "main_agent_processing", "done", "failed", "cancelled"
     pub trigger_reason: String,
     pub created_at: String,
     pub started_at: Option<String>,
@@ -3089,6 +3089,20 @@ impl Database {
         conn.execute(
             "UPDATE background_jobs SET status = 'failed', finished_at = ?1, error_text = ?2 WHERE id = ?3",
             params![now, error_text, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_job_cancelled(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs SET status = 'cancelled', finished_at = ?1, error_text = ?2 WHERE id = ?3",
+            params![now, reason, id],
         )?;
         Ok(())
     }

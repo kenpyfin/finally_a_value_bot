@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { Persona, QueueLane } from '../types'
+import type { BackgroundJobItem, Persona, QueueLane } from '../types'
 
 export async function fetchQueueLaneForChat(chatId: number): Promise<QueueLane | null> {
   const data = await api<{ lanes?: QueueLane[] }>('/api/queue_diagnostics')
@@ -7,11 +7,22 @@ export async function fetchQueueLaneForChat(chatId: number): Promise<QueueLane |
   return lanes.find((l) => l.chat_id === chatId) ?? null
 }
 
-export async function fetchBackgroundActiveCount(chatId: number): Promise<number> {
+export type BackgroundJobsSnapshot = {
+  jobs: BackgroundJobItem[]
+  activeCount: number
+}
+
+export async function fetchBackgroundJobsSnapshot(chatId: number): Promise<BackgroundJobsSnapshot> {
   const q = new URLSearchParams({ chat_id: String(chatId) })
-  const data = await api<{ active_heartbeats?: unknown[] }>(`/api/background_jobs?${q.toString()}`)
-  const arr = Array.isArray(data.active_heartbeats) ? data.active_heartbeats : []
-  return arr.length
+  const data = await api<{ jobs?: BackgroundJobItem[]; active_heartbeats?: unknown[] }>(
+    `/api/background_jobs?${q.toString()}`,
+  )
+  const jobs = Array.isArray(data.jobs) ? data.jobs : []
+  const activeHeartbeats = Array.isArray(data.active_heartbeats) ? data.active_heartbeats : []
+  const activeByStatus = jobs.filter((j) =>
+    ['pending', 'running', 'completed_raw', 'main_agent_processing'].includes(j.status),
+  ).length
+  return { jobs, activeCount: Math.max(activeByStatus, activeHeartbeats.length) }
 }
 
 export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> {
@@ -31,14 +42,20 @@ export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> 
 export type OpsPollBundle = {
   queueLane: QueueLane | null
   backgroundActiveCount: number
+  backgroundJobs: BackgroundJobItem[]
   personasSnapshot: Persona[]
 }
 
 export async function fetchOpsPollBundle(chatId: number): Promise<OpsPollBundle> {
-  const [queueLane, backgroundActiveCount, personasSnapshot] = await Promise.all([
+  const [queueLane, background, personasSnapshot] = await Promise.all([
     fetchQueueLaneForChat(chatId),
-    fetchBackgroundActiveCount(chatId),
+    fetchBackgroundJobsSnapshot(chatId),
     fetchPersonasSnapshot(chatId),
   ])
-  return { queueLane, backgroundActiveCount, personasSnapshot }
+  return {
+    queueLane,
+    backgroundActiveCount: background.activeCount,
+    backgroundJobs: background.jobs,
+    personasSnapshot,
+  }
 }

@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 use crate::agent_history::{
     truncate_preview, write_agent_history_run, AgentRunRecord, IterationRecord, ToolCallRecord,
 };
+use crate::background_jobs::BackgroundJobControl;
 use crate::chat_queue::{ChatRunQueue, QueueEnqueueMeta, QueueSource};
 use crate::claude::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
@@ -67,6 +68,7 @@ pub struct AppState {
     /// Discord HTTP clients keyed by `channel_bot_instances.id`.
     pub discord_http: Arc<HashMap<i64, Arc<SerenityHttp>>>,
     pub chat_queue: ChatRunQueue,
+    pub background_job_control: BackgroundJobControl,
 }
 
 impl AppState {
@@ -236,6 +238,7 @@ pub async fn run_bot(
         tools,
         discord_http: Arc::new(discord_http_map),
         chat_queue: ChatRunQueue::default(),
+        background_job_control: BackgroundJobControl::default(),
     });
 
     // Start scheduler

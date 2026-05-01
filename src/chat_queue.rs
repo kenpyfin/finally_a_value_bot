@@ -3,16 +3,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 type BoxTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type RunCancel = Arc<AtomicBool>;
 type RunRegistryValue = (i64, RunCancel);
 type RunRegistry = HashMap<String, RunRegistryValue>;
+const QUEUED_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Where the queued work originated (for web diagnostics).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,7 +221,42 @@ impl ChatRunQueue {
                         queue.finish_one(chat_id_worker, &run_id).await;
                         continue;
                     }
-                    task.fut.await;
+
+                    // Isolate each queue task so a panic cannot kill the lane worker.
+                    let mut task_handle = tokio::spawn(task.fut);
+                    match tokio::time::timeout(QUEUED_TASK_HARD_TIMEOUT, &mut task_handle).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let msg = if e.is_panic() {
+                                "queued task panicked; lane recovered".to_string()
+                            } else {
+                                "queued task join failed; lane recovered".to_string()
+                            };
+                            warn!(
+                                chat_id = chat_id_worker,
+                                run_id = %run_id,
+                                error = %e,
+                                "{msg}"
+                            );
+                            queue.note_lane_error(chat_id_worker, msg).await;
+                        }
+                        Err(_) => {
+                            task_handle.abort();
+                            let _ = task_handle.await;
+                            let msg = format!(
+                                "queued task exceeded hard timeout ({}s) and was cancelled",
+                                QUEUED_TASK_HARD_TIMEOUT.as_secs()
+                            );
+                            warn!(
+                                chat_id = chat_id_worker,
+                                run_id = %run_id,
+                                timeout_secs = QUEUED_TASK_HARD_TIMEOUT.as_secs(),
+                                "{msg}"
+                            );
+                            queue.note_lane_error(chat_id_worker, msg).await;
+                        }
+                    }
+
                     queue.finish_one(chat_id_worker, &run_id).await;
                 }
             });
@@ -303,6 +339,13 @@ impl ChatRunQueue {
         }
     }
 
+    async fn note_lane_error(&self, chat_id: i64, message: String) {
+        let mut lanes = self.lanes.lock().await;
+        if let Some(lane) = lanes.get_mut(&chat_id) {
+            lane.last_error = Some(message);
+        }
+    }
+
     /// Request cooperative cancellation for `run_id`. Returns `true` if the run was known and `chat_id` matches.
     pub async fn request_cancel(&self, run_id: &str, chat_id: i64) -> bool {
         let cancel = {
@@ -317,8 +360,10 @@ impl ChatRunQueue {
         };
         if let Some(c) = cancel {
             c.store(true, Ordering::SeqCst);
+            info!(chat_id, run_id, "queue cancel requested");
             return true;
         }
+        warn!(chat_id, run_id, "queue cancel requested for unknown run");
         false
     }
 

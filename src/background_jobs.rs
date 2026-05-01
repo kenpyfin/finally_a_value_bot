@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::unbounded_channel;
-use tracing::{error, info};
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
 use crate::channel::deliver_to_contact;
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
@@ -10,6 +13,52 @@ use crate::job_heartbeat::{
     signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
 };
 use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
+
+type JobCancel = Arc<AtomicBool>;
+type JobRegistryValue = (i64, JobCancel);
+type JobRegistry = HashMap<String, JobRegistryValue>;
+
+#[derive(Clone, Default)]
+pub struct BackgroundJobControl {
+    jobs: Arc<Mutex<JobRegistry>>,
+}
+
+impl BackgroundJobControl {
+    pub async fn register(&self, job_id: String, chat_id: i64) -> JobCancel {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut guard = self.jobs.lock().await;
+        guard.insert(job_id, (chat_id, cancel.clone()));
+        cancel
+    }
+
+    pub async fn request_cancel(&self, job_id: &str, chat_id: i64) -> bool {
+        let cancel = {
+            let guard = self.jobs.lock().await;
+            guard.get(job_id).and_then(|(cid, c)| {
+                if *cid == chat_id {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(c) = cancel {
+            c.store(true, Ordering::SeqCst);
+            info!(chat_id, job_id, "background job cancel requested");
+            return true;
+        }
+        warn!(
+            chat_id,
+            job_id, "background job cancel requested for unknown job"
+        );
+        false
+    }
+
+    pub async fn finish(&self, job_id: &str) {
+        let mut guard = self.jobs.lock().await;
+        guard.remove(job_id);
+    }
+}
 
 /// Spawn a background job and deliver the final result asynchronously.
 pub fn spawn_background_job(
@@ -20,6 +69,10 @@ pub fn spawn_background_job(
     prompt: String,
 ) {
     tokio::spawn(async move {
+        let cancel = state
+            .background_job_control
+            .register(job_id.clone(), chat_id)
+            .await;
         info!(
             job_id = %job_id,
             chat_id = chat_id,
@@ -34,6 +87,18 @@ pub fn spawn_background_job(
         .await
         {
             error!(job_id = %job_id, "Failed to mark background job running: {e}");
+            state.background_job_control.finish(&job_id).await;
+            return;
+        }
+
+        if cancel.load(Ordering::SeqCst) {
+            let jid = job_id.clone();
+            let _ = call_blocking(state.db.clone(), move |db| {
+                db.mark_background_job_cancelled(&jid, "Cancelled by user")
+            })
+            .await;
+            info!(job_id = %job_id, chat_id = chat_id, "Background job cancelled before start");
+            state.background_job_control.finish(&job_id).await;
             return;
         }
 
@@ -74,7 +139,7 @@ pub fn spawn_background_job(
             Some(&prompt),
             None,
             Some(&evt_tx),
-            None,
+            Some(cancel.clone()),
         )
         .await;
         drop(evt_tx);
@@ -91,6 +156,21 @@ pub fn spawn_background_job(
         } else {
             hb_tx.send(HeartbeatSignal::Failed(raw_output.clone()))
         };
+
+        let cancelled = cancel.load(Ordering::SeqCst) || raw_output.trim() == "Run cancelled.";
+        if cancelled {
+            let _ = hb_tx.send(HeartbeatSignal::Failed(
+                "background job cancelled".to_string(),
+            ));
+            let jid = job_id.clone();
+            let _ = call_blocking(state.db.clone(), move |db| {
+                db.mark_background_job_cancelled(&jid, "Cancelled by user")
+            })
+            .await;
+            info!(job_id = %job_id, chat_id = chat_id, "Background job cancelled");
+            state.background_job_control.finish(&job_id).await;
+            return;
+        }
 
         // Persist raw background result/error.
         let jid = job_id.clone();
@@ -172,6 +252,7 @@ pub fn spawn_background_job(
                     })
                     .await;
                     info!(job_id = %job_id, chat_id = chat_id, "Background job finished");
+                    state.background_job_control.finish(&job_id).await;
                     return;
                 }
 
@@ -218,5 +299,6 @@ pub fn spawn_background_job(
         }
 
         info!(job_id = %job_id, chat_id = chat_id, "Background job finished");
+        state.background_job_control.finish(&job_id).await;
     });
 }

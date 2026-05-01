@@ -1541,17 +1541,85 @@ async fn api_queue_cancel(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
-    if body.run_id.trim().is_empty() {
+    let run_id = body.run_id.trim();
+    if run_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "run_id is required".into()));
     }
+    info!(chat_id, run_id, "web queue cancel requested");
     let ok = state
         .app_state
         .chat_queue
-        .request_cancel(body.run_id.trim(), chat_id)
+        .request_cancel(run_id, chat_id)
         .await;
     if !ok {
+        warn!(chat_id, run_id, "web queue cancel target not found");
         return Err((StatusCode::NOT_FOUND, "run not found for this chat".into()));
     }
+    info!(chat_id, run_id, "web queue cancel accepted");
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn is_background_job_active_status(status: &str) -> bool {
+    matches!(
+        status,
+        "pending" | "running" | "completed_raw" | "main_agent_processing"
+    )
+}
+
+#[derive(Deserialize)]
+struct BackgroundJobCancelRequest {
+    job_id: String,
+    chat_id: Option<i64>,
+}
+
+async fn api_background_job_cancel(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<BackgroundJobCancelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let job_id = body.job_id.trim().to_string();
+    if job_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "job_id is required".into()));
+    }
+
+    let job = call_blocking(state.app_state.db.clone(), {
+        let job_id = job_id.clone();
+        move |db| db.get_background_job(&job_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(job) = job else {
+        return Err((StatusCode::NOT_FOUND, "background job not found".into()));
+    };
+    if job.chat_id != chat_id {
+        return Err((StatusCode::NOT_FOUND, "background job not found".into()));
+    }
+    if !is_background_job_active_status(job.status.as_str()) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("background job is not active (status: {})", job.status),
+        ));
+    }
+
+    info!(chat_id, job_id, "web background job cancel requested");
+    let cancelled = state
+        .app_state
+        .background_job_control
+        .request_cancel(&job_id, chat_id)
+        .await;
+    if !cancelled {
+        warn!(
+            chat_id,
+            job_id, "web background job cancel target not found in runtime registry"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "background job is no longer cancellable".into(),
+        ));
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -4026,6 +4094,10 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/schedules/:id", patch(api_schedules_update))
         .route("/api/background_jobs", get(api_background_jobs_list))
         .route("/api/background_jobs/:job_id", get(api_background_job_get))
+        .route(
+            "/api/background_jobs/cancel",
+            post(api_background_job_cancel),
+        )
         .route("/api/history", get(api_history))
         .route("/api/history/days", get(api_history_days))
         .route("/api/artifacts", get(api_artifacts))
@@ -4309,6 +4381,7 @@ mod tests {
             tools: ToolRegistry::new(&cfg, bot, db),
             discord_http: Arc::new(std::collections::HashMap::new()),
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
+            background_job_control: crate::background_jobs::BackgroundJobControl::default(),
         };
         Arc::new(state)
     }
