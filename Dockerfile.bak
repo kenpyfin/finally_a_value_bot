@@ -38,8 +38,9 @@ ENV AGENT_BROWSER_PATH=/usr/local/bin/agent-browser
 # Copy finally-a-value-bot binary from builder
 COPY --from=builder /build/target/release/finally-a-value-bot /usr/local/bin/finally-a-value-bot
 
-# Built-in vault scripts (query_vault, index_vault)
-COPY scripts/vault/ /app/scripts/vault/
+# Built-in skills include vault scripts (query_vault/index_vault + setup helper)
+# Keep this at /app/builtin_skills so builtin skill discovery works in container.
+COPY builtin_skills/ /app/builtin_skills/
 
 # Entrypoint ensures workspace layout (e.g. shared/vault_db for vector DB)
 COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh

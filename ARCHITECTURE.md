@@ -2,7 +2,7 @@
 
 This document describes the core architecture of FinallyAValueBot: the agentic loop, tool system, skills, sub-agents, and how they connect.
 
-See also: [CLAUDE.md](CLAUDE.md) (overview and quick reference), [DEVELOP.md](DEVELOP.md) (development guide), [DOCKER.md](DOCKER.md) (deployment).
+See also: [CLAUDE.md](CLAUDE.md) (overview and quick reference), [DEVELOP.md](DEVELOP.md) (development guide), [DOCKER.md.bak](DOCKER.md.bak) (archived legacy deployment notes).
 
 ---
 

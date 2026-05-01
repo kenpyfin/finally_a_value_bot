@@ -80,7 +80,8 @@ Built-in vault skills need an embedding endpoint. Configure `VAULT_*` in `.env` 
 - [ARCHITECTURE.md](ARCHITECTURE.md): Agentic loop and project structure.
 - [DEVELOP.md](DEVELOP.md): Contributing and building from source.
 - [TEST.md](TEST.md): Testing guide.
-- [DOCKER.md](DOCKER.md): Legacy container notes — **not recommended** for new deployments; prefer the native binary and `gateway` above.
+- Docker deployment is not recommended and is no longer supported in this repo. Prefer the native binary install flow and `finally-a-value-bot gateway install`.
+- [DOCKER.md.bak](DOCKER.md.bak): Archived legacy container notes (reference only).
 
 ## License
 

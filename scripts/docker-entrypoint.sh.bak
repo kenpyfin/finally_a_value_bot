@@ -3,9 +3,12 @@ set -e
 # Ensure vector DB directory exists for vault semantic search (ChromaDB)
 mkdir -p /app/workspace/shared/vault_db
 
-# Create vault venv (ChromaDB + openai) if setup script exists and venv is missing or broken
-# Prefer built-in scripts/vault/setup_vault_env.sh; fall back to workspace/shared/
-SETUP_SCRIPT=/app/scripts/vault/setup_vault_env.sh
+# Create vault venv (ChromaDB + openai) if setup script exists and venv is missing or broken.
+# Prefer built-in skill scripts shipped in the image; fall back to workspace/shared/.
+SETUP_SCRIPT=/app/builtin_skills/search-vault/setup_vault_env.sh
+if [ ! -f "$SETUP_SCRIPT" ]; then
+  SETUP_SCRIPT=/app/builtin_skills/index-vault/setup_vault_env.sh
+fi
 if [ ! -f "$SETUP_SCRIPT" ]; then
   SETUP_SCRIPT=/app/workspace/shared/setup_vault_env.sh
 fi
