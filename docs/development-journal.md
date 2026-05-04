@@ -18,6 +18,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-04 — Secret redaction + sensitive path hardening for TSA/tool loop
+
+- **Area:** agent safety / tools / channels
+- **Summary:** Added centralized secret redaction with deterministic masking and applied it across tool outputs, TSA and PTE previews, bash command logging, main-agent tool preview logging, agent-history tool-call previews, and final output safeguards. Also tightened sensitive path checks by blocking `.env`-like filenames (e.g. `mercari.env`) outside `skills/` and enforcing `path_guard` for `send_message` attachment paths.
+- **Rationale:** Debug runs could surface API keys/tokens via tool previews and logs, and non-standard env filenames were not blocked by the previous path guard list.
+- **Key files / symbols:** `src/safety_redaction.rs` (`redact_secrets`), `src/tools/mod.rs` (`ToolRegistry::execute`), `src/tool_skill_agent.rs` (`evaluate_tool_use`), `src/post_tool_evaluator.rs` (`build_tool_results_summary`), `src/channels/telegram.rs` (`apply_output_safeguards`, tool preview logging/history capture), `src/tools/path_guard.rs` (`is_env_like_name`), `src/tools/send_message.rs` (attachment `check_path`), `src/tools/bash.rs` (redacted command logging), `src/lib.rs` (module export).
+- **Follow-ups:** Consider applying the same redaction helper to additional structured telemetry payloads and web-facing debug previews if those expand.
+
 ### 2026-05-04 — Web chat: mobile composer zoom guard + centered thread content
 
 - **Area:** web UI / chat thread

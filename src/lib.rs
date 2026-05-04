@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod memory;
 pub mod persona;
 pub mod post_tool_evaluator;
+pub mod safety_redaction;
 pub mod scheduler;
 pub mod setup;
 pub mod skills;

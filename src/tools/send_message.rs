@@ -493,6 +493,9 @@ impl Tool for SendMessageTool {
         }
 
         if let Some(path) = attachment_path {
+            if let Err(e) = super::path_guard::check_path(&path) {
+                return ToolResult::error(e).with_error_type("path_blocked");
+            }
             let auth = match auth_context_from_input(&input) {
                 Some(a) => a,
                 None => {

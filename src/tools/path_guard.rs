@@ -34,6 +34,11 @@ const CREDENTIAL_FILES: &[&str] = &[
     "secrets.json",
 ];
 
+fn is_env_like_name(component: &str) -> bool {
+    let lower = component.to_ascii_lowercase();
+    lower == ".env" || lower.starts_with(".env.") || lower.ends_with(".env")
+}
+
 /// Absolute paths that are always blocked.
 const BLOCKED_ABSOLUTE: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
@@ -80,7 +85,7 @@ pub fn is_blocked(path: &Path) -> bool {
         if BLOCKED_FILES.contains(&component.as_str()) {
             return true;
         }
-        if CREDENTIAL_FILES.contains(&component.as_str()) {
+        if CREDENTIAL_FILES.contains(&component.as_str()) || is_env_like_name(component.as_str()) {
             // Allow credential files only when under a "skills" directory (skill folder .env, token.json, etc.)
             let under_skills = components[..i].iter().any(|c| c.as_str() == "skills");
             if !under_skills {
@@ -153,6 +158,8 @@ mod tests {
         assert!(is_blocked(Path::new("/project/.env.local")));
         assert!(is_blocked(Path::new("/project/.env.production")));
         assert!(is_blocked(Path::new("/project/.env.development")));
+        assert!(is_blocked(Path::new("/project/mercari.env")));
+        assert!(is_blocked(Path::new("/project/foo/bar/custom.env")));
     }
 
     #[test]
@@ -165,6 +172,9 @@ mod tests {
         )));
         assert!(!is_blocked(Path::new(
             "workspace/skills/my-skill/token.json"
+        )));
+        assert!(!is_blocked(Path::new(
+            "workspace/skills/my-skill/mercari.env"
         )));
     }
 

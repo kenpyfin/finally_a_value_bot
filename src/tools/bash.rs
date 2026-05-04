@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
+use crate::safety_redaction::redact_secrets;
 use crate::tools::command_runner::{build_command, shell_command};
 
 use super::{schema_object, Tool, ToolResult};
@@ -192,7 +193,7 @@ Add explicit confirmation by re-running with prefix: CONFIRM_EXECUTE <your comma
             }
         }
 
-        info!("Executing bash: {}", command);
+        info!("Executing bash: {}", redact_secrets(&command));
 
         let spec = shell_command(&command);
         let result = tokio::time::timeout(

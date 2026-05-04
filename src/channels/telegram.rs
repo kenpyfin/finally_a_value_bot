@@ -26,6 +26,7 @@ use crate::db::{call_blocking, Database, StoredMessage};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::post_tool_evaluator::{evaluate_completion, PteAction};
+use crate::safety_redaction::redact_secrets;
 use crate::skills::SkillManager;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
@@ -2241,6 +2242,7 @@ pub async fn process_with_agent_with_events(
                     } else {
                         input_str
                     };
+                    let input_preview = redact_secrets(&input_preview);
                     info!(
                         "Main agent iteration {}/{}: executing tool={}, input={}",
                         iteration + 1,
@@ -2385,6 +2387,7 @@ pub async fn process_with_agent_with_events(
                     } else {
                         result.content.clone()
                     };
+                    let result_preview = redact_secrets(&result_preview);
                     info!(
                         "Main agent iteration {}/{}: tool={} {}completed in {}ms, result_len={}, is_error={}, preview=\"{}\"",
                         iteration + 1,
@@ -2479,11 +2482,11 @@ pub async fn process_with_agent_with_events(
                     .await;
                     history_tool_calls.push(ToolCallRecord {
                         name: name.clone(),
-                        input_preview: truncate_preview(
+                        input_preview: redact_secrets(&truncate_preview(
                             &serde_json::to_string(input).unwrap_or_default(),
                             10000,
-                        ),
-                        result_preview: truncate_preview(&result.content, 10000),
+                        )),
+                        result_preview: redact_secrets(&truncate_preview(&result.content, 10000)),
                         duration_ms: result
                             .duration_ms
                             .unwrap_or_else(|| started.elapsed().as_millis()),
@@ -3785,9 +3788,10 @@ pub fn balance_markdown(text: &str) -> String {
 }
 
 fn apply_output_safeguards(text: &str, config: &Config) -> String {
+    let sanitized = redact_secrets(text);
     let mode = config.safety_output_guard_mode.as_str();
     if mode == "off" {
-        return text.to_string();
+        return sanitized;
     }
 
     let effective_emoji_limit = if mode == "strict" {
@@ -3801,7 +3805,7 @@ fn apply_output_safeguards(text: &str, config: &Config) -> String {
         std::cmp::max(2, config.safety_tail_repeat_limit)
     };
 
-    let without_repeated_tail = trim_repeated_tail_patterns(text, effective_repeat_limit);
+    let without_repeated_tail = trim_repeated_tail_patterns(&sanitized, effective_repeat_limit);
     trim_excess_emojis(&without_repeated_tail, effective_emoji_limit)
 }
 

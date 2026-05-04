@@ -5,6 +5,7 @@ use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
 use crate::llm;
+use crate::safety_redaction::redact_secrets;
 use crate::tools::ToolAuthContext;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -87,13 +88,14 @@ pub async fn evaluate_tool_use(
         llm_config.model = config.orchestrator_model.trim().to_string();
     }
 
-    let context = build_context_snippet(messages, 4, 300);
+    let context = redact_secrets(&build_context_snippet(messages, 4, 300));
     let input_preview = serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".into());
     let input_preview = if input_preview.len() > 500 {
         format!("{}...", &input_preview[..500])
     } else {
         input_preview
     };
+    let input_preview = redact_secrets(&input_preview);
     let user_content = format!(
         "Conversation:\n{}\n\nRequested tool: {}\nTool input (JSON): {}",
         context, tool_name, input_preview

@@ -5,6 +5,7 @@ use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock}
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
 use crate::llm;
+use crate::safety_redaction::redact_secrets;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -107,7 +108,8 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                             };
                             out.push_str(&format!(
                                 "Tool called: {} with {}\n",
-                                name, input_preview
+                                name,
+                                redact_secrets(&input_preview)
                             ));
                         }
                         ContentBlock::ToolResult {
@@ -123,7 +125,11 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                             } else {
                                 content.clone()
                             };
-                            out.push_str(&format!("Result ({}): {}\n", status, preview));
+                            out.push_str(&format!(
+                                "Result ({}): {}\n",
+                                status,
+                                redact_secrets(&preview)
+                            ));
                         }
                         _ => {}
                     }
@@ -136,7 +142,7 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                     } else {
                         t.clone()
                     };
-                    out.push_str(&format!("Assistant: {}\n", preview));
+                    out.push_str(&format!("Assistant: {}\n", redact_secrets(&preview)));
                 }
             }
         }
