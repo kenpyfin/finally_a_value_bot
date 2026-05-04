@@ -66,10 +66,13 @@ pub fn spawn_shared_heartbeat(
     chat_id: i64,
     persona_id: i64,
     job_type: JobType,
+    _lease_owner: Option<String>,
 ) -> UnboundedSender<HeartbeatSignal> {
     let (tx, mut rx) = mpsc::unbounded_channel::<HeartbeatSignal>();
     tokio::spawn(async move {
-        let heartbeat_period = Duration::from_secs(30);
+        let heartbeat_period =
+            Duration::from_secs(state.config.background_job_lease_fallback_renew_secs.max(1));
+        let lease_ttl_secs = state.config.background_job_lease_ttl_secs as i64;
         let mut ticker = tokio::time::interval(heartbeat_period);
         let mut stage = "queued".to_string();
         let mut message = "queued".to_string();
@@ -203,6 +206,16 @@ pub fn spawn_shared_heartbeat(
                         move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, active)
                     })
                     .await;
+                    if active && job_type == JobType::ManualBackground {
+                        let _ = call_blocking(state.db.clone(), {
+                            let run_key = run_key.clone();
+                            let stage = stage.clone();
+                            move |db| {
+                                db.renew_background_job_lease(&run_key, lease_ttl_secs, &stage)
+                            }
+                        })
+                        .await;
+                    }
                     let _ = call_blocking(state.db.clone(), {
                         let run_key = run_key.clone();
                         let stage = stage.clone();
@@ -239,14 +252,16 @@ pub fn spawn_shared_heartbeat(
                         let job_type = job_type.as_str().to_string();
                         move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, active)
                     }).await;
-                    let _ = call_blocking(state.db.clone(), {
-                        let run_key = run_key.clone();
-                        let stage = stage.clone();
-                        let message = message.clone();
-                        let payload = format!(r#"{{"stage":"{}","message":"{}"}}"#, stage, message.replace('"', "'"));
-                        move |db| db.append_run_timeline_event(&run_key, chat_id, persona_id, "heartbeat", Some(&payload))
-                    })
-                    .await;
+                    if active && job_type == JobType::ManualBackground {
+                        let _ = call_blocking(state.db.clone(), {
+                            let run_key = run_key.clone();
+                            let stage = stage.clone();
+                            move |db| {
+                                db.renew_background_job_lease(&run_key, lease_ttl_secs, &stage)
+                            }
+                        })
+                        .await;
+                    }
 
                     if active
                         && job_type.notify_user_periodically()

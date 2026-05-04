@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
+use crate::background_jobs::BackgroundStartAck;
 use crate::channel::deliver_to_contact;
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::claude::{Message, MessageContent};
@@ -1155,11 +1156,37 @@ async fn api_send_stream(
 
                     // Allow only one active background subagent per chat to avoid
                     // result interleaving and ambiguous follow-up replies.
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let pending_timeout_secs =
+                        state_for_task.app_state.config.background_job_pending_start_timeout_secs
+                            as i64;
                     let active_jobs = call_blocking(state_for_task.app_state.db.clone(), move |db| {
-                        db.count_active_background_jobs_for_chat(chat_id)
+                        db.count_active_background_jobs_for_chat(
+                            chat_id,
+                            &now,
+                            pending_timeout_secs,
+                        )
                     })
                     .await
-                    .unwrap_or(0);
+                    .map_err(|e| e.to_string());
+                    let active_jobs = match active_jobs {
+                        Ok(v) => v,
+                        Err(err_text) => {
+                            state_for_task
+                                .run_hub
+                                .publish(
+                                    &run_id_for_task,
+                                    "error",
+                                    json!({
+                                        "error": format!("Failed to check active background jobs: {err_text}")
+                                    })
+                                    .to_string(),
+                                    limits.run_history_limit,
+                                )
+                                .await;
+                            return;
+                        }
+                    };
                     if active_jobs > 0 {
                         state_for_task
                             .run_hub
@@ -1176,18 +1203,25 @@ async fn api_send_stream(
                     } else {
                         let jid = job_id.clone();
                         let prompt_for_db = prompt_text.clone();
-                        let _ = call_blocking(state_for_task.app_state.db.clone(), move |db| {
+                        let create_result = call_blocking(state_for_task.app_state.db.clone(), move |db| {
                             db.create_background_job(&jid, chat_id, persona_id, &prompt_for_db, "timeout")
                         })
                         .await;
-
-                        crate::background_jobs::spawn_background_job(
-                            state_for_task.app_state.clone(),
-                            job_id.clone(),
-                            chat_id,
-                            persona_id,
-                            prompt_text,
-                        );
+                        if let Err(e) = create_result {
+                            state_for_task
+                                .run_hub
+                                .publish(
+                                    &run_id_for_task,
+                                    "done",
+                                    json!({
+                                        "response": format!("Failed to queue background task: {e}")
+                                    })
+                                    .to_string(),
+                                    limits.run_history_limit,
+                                )
+                                .await;
+                            return;
+                        }
 
                         state_for_task
                             .run_hub
@@ -1196,26 +1230,85 @@ async fn api_send_stream(
                                 "background_job",
                                 json!({
                                     "job_id": job_id,
-                                    "message": "Task moved to background due to timeout. You can keep chatting while it runs."
+                                    "message": "Task queued in background."
                                 })
                                 .to_string(),
                                 limits.run_history_limit,
                             )
                             .await;
 
-                        state_for_task
-                            .run_hub
-                            .publish(
-                                &run_id_for_task,
-                                "done",
-                                json!({
-                                    "response": "This task is now running as a background subagent. You can continue chatting; a separate reply will arrive when it finishes.",
-                                    "background_job_id": job_id
-                                })
-                                .to_string(),
-                                limits.run_history_limit,
-                            )
-                            .await;
+                        let start_ack = crate::background_jobs::spawn_background_job(
+                            state_for_task.app_state.clone(),
+                            job_id.clone(),
+                            chat_id,
+                            persona_id,
+                            prompt_text,
+                        );
+
+                        let ack =
+                            tokio::time::timeout(Duration::from_secs(8), start_ack).await;
+                        match ack {
+                            Ok(Ok(BackgroundStartAck::Running)) => {
+                                state_for_task
+                                    .run_hub
+                                    .publish(
+                                        &run_id_for_task,
+                                        "done",
+                                        json!({
+                                            "response": "This task is now running as a background subagent. You can continue chatting; a separate reply will arrive when it finishes.",
+                                            "background_job_id": job_id
+                                        })
+                                        .to_string(),
+                                        limits.run_history_limit,
+                                    )
+                                    .await;
+                            }
+                            Ok(Ok(BackgroundStartAck::Failed(reason))) => {
+                                state_for_task
+                                    .run_hub
+                                    .publish(
+                                        &run_id_for_task,
+                                        "done",
+                                        json!({
+                                            "response": format!("Background task failed to start: {reason}"),
+                                            "background_job_id": job_id
+                                        })
+                                        .to_string(),
+                                        limits.run_history_limit,
+                                    )
+                                    .await;
+                            }
+                            Ok(Err(_)) => {
+                                state_for_task
+                                    .run_hub
+                                    .publish(
+                                        &run_id_for_task,
+                                        "done",
+                                        json!({
+                                            "response": "Background task was queued, but startup confirmation channel closed early. Please check background jobs panel.",
+                                            "background_job_id": job_id
+                                        })
+                                        .to_string(),
+                                        limits.run_history_limit,
+                                    )
+                                    .await;
+                            }
+                            Err(_) => {
+                                state_for_task
+                                    .run_hub
+                                    .publish(
+                                        &run_id_for_task,
+                                        "done",
+                                        json!({
+                                            "response": "Background task was queued. Startup confirmation is delayed; check the background jobs panel for live status.",
+                                            "background_job_id": job_id
+                                        })
+                                        .to_string(),
+                                        limits.run_history_limit,
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 } else {
                     state_for_task
@@ -3243,6 +3336,16 @@ async fn api_background_jobs_list(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let pending_timeout_secs = state
+        .app_state
+        .config
+        .background_job_pending_start_timeout_secs as i64;
+    let active_count = call_blocking(state.app_state.db.clone(), move |db| {
+        db.count_active_background_jobs_for_chat(chat_id, &now, pending_timeout_secs)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<serde_json::Value> = jobs
         .into_iter()
@@ -3260,6 +3363,10 @@ async fn api_background_jobs_list(
                 "finished_at": j.finished_at,
                 "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
                 "error_text": j.error_text,
+                "lease_owner": j.lease_owner,
+                "lease_expires_at": j.lease_expires_at,
+                "last_progress_at": j.last_progress_at,
+                "last_stage": j.last_stage,
                 "heartbeat": hb.map(json_job_heartbeat),
             })
         })
@@ -3272,6 +3379,7 @@ async fn api_background_jobs_list(
         "ok": true,
         "chat_id": chat_id,
         "jobs": items,
+        "active_count": active_count,
         "active_heartbeats": active_hb_json,
     })))
 }
@@ -3339,6 +3447,10 @@ async fn api_background_job_get(
             "finished_at": job.finished_at,
             "result_text": job.result_text,
             "error_text": job.error_text,
+            "lease_owner": job.lease_owner,
+            "lease_expires_at": job.lease_expires_at,
+            "last_progress_at": job.last_progress_at,
+            "last_stage": job.last_stage,
         },
         "heartbeat": hb.as_ref().map(json_job_heartbeat),
         "timeline_events_recent": timeline_json,

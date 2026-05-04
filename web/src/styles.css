@@ -224,26 +224,31 @@ html.dark .aui-thread-viewport {
 }
 
 html.dark .aui-assistant-message-root {
-  grid-template-columns: auto 1fr;
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
 }
 
-html.dark .aui-assistant-avatar,
-html.dark :where(.aui-assistant-message-root) > .aui-avatar-root {
-  margin-right: 0;
+html.dark :where(.aui-assistant-message-root) > .aui-branch-picker-root,
+html:not(.dark) :where(.aui-assistant-message-root) > .aui-branch-picker-root {
+  grid-column: 1;
+  grid-row: auto;
 }
 
-html.dark .aui-avatar-fallback {
-  border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #0d1714);
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--mc-accent) 22%, #102018),
-    color-mix(in srgb, var(--mc-accent) 16%, #0a1712)
-  );
-  color: hsl(145 26% 88%);
+html.dark .aui-assistant-message-root > .mc-assistant-placeholder,
+html:not(.dark) .aui-assistant-message-root > .mc-assistant-placeholder {
+  grid-column: 1;
+  grid-row: auto;
+}
+
+html.dark .aui-assistant-message-root > .mc-msg-meta-row,
+html:not(.dark) .aui-assistant-message-root > .mc-msg-meta-row {
+  grid-column: 1;
+  grid-row: auto;
 }
 
 html.dark .aui-assistant-message-content {
+  grid-column: 1 / -1;
+  grid-row: auto;
   max-width: calc(var(--aui-thread-max-width) * 0.98);
   border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #10181a);
   border-radius: 14px;
@@ -404,14 +409,16 @@ html.dark .aui-composer-send:hover {
   filter: brightness(1.08);
 }
 
-html.dark .aui-assistant-action-bar-root {
-  grid-column-start: 2;
+html.dark .aui-assistant-action-bar-root,
+html:not(.dark) .aui-assistant-action-bar-root {
+  grid-column-start: 1;
   margin-left: 2px;
   margin-top: 2px;
   opacity: 0.9;
 }
 
-html.dark .aui-assistant-action-bar-root button {
+html.dark .aui-assistant-action-bar-root button,
+html:not(.dark) .aui-assistant-action-bar-root button {
   border-radius: 8px;
 }
 
@@ -453,26 +460,13 @@ html:not(.dark) .aui-thread-viewport {
 }
 
 html:not(.dark) .aui-assistant-message-root {
-  grid-template-columns: auto 1fr;
-  gap: 10px;
-}
-
-html:not(.dark) .aui-assistant-avatar,
-html:not(.dark) :where(.aui-assistant-message-root) > .aui-avatar-root {
-  margin-right: 0;
-}
-
-html:not(.dark) .aui-avatar-fallback {
-  border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #cbd5e1);
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--mc-accent) 14%, #ffffff),
-    color-mix(in srgb, var(--mc-accent) 20%, #f8fafc)
-  );
-  color: color-mix(in srgb, var(--mc-accent) 55%, #0f172a);
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
 }
 
 html:not(.dark) .aui-assistant-message-content {
+  grid-column: 1 / -1;
+  grid-row: auto;
   max-width: calc(var(--aui-thread-max-width) * 0.98);
   border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #cbd5e1);
   border-radius: 14px;
@@ -646,6 +640,50 @@ html:not(.dark) .aui-composer-send:hover {
 .mc-msg-meta-row .aui-assistant-action-bar-root,
 .mc-msg-meta-row .aui-user-action-bar-root {
   position: static;
+}
+
+/* Thread layout: messages scroll; composer docked below (not sticky inside scroll). */
+.mc-thread-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.mc-thread-viewport.aui-thread-viewport {
+  flex: 1 1 0%;
+  min-height: 0;
+  height: auto;
+  width: 100%;
+  align-items: center;
+}
+
+html.dark .mc-thread-composer-dock {
+  border-top: 1px solid color-mix(in srgb, var(--mc-accent) 28%, #121a1a);
+  background-color: var(--mc-bg-panel);
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.24);
+}
+
+html:not(.dark) .mc-thread-composer-dock {
+  border-top: 1px solid color-mix(in srgb, var(--mc-accent) 24%, #cbd5e1);
+  background-color: #ffffff;
+  box-shadow: 0 -3px 16px rgba(15, 23, 42, 0.08);
+}
+
+.mc-thread-composer-dock .aui-composer-root {
+  border-radius: 12px;
+  max-width: 100%;
+}
+
+.mc-thread-composer-dock .aui-thread-scroll-to-bottom {
+  position: absolute;
+  right: 0.75rem;
+  top: 0;
+  left: auto;
+  margin: 0;
+  transform: translateY(calc(-100% - 0.35rem));
 }
 
 .mc-cockpit .mc-cockpit-bookmark-btn {
@@ -876,16 +914,61 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   opacity: 0.65;
 }
 
-/* Narrow screens: keep thread readable; reduce attachment row padding from assistant-ui defaults */
+/* Narrow screens: flat assistant text (no bubble) with comfortable side gutters */
 @media (max-width: 639px) {
   html.dark .aui-thread-viewport,
   html:not(.dark) .aui-thread-viewport {
-    padding-left: 0.5rem;
-    padding-right: 0.5rem;
+    padding-left: max(0.875rem, env(safe-area-inset-left, 0px));
+    padding-right: max(0.875rem, env(safe-area-inset-right, 0px));
+  }
+
+  html.dark .aui-assistant-message-root,
+  html:not(.dark) .aui-assistant-message-root {
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  html.dark .aui-assistant-message-content,
+  html:not(.dark) .aui-assistant-message-content {
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    border-radius: 0;
+    /* Extra inset so long paragraphs do not feel glued to the gutter line */
+    padding: 0.125rem 0.25rem;
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+
+  html.dark .aui-user-message-content,
+  html:not(.dark) .aui-user-message-content {
+    max-width: 92%;
+    padding: 0.625rem 0.875rem;
+  }
+
+  .mc-assistant-placeholder {
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    border-radius: 0;
+    padding: 0.5rem 0.25rem;
+    min-height: auto;
   }
 
   .aui-composer-attachments {
     padding-left: 0.75rem;
     padding-right: 0.75rem;
+  }
+
+  .mc-thread-composer-dock .aui-composer-root {
+    border-radius: 10px;
+    padding-left: 0.35rem;
+    padding-right: 0.35rem;
+  }
+
+  .mc-thread-composer-dock .aui-composer-input {
+    font-size: 16px;
+    padding-top: 0.65rem;
+    padding-bottom: 0.65rem;
   }
 }

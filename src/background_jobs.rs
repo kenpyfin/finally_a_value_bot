@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -17,6 +18,12 @@ use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppSt
 type JobCancel = Arc<AtomicBool>;
 type JobRegistryValue = (i64, JobCancel);
 type JobRegistry = HashMap<String, JobRegistryValue>;
+
+#[derive(Debug, Clone)]
+pub enum BackgroundStartAck {
+    Running,
+    Failed(String),
+}
 
 #[derive(Clone, Default)]
 pub struct BackgroundJobControl {
@@ -67,28 +74,63 @@ pub fn spawn_background_job(
     chat_id: i64,
     persona_id: i64,
     prompt: String,
-) {
+) -> oneshot::Receiver<BackgroundStartAck> {
+    let (start_tx, start_rx) = oneshot::channel::<BackgroundStartAck>();
     tokio::spawn(async move {
         let cancel = state
             .background_job_control
             .register(job_id.clone(), chat_id)
             .await;
+        let mut start_tx = Some(start_tx);
+        let lease_owner = uuid::Uuid::new_v4().to_string();
+        let lease_ttl_secs = state.config.background_job_lease_ttl_secs as i64;
         info!(
             job_id = %job_id,
             chat_id = chat_id,
             "Background job starting"
         );
 
-        // Mark running
+        // Atomically claim and mark running.
         let jid = job_id.clone();
-        if let Err(e) = call_blocking(state.db.clone(), move |db| {
-            db.mark_background_job_running(&jid)
+        let lease_owner_for_claim = lease_owner.clone();
+        let claim_res = call_blocking(state.db.clone(), move |db| {
+            db.claim_background_job_running(&jid, &lease_owner_for_claim, lease_ttl_secs)
         })
-        .await
-        {
-            error!(job_id = %job_id, "Failed to mark background job running: {e}");
-            state.background_job_control.finish(&job_id).await;
-            return;
+        .await;
+        match claim_res {
+            Ok(true) => {
+                if let Some(tx) = start_tx.take() {
+                    let _ = tx.send(BackgroundStartAck::Running);
+                }
+            }
+            Ok(false) => {
+                let msg = "background job claim rejected; job is no longer pending".to_string();
+                warn!(job_id = %job_id, "{msg}");
+                if let Some(tx) = start_tx.take() {
+                    let _ = tx.send(BackgroundStartAck::Failed(msg.clone()));
+                }
+                let jid = job_id.clone();
+                let _ = call_blocking(state.db.clone(), move |db| {
+                    db.fail_background_job(&jid, &msg)
+                })
+                .await;
+                state.background_job_control.finish(&job_id).await;
+                return;
+            }
+            Err(e) => {
+                let msg = format!("failed to claim background job: {e}");
+                error!(job_id = %job_id, "{msg}");
+                if let Some(tx) = start_tx.take() {
+                    let _ = tx.send(BackgroundStartAck::Failed(msg.clone()));
+                }
+                let jid = job_id.clone();
+                let _ = call_blocking(state.db.clone(), move |db| {
+                    db.fail_background_job(&jid, &msg)
+                })
+                .await;
+                state.background_job_control.finish(&job_id).await;
+                return;
+            }
         }
 
         if cancel.load(Ordering::SeqCst) {
@@ -108,6 +150,7 @@ pub fn spawn_background_job(
             chat_id,
             persona_id,
             JobType::ManualBackground,
+            Some(lease_owner),
         );
         let _ = hb_tx.send(HeartbeatSignal::Started(
             "background job started".to_string(),
@@ -182,8 +225,9 @@ pub fn spawn_background_job(
 
         // Mark continuation lane while we generate user-facing output.
         let jid = job_id.clone();
+        let lease_ttl_for_processing = state.config.background_job_lease_ttl_secs as i64;
         let _ = call_blocking(state.db.clone(), move |db| {
-            db.mark_background_job_main_agent_processing(&jid)
+            db.mark_background_job_main_agent_processing(&jid, lease_ttl_for_processing)
         })
         .await;
 
@@ -301,4 +345,5 @@ pub fn spawn_background_job(
         info!(job_id = %job_id, chat_id = chat_id, "Background job finished");
         state.background_job_control.finish(&job_id).await;
     });
+    start_rx
 }

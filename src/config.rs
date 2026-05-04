@@ -131,6 +131,18 @@ fn default_scheduler_poll_interval_secs() -> u64 {
     60
 }
 
+fn default_background_job_lease_ttl_secs() -> u64 {
+    120
+}
+
+fn default_background_job_lease_fallback_renew_secs() -> u64 {
+    180
+}
+
+fn default_background_job_pending_start_timeout_secs() -> u64 {
+    120
+}
+
 fn default_runtime_reliability_profile() -> String {
     "balanced".into()
 }
@@ -444,6 +456,15 @@ pub struct Config {
     /// Seconds between scheduler ticks (reclaim + due-task scan). Default 60.
     #[serde(default = "default_scheduler_poll_interval_secs")]
     pub scheduler_poll_interval_secs: u64,
+    /// Lease TTL for active manual background jobs. Worker heartbeat/event flow renews this lease. Default 120.
+    #[serde(default = "default_background_job_lease_ttl_secs")]
+    pub background_job_lease_ttl_secs: u64,
+    /// Fallback heartbeat lease renewal cadence when no events are emitted. Default 180.
+    #[serde(default = "default_background_job_lease_fallback_renew_secs")]
+    pub background_job_lease_fallback_renew_secs: u64,
+    /// Maximum age for a pending background job before stale reconciliation fails it. Default 120.
+    #[serde(default = "default_background_job_pending_start_timeout_secs")]
+    pub background_job_pending_start_timeout_secs: u64,
     /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
     #[serde(default = "default_runtime_reliability_profile")]
     pub runtime_reliability_profile: String,
@@ -825,6 +846,18 @@ impl Config {
             scheduler_poll_interval_secs: Self::env_u64(
                 "SCHEDULER_POLL_INTERVAL_SECS",
                 default_scheduler_poll_interval_secs(),
+            ),
+            background_job_lease_ttl_secs: Self::env_u64(
+                "BACKGROUND_JOB_LEASE_TTL_SECS",
+                default_background_job_lease_ttl_secs(),
+            ),
+            background_job_lease_fallback_renew_secs: Self::env_u64(
+                "BACKGROUND_JOB_LEASE_FALLBACK_RENEW_SECS",
+                default_background_job_lease_fallback_renew_secs(),
+            ),
+            background_job_pending_start_timeout_secs: Self::env_u64(
+                "BACKGROUND_JOB_PENDING_START_TIMEOUT_SECS",
+                default_background_job_pending_start_timeout_secs(),
             ),
             runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
                 .unwrap_or_else(default_runtime_reliability_profile),
@@ -1276,6 +1309,11 @@ pub fn test_config() -> Config {
         scheduler_stale_running_reclaim_secs: default_scheduler_stale_running_reclaim_secs(),
         scheduler_max_concurrent_tasks: default_scheduler_max_concurrent_tasks(),
         scheduler_poll_interval_secs: default_scheduler_poll_interval_secs(),
+        background_job_lease_ttl_secs: default_background_job_lease_ttl_secs(),
+        background_job_lease_fallback_renew_secs: default_background_job_lease_fallback_renew_secs(
+        ),
+        background_job_pending_start_timeout_secs:
+            default_background_job_pending_start_timeout_secs(),
         runtime_reliability_profile: default_runtime_reliability_profile(),
         workflow_auto_learn: default_workflow_auto_learn(),
         workflow_min_success_repetitions: default_workflow_min_success_repetitions(),

@@ -467,6 +467,7 @@ function App() {
   const [newBotToken, setNewBotToken] = useState('')
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [mobileChatHeaderCollapsed, setMobileChatHeaderCollapsed] = useState(false)
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState<boolean>(readDesktopSidebarOpen)
   const [desktopSidebarWidth, setDesktopSidebarWidth] = useState<number>(readDesktopSidebarWidth)
   const [desktopSidebarResizing, setDesktopSidebarResizing] = useState(false)
@@ -561,6 +562,12 @@ function App() {
       || status === 'main_agent_processing'
     )
   }
+
+  function isTerminalBackgroundJobStatus(status: string): boolean {
+    return status === 'done' || status === 'failed' || status === 'cancelled'
+  }
+
+  const prevBgJobStatusByIdRef = useRef<Map<string, string>>(new Map())
 
   const personaHasNew = useMemo<Record<number, boolean>>(() => {
     if (chatId == null) return {}
@@ -1419,6 +1426,52 @@ function App() {
   }, [chatId, activePersonaId])
 
   useEffect(() => {
+    prevBgJobStatusByIdRef.current = new Map()
+  }, [chatId])
+
+  useEffect(() => {
+    if (chatId == null) return
+    const prev = prevBgJobStatusByIdRef.current
+    let shouldReloadThread = false
+    let reloadBulletin = false
+    for (const job of backgroundJobs) {
+      const last = prev.get(job.id)
+      if (
+        last !== undefined
+        && isActiveBackgroundJobStatus(last)
+        && isTerminalBackgroundJobStatus(job.status)
+      ) {
+        if (activePersonaId == null || job.persona_id === activePersonaId) {
+          shouldReloadThread = true
+        }
+        if (activePersonaId != null && job.persona_id === activePersonaId) {
+          reloadBulletin = true
+        }
+      }
+    }
+    const next = new Map<string, string>()
+    for (const job of backgroundJobs) {
+      next.set(job.id, job.status)
+    }
+    prevBgJobStatusByIdRef.current = next
+    if (!shouldReloadThread) return
+    setStatusText('Done')
+    void loadHistory(chatId, activePersonaId ?? undefined)
+    if (reloadBulletin && activePersonaId != null) {
+      void loadPersonaBulletin(activePersonaId)
+    }
+    setHistoryPollUntilMs(Date.now() + 2 * 60 * 1000)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId, activePersonaId, backgroundJobs])
+
+  useEffect(() => {
+    if (chatId == null) return
+    if (backgroundActiveCount <= 0) return
+    const extendTo = Date.now() + 5 * 60 * 1000
+    setHistoryPollUntilMs((prev) => (prev > extendTo ? prev : extendTo))
+  }, [chatId, backgroundActiveCount])
+
+  useEffect(() => {
     if (pendingRunIds.length === 0) return
     let cancelled = false
     const interval = setInterval(() => {
@@ -1468,6 +1521,29 @@ function App() {
   }, [chatId, activePersonaId, historyPollUntilMs])
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}`
+
+  const handleMobileThreadScroll = useCallback((opts: { collapseHeader: boolean }) => {
+    setMobileChatHeaderCollapsed(opts.collapseHeader)
+  }, [])
+
+  useEffect(() => {
+    setMobileChatHeaderCollapsed(false)
+  }, [runtimeKey])
+
+  useEffect(() => {
+    if (mobileNavOpen) setMobileChatHeaderCollapsed(false)
+  }, [mobileNavOpen])
+
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 768px)')
+    const clearCollapsed = () => {
+      if (mq.matches) setMobileChatHeaderCollapsed(false)
+    }
+    mq.addEventListener('change', clearCollapsed)
+    clearCollapsed()
+    return () => mq.removeEventListener('change', clearCollapsed)
+  }, [])
+
   const activeDraftKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
   const activeDraftText = draftByThreadKey[activeDraftKey] ?? ''
   const handleDraftTextChange = useCallback((nextText: string) => {
@@ -1617,14 +1693,84 @@ function App() {
                 : 'flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-white/95'
             }
           >
+            {mobileChatHeaderCollapsed ? (
+              <div
+                className={
+                  appearance === 'dark'
+                    ? 'fixed left-0 right-0 top-0 z-30 flex h-11 shrink-0 items-center gap-2 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/98 px-2 backdrop-blur-sm md:hidden'
+                    : 'fixed left-0 right-0 top-0 z-30 flex h-11 shrink-0 items-center gap-2 border-b border-slate-200 bg-white/98 px-2 backdrop-blur-sm md:hidden'
+                }
+              >
+                <IconButton
+                  size="3"
+                  variant="soft"
+                  color="gray"
+                  className="shrink-0 min-h-9 min-w-9"
+                  type="button"
+                  aria-expanded={mobileNavOpen}
+                  aria-haspopup="dialog"
+                  aria-controls="mobile-session-sidebar-panel"
+                  aria-label="Open personas and theme"
+                  title="Personas & theme"
+                  onClick={() => setMobileNavOpen(true)}
+                >
+                  <svg
+                    className="size-5 shrink-0"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden
+                  >
+                    <path d="M4 6h16M4 12h16M4 18h16" />
+                  </svg>
+                </IconButton>
+                <Heading size="3" className="min-w-0 flex-1 truncate">
+                  {selectedSessionLabel}
+                </Heading>
+                <div className="shrink-0">
+                  <DropdownMenu.Root>
+                    <DropdownMenu.Trigger>
+                      <Button size="1" variant="soft" type="button" className="min-h-9">
+                        More
+                      </Button>
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Content size="2">
+                      <DropdownMenu.Item onSelect={() => setSettingsDialogOpen(true)}>Settings</DropdownMenu.Item>
+                      <DropdownMenu.Item onSelect={() => setSchedulesDialogOpen(true)}>Schedules</DropdownMenu.Item>
+                      <DropdownMenu.Item onSelect={() => setAgentsMdOpen(true)}>Principles</DropdownMenu.Item>
+                      <DropdownMenu.Item onSelect={() => setArtifactsDialogOpen(true)}>Artifacts</DropdownMenu.Item>
+                      <DropdownMenu.Item onSelect={() => setMemoryDialogOpen(true)}>Memory</DropdownMenu.Item>
+                      <DropdownMenu.Item
+                        disabled={activePersonaId == null}
+                        onSelect={() => {
+                          if (activePersonaId != null) setAgentHistoryDialogOpen(true)
+                        }}
+                      >
+                        Last agent run
+                      </DropdownMenu.Item>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Root>
+                </div>
+              </div>
+            ) : null}
+            <div
+              className={
+                mobileChatHeaderCollapsed
+                  ? 'max-md:max-h-0 max-md:overflow-hidden max-md:opacity-0 max-md:transition-[max-height,opacity] max-md:duration-200 max-md:ease-out md:max-h-none md:opacity-100'
+                  : 'max-md:overflow-visible max-md:opacity-100 max-md:transition-[max-height,opacity] max-md:duration-200 max-md:ease-out'
+              }
+            >
             <header
               className={
                 appearance === 'dark'
-                  ? 'sticky top-0 z-10 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/95 backdrop-blur-sm'
-                  : 'sticky top-0 z-10 border-b border-slate-200 bg-white/92 backdrop-blur-sm'
+                  ? 'max-md:relative z-10 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/95 backdrop-blur-sm md:sticky md:top-0'
+                  : 'max-md:relative z-10 border-b border-slate-200 bg-white/92 backdrop-blur-sm md:sticky md:top-0'
               }
             >
-              <div className="px-4 py-3">
+              <div className="px-3 py-2 md:px-4 md:py-3">
               <Flex
                 justify="between"
                 align="center"
@@ -2837,12 +2983,13 @@ function App() {
               </Flex>
               </div>
             </header>
+            </div>
 
             <div
               className={
                 appearance === 'dark'
-                  ? 'relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]'
-                  : 'relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]'
+                  ? `relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]${mobileChatHeaderCollapsed ? ' max-md:pt-11' : ''}`
+                  : `relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]${mobileChatHeaderCollapsed ? ' max-md:pt-11' : ''}`
               }
             >
               <div className="pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2">
@@ -2862,7 +3009,7 @@ function App() {
                   />
                 </div>
               </div>
-              <div className="mx-auto w-full max-w-5xl px-3 pt-14">
+              <div className="mx-auto w-full max-w-5xl px-2 pt-10 md:px-3 md:pt-14">
                 {installationStatus != null &&
                 !onboardingDismissed &&
                 (!installationStatus.llm_ready || !installationStatus.channel_ready) ? (
@@ -2921,7 +3068,7 @@ function App() {
                 ) : null}
               </div>
 
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col px-1 pb-1">
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col px-0 pb-1 md:px-1">
                 <div className="min-h-0 min-w-0 flex-1">
                   <ThreadPane
                     key={runtimeKey}
@@ -2932,6 +3079,7 @@ function App() {
                     onDraftTextChange={handleDraftTextChange}
                     bookmarkedMessageIds={bookmarkedMessageIds}
                     onToggleBookmark={toggleMessageBookmark}
+                    onMobileThreadScroll={handleMobileThreadScroll}
                   />
                 </div>
               </div>

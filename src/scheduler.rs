@@ -102,6 +102,41 @@ async fn run_due_tasks(
         _ => {}
     }
 
+    let pending_timeout_secs = state.config.background_job_pending_start_timeout_secs as i64;
+    match call_blocking(state.db.clone(), {
+        let now = now.clone();
+        move |db| db.reconcile_stale_pending_background_jobs(&now, pending_timeout_secs)
+    })
+    .await
+    {
+        Ok(ids) if !ids.is_empty() => {
+            info!(
+                "Scheduler: reconciled {} stale pending background job(s): {:?}",
+                ids.len(),
+                ids
+            );
+        }
+        Err(e) => error!("Scheduler: failed to reconcile stale pending background jobs: {e}"),
+        _ => {}
+    }
+
+    match call_blocking(state.db.clone(), {
+        let now = now.clone();
+        move |db| db.reconcile_expired_background_job_leases(&now)
+    })
+    .await
+    {
+        Ok(ids) if !ids.is_empty() => {
+            info!(
+                "Scheduler: reconciled {} expired background job lease(s): {:?}",
+                ids.len(),
+                ids
+            );
+        }
+        Err(e) => error!("Scheduler: failed to reconcile expired background leases: {e}"),
+        _ => {}
+    }
+
     match call_blocking(state.db.clone(), {
         let now = now.clone();
         move |db| db.reconcile_orphan_stale_background_jobs(&now, stale_reclaim_secs)
@@ -349,6 +384,7 @@ async fn run_scheduled_agent_and_finalize(
         chat_id,
         persona_id,
         JobType::Scheduled,
+        None,
     );
     let _ = hb_tx.send(HeartbeatSignal::Started(format!(
         "scheduled task #{} started",

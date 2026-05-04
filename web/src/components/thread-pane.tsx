@@ -22,6 +22,7 @@ import {
   BranchPicker,
   Composer,
   Thread,
+  ThreadWelcome,
   UserActionBar,
   UserMessage,
   makeMarkdownText,
@@ -139,7 +140,6 @@ function CustomAssistantMessage() {
 
   return (
     <AssistantMessage.Root data-message-id={messageId || undefined}>
-      <AssistantMessage.Avatar />
       {hasRenderableContent ? (
         <AssistantMessage.Content />
       ) : (
@@ -222,6 +222,8 @@ export type ThreadPaneProps = {
   onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
+  /** Mobile (max-width 767px): report scroll direction so the app shell can collapse the main header. */
+  onMobileThreadScroll?: (opts: { collapseHeader: boolean }) => void
 }
 
 function DraftAwareComposer() {
@@ -252,6 +254,7 @@ export const ThreadPane = React.memo(function ThreadPane({
   onDraftTextChange,
   bookmarkedMessageIds,
   onToggleBookmark,
+  onMobileThreadScroll,
 }: ThreadPaneProps) {
   const MarkdownText = makeMarkdownText({
     remarkPlugins: [remarkGfm],
@@ -290,12 +293,71 @@ export const ThreadPane = React.memo(function ThreadPane({
     [bookmarkedMessageIds, draftText, onDraftTextChange, onToggleBookmark],
   )
 
+  const viewportScrollCleanupRef = React.useRef<(() => void) | null>(null)
+  const lastViewportScrollTopRef = React.useRef(0)
+
+  const bindThreadViewport = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      viewportScrollCleanupRef.current?.()
+      viewportScrollCleanupRef.current = null
+      if (!el || !onMobileThreadScroll) return
+
+      const mq = window.matchMedia('(max-width: 767px)')
+      lastViewportScrollTopRef.current = el.scrollTop
+
+      const onScroll = () => {
+        if (!mq.matches) {
+          onMobileThreadScroll({ collapseHeader: false })
+          return
+        }
+        const st = el.scrollTop
+        const delta = st - lastViewportScrollTopRef.current
+        lastViewportScrollTopRef.current = st
+        if (st < 20) {
+          onMobileThreadScroll({ collapseHeader: false })
+          return
+        }
+        if (delta > 10) {
+          onMobileThreadScroll({ collapseHeader: true })
+        } else if (delta < -10) {
+          onMobileThreadScroll({ collapseHeader: false })
+        }
+      }
+
+      const onMqChange = () => {
+        if (!mq.matches) {
+          onMobileThreadScroll({ collapseHeader: false })
+        }
+      }
+
+      el.addEventListener('scroll', onScroll, { passive: true })
+      mq.addEventListener('change', onMqChange)
+      viewportScrollCleanupRef.current = () => {
+        el.removeEventListener('scroll', onScroll)
+        mq.removeEventListener('change', onMqChange)
+      }
+    },
+    [onMobileThreadScroll],
+  )
+
+  React.useEffect(() => {
+    onMobileThreadScroll?.({ collapseHeader: false })
+  }, [runtimeKey, onMobileThreadScroll])
+
+  React.useEffect(
+    () => () => {
+      viewportScrollCleanupRef.current?.()
+      viewportScrollCleanupRef.current = null
+    },
+    [],
+  )
+
   return (
     <ThreadPaneUiContext.Provider value={uiContextValue}>
       <AssistantRuntimeProvider key={runtimeKey} runtime={runtime}>
-        <div className="aui-root h-full min-h-0 min-w-0">
-          <Thread
-            assistantMessage={{
+        <Thread.Root
+          config={{
+            assistantMessage: {
               allowCopy: false,
               allowReload: false,
               allowSpeak: false,
@@ -305,22 +367,45 @@ export const ThreadPane = React.memo(function ThreadPane({
                 Text: MarkdownText,
                 ToolFallback: ToolCallCard,
               },
-            }}
-            userMessage={{ allowEdit: false }}
-            composer={{ allowAttachments: true }}
-            components={{
+            },
+            userMessage: { allowEdit: false },
+            composer: { allowAttachments: true },
+            components: {
               Composer: DraftAwareComposer,
               AssistantMessage: CustomAssistantMessage,
               UserMessage: CustomUserMessage,
-            }}
-            strings={{
+            },
+            strings: {
               composer: {
                 input: { placeholder: 'Message FinallyAValueBot...' },
               },
-            }}
-            assistantAvatar={{ fallback: 'M' }}
-          />
-        </div>
+            },
+            assistantAvatar: {},
+          }}
+          className="h-full min-h-0 min-w-0"
+        >
+          <div className="mc-thread-shell flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+            <Thread.Viewport ref={bindThreadViewport} className="aui-thread-viewport mc-thread-viewport">
+              <ThreadWelcome />
+              <Thread.Messages
+                components={{
+                  AssistantMessage: CustomAssistantMessage,
+                  UserMessage: CustomUserMessage,
+                }}
+              />
+              <Thread.FollowupSuggestions />
+            </Thread.Viewport>
+            <div
+              className="mc-thread-composer-dock"
+              onFocusCapture={() => onMobileThreadScroll?.({ collapseHeader: false })}
+            >
+              <div className="relative mx-auto w-full max-w-[var(--aui-thread-max-width)] px-2 pb-1 pt-1 md:px-3">
+                <Thread.ScrollToBottom />
+                <DraftAwareComposer />
+              </div>
+            </div>
+          </div>
+        </Thread.Root>
       </AssistantRuntimeProvider>
     </ThreadPaneUiContext.Provider>
   )

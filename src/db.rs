@@ -168,6 +168,10 @@ pub struct BackgroundJob {
     pub finished_at: Option<String>,
     pub result_text: Option<String>,
     pub error_text: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub last_progress_at: Option<String>,
+    pub last_stage: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -401,7 +405,11 @@ impl Database {
                 started_at TEXT,
                 finished_at TEXT,
                 result_text TEXT,
-                error_text TEXT
+                error_text TEXT,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                last_progress_at TEXT,
+                last_stage TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_background_jobs_chat_id
                 ON background_jobs(chat_id);
@@ -530,6 +538,7 @@ impl Database {
         Self::migrate_drop_project_artifacts(&conn)?;
         Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
         Self::migrate_workflow_learning_schema(&conn)?;
+        Self::migrate_background_jobs_lease_schema(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -951,6 +960,38 @@ impl Database {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    fn migrate_background_jobs_lease_schema(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "background_jobs", "lease_owner")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN lease_owner TEXT",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "background_jobs", "lease_expires_at")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN lease_expires_at TEXT",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "background_jobs", "last_progress_at")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN last_progress_at TEXT",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "background_jobs", "last_stage")? {
+            conn.execute("ALTER TABLE background_jobs ADD COLUMN last_stage TEXT", [])?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_background_jobs_lease_expires_at
+             ON background_jobs(lease_expires_at)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -3025,21 +3066,62 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending')",
             params![id, chat_id, persona_id, prompt, trigger_reason, now],
         )?;
         Ok(())
     }
 
-    pub fn mark_background_job_running(&self, id: &str) -> Result<(), FinallyAValueBotError> {
+    pub fn claim_background_job_running(
+        &self,
+        id: &str,
+        lease_owner: &str,
+        lease_ttl_secs: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'running', started_at = ?1 WHERE id = ?2",
-            params![now, id],
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires =
+            (now_dt + chrono::Duration::seconds(lease_ttl_secs.max(1))).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'running',
+                 started_at = COALESCE(started_at, ?1),
+                 lease_owner = ?2,
+                 lease_expires_at = ?3,
+                 last_progress_at = ?1,
+                 last_stage = 'running'
+             WHERE id = ?4 AND status = 'pending'",
+            params![now, lease_owner, lease_expires, id],
         )?;
-        Ok(())
+        Ok(rows == 1)
+    }
+
+    pub fn renew_background_job_lease(
+        &self,
+        id: &str,
+        lease_ttl_secs: i64,
+        stage: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires =
+            (now_dt + chrono::Duration::seconds(lease_ttl_secs.max(1))).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET lease_expires_at = ?1,
+                 last_progress_at = ?2,
+                 last_stage = ?3
+             WHERE id = ?4
+               AND status IN ('running', 'completed_raw', 'main_agent_processing')",
+            params![lease_expires, now, stage, id],
+        )?;
+        if rows == 0 {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub fn mark_background_job_completed_raw(
@@ -3048,34 +3130,74 @@ impl Database {
         result_text: &str,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires = (now_dt + chrono::Duration::seconds(120)).to_rfc3339();
+        let rows = conn.execute(
             "UPDATE background_jobs
-             SET status = 'completed_raw', finished_at = ?1, result_text = ?2
-             WHERE id = ?3",
-            params![now, result_text, id],
+             SET status = 'completed_raw',
+                 finished_at = ?1,
+                 result_text = ?2,
+                 lease_expires_at = ?3,
+                 last_progress_at = ?1,
+                 last_stage = 'completed_raw'
+             WHERE id = ?4",
+            params![now, result_text, lease_expires, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_completed_raw: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
     pub fn mark_background_job_main_agent_processing(
         &self,
         id: &str,
+        lease_ttl_secs: i64,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'main_agent_processing' WHERE id = ?1",
-            params![id],
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires =
+            (now_dt + chrono::Duration::seconds(lease_ttl_secs.max(1))).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'main_agent_processing',
+                 lease_expires_at = ?1,
+                 last_progress_at = ?2,
+                 last_stage = 'main_agent_processing'
+             WHERE id = ?3",
+            params![lease_expires, now, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_main_agent_processing: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
     pub fn mark_background_job_done(&self, id: &str) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'done' WHERE id = ?1",
-            params![id],
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'done',
+                 finished_at = COALESCE(finished_at, ?1),
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_progress_at = ?1,
+                 last_stage = 'done'
+             WHERE id = ?2",
+            params![now, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_done: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
@@ -3086,10 +3208,23 @@ impl Database {
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'failed', finished_at = ?1, error_text = ?2 WHERE id = ?3",
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'failed',
+                 finished_at = ?1,
+                 error_text = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_progress_at = ?1,
+                 last_stage = 'failed'
+             WHERE id = ?3",
             params![now, error_text, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "fail_background_job: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
@@ -3100,23 +3235,53 @@ impl Database {
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'cancelled', finished_at = ?1, error_text = ?2 WHERE id = ?3",
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'cancelled',
+                 finished_at = ?1,
+                 error_text = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_progress_at = ?1,
+                 last_stage = 'cancelled'
+             WHERE id = ?3",
             params![now, reason, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_cancelled: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
     pub fn count_active_background_jobs_for_chat(
         &self,
         chat_id: i64,
+        now_rfc3339: &str,
+        pending_timeout_secs: i64,
     ) -> Result<i64, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "count_active_background_jobs_for_chat: invalid now timestamp: {e}"
+                ))
+            })?;
+        let pending_cutoff =
+            (now - chrono::Duration::seconds(pending_timeout_secs.max(1))).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         let count = conn.query_row(
             "SELECT COUNT(*) FROM background_jobs
              WHERE chat_id = ?1
-               AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
-            params![chat_id],
+               AND (
+                    (status = 'pending' AND created_at >= ?2)
+                    OR (
+                        status IN ('running', 'completed_raw', 'main_agent_processing')
+                        AND COALESCE(lease_expires_at, '9999-12-31T23:59:59+00:00') >= ?3
+                    )
+               )",
+            params![chat_id, pending_cutoff, now_rfc3339],
             |row| row.get::<_, i64>(0),
         )?;
         Ok(count)
@@ -3129,7 +3294,7 @@ impl Database {
     ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
+            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage
              FROM background_jobs
              WHERE chat_id = ?1
              ORDER BY created_at DESC
@@ -3149,6 +3314,10 @@ impl Database {
                     finished_at: row.get(8)?,
                     result_text: row.get(9)?,
                     error_text: row.get(10)?,
+                    lease_owner: row.get(11)?,
+                    lease_expires_at: row.get(12)?,
+                    last_progress_at: row.get(13)?,
+                    last_stage: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3161,7 +3330,7 @@ impl Database {
     ) -> Result<Option<BackgroundJob>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
+            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage
              FROM background_jobs WHERE id = ?1",
             params![id],
             |row| {
@@ -3177,6 +3346,10 @@ impl Database {
                     finished_at: row.get(8)?,
                     result_text: row.get(9)?,
                     error_text: row.get(10)?,
+                    lease_owner: row.get(11)?,
+                    lease_expires_at: row.get(12)?,
+                    last_progress_at: row.get(13)?,
+                    last_stage: row.get(14)?,
                 })
             },
         );
@@ -3382,7 +3555,13 @@ impl Database {
             if job_type == "manual_background" {
                 let _ = conn.execute(
                     "UPDATE background_jobs
-                     SET status = 'failed', finished_at = ?1, error_text = ?2
+                     SET status = 'failed',
+                         finished_at = ?1,
+                         error_text = ?2,
+                         lease_owner = NULL,
+                         lease_expires_at = NULL,
+                         last_progress_at = ?1,
+                         last_stage = 'failed'
                      WHERE id = ?3
                        AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
                     params![now_str, stale_msg, run_key],
@@ -3392,6 +3571,105 @@ impl Database {
         }
 
         Ok(reconciled)
+    }
+
+    /// Fail web background jobs that are still pending and never started within the allowed age.
+    pub fn reconcile_stale_pending_background_jobs(
+        &self,
+        now_rfc3339: &str,
+        max_pending_secs: i64,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "reconcile_stale_pending_background_jobs: invalid now timestamp: {e}"
+                ))
+            })?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at
+             FROM background_jobs
+             WHERE status = 'pending'
+               AND started_at IS NULL",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let stale_msg = "stale pending job — worker never confirmed start";
+        let now_str = now.to_rfc3339();
+        let mut out = Vec::new();
+
+        for (id, created_at) in rows {
+            let Ok(created) = DateTime::parse_from_rfc3339(&created_at) else {
+                continue;
+            };
+            let created = created.with_timezone(&Utc);
+            if now.signed_duration_since(created).num_seconds() <= max_pending_secs {
+                continue;
+            }
+            let n = conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
+                 WHERE id = ?3
+                   AND status = 'pending'
+                   AND started_at IS NULL",
+                params![now_str, stale_msg, id],
+            )?;
+            if n > 0 {
+                out.push(id);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Fail active web background jobs with expired leases.
+    pub fn reconcile_expired_background_job_leases(
+        &self,
+        now_rfc3339: &str,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let stale_msg = "stale lease expired — worker heartbeat not renewed";
+        let mut stmt = conn.prepare(
+            "SELECT id
+             FROM background_jobs
+             WHERE status IN ('running', 'completed_raw', 'main_agent_processing')
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < ?1",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![now_rfc3339], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut out = Vec::new();
+        for id in rows {
+            let n = conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
+                 WHERE id = ?3
+                   AND status IN ('running', 'completed_raw', 'main_agent_processing')",
+                params![now_rfc3339, stale_msg, id],
+            )?;
+            if n > 0 {
+                out.push(id);
+            }
+        }
+        Ok(out)
     }
 
     /// Fail web `background_jobs` rows that never got a heartbeat row but stayed active too long.
@@ -3438,7 +3716,13 @@ impl Database {
             }
             let n = conn.execute(
                 "UPDATE background_jobs
-                 SET status = 'failed', finished_at = ?1, error_text = ?2
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
                  WHERE id = ?3
                    AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
                 params![now_str, stale_msg, id],

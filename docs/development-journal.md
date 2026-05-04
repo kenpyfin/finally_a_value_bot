@@ -18,6 +18,38 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-04 — Web chat: mobile composer zoom guard + centered thread content
+
+- **Area:** web UI / chat thread
+- **Summary:** Restored centered assistant message layout in the web thread by aligning the custom viewport override with assistant-ui defaults (`align-items: center`) and added a mobile composer safeguard (`font-size: 16px` at `max-width: 639px`) to prevent browser auto-zoom when focusing the input.
+- **Rationale:** A recent custom viewport rule made assistant message content appear left-shifted on desktop, and sub-16px composer text could trigger iOS-style focus zoom that caused apparent viewport enlargement and edge overflow on mobile.
+- **Key files / symbols:** `web/src/styles.css` (`.mc-thread-viewport.aui-thread-viewport`, mobile `.mc-thread-composer-dock .aui-composer-input` rule).
+- **Follow-ups:** If zoom still reproduces on larger phones/tablets, expand the 16px composer rule to the `max-width: 767px` breakpoint.
+
+### 2026-05-04 — Mobile chat header hide + docked composer
+
+- **Area:** web UI / chat thread / main shell
+- **Summary:** Replaced the default `<Thread />` layout with `Thread.Root` + `Thread.Viewport` (messages + welcome + follow-ups only) and a sibling **composer dock** below the scroll area so the input is no longer `sticky` inside the message list. On narrow viewports, scrolling the thread down collapses the large header (max-height + opacity); a fixed **compact strip** (hamburger, truncated title, More) stays reachable. `ThreadPane` reports scroll via `onMobileThreadScroll`; `main.tsx` owns `mobileChatHeaderCollapsed` and resets it on thread/persona change, mobile nav open, and composer focus.
+- **Rationale:** Sticky composer over messages felt disconnected on phones; collapsing chrome while reading matches common chat apps while preserving navigation when collapsed.
+- **Key files / symbols:** `web/src/components/thread-pane.tsx` (`Thread.Root`, `Thread.Viewport`, `bindThreadViewport`, `onMobileThreadScroll`); `web/src/main.tsx` (`mobileChatHeaderCollapsed`, `handleMobileThreadScroll`, compact bar, header wrapper); `web/src/styles.css` (`.mc-thread-shell`, `.mc-thread-viewport`, `.mc-thread-composer-dock`).
+- **Follow-ups:** Optional: animate compact bar; tune scroll thresholds.
+
+### 2026-05-03 — Edge-to-edge assistant text on mobile web chat
+
+- **Area:** web UI / chat thread
+- **Summary:** Removed the assistant avatar from `CustomAssistantMessage` and collapsed the assistant message grid to a single column. On viewports ≤639px, assistant bubbles lose border/background/padding so markdown reads nearly full-width; thread viewport horizontal padding is 0; user bubbles stay styled but widen to 92% with tighter padding. Header and thread-area chrome use smaller padding on mobile (`main.tsx`). `assistantAvatar={{ fallback: undefined }}` on `<Thread>` prevents the empty-state welcome letter (the library defaults to `"A"` when the prop is omitted).
+- **Rationale:** Reading long bot replies is the primary use case; avatars and bubble chrome consumed horizontal space on phones.
+- **Key files / symbols:** `web/src/components/thread-pane.tsx` (`CustomAssistantMessage`, `Thread` props); `web/src/styles.css` (`.aui-assistant-message-root`, branch/placeholder/meta-row grid placement, `@media (max-width: 639px)`); `web/src/main.tsx` (header wrapper, hero `pt-14` → `pt-10` on small screens, thread `px-0`).
+- **Follow-ups:** Optional: hide or compact the floating cockpit strip for even more vertical space.
+
+### 2026-05-03 — Web thread reload when manual background jobs finish
+
+- **Area:** web UI / background jobs
+- **Summary:** When a manual background job’s status moves from an active state to `done` / `failed` / `cancelled`, the web app now calls `loadHistory` (and refreshes the persona bulletin when the job matches the active persona). While any background job is active for the chat, `historyPollUntilMs` is extended so the 10s history poll keeps running as a safety net.
+- **Rationale:** The server already persisted the final reply via `deliver_to_contact` in `spawn_background_job`, but the UI only reloaded history briefly after the foreground run ended; long jobs completed after that window so users never saw the result in-thread.
+- **Key files / symbols:** `web/src/main.tsx` (`isTerminalBackgroundJobStatus`, `prevBgJobStatusByIdRef`, effects after `setPendingRunIds` reset).
+- **Follow-ups:** Optional: persist the web handoff interim line via `deliver_to_contact` in `web.rs` so history shows the “queued in background” copy without relying on heartbeat updates.
+
 ### 2026-04-24 — Web chat history pagination restored in hero area
 
 - **Area:** web UI / chat history loading

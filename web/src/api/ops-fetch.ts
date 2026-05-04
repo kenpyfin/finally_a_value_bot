@@ -14,15 +14,17 @@ export type BackgroundJobsSnapshot = {
 
 export async function fetchBackgroundJobsSnapshot(chatId: number): Promise<BackgroundJobsSnapshot> {
   const q = new URLSearchParams({ chat_id: String(chatId) })
-  const data = await api<{ jobs?: BackgroundJobItem[]; active_heartbeats?: unknown[] }>(
+  const data = await api<{ jobs?: BackgroundJobItem[]; active_heartbeats?: unknown[]; active_count?: number }>(
     `/api/background_jobs?${q.toString()}`,
   )
   const jobs = Array.isArray(data.jobs) ? data.jobs : []
-  const activeHeartbeats = Array.isArray(data.active_heartbeats) ? data.active_heartbeats : []
+  const activeCountFromApi = typeof data.active_count === 'number' && Number.isFinite(data.active_count)
+    ? Math.max(0, Math.floor(data.active_count))
+    : null
   const activeByStatus = jobs.filter((j) =>
     ['pending', 'running', 'completed_raw', 'main_agent_processing'].includes(j.status),
   ).length
-  return { jobs, activeCount: Math.max(activeByStatus, activeHeartbeats.length) }
+  return { jobs, activeCount: activeCountFromApi ?? activeByStatus }
 }
 
 export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> {
