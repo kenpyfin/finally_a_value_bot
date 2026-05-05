@@ -18,6 +18,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-04 — Prevent duplicate cross-channel deliveries from duplicate bot instances
+
+- **Area:** channels / delivery fanout / startup
+- **Summary:** Added startup dedupe for Telegram and Discord bot instances that share the same token so only one dispatcher/client is launched per token, and added fanout dedupe in `deliver_to_contact` so each `(channel_type, channel_handle)` target receives at most one copy of a reply even if duplicate bindings exist.
+- **Rationale:** Duplicate bot-instance rows or duplicate bindings could cause the same run to be delivered multiple times, producing repeated bot replies in Telegram and duplicate entries observed in the web UI history.
+- **Key files / symbols:** `src/channels/telegram.rs` (`run_bot` token-owner dedupe for Telegram/Discord instances), `src/channel.rs` (`deliver_to_contact` target dedupe via `HashSet`), `docs/development-journal.md`.
+- **Follow-ups:** Consider a DB-level cleanup/migration utility to remove duplicate `channel_bindings` rows and duplicate bot-instance tokens automatically.
+
 ### 2026-05-04 — Secret redaction + sensitive path hardening for TSA/tool loop
 
 - **Area:** agent safety / tools / channels

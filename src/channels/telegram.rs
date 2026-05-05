@@ -138,12 +138,22 @@ pub async fn run_bot(
     let telegram_enabled = !config.telegram_bot_token.trim().is_empty();
 
     let mut telegram_bots_map: HashMap<i64, Bot> = HashMap::new();
+    let mut telegram_token_owner: HashMap<String, i64> = HashMap::new();
     let tg_rows = db.list_channel_bot_instances_by_platform("telegram")?;
     for row in tg_rows {
-        if row.token.trim().is_empty() {
+        let token = row.token.trim();
+        if token.is_empty() {
             continue;
         }
-        telegram_bots_map.insert(row.id, Bot::new(row.token.as_str()));
+        if let Some(existing_id) = telegram_token_owner.get(token) {
+            warn!(
+                "Skipping duplicate Telegram bot instance {} (same token already owned by instance {})",
+                row.id, existing_id
+            );
+            continue;
+        }
+        telegram_token_owner.insert(token.to_string(), row.id);
+        telegram_bots_map.insert(row.id, Bot::new(token));
     }
     if telegram_bots_map.is_empty() && telegram_enabled {
         telegram_bots_map.insert(
@@ -209,13 +219,23 @@ pub async fn run_bot(
 
     let mut discord_http_map: HashMap<i64, Arc<SerenityHttp>> = HashMap::new();
     let mut discord_launches: Vec<(i64, String)> = Vec::new();
+    let mut discord_token_owner: HashMap<String, i64> = HashMap::new();
     let dc_rows = db.list_channel_bot_instances_by_platform("discord")?;
     for row in dc_rows {
-        if row.token.trim().is_empty() {
+        let token = row.token.trim();
+        if token.is_empty() {
             continue;
         }
-        discord_launches.push((row.id, row.token.clone()));
-        discord_http_map.insert(row.id, Arc::new(SerenityHttp::new(row.token.as_str())));
+        if let Some(existing_id) = discord_token_owner.get(token) {
+            warn!(
+                "Skipping duplicate Discord bot instance {} (same token already owned by instance {})",
+                row.id, existing_id
+            );
+            continue;
+        }
+        discord_token_owner.insert(token.to_string(), row.id);
+        discord_launches.push((row.id, token.to_string()));
+        discord_http_map.insert(row.id, Arc::new(SerenityHttp::new(token)));
     }
     if discord_http_map.is_empty() {
         if let Some(ref t) = config.discord_bot_token {

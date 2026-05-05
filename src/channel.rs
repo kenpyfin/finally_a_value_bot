@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -177,6 +177,7 @@ pub async fn deliver_to_contact(
         policy_by_instance.insert(p.bot_instance_id, (p.mode, p.persona_id));
     }
 
+    let mut delivered_targets: HashSet<(String, String)> = HashSet::new();
     for b in &bindings {
         if let Some((mode, policy_persona_id)) = policy_by_instance.get(&b.bot_instance_id) {
             if *mode == crate::db::ChannelPersonaMode::Single
@@ -185,6 +186,10 @@ pub async fn deliver_to_contact(
             {
                 continue;
             }
+        }
+        let target_key = (b.channel_type.clone(), b.channel_handle.clone());
+        if !delivered_targets.insert(target_key) {
+            continue;
         }
         match b.channel_type.as_str() {
             "telegram" => {
