@@ -98,9 +98,9 @@ mod tests {
 
     #[test]
     fn redacts_apify_tokens() {
-        let input = "token=apify_api_lLLWRw8DBX4S99wN4ra4XRlLC1nkpv30zPHo";
+        let input = "token=test_api_lLLWRw8DBX4S99wN4ra4XRlLC1nkpv30zPHo";
         let output = redact_secrets(input);
-        assert!(!output.contains("apify_api_"));
+        assert!(!output.contains("test_api_"));
         assert!(output.contains("[REDACTED_SECRET]"));
     }
 
