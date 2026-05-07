@@ -137,6 +137,13 @@ pub struct ChatRunQueue {
     runs: Arc<Mutex<RunRegistry>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueRemoveOutcome {
+    Removed,
+    Running,
+    NotFound,
+}
+
 impl ChatRunQueue {
     /// Enqueue a task for a chat-scoped FIFO lane.
     /// Returns 1-based queue position and the cancel handle for cooperative cancellation.
@@ -204,12 +211,6 @@ impl ChatRunQueue {
                         );
                     }
                     let run_id = task.run_id.clone();
-                    {
-                        let mut lanes = queue.lanes.lock().await;
-                        if let Some(lane) = lanes.get_mut(&chat_id_worker) {
-                            lane.current_run_id = Some(run_id.clone());
-                        }
-                    }
                     let skip = {
                         let guard = queue.runs.lock().await;
                         guard
@@ -220,6 +221,12 @@ impl ChatRunQueue {
                     if skip {
                         queue.finish_one(chat_id_worker, &run_id).await;
                         continue;
+                    }
+                    {
+                        let mut lanes = queue.lanes.lock().await;
+                        if let Some(lane) = lanes.get_mut(&chat_id_worker) {
+                            lane.current_run_id = Some(run_id.clone());
+                        }
                     }
 
                     // Isolate each queue task so a panic cannot kill the lane worker.
@@ -318,15 +325,20 @@ impl ChatRunQueue {
         }
         let mut lanes = self.lanes.lock().await;
         let remove_lane = if let Some(lane) = lanes.get_mut(&chat_id) {
-            if lane.current_run_id.as_deref() == Some(run_id) {
+            let was_running = lane.current_run_id.as_deref() == Some(run_id);
+            if was_running {
                 lane.current_run_id = None;
             }
+            let mut removed_from_items = false;
             if let Some(front) = lane.items.front() {
                 if front.run_id == run_id {
                     lane.items.pop_front();
+                    removed_from_items = true;
                 }
             }
-            lane.pending = lane.pending.saturating_sub(1);
+            if was_running || removed_from_items {
+                lane.pending = lane.pending.saturating_sub(1);
+            }
             if lane.pending == 0 {
                 lane.oldest_enqueued_at = None;
             }
@@ -365,6 +377,63 @@ impl ChatRunQueue {
         }
         warn!(chat_id, run_id, "queue cancel requested for unknown run");
         false
+    }
+
+    /// Remove a queued (not currently running) item.
+    pub async fn request_remove_queued(&self, run_id: &str, chat_id: i64) -> QueueRemoveOutcome {
+        let cancel = {
+            let guard = self.runs.lock().await;
+            guard.get(run_id).and_then(|(cid, c)| {
+                if *cid == chat_id {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        let Some(cancel) = cancel else {
+            warn!(chat_id, run_id, "queue remove requested for unknown run");
+            return QueueRemoveOutcome::NotFound;
+        };
+
+        let mut lanes = self.lanes.lock().await;
+        let Some(lane) = lanes.get_mut(&chat_id) else {
+            warn!(
+                chat_id,
+                run_id, "queue remove requested but lane missing for chat"
+            );
+            return QueueRemoveOutcome::NotFound;
+        };
+
+        if lane.current_run_id.as_deref() == Some(run_id) {
+            info!(
+                chat_id,
+                run_id, "queue remove rejected because run is currently running"
+            );
+            return QueueRemoveOutcome::Running;
+        }
+
+        let idx = lane.items.iter().position(|e| e.run_id == run_id);
+        let Some(idx) = idx else {
+            warn!(
+                chat_id,
+                run_id, "queue remove requested but run is not queued"
+            );
+            return QueueRemoveOutcome::NotFound;
+        };
+
+        lane.items.remove(idx);
+        lane.pending = lane.pending.saturating_sub(1);
+        if lane.pending == 0 {
+            lane.oldest_enqueued_at = None;
+        }
+        cancel.store(true, Ordering::SeqCst);
+        info!(chat_id, run_id, "queue remove accepted for queued run");
+
+        if lane.pending == 0 {
+            lanes.remove(&chat_id);
+        }
+        QueueRemoveOutcome::Removed
     }
 
     pub async fn diagnostics(&self) -> Vec<LaneDiagnostic> {

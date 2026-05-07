@@ -658,6 +658,10 @@ html:not(.dark) .aui-composer-send:hover {
   height: auto;
   width: 100%;
   align-items: center;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 html.dark .mc-thread-composer-dock {
@@ -914,12 +918,23 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   opacity: 0.65;
 }
 
-/* Narrow screens: flat assistant text (no bubble) with comfortable side gutters */
-@media (max-width: 639px) {
+/* Mobile screens: flat assistant text (no bubble) with comfortable side gutters */
+@media (max-width: 767px) {
+  html,
+  body {
+    overflow: hidden;
+    overscroll-behavior-y: none;
+  }
+
+  #root {
+    overflow: hidden;
+  }
+
   html.dark .aui-thread-viewport,
   html:not(.dark) .aui-thread-viewport {
     padding-left: max(0.875rem, env(safe-area-inset-left, 0px));
     padding-right: max(0.875rem, env(safe-area-inset-right, 0px));
+    scroll-behavior: auto;
   }
 
   html.dark .aui-assistant-message-root,
@@ -935,15 +950,29 @@ html.dark *::-webkit-scrollbar-thumb:hover {
     box-shadow: none;
     border-radius: 0;
     /* Extra inset so long paragraphs do not feel glued to the gutter line */
-    padding: 0.125rem 0.25rem;
+    max-width: 100%;
+    padding: 0.125rem 0.5rem;
     margin-top: 0;
     margin-bottom: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   html.dark .aui-user-message-content,
   html:not(.dark) .aui-user-message-content {
     max-width: 92%;
     padding: 0.625rem 0.875rem;
+  }
+
+  html.dark .aui-assistant-message-content pre,
+  html:not(.dark) .aui-assistant-message-content pre {
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  html.dark .aui-assistant-message-content code,
+  html:not(.dark) .aui-assistant-message-content code {
+    word-break: break-word;
   }
 
   .mc-assistant-placeholder {
@@ -962,13 +991,25 @@ html.dark *::-webkit-scrollbar-thumb:hover {
 
   .mc-thread-composer-dock .aui-composer-root {
     border-radius: 10px;
-    padding-left: 0.35rem;
-    padding-right: 0.35rem;
+    padding-left: 0.45rem;
+    padding-right: 0.45rem;
   }
 
   .mc-thread-composer-dock .aui-composer-input {
     font-size: 16px;
-    padding-top: 0.65rem;
-    padding-bottom: 0.65rem;
+    line-height: 1.35;
+    padding-top: 0.7rem;
+    padding-bottom: 0.7rem;
+  }
+
+  .mc-thread-composer-dock {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .mc-thread-composer-dock .aui-composer-send,
+  .mc-thread-composer-dock .aui-composer-cancel,
+  .mc-thread-composer-dock .aui-composer-attach {
+    width: 2.2rem;
+    height: 2.2rem;
   }
 }

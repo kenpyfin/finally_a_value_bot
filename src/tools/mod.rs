@@ -37,7 +37,7 @@ use teloxide::prelude::*;
 use crate::claude::ToolDefinition;
 use crate::config::Config;
 use crate::db::Database;
-use crate::safety_redaction::redact_secrets;
+use crate::safety_redaction::redact_secrets_internal;
 
 pub struct ToolResult {
     pub content: String,
@@ -520,7 +520,7 @@ impl ToolRegistry {
             if tool.name() == name {
                 let started = Instant::now();
                 let mut result = tool.execute(input).await;
-                result.content = redact_secrets(&result.content);
+                result.content = redact_secrets_internal(&result.content);
                 result.duration_ms = Some(started.elapsed().as_millis());
                 result.bytes = result.content.len();
                 if result.is_error && result.error_type.is_none() {

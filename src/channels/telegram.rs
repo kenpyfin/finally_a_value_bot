@@ -26,7 +26,7 @@ use crate::db::{call_blocking, Database, StoredMessage};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::post_tool_evaluator::{evaluate_completion, PteAction};
-use crate::safety_redaction::redact_secrets;
+use crate::safety_redaction::{redact_secrets_internal, redact_secrets_user_visible};
 use crate::skills::SkillManager;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
@@ -1365,6 +1365,26 @@ pub async fn process_with_agent(
     process_with_agent_with_events(state, context, override_prompt, image_data, None, None).await
 }
 
+fn cancel_requested(cancel: Option<&Arc<AtomicBool>>) -> bool {
+    cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false)
+}
+
+async fn await_with_cancel<F, T>(fut: F, cancel: Option<&Arc<AtomicBool>>) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    loop {
+        if cancel_requested(cancel) {
+            return Err(());
+        }
+        tokio::select! {
+            output = &mut fut => return Ok(output),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+}
+
 pub async fn process_with_agent_with_events(
     state: &AppState,
     context: AgentRequestContext<'_>,
@@ -2057,14 +2077,17 @@ pub async fn process_with_agent_with_events(
             } else {
                 Some(tool_defs.clone())
             };
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                state.llm.send_message(&system_prompt, messages, tool_defs),
+            match await_with_cancel(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
+                    state.llm.send_message(&system_prompt, messages, tool_defs),
+                ),
+                cancel.as_ref(),
             )
             .await
             {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(e))) => {
                     info!(
                         "Main agent iteration {}/{}: LLM error after {}ms: {}",
                         iteration + 1,
@@ -2075,7 +2098,7 @@ pub async fn process_with_agent_with_events(
                     save_run_history!("llm_error");
                     return Err(e.into());
                 }
-                Err(_) => {
+                Ok(Err(_)) => {
                     info!(
                         "Main agent iteration {}/{}: LLM timed out after {}s",
                         iteration + 1,
@@ -2084,6 +2107,14 @@ pub async fn process_with_agent_with_events(
                     );
                     save_run_history!("llm_timeout");
                     return Ok("The request took too long after the last step. Please try again or break your request into smaller steps.".to_string());
+                }
+                Err(()) => {
+                    info!(
+                        "Main agent iteration {}/{}: LLM wait interrupted by cancel request",
+                        iteration + 1,
+                        state.config.max_tool_iterations
+                    );
+                    return Ok("Run cancelled.".to_string());
                 }
             }
         };
@@ -2228,12 +2259,14 @@ pub async fn process_with_agent_with_events(
             let mut iteration_timed_out = false;
             let mut history_tool_calls: Vec<ToolCallRecord> = Vec::new();
             let mut force_stall_response: Option<String> = None;
+            let mut executed_tool_names: Vec<String> = Vec::new();
 
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse {
                     id, name, input, ..
                 } = block
                 {
+                    executed_tool_names.push(name.clone());
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolStart {
                             tool_use_id: id.clone(),
@@ -2262,7 +2295,7 @@ pub async fn process_with_agent_with_events(
                     } else {
                         input_str
                     };
-                    let input_preview = redact_secrets(&input_preview);
+                    let input_preview = redact_secrets_internal(&input_preview);
                     info!(
                         "Main agent iteration {}/{}: executing tool={}, input={}",
                         iteration + 1,
@@ -2355,16 +2388,19 @@ pub async fn process_with_agent_with_events(
                         )
                         .with_error_type("skill_required")
                     } else {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
-                            state
-                                .tools
-                                .execute_with_auth(name, input.clone(), &tool_auth),
+                        match await_with_cancel(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
+                                state
+                                    .tools
+                                    .execute_with_auth(name, input.clone(), &tool_auth),
+                            ),
+                            cancel.as_ref(),
                         )
                         .await
                         {
-                            Ok(tool_result) => tool_result,
-                            Err(_) => {
+                            Ok(Ok(tool_result)) => tool_result,
+                            Ok(Err(_)) => {
                                 info!(
                                     "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
                                     iteration + 1,
@@ -2387,6 +2423,15 @@ pub async fn process_with_agent_with_events(
                                     error_type: Some("timeout".into()),
                                 }
                             }
+                            Err(()) => {
+                                info!(
+                                    "Main agent iteration {}/{}: tool={} interrupted by cancel request",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    name
+                                );
+                                return Ok("Run cancelled.".to_string());
+                            }
                         }
                     };
                     if activates_required_schedule_skill && !result.is_error {
@@ -2407,7 +2452,7 @@ pub async fn process_with_agent_with_events(
                     } else {
                         result.content.clone()
                     };
-                    let result_preview = redact_secrets(&result_preview);
+                    let result_preview = redact_secrets_internal(&result_preview);
                     info!(
                         "Main agent iteration {}/{}: tool={} {}completed in {}ms, result_len={}, is_error={}, preview=\"{}\"",
                         iteration + 1,
@@ -2502,11 +2547,14 @@ pub async fn process_with_agent_with_events(
                     .await;
                     history_tool_calls.push(ToolCallRecord {
                         name: name.clone(),
-                        input_preview: redact_secrets(&truncate_preview(
+                        input_preview: redact_secrets_internal(&truncate_preview(
                             &serde_json::to_string(input).unwrap_or_default(),
                             10000,
                         )),
-                        result_preview: redact_secrets(&truncate_preview(&result.content, 10000)),
+                        result_preview: redact_secrets_internal(&truncate_preview(
+                            &result.content,
+                            10000,
+                        )),
                         duration_ms: result
                             .duration_ms
                             .unwrap_or_else(|| started.elapsed().as_millis()),
@@ -2547,6 +2595,56 @@ pub async fn process_with_agent_with_events(
                 return Ok(stall_text);
             }
 
+            // If this iteration only wrote memory, return the assistant's authored
+            // answer directly instead of requiring another LLM round-trip.
+            if !iteration_timed_out
+                && !assistant_text.trim().is_empty()
+                && !executed_tool_names.is_empty()
+                && executed_tool_names
+                    .iter()
+                    .all(|name| is_memory_write_tool(name))
+            {
+                let display_text = if state.config.show_thinking {
+                    assistant_text.clone()
+                } else {
+                    strip_thinking(&assistant_text)
+                };
+                let guarded_text = apply_output_safeguards(&display_text, &state.config);
+                let final_text = if guarded_text.trim().is_empty() {
+                    "Done.".to_string()
+                } else {
+                    guarded_text
+                };
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(AgentEvent::FinalResponse {
+                        text: final_text.clone(),
+                    });
+                }
+                info!(
+                    "Main agent finished: stop_reason=tool_use(memory_write_short_circuit), final_response_len={}, total_iterations={}",
+                    final_text.len(),
+                    iteration + 1
+                );
+                if should_run_memory_maintenance(
+                    context.is_background_job,
+                    &messages,
+                    final_text.len(),
+                    true,
+                ) {
+                    run_memory_maintenance_after_response(
+                        state,
+                        chat_id,
+                        persona_id,
+                        context.caller_channel,
+                        &system_prompt,
+                        &messages,
+                    )
+                    .await;
+                }
+                save_run_history!("memory_write_short_circuit");
+                return Ok(final_text);
+            }
+
             // Post-Tool Evaluator: check if task is complete after tool execution
             if !iteration_timed_out {
                 if state.config.post_tool_evaluator_enabled {
@@ -2557,16 +2655,27 @@ pub async fn process_with_agent_with_events(
                     );
                 }
                 let pte_start = std::time::Instant::now();
-                match evaluate_completion(
-                    &state.config,
-                    &principles_content,
-                    &memory_context,
-                    &messages,
-                    iteration,
+                match await_with_cancel(
+                    evaluate_completion(
+                        &state.config,
+                        &principles_content,
+                        &memory_context,
+                        &messages,
+                        iteration,
+                    ),
+                    cancel.as_ref(),
                 )
                 .await
                 {
-                    Ok(pte_result) if pte_result.action == PteAction::Complete => {
+                    Err(()) => {
+                        info!(
+                            "Main agent iteration {}/{}: PTE evaluation interrupted by cancel request",
+                            iteration + 1,
+                            state.config.max_tool_iterations
+                        );
+                        return Ok("Run cancelled.".to_string());
+                    }
+                    Ok(Ok(pte_result)) if pte_result.action == PteAction::Complete => {
                         info!(
                             "Main agent iteration {}/{}: PTE decision=COMPLETE in {}ms, reason=\"{}\" — synthesizing final response",
                             iteration + 1,
@@ -2575,16 +2684,19 @@ pub async fn process_with_agent_with_events(
                             pte_result.reason
                         );
                         let synth_start = std::time::Instant::now();
-                        let final_response = match tokio::time::timeout(
-                            std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                            state
-                                .llm
-                                .send_message(&system_prompt, messages.clone(), None),
+                        let final_response = match await_with_cancel(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
+                                state
+                                    .llm
+                                    .send_message(&system_prompt, messages.clone(), None),
+                            ),
+                            cancel.as_ref(),
                         )
                         .await
                         {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(e)) => {
+                            Ok(Ok(Ok(r))) => r,
+                            Ok(Ok(Err(e))) => {
                                 info!(
                                     "Main agent iteration {}/{}: PTE synthesis LLM error after {}ms: {}",
                                     iteration + 1,
@@ -2594,7 +2706,7 @@ pub async fn process_with_agent_with_events(
                                 );
                                 return Err(e.into());
                             }
-                            Err(_) => {
+                            Ok(Err(_)) => {
                                 info!(
                                     "Main agent iteration {}/{}: PTE synthesis LLM timed out after {}s",
                                     iteration + 1,
@@ -2602,6 +2714,14 @@ pub async fn process_with_agent_with_events(
                                     LLM_ROUND_TIMEOUT_SECS
                                 );
                                 return Ok("Task completed, but I couldn't generate a final summary in time.".to_string());
+                            }
+                            Err(()) => {
+                                info!(
+                                    "Main agent iteration {}/{}: PTE synthesis interrupted by cancel request",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations
+                                );
+                                return Ok("Run cancelled.".to_string());
                             }
                         };
 
@@ -2667,7 +2787,7 @@ pub async fn process_with_agent_with_events(
                         save_run_history!("pte_complete");
                         return Ok(final_text);
                     }
-                    Ok(pte_result) if pte_result.action == PteAction::AskUser => {
+                    Ok(Ok(pte_result)) if pte_result.action == PteAction::AskUser => {
                         let ask_text = format!(
                             "I paused because progress is stalled: {}. Choose: retry now, wait, or adjust the request.",
                             pte_result.reason
@@ -2680,7 +2800,7 @@ pub async fn process_with_agent_with_events(
                         save_run_history!("pte_ask_user");
                         return Ok(ask_text);
                     }
-                    Ok(pte_result) if pte_result.action == PteAction::StopWithSummary => {
+                    Ok(Ok(pte_result)) if pte_result.action == PteAction::StopWithSummary => {
                         let summary_text = format!(
                             "I stopped this run to avoid repeated no-progress loops. {}",
                             pte_result.reason
@@ -2693,7 +2813,7 @@ pub async fn process_with_agent_with_events(
                         save_run_history!("pte_stop_with_summary");
                         return Ok(summary_text);
                     }
-                    Ok(pte_result) if pte_result.action == PteAction::HandoffBackground => {
+                    Ok(Ok(pte_result)) if pte_result.action == PteAction::HandoffBackground => {
                         if context.caller_channel == "web" && !context.is_background_job {
                             save_run_history!("pte_background_handoff");
                             return Ok(format!(
@@ -2702,7 +2822,7 @@ pub async fn process_with_agent_with_events(
                             ));
                         }
                     }
-                    Ok(pte_result) => {
+                    Ok(Ok(pte_result)) => {
                         if state.config.post_tool_evaluator_enabled {
                             info!(
                                 "Main agent iteration {}/{}: PTE decision=CONTINUE in {}ms, reason=\"{}\"",
@@ -2713,7 +2833,7 @@ pub async fn process_with_agent_with_events(
                             );
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         info!(
                             "Main agent iteration {}/{}: PTE evaluation FAILED in {}ms, continuing: {}",
                             iteration + 1,
@@ -3216,6 +3336,17 @@ fn should_apply_generic_loop_guard(tool_name: &str) -> bool {
             | "read_agent_history"
             | "read_memory"
             | "read_tiered_memory"
+    )
+}
+
+fn is_memory_write_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "write_memory"
+            | "write_tiered_memory"
+            | "tiered_memory_write"
+            | "write_memory_state"
+            | "patch_memory_state"
     )
 }
 
@@ -3808,7 +3939,7 @@ pub fn balance_markdown(text: &str) -> String {
 }
 
 fn apply_output_safeguards(text: &str, config: &Config) -> String {
-    let sanitized = redact_secrets(text);
+    let sanitized = redact_secrets_user_visible(text);
     let mode = config.safety_output_guard_mode.as_str();
     if mode == "off" {
         return sanitized;

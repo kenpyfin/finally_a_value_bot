@@ -1301,13 +1301,25 @@ function App() {
     await loadQueueDiagnostics(chatId)
   }
 
-  async function handleQueueStop(runId: string): Promise<void> {
+  async function removeQueueRun(runId: string): Promise<void> {
+    await api('/api/queue/remove', {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId, chat_id: chatId ?? undefined }),
+    })
+    await loadQueueDiagnostics(chatId)
+  }
+
+  async function handleQueueAction(runId: string, state: string): Promise<void> {
     const id = runId.trim()
     if (!id) return
     if (stoppingRunIds.includes(id)) return
     setStoppingRunIds((prev) => (prev.includes(id) ? prev : [...prev, id]))
     try {
-      await cancelQueueRun(id)
+      if (state === 'running') {
+        await cancelQueueRun(id)
+      } else {
+        await removeQueueRun(id)
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1522,8 +1534,20 @@ function App() {
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}`
 
-  const handleMobileThreadScroll = useCallback((opts: { collapseHeader: boolean }) => {
-    setMobileChatHeaderCollapsed(opts.collapseHeader)
+  const handleMobileThreadScroll = useCallback((opts: {
+    collapseHeader: boolean
+    source: 'scroll' | 'reset' | 'focus' | 'media-change'
+    scrollTop?: number
+  }) => {
+    if (opts.source !== 'scroll') {
+      setMobileChatHeaderCollapsed(false)
+      return
+    }
+    if ((opts.scrollTop ?? 0) < 28) {
+      setMobileChatHeaderCollapsed(false)
+      return
+    }
+    setMobileChatHeaderCollapsed((prev) => (prev === opts.collapseHeader ? prev : opts.collapseHeader))
   }, [])
 
   useEffect(() => {
@@ -1603,8 +1627,8 @@ function App() {
       <div
         className={
           appearance === 'dark'
-            ? 'h-[100dvh] min-w-0 w-full overflow-x-hidden bg-[var(--mc-bg-main)] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
-            : 'h-[100dvh] min-w-0 w-full overflow-x-hidden bg-[radial-gradient(1200px_560px_at_-8%_-10%,#d1fae5_0%,transparent_58%),radial-gradient(1200px_560px_at_108%_-12%,#e0f2fe_0%,transparent_58%),#f8fafc] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
+            ? 'h-[100dvh] min-w-0 w-full overflow-hidden bg-[var(--mc-bg-main)] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
+            : 'h-[100dvh] min-w-0 w-full overflow-hidden bg-[radial-gradient(1200px_560px_at_-8%_-10%,#d1fae5_0%,transparent_58%),radial-gradient(1200px_560px_at_108%_-12%,#e0f2fe_0%,transparent_58%),#f8fafc] pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)]'
         }
       >
         {mobileNavOpen ? (
@@ -1693,84 +1717,18 @@ function App() {
                 : 'flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-white/95'
             }
           >
-            {mobileChatHeaderCollapsed ? (
-              <div
-                className={
-                  appearance === 'dark'
-                    ? 'fixed left-0 right-0 top-0 z-30 flex h-11 shrink-0 items-center gap-2 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/98 px-2 backdrop-blur-sm md:hidden'
-                    : 'fixed left-0 right-0 top-0 z-30 flex h-11 shrink-0 items-center gap-2 border-b border-slate-200 bg-white/98 px-2 backdrop-blur-sm md:hidden'
-                }
-              >
-                <IconButton
-                  size="3"
-                  variant="soft"
-                  color="gray"
-                  className="shrink-0 min-h-9 min-w-9"
-                  type="button"
-                  aria-expanded={mobileNavOpen}
-                  aria-haspopup="dialog"
-                  aria-controls="mobile-session-sidebar-panel"
-                  aria-label="Open personas and theme"
-                  title="Personas & theme"
-                  onClick={() => setMobileNavOpen(true)}
-                >
-                  <svg
-                    className="size-5 shrink-0"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden
-                  >
-                    <path d="M4 6h16M4 12h16M4 18h16" />
-                  </svg>
-                </IconButton>
-                <Heading size="3" className="min-w-0 flex-1 truncate">
-                  {selectedSessionLabel}
-                </Heading>
-                <div className="shrink-0">
-                  <DropdownMenu.Root>
-                    <DropdownMenu.Trigger>
-                      <Button size="1" variant="soft" type="button" className="min-h-9">
-                        More
-                      </Button>
-                    </DropdownMenu.Trigger>
-                    <DropdownMenu.Content size="2">
-                      <DropdownMenu.Item onSelect={() => setSettingsDialogOpen(true)}>Settings</DropdownMenu.Item>
-                      <DropdownMenu.Item onSelect={() => setSchedulesDialogOpen(true)}>Schedules</DropdownMenu.Item>
-                      <DropdownMenu.Item onSelect={() => setAgentsMdOpen(true)}>Principles</DropdownMenu.Item>
-                      <DropdownMenu.Item onSelect={() => setArtifactsDialogOpen(true)}>Artifacts</DropdownMenu.Item>
-                      <DropdownMenu.Item onSelect={() => setMemoryDialogOpen(true)}>Memory</DropdownMenu.Item>
-                      <DropdownMenu.Item
-                        disabled={activePersonaId == null}
-                        onSelect={() => {
-                          if (activePersonaId != null) setAgentHistoryDialogOpen(true)
-                        }}
-                      >
-                        Last agent run
-                      </DropdownMenu.Item>
-                    </DropdownMenu.Content>
-                  </DropdownMenu.Root>
-                </div>
-              </div>
-            ) : null}
-            <div
-              className={
-                mobileChatHeaderCollapsed
-                  ? 'max-md:max-h-0 max-md:overflow-hidden max-md:opacity-0 max-md:transition-[max-height,opacity] max-md:duration-200 max-md:ease-out md:max-h-none md:opacity-100'
-                  : 'max-md:overflow-visible max-md:opacity-100 max-md:transition-[max-height,opacity] max-md:duration-200 max-md:ease-out'
-              }
-            >
             <header
               className={
                 appearance === 'dark'
-                  ? 'max-md:relative z-10 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/95 backdrop-blur-sm md:sticky md:top-0'
-                  : 'max-md:relative z-10 border-b border-slate-200 bg-white/92 backdrop-blur-sm md:sticky md:top-0'
+                  ? 'sticky top-0 z-30 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/95 backdrop-blur-sm md:top-0'
+                  : 'sticky top-0 z-30 border-b border-slate-200 bg-white/92 backdrop-blur-sm md:top-0'
               }
             >
-              <div className="px-3 py-2 md:px-4 md:py-3">
+              <div
+                className={`px-3 transition-[padding] duration-200 max-md:ease-out md:px-4 md:py-3 ${
+                  mobileChatHeaderCollapsed ? 'max-md:py-1.5' : 'max-md:py-2'
+                }`}
+              >
               <Flex
                 justify="between"
                 align="center"
@@ -1778,12 +1736,16 @@ function App() {
                 wrap="wrap"
                 className="w-full flex-col md:flex-row md:flex-wrap"
               >
-                <Flex align="center" gap="2" className="min-h-[44px] min-w-0 w-full md:flex-1">
+                <Flex
+                  align="center"
+                  gap="2"
+                  className={`min-w-0 w-full md:flex-1 ${mobileChatHeaderCollapsed ? 'min-h-[40px]' : 'min-h-[44px]'}`}
+                >
                   <IconButton
                     size="3"
                     variant="soft"
                     color="gray"
-                    className="shrink-0 md:!hidden min-h-10 min-w-10"
+                    className={`shrink-0 md:!hidden ${mobileChatHeaderCollapsed ? 'min-h-9 min-w-9' : 'min-h-10 min-w-10'}`}
                     type="button"
                     aria-expanded={mobileNavOpen}
                     aria-haspopup="dialog"
@@ -1820,13 +1782,23 @@ function App() {
                       {desktopSidebarOpen ? '⟨' : '⟩'}
                     </span>
                   </IconButton>
-                  <Heading size="6" className="min-w-0 flex-1 truncate max-md:[font-size:1.125rem]">
+                  <Heading
+                    size="6"
+                    className={`min-w-0 flex-1 truncate transition-[font-size] duration-200 max-md:ease-out ${
+                      mobileChatHeaderCollapsed ? 'max-md:[font-size:1rem]' : 'max-md:[font-size:1.125rem]'
+                    }`}
+                  >
                     {selectedSessionLabel}
                   </Heading>
                   <div className="ml-auto shrink-0 md:hidden">
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger>
-                        <Button size="2" variant="soft" type="button" className="min-h-10">
+                        <Button
+                          size="2"
+                          variant="soft"
+                          type="button"
+                          className={mobileChatHeaderCollapsed ? 'min-h-9' : 'min-h-10'}
+                        >
                           More
                         </Button>
                       </DropdownMenu.Trigger>
@@ -2077,7 +2049,7 @@ function App() {
                     <Dialog.Content style={{ maxWidth: 920 }}>
                       <Dialog.Title>Run queue</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
-                        Pending and running agent work for this chat (FIFO). Stop requests cooperative cancellation between iterations.
+                        Pending and running agent work for this chat (FIFO). Queued items can be removed immediately; running items can be stopped.
                       </Dialog.Description>
                       <div className="max-h-[min(420px,60vh)] overflow-auto rounded-md border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
                         {(queueLane?.items?.length ?? 0) === 0 ? (
@@ -2100,6 +2072,7 @@ function App() {
                               <tbody>
                                 {(queueLane?.items ?? []).map((it) => {
                                   const isStopping = stoppingRunIds.includes(it.run_id)
+                                  const isRunning = it.state === 'running'
                                   return (
                                     <tr key={it.run_id} className="border-t border-[color:var(--gray-6)] align-top">
                                       <td className="p-1 pr-2 font-mono text-xs">{it.position}</td>
@@ -2115,9 +2088,11 @@ function App() {
                                           variant="soft"
                                           color="red"
                                           disabled={isStopping}
-                                          onClick={() => void handleQueueStop(it.run_id)}
+                                          onClick={() => void handleQueueAction(it.run_id, it.state)}
                                         >
-                                          {isStopping ? 'Stopping...' : 'Stop'}
+                                          {isStopping
+                                            ? (isRunning ? 'Stopping...' : 'Removing...')
+                                            : (isRunning ? 'Stop' : 'Remove')}
                                         </Button>
                                       </td>
                                     </tr>
@@ -2128,6 +2103,7 @@ function App() {
                             <div className="flex flex-col gap-2 md:hidden">
                               {(queueLane?.items ?? []).map((it) => {
                                 const isStopping = stoppingRunIds.includes(it.run_id)
+                                const isRunning = it.state === 'running'
                                 return (
                                   <div
                                     key={it.run_id}
@@ -2146,9 +2122,11 @@ function App() {
                                         variant="soft"
                                         color="red"
                                         disabled={isStopping}
-                                        onClick={() => void handleQueueStop(it.run_id)}
+                                        onClick={() => void handleQueueAction(it.run_id, it.state)}
                                       >
-                                        {isStopping ? 'Stopping...' : 'Stop'}
+                                        {isStopping
+                                          ? (isRunning ? 'Stopping...' : 'Removing...')
+                                          : (isRunning ? 'Stop' : 'Remove')}
                                       </Button>
                                     </Flex>
                                     <Text size="1" color="gray" className="mb-1 block">
@@ -2983,16 +2961,21 @@ function App() {
               </Flex>
               </div>
             </header>
-            </div>
 
             <div
               className={
                 appearance === 'dark'
-                  ? `relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]${mobileChatHeaderCollapsed ? ' max-md:pt-11' : ''}`
-                  : `relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]${mobileChatHeaderCollapsed ? ' max-md:pt-11' : ''}`
+                  ? 'relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,var(--mc-bg-panel),var(--mc-bg-main)_28%)]'
+                  : 'relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]'
               }
             >
-              <div className="pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2">
+              <div
+                className={`pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2 transition-all duration-200 max-md:ease-out ${
+                  mobileChatHeaderCollapsed
+                    ? 'max-md:-translate-y-2 max-md:opacity-0'
+                    : 'max-md:translate-y-0 max-md:opacity-100'
+                }`}
+              >
                 <div className="pointer-events-auto w-full max-w-5xl">
                   <CockpitBar
                     appearance={appearance}

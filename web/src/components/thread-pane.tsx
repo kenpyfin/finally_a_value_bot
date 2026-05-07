@@ -223,7 +223,11 @@ export type ThreadPaneProps = {
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
   /** Mobile (max-width 767px): report scroll direction so the app shell can collapse the main header. */
-  onMobileThreadScroll?: (opts: { collapseHeader: boolean }) => void
+  onMobileThreadScroll?: (opts: {
+    collapseHeader: boolean
+    source: 'scroll' | 'reset' | 'focus' | 'media-change'
+    scrollTop?: number
+  }) => void
 }
 
 function DraftAwareComposer() {
@@ -295,6 +299,7 @@ export const ThreadPane = React.memo(function ThreadPane({
 
   const viewportScrollCleanupRef = React.useRef<(() => void) | null>(null)
   const lastViewportScrollTopRef = React.useRef(0)
+  const scrollGuardUntilRef = React.useRef(0)
 
   const bindThreadViewport = React.useCallback(
     (el: HTMLDivElement | null) => {
@@ -304,29 +309,33 @@ export const ThreadPane = React.memo(function ThreadPane({
 
       const mq = window.matchMedia('(max-width: 767px)')
       lastViewportScrollTopRef.current = el.scrollTop
+      scrollGuardUntilRef.current = Date.now() + 550
 
       const onScroll = () => {
         if (!mq.matches) {
-          onMobileThreadScroll({ collapseHeader: false })
+          onMobileThreadScroll({ collapseHeader: false, source: 'media-change', scrollTop: el.scrollTop })
+          return
+        }
+        if (Date.now() < scrollGuardUntilRef.current) {
           return
         }
         const st = el.scrollTop
         const delta = st - lastViewportScrollTopRef.current
         lastViewportScrollTopRef.current = st
-        if (st < 20) {
-          onMobileThreadScroll({ collapseHeader: false })
+        if (st < 28) {
+          onMobileThreadScroll({ collapseHeader: false, source: 'scroll', scrollTop: st })
           return
         }
-        if (delta > 10) {
-          onMobileThreadScroll({ collapseHeader: true })
-        } else if (delta < -10) {
-          onMobileThreadScroll({ collapseHeader: false })
+        if (delta > 14) {
+          onMobileThreadScroll({ collapseHeader: true, source: 'scroll', scrollTop: st })
+        } else if (delta < -12) {
+          onMobileThreadScroll({ collapseHeader: false, source: 'scroll', scrollTop: st })
         }
       }
 
       const onMqChange = () => {
         if (!mq.matches) {
-          onMobileThreadScroll({ collapseHeader: false })
+          onMobileThreadScroll({ collapseHeader: false, source: 'media-change', scrollTop: el.scrollTop })
         }
       }
 
@@ -341,7 +350,8 @@ export const ThreadPane = React.memo(function ThreadPane({
   )
 
   React.useEffect(() => {
-    onMobileThreadScroll?.({ collapseHeader: false })
+    scrollGuardUntilRef.current = Date.now() + 700
+    onMobileThreadScroll?.({ collapseHeader: false, source: 'reset' })
   }, [runtimeKey, onMobileThreadScroll])
 
   React.useEffect(
@@ -397,7 +407,9 @@ export const ThreadPane = React.memo(function ThreadPane({
             </Thread.Viewport>
             <div
               className="mc-thread-composer-dock"
-              onFocusCapture={() => onMobileThreadScroll?.({ collapseHeader: false })}
+              onFocusCapture={() =>
+                onMobileThreadScroll?.({ collapseHeader: false, source: 'focus' })
+              }
             >
               <div className="relative mx-auto w-full max-w-[var(--aui-thread-max-width)] px-2 pb-1 pt-1 md:px-3">
                 <Thread.ScrollToBottom />

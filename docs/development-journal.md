@@ -18,6 +18,38 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-07 — Redact scheduler failure details before delivery
+
+- **Area:** scheduler / safety redaction / channel delivery
+- **Summary:** Added explicit secret redaction on scheduler delivery boundaries so scheduled-run outputs and failure callouts are sanitized before `deliver_to_contact`. Success responses now pass through user-visible redaction, while scheduler error logs/heartbeat/DB summaries use internal redaction.
+- **Rationale:** Scheduled task failure messages were composed directly from raw error strings and could include credential-bearing URLs (for example `...?key=...`) that bypassed `apply_output_safeguards`.
+- **Key files / symbols:** `src/scheduler.rs` (`run_scheduled_agent_and_finalize`), `redact_secrets_user_visible`, `redact_secrets_internal`.
+- **Follow-ups:** Consider applying the same delivery-boundary sanitization in any other code paths that call `deliver_to_contact` with externally sourced error text.
+
+### 2026-05-06 — Split secret redaction: user-visible vs internal
+
+- **Area:** agent safety / channels / tools
+- **Summary:** Replaced a single `redact_secrets` entry point with `redact_secrets_user_visible` (known patterns only, no long-token heuristic) and `redact_secrets_internal` (targeted + long-token fallback). Final assistant output sanitization uses the user-visible path; tool outputs, bash logging, PTE/TSA excerpts, and tool preview/history artifacts use internal redaction.
+- **Rationale:** The long-token fallback was masking benign user-facing strings (e.g., long résumé PDF basenames). Narrowing user-visible masking preserves filenames and prose while retaining stricter masking where leaks are likelier (tool results, logs, evaluator prompts).
+- **Key files / symbols:** `src/safety_redaction.rs` (`redact_secrets_user_visible`, `redact_secrets_internal`, `redact_targeted_secrets`, `apply_long_token_fallback`), `src/channels/telegram.rs` (`apply_output_safeguards`, tool preview logging / `ToolCallRecord`), `src/tools/mod.rs` (`ToolRegistry::execute`), `src/tools/bash.rs`, `src/post_tool_evaluator.rs` (`build_tool_results_summary`), `src/tool_skill_agent.rs` (`evaluate_tool_use`).
+- **Follow-ups:** Consider routing any remaining stray final-text paths through `apply_output_safeguards` for consistent user-visible masking; optionally refine `assignment_secret_regex` (`PASS` / `AUTH` suffix false positives).
+
+### 2026-05-06 — Short-circuit memory-only tool iterations
+
+- **Area:** agent loop / channels
+- **Summary:** Updated the main agent loop so iterations that only execute memory-write tools now return the already-authored assistant text immediately, without forcing a follow-up LLM iteration just to end the turn.
+- **Rationale:** Memory persistence side effects (for example `patch_memory_state`) were causing an extra model round-trip that could replace a complete Iteration 1 answer with a weaker Iteration 2 follow-up.
+- **Key files / symbols:** `src/channels/telegram.rs` (`is_memory_write_tool`, memory-write short-circuit branch in `process_with_agent_with_events` tool-use handling).
+- **Follow-ups:** Consider extending the same short-circuit to other non-user-facing state-write tools if they show similar second-turn regressions.
+
+### 2026-05-05 — Mobile web shell overhaul: stable header + single-scroll thread
+
+- **Area:** web UI / mobile shell / thread viewport
+- **Summary:** Reworked the mobile chat shell to remove the dual-header collapse pattern and use one sticky top bar with compact state transitions instead of `max-height` hide/show swaps. Hardened thread scroll signaling with source-aware events and mount guards, and enforced mobile scroll ownership so the thread viewport remains the primary vertical scroller while the app root/body stay non-scrolling.
+- **Rationale:** Refresh-time layout jitter and occasional document scrolling came from mixed header geometry transitions and loose root overflow behavior; the overhaul makes mobile behavior deterministic across iOS Safari and Android Chrome while keeping desktop flows intact.
+- **Key files / symbols:** `web/src/main.tsx` (`handleMobileThreadScroll`, sticky mobile header classes, root overflow locking, cockpit transition behavior), `web/src/components/thread-pane.tsx` (`onMobileThreadScroll` source metadata, scroll guard timing, threshold tuning), `web/src/styles.css` (mobile `@media (max-width: 767px)` overflow contract, viewport scroll behavior, composer/readability touch adjustments).
+- **Follow-ups:** Validate on physical devices for keyboard open/close edge cases and adjust collapse thresholds if needed for very short chats.
+
 ### 2026-05-04 — Prevent duplicate cross-channel deliveries from duplicate bot instances
 
 - **Area:** channels / delivery fanout / startup

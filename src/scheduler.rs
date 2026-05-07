@@ -14,6 +14,7 @@ use crate::error::FinallyAValueBotError;
 use crate::job_heartbeat::{
     signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
 };
+use crate::safety_redaction::{redact_secrets_internal, redact_secrets_user_visible};
 use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 fn channel_from_chat_type(chat_type: &str) -> &'static str {
@@ -469,6 +470,7 @@ async fn run_scheduled_agent_and_finalize(
             } else {
                 response
             };
+            let response_text = redact_secrets_user_visible(&response_text);
             const DEDUPE_WINDOW_SECS: i64 = 120;
             let dedupe_text = crate::channel::with_persona_indicator(
                 state.db.clone(),
@@ -536,17 +538,21 @@ async fn run_scheduled_agent_and_finalize(
                         (true, Some(summary))
                     }
                     Err(e) => {
+                        let redacted_error = redact_secrets_internal(&e.to_string());
                         let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
                             "scheduled task #{} delivery failed: {}",
-                            task_id, e
+                            task_id, redacted_error
                         )));
                         error!(
                             "Scheduler: task #{} produced a response but delivery failed: {}",
-                            task_id, e
+                            task_id, redacted_error
                         );
                         (
                             false,
-                            Some(format!("Delivery error after successful execution: {e}")),
+                            Some(format!(
+                                "Delivery error after successful execution: {}",
+                                redacted_error
+                            )),
                         )
                     }
                 }
@@ -555,12 +561,21 @@ async fn run_scheduled_agent_and_finalize(
         Ok(Err(e)) => {
             drop(evt_tx);
             let _ = hb_forward.await;
-            error!("Scheduler: task #{} failed: {e}", task_id);
+            let raw_error = e.to_string();
+            let redacted_error_internal = redact_secrets_internal(&raw_error);
+            let redacted_error_user = redact_secrets_user_visible(&raw_error);
+            error!(
+                "Scheduler: task #{} failed: {}",
+                task_id, redacted_error_internal
+            );
             let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
                 "scheduled task #{} failed: {}",
-                task_id, e
+                task_id, redacted_error_internal
             )));
-            let err_text = format!("Scheduled task #{} failed: {e}", task_id);
+            let err_text = format!(
+                "Scheduled task #{} failed: {}",
+                task_id, redacted_error_user
+            );
             let delivery_ok = deliver_to_contact(
                 state.db.clone(),
                 state.telegram_bots.as_ref(),
@@ -574,11 +589,14 @@ async fn run_scheduled_agent_and_finalize(
             .await
             .is_ok();
             if delivery_ok {
-                (false, Some(format!("Error: {e}")))
+                (false, Some(format!("Error: {}", redacted_error_internal)))
             } else {
                 (
                     false,
-                    Some(format!("Error: {e} (and failed to deliver error message)")),
+                    Some(format!(
+                        "Error: {} (and failed to deliver error message)",
+                        redacted_error_internal
+                    )),
                 )
             }
         }

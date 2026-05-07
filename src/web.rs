@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::background_jobs::BackgroundStartAck;
 use crate::channel::deliver_to_contact;
-use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
+use crate::chat_queue::{QueueEnqueueMeta, QueueRemoveOutcome, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
 use crate::db::{
@@ -1650,6 +1650,51 @@ async fn api_queue_cancel(
     }
     info!(chat_id, run_id, "web queue cancel accepted");
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct QueueRemoveRequest {
+    run_id: String,
+    chat_id: Option<i64>,
+}
+
+async fn api_queue_remove(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<QueueRemoveRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let run_id = body.run_id.trim();
+    if run_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "run_id is required".into()));
+    }
+    info!(chat_id, run_id, "web queue remove requested");
+    let outcome = state
+        .app_state
+        .chat_queue
+        .request_remove_queued(run_id, chat_id)
+        .await;
+    match outcome {
+        QueueRemoveOutcome::Removed => {
+            info!(chat_id, run_id, "web queue remove accepted");
+            Ok(Json(json!({ "ok": true })))
+        }
+        QueueRemoveOutcome::Running => {
+            warn!(
+                chat_id,
+                run_id, "web queue remove rejected because run is running"
+            );
+            Err((
+                StatusCode::CONFLICT,
+                "run is currently running; use Stop instead".into(),
+            ))
+        }
+        QueueRemoveOutcome::NotFound => {
+            warn!(chat_id, run_id, "web queue remove target not found");
+            Err((StatusCode::NOT_FOUND, "run not found for this chat".into()))
+        }
+    }
 }
 
 fn is_background_job_active_status(status: &str) -> bool {
@@ -4219,6 +4264,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/run_status", get(api_run_status))
         .route("/api/queue_diagnostics", get(api_queue_diagnostics))
         .route("/api/queue/cancel", post(api_queue_cancel))
+        .route("/api/queue/remove", post(api_queue_remove))
         .route("/api/reset", post(api_reset))
         .route("/api/delete_session", post(api_delete_session))
         .route("/api/personas", get(api_personas))
