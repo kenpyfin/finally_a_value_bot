@@ -187,6 +187,18 @@ fn default_post_tool_evaluator_model() -> String {
     String::new()
 }
 
+fn default_allow_fuzzy_search_replace() -> bool {
+    false
+}
+
+fn default_symbol_edit_enabled() -> bool {
+    false
+}
+
+fn default_post_edit_validation_enabled() -> bool {
+    true
+}
+
 fn default_cursor_agent_tmux_session_prefix() -> String {
     "finally_a_value_bot-cursor".into()
 }
@@ -435,6 +447,18 @@ pub struct Config {
     /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_post_tool_evaluator_model")]
     pub post_tool_evaluator_model: String,
+    /// Allow fuzzy fallback in apply_search_replace when input requests allow_fuzzy.
+    #[serde(default = "default_allow_fuzzy_search_replace")]
+    pub allow_fuzzy_search_replace: bool,
+    /// Enable symbol_edit tool for language-aware symbol anchoring.
+    #[serde(default = "default_symbol_edit_enabled")]
+    pub symbol_edit_enabled: bool,
+    /// Run post-edit validation automatically after successful code edits.
+    #[serde(default = "default_post_edit_validation_enabled")]
+    pub post_edit_validation_enabled: bool,
+    /// Optional override commands for post-edit validation, separated by `;;`.
+    #[serde(default)]
+    pub post_edit_validation_commands: Option<String>,
     /// Tmux session name prefix for cursor_agent when detach=true (e.g. finally_a_value_bot-cursor).
     #[serde(default = "default_cursor_agent_tmux_session_prefix")]
     pub cursor_agent_tmux_session_prefix: String,
@@ -823,6 +847,19 @@ impl Config {
                 default_post_tool_evaluator_enabled(),
             ),
             post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
+            allow_fuzzy_search_replace: Self::env_bool(
+                "ALLOW_FUZZY_SEARCH_REPLACE",
+                default_allow_fuzzy_search_replace(),
+            ),
+            symbol_edit_enabled: Self::env_bool(
+                "SYMBOL_EDIT_ENABLED",
+                default_symbol_edit_enabled(),
+            ),
+            post_edit_validation_enabled: Self::env_bool(
+                "POST_EDIT_VALIDATION_ENABLED",
+                default_post_edit_validation_enabled(),
+            ),
+            post_edit_validation_commands: Self::env("POST_EDIT_VALIDATION_COMMANDS"),
             cursor_agent_tmux_session_prefix: Self::env("CURSOR_AGENT_TMUX_SESSION_PREFIX")
                 .unwrap_or_else(default_cursor_agent_tmux_session_prefix),
             cursor_agent_tmux_enabled: Self::env_bool(
@@ -1012,6 +1049,11 @@ impl Config {
         if !["strict", "adaptive", "loose"].contains(&self.workflow_replay_strictness.as_str()) {
             self.workflow_replay_strictness = default_workflow_replay_strictness();
         }
+        if let Some(cmds) = &self.post_edit_validation_commands {
+            if cmds.trim().is_empty() {
+                self.post_edit_validation_commands = None;
+            }
+        }
         if !["strict", "balanced", "loose"]
             .contains(&self.project_auto_association_strictness.as_str())
         {
@@ -1145,6 +1187,35 @@ impl Config {
             "PROJECT_AUTO_ASSOCIATION_STRICTNESS={}",
             esc(&self.project_auto_association_strictness)
         ));
+        lines.push(format!(
+            "ALLOW_FUZZY_SEARCH_REPLACE={}",
+            if self.allow_fuzzy_search_replace {
+                "true"
+            } else {
+                "false"
+            }
+        ));
+        lines.push(format!(
+            "SYMBOL_EDIT_ENABLED={}",
+            if self.symbol_edit_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        ));
+        lines.push(format!(
+            "POST_EDIT_VALIDATION_ENABLED={}",
+            if self.post_edit_validation_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        ));
+        if let Some(cmds) = &self.post_edit_validation_commands {
+            if !cmds.trim().is_empty() {
+                lines.push(format!("POST_EDIT_VALIDATION_COMMANDS={}", esc(cmds)));
+            }
+        }
         lines.push(format!(
             "MAX_DOCUMENT_SIZE_MB={}",
             self.max_document_size_mb
@@ -1302,6 +1373,10 @@ pub fn test_config() -> Config {
         tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
+        allow_fuzzy_search_replace: false,
+        symbol_edit_enabled: false,
+        post_edit_validation_enabled: true,
+        post_edit_validation_commands: None,
         cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
         cursor_agent_tmux_enabled: true,
         cursor_agent_runner_url: None,

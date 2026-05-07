@@ -18,6 +18,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-07 — Agentic framework hardening: precise edits, repo map, post-edit validation
+
+- **Area:** agent loop / tools / config / docs
+- **Summary:** Added three new tools (`apply_search_replace`, `read_repo_map`, `symbol_edit`), expanded `read_file` with centered adaptive windows, and wired automatic post-edit validator feedback into the shared agent loop after successful code edits. Updated prompt guidance/capabilities and docs to promote map-first retrieval and exact-first block editing.
+- **Rationale:** Baseline validation showed the loop relied on exact `edit_file` string replacement, lacked automatic linter-in-the-loop checks, and had no dedicated repository-map retrieval path. This change closes those gaps with conservative defaults: exact matching by default, fuzzy matching opt-in, and symbol editing gated behind config.
+- **Key files / symbols:** `src/tools/apply_search_replace.rs`, `src/tools/read_repo_map.rs`, `src/tools/symbol_edit.rs`, `src/tools/read_file.rs` (`center_line`, `context_before`, `context_after`), `src/tools/mod.rs` (tool registration, read-only filtering, risk levels), `src/channels/telegram.rs` (`should_validate_post_edit`, `run_post_edit_validation`, prompt/code-edit strategy updates), `src/config.rs` / `src/config_wizard.rs` (new env-backed toggles), `DEVELOP.md`, `docs/workflow.md`.
+- **Follow-ups:** Consider replacing regex/brace heuristics in `symbol_edit` with a true parser-backed implementation (tree-sitter) once language coverage requirements are clearer; refine default JS/TS validator behavior for monorepo layouts.
+
 ### 2026-05-07 — Redact scheduler failure details before delivery
 
 - **Area:** scheduler / safety redaction / channel delivery

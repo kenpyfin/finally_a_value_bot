@@ -80,6 +80,19 @@ When a workflow was **selected** at the start of a run, `log_workflow_execution`
 | `WORKFLOW_MIN_SUCCESS_REPETITIONS` | Reserved for future promotion logic (not wired to DB updates). |
 | `WORKFLOW_REPLAY_STRICTNESS` | `strict` \| `adaptive` \| `loose` — captured for policy; replay is still **prompt-guided** (see [`runtime-gap-analysis.md`](runtime-gap-analysis.md)). |
 
+## Related agentic editing/retrieval controls
+
+The learned-workflow feature is independent from file-edit precision controls, but they often appear together during tool-heavy runs in `process_with_agent_with_events`.
+
+Relevant env toggles in `.env`:
+
+| Variable | Role |
+| --- | --- |
+| `ALLOW_FUZZY_SEARCH_REPLACE` | Enables opt-in fuzzy fallback for `apply_search_replace` blocks (exact matching remains default). |
+| `SYMBOL_EDIT_ENABLED` | Enables the `symbol_edit` tool for symbol-span replacement. |
+| `POST_EDIT_VALIDATION_ENABLED` | Enables automatic post-edit validator checks in the tool loop. |
+| `POST_EDIT_VALIDATION_COMMANDS` | Optional command override list (`;;` separated) for post-edit validation. |
+
 ## Interaction with skills and scheduled tasks
 
 - **Skills:** Loaded into the base system prompt; the learned hint is a **separate** append. Both can coexist; the model may need to reconcile conflicting guidance.

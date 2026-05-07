@@ -1,5 +1,6 @@
 pub mod activate_skill;
 pub mod agent_history;
+pub mod apply_search_replace;
 pub mod bash;
 pub mod browser;
 pub mod bulletin;
@@ -14,11 +15,13 @@ pub mod memory;
 pub mod memory_state;
 pub mod path_guard;
 pub mod read_file;
+pub mod read_repo_map;
 pub mod schedule;
 pub mod search_history;
 pub mod search_vault;
 pub mod send_message;
 pub mod social_feed;
+pub mod symbol_edit;
 pub mod sync_skills;
 pub mod tiered_memory;
 pub mod vault_add;
@@ -107,6 +110,8 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         "cursor_agent"
         | "write_file"
         | "edit_file"
+        | "apply_search_replace"
+        | "symbol_edit"
         | "write_memory"
         | "write_tiered_memory"
         | "write_memory_state"
@@ -322,8 +327,17 @@ impl ToolRegistry {
                 config.agent_browser_path.clone(),
             )),
             Box::new(read_file::ReadFileTool::new(config.working_dir())),
+            Box::new(read_repo_map::ReadRepoMapTool::new(config.working_dir())),
             Box::new(write_file::WriteFileTool::new(config.working_dir())),
             Box::new(edit_file::EditFileTool::new(config.working_dir())),
+            Box::new(apply_search_replace::ApplySearchReplaceTool::new(
+                config.working_dir(),
+                config.allow_fuzzy_search_replace,
+            )),
+            Box::new(symbol_edit::SymbolEditTool::new(
+                config.working_dir(),
+                config.symbol_edit_enabled,
+            )),
             Box::new(glob::GlobTool::new(config.working_dir())),
             Box::new(grep::GrepTool::new(config.working_dir())),
             Box::new(memory::ReadMemoryTool::new(
@@ -492,6 +506,7 @@ impl ToolRegistry {
                 let allowed = matches!(
                     name,
                     "read_file"
+                        | "read_repo_map"
                         | "glob"
                         | "grep"
                         | "read_memory"
@@ -681,6 +696,8 @@ mod tests {
     fn test_tool_risk_levels() {
         assert_eq!(tool_risk("bash"), ToolRisk::High);
         assert_eq!(tool_risk("write_file"), ToolRisk::Medium);
+        assert_eq!(tool_risk("apply_search_replace"), ToolRisk::Medium);
+        assert_eq!(tool_risk("symbol_edit"), ToolRisk::Medium);
         assert_eq!(tool_risk("pause_scheduled_task"), ToolRisk::Medium);
         assert_eq!(tool_risk("sync_skills"), ToolRisk::Medium);
         assert_eq!(tool_risk("read_file"), ToolRisk::Low);

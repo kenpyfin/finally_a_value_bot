@@ -42,6 +42,18 @@ impl Tool for ReadFileTool {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of lines to read"
+                    },
+                    "center_line": {
+                        "type": "integer",
+                        "description": "Optional 1-based center line for adaptive window reads"
+                    },
+                    "context_before": {
+                        "type": "integer",
+                        "description": "When center_line is set, lines to include before the center"
+                    },
+                    "context_after": {
+                        "type": "integer",
+                        "description": "When center_line is set, lines to include after the center"
                     }
                 }),
                 &["path"],
@@ -79,7 +91,31 @@ impl Tool for ReadFileTool {
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|l| l as usize)
-            .unwrap_or(2000);
+            .unwrap_or(800);
+
+        let center_line = input
+            .get("center_line")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let context_before = input
+            .get("context_before")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(25);
+        let context_after = input
+            .get("context_after")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(25);
+
+        let (offset, limit) = if let Some(center) = center_line {
+            let center_idx = center.saturating_sub(1);
+            let start = center_idx.saturating_sub(context_before);
+            let adaptive_limit = context_before + context_after + 1;
+            (start, adaptive_limit.max(1))
+        } else {
+            (offset, limit.max(1))
+        };
 
         let end = (offset + limit).min(lines.len());
         let selected: Vec<String> = lines[offset..end]
@@ -133,6 +169,32 @@ mod tests {
         assert!(result.content.contains("b"));
         assert!(result.content.contains("c"));
         assert!(!result.content.contains("\ta\n") && !result.content.contains("\td"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_center_line_window() {
+        let dir =
+            std::env::temp_dir().join(format!("finally_a_value_bot_rf4_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "1\n2\n3\n4\n5\n6\n7").unwrap();
+
+        let tool = ReadFileTool::new(".");
+        let result = tool
+            .execute(json!({
+                "path": file.to_str().unwrap(),
+                "center_line": 4,
+                "context_before": 1,
+                "context_after": 2
+            }))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("3"));
+        assert!(result.content.contains("4"));
+        assert!(result.content.contains("6"));
+        assert!(!result.content.contains("\t1"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

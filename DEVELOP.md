@@ -56,9 +56,12 @@ src/
         mod.rs           # Tool trait, ToolRegistry, ToolResult.
                          # Registry takes data_dir, Bot, Arc<Database>.
         bash.rs          # Shell command execution (tokio::process::Command)
-        read_file.rs     # File reading with line numbers, offset/limit
+        read_file.rs     # File reading with line numbers, offset/limit, and centered context windows
+        read_repo_map.rs # Lightweight repository map (files + symbol signatures)
         write_file.rs    # File creation/overwrite, auto-creates directories
         edit_file.rs     # Find/replace editing, validates uniqueness
+        apply_search_replace.rs # Deterministic block-based search/replace (exact-first, optional fuzzy)
+        symbol_edit.rs   # Optional language-aware symbol-span replacement
         glob.rs          # File pattern matching (glob crate)
         grep.rs          # Recursive regex search, directory traversal
         memory.rs        # read_memory / write_memory tools
@@ -111,8 +114,10 @@ Telegram message
        v
     Agentic loop (up to max_tool_iterations):
        1. Call Claude API with messages + tool definitions
-       2. If stop_reason == "tool_use" -> execute tools -> append results -> loop
-       3. If stop_reason == "end_turn" -> extract text -> return
+       2. If stop_reason == "tool_use" -> execute tools
+          - For code edits, optional post-edit validator checks run and feed structured PASS/FAIL output back into tool results
+       3. Append tool results -> loop
+       4. If stop_reason == "end_turn" -> extract text -> return
        |
        v
     Strip image base64 data, save session to SQLite
