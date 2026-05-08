@@ -1694,4 +1694,39 @@ discord_allowed_channels: [111, 222]
         assert!(content.contains("WEB_SESSION_IDLE_TTL_SECONDS=600"));
         std::fs::remove_file(path).ok();
     }
+
+    #[test]
+    fn test_config_new_framework_fields_from_yaml() {
+        let yaml = r#"
+telegram_bot_token: tok
+bot_username: bot
+api_key: key
+allow_fuzzy_search_replace: true
+symbol_edit_enabled: true
+post_edit_validation_enabled: false
+post_edit_validation_commands: "echo one ;; echo two"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert!(config.allow_fuzzy_search_replace);
+        assert!(config.symbol_edit_enabled);
+        assert!(!config.post_edit_validation_enabled);
+        assert_eq!(
+            config.post_edit_validation_commands.as_deref(),
+            Some("echo one ;; echo two")
+        );
+    }
+
+    #[test]
+    fn test_post_deserialize_empty_post_edit_validation_commands_none() {
+        let yaml = r#"
+telegram_bot_token: tok
+bot_username: bot
+api_key: key
+post_edit_validation_commands: "   "
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert!(config.post_edit_validation_commands.is_none());
+    }
 }

@@ -18,6 +18,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-07 — Framework activation fix: portable validator + routing/telemetry hardening
+
+- **Area:** agent loop / validation / observability
+- **Summary:** Fixed post-edit validator portability by replacing the Python default command with `compileall`-based validation and adding skip-on-missing-tool behavior for default validator profiles. Added stronger routing pressure toward `read_repo_map` + `apply_search_replace`, plus startup telemetry that logs effective framework toggles and registered edit-tool set.
+- **Rationale:** Live runs showed the new hook was active but failing due to `rg` not being available in target runtime shells (`python -m py_compile $(rg --files ...)`). This produced false-negative validation failures and made the framework appear inactive.
+- **Key files / symbols:** `src/channels/telegram.rs` (`validator_commands_for_path`, `configured_validator_commands`, `run_post_edit_validation`, `should_skip_validator_failure`, routing-hint injection in tool loop, startup logs in `run_bot`), `src/config.rs` (new regression tests for framework fields/override cleanup).
+- **Follow-ups:** Optionally add a dedicated integration smoke command that emits one synthetic post-edit validation block into agent history for easier operator verification after deploy/restart.
+
 ### 2026-05-07 — Agentic framework hardening: precise edits, repo map, post-edit validation
 
 - **Area:** agent loop / tools / config / docs
