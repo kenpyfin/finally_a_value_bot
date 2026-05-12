@@ -3811,7 +3811,7 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
 
     // Memory (this persona): canonical state projection + JSON payload
     if !memory_context.is_empty() {
-        prompt.push_str("\n# Memory (this persona)\n\nThe following is this persona's canonical memory projection plus JSON state. Use it as context; principles above take precedence.\n\n");
+        prompt.push_str("\n# Memory (this persona)\n\nThe following includes a compact memory field legend, this persona's canonical memory projection, and JSON state. Use it as context; principles above take precedence.\n\n");
         prompt.push_str(memory_context);
         prompt.push_str("\n\n");
     }
@@ -5655,11 +5655,12 @@ mod tests {
     fn test_build_system_prompt_with_memory_and_skills() {
         let principles = "Test";
         let skills = "- translate: Translate text";
+        let memory_context = "<memory_field_legend>\nmeta.version: schema version\n</memory_field_legend>\n<memory_this_persona>\n# Memory\n</memory_this_persona>";
         let prompt = build_system_prompt(
             "bot",
             principles,
             "finally_a_value_bot.data/AGENTS.md",
-            "",
+            memory_context,
             42,
             1,
             skills,
@@ -5674,6 +5675,9 @@ mod tests {
         assert!(prompt.contains("Test"));
         assert!(prompt.contains("# Agent Skills"));
         assert!(prompt.contains("translate: Translate text"));
+        assert!(prompt.contains("# Memory (this persona)"));
+        assert!(prompt.contains("<memory_field_legend>"));
+        assert!(prompt.contains("compact memory field legend"));
     }
 
     #[test]

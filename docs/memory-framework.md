@@ -219,6 +219,16 @@ Per-event fields:
 {"ts":"2026-05-08T16:05:00Z","event_type":"manual_edit","actor":"user","chat_id":123,"persona_id":1,"payload":{"field":"tier1.stable_facts","reason":"added durable preference"}}
 ```
 
+## Runtime Prompt Injection
+
+At runtime, persona memory context injected into the system prompt includes:
+
+- `<memory_field_legend>`: compact deterministic field-meaning map for canonical memory keys
+- `<memory_this_persona>`: rendered memory projection for quick model consumption
+- `<memory_state_json>`: raw canonical JSON state for precise structured reference
+
+This keeps field semantics always available to the model while keeping token overhead low compared to injecting full prose documentation.
+
 ## Safety and Manual Edits
 
 Manual edits should use:

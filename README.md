@@ -195,6 +195,7 @@ Common `payload` meanings by `event_type`:
 - On parse errors, backup recovery is attempted and corresponding diagnostic events are logged.
 
 For a full nested field-by-field reference (including example JSON objects), see [`docs/memory-framework.md`](docs/memory-framework.md).
+Runtime prompts also inject a compact `<memory_field_legend>` plus both `<memory_this_persona>` and `<memory_state_json>` blocks so field meanings and live state are available to the model.
 
 ## License
 

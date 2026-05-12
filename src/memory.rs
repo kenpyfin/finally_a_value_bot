@@ -8,6 +8,7 @@ use serde_json::json;
 const MEMORY_SCHEMA_VERSION: u32 = 1;
 const MEMORY_STATE_FILE: &str = "memory_state.json";
 const MEMORY_EVENTS_FILE: &str = "memory_events.jsonl";
+const MEMORY_FIELD_LEGEND_MAX_CHARS: usize = 2400;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemoryStateMeta {
@@ -400,6 +401,9 @@ impl MemoryManager {
 
         if let Some(state) = self.read_or_migrate_persona_memory_state(chat_id, persona_id) {
             if let Ok(state_json) = serde_json::to_string_pretty(&state) {
+                context.push_str("<memory_field_legend>\n");
+                context.push_str(&render_memory_field_legend_compact());
+                context.push_str("\n</memory_field_legend>\n");
                 context.push_str("<memory_this_persona>\n");
                 context.push_str(&render_memory_markdown(&state));
                 context.push_str("\n</memory_this_persona>\n");
@@ -822,6 +826,42 @@ pub fn render_memory_markdown(state: &PersonaMemoryState) -> String {
     out
 }
 
+fn render_memory_field_legend_compact() -> String {
+    let mut out = [
+        "meta.version: schema version; normalized to current version.",
+        "meta.revision: monotonic state write counter.",
+        "meta.updated_at: RFC3339 timestamp of last state write.",
+        "identity.display_name: canonical persona name.",
+        "identity.self_model: concise self-description for behavior framing.",
+        "identity.voice_style: preferred tone/style guidance.",
+        "identity.non_negotiables[]: hard constraints the persona should not violate.",
+        "tier1.stable_facts[]: long-lived durable facts.",
+        "tier1.workflow_principles[]: reusable workflow rules from repeated success.",
+        "tier2.active_projects[]: current in-flight project list.",
+        "tier2.active_projects[].id: stable project key; derived from summary if missing.",
+        "tier2.active_projects[].status: project lifecycle label; defaults to active.",
+        "tier2.active_projects[].summary: required human-readable project statement.",
+        "tier2.active_projects[].updated_at: RFC3339 timestamp of project update.",
+        "tier3.recent_focus[]: short-term focus items; passive context only; capped to 15.",
+        "workflow_memory.intents[]: learned intent-pattern retention entries.",
+        "workflow_memory.intents[].intent_signature: canonical lowercased intent key.",
+        "workflow_memory.intents[].approach_summary: concise strategy summary.",
+        "workflow_memory.intents[].step_trace[]: high-level ordered step/tool flow.",
+        "workflow_memory.intents[].outcome: attempt result label (success|failure|unknown).",
+        "workflow_memory.intents[].failure_reason: optional failure cause.",
+        "workflow_memory.intents[].confidence: confidence score in [0.0, 1.0].",
+        "workflow_memory.intents[].support_count: supporting observation count.",
+        "workflow_memory.intents[].last_seen_at: RFC3339 last-observed timestamp.",
+        "workflow_memory.intents[].evidence_refs[]: references backing the pattern.",
+        "links.mem_palace_refs[]: retrieval alignment references to mem-palace artifacts.",
+    ]
+    .join("\n");
+    if out.len() > MEMORY_FIELD_LEGEND_MAX_CHARS {
+        out.truncate(MEMORY_FIELD_LEGEND_MAX_CHARS);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,6 +1005,9 @@ mod tests {
         state.tier1.stable_facts = vec!["persona memory".to_string()];
         mm.write_persona_memory_state(100, 1, state).unwrap();
         let ctx = mm.build_memory_context(100, 1);
+        assert!(ctx.contains("<memory_field_legend>"));
+        assert!(ctx.contains("meta.version: schema version; normalized to current version."));
+        assert!(ctx.contains("workflow_memory.intents[].confidence: confidence score in [0.0, 1.0]."));
         assert!(ctx.contains("<memory_this_persona>"));
         assert!(ctx.contains("persona memory"));
         assert!(ctx.contains("<memory_state_json>"));
@@ -981,8 +1024,19 @@ mod tests {
         state.tier3.recent_focus = vec![];
         mm.write_persona_memory_state(100, 1, state).unwrap();
         let ctx = mm.build_memory_context(100, 1);
+        assert!(ctx.contains("<memory_field_legend>"));
         assert!(ctx.contains("<memory_this_persona>"));
         cleanup(&dir);
+    }
+
+    #[test]
+    fn test_memory_field_legend_compact_is_deterministic_and_bounded() {
+        let legend_a = render_memory_field_legend_compact();
+        let legend_b = render_memory_field_legend_compact();
+        assert_eq!(legend_a, legend_b);
+        assert!(legend_a.contains("meta.version: schema version; normalized to current version."));
+        assert!(legend_a.contains("links.mem_palace_refs[]: retrieval alignment references to mem-palace artifacts."));
+        assert!(legend_a.len() <= MEMORY_FIELD_LEGEND_MAX_CHARS);
     }
 
     #[test]
