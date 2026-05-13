@@ -18,6 +18,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-13 — Agent final vs `send_message`: fuzzy dedupe + memory-tail-only delivery
+
+- **Area:** agent loop / channels / web / scheduler / WhatsApp
+- **Summary:** Added `final_delivery_dedupe` (token-bag similarity, attachment echo stripping, optional `---` / **Memory** tail split) and `channel::deliver_agent_final_to_contact`, which picks the newest recent **`send_message`-style** DB row as anchor (skips newer plain bot rows like memory patches). Agent finals can be skipped or reduced to the memory suffix so web/Telegram/Discord no longer double-post paraphrases after attachment sends.
+- **Rationale:** `deliver_to_contact` always ran after `end_turn`; `send_message` + attachment already stored user-visible text; exact-match dedupe missed paraphrases. Anchor scan fixes `patch_memory` (or similar) sitting as the latest bot message after `send_message`.
+- **Key files / symbols:** `src/final_delivery_dedupe.rs` (`find_send_message_dedupe_anchor`, `plan_agent_final_delivery`, `strip_send_message_echo`, `split_memory_tail`), `src/channel.rs` (`deliver_agent_final_to_contact`, `AgentFinalDeliveryOutcome`), call sites in `src/web.rs`, `src/channels/telegram.rs`, `src/channels/discord.rs`, `src/channels/whatsapp.rs`, `src/scheduler.rs`, `src/background_jobs.rs`; system prompt bullet in `src/channels/telegram.rs` (`build_system_prompt`).
+- **Follow-ups:** `/api/send` returns `response: ""` when the final is fully suppressed (client should rely on chat history). `Database::should_skip_duplicate_final_delivery` is now unused by the hot path but kept for compatibility.
+
 ### 2026-05-13 — Background handoff: unified enqueue, scheduler/web fixes, quiet heartbeats
 
 - **Area:** web / scheduler / background jobs / job heartbeat

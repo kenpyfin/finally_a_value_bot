@@ -22,7 +22,7 @@ use crate::background_jobs::{
     await_handoff_startup_ack, handoff_trigger_for_db, is_background_handoff_response,
     try_enqueue_background_handoff, HandoffEnqueueOutcome,
 };
-use crate::channel::deliver_to_contact;
+use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact};
 use crate::chat_queue::{QueueEnqueueMeta, QueueRemoveOutcome, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
@@ -1852,7 +1852,7 @@ async fn send_and_store_response_with_events(
         }
     } else {
         response = materialize_response_file_links(&state, chat_id, &response).await?;
-        deliver_to_contact(
+        let delivery = deliver_agent_final_to_contact(
             state.app_state.db.clone(),
             state.app_state.telegram_bots.as_ref(),
             state.app_state.discord_http.as_ref(),
@@ -1864,6 +1864,7 @@ async fn send_and_store_response_with_events(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        response = delivery.response_for_client;
     }
 
     let mut out = json!({

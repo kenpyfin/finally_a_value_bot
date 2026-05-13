@@ -2,10 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::Utc;
 use teloxide::prelude::*;
 
 use crate::channels::telegram::send_response_result;
 use crate::db::{call_blocking, Database, StoredMessage};
+use crate::final_delivery_dedupe::{
+    find_send_message_dedupe_anchor, plan_agent_final_delivery, AgentFinalDeliveryPlan,
+};
 use crate::tools::auth_context_from_input;
 
 pub async fn is_web_chat(db: Arc<Database>, chat_id: i64) -> bool {
@@ -249,6 +253,101 @@ pub async fn deliver_to_contact(
     }
 
     Ok(())
+}
+
+/// Same window as the legacy Telegram exact-match duplicate check.
+pub const AGENT_FINAL_DEDUPE_WINDOW_SECS: i64 = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFinalDeliveryOutcome {
+    /// Text the HTTP API should echo (`""` when the final was suppressed as redundant).
+    pub response_for_client: String,
+}
+
+/// Agent loop completion only: dedupe near-duplicate finals against a recent `send_message` row,
+/// then [`deliver_to_contact`]. On DB errors while planning, delivers the full final (fail-open).
+pub async fn deliver_agent_final_to_contact(
+    db: Arc<Database>,
+    telegram_bots: &HashMap<i64, Bot>,
+    discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
+    bot_username: &str,
+    canonical_chat_id: i64,
+    persona_id: i64,
+    raw_final: &str,
+    workspace_root: Option<PathBuf>,
+) -> Result<AgentFinalDeliveryOutcome, String> {
+    let indicated = with_persona_indicator(db.clone(), persona_id, raw_final).await;
+
+    let recent_res = call_blocking(db.clone(), {
+        let cid = canonical_chat_id;
+        let pid = persona_id;
+        move |d| d.get_recent_messages(cid, pid, 8)
+    })
+    .await;
+
+    let plan = match recent_res {
+        Ok(recent) => {
+            let anchor = find_send_message_dedupe_anchor(
+                &recent,
+                Utc::now(),
+                AGENT_FINAL_DEDUPE_WINDOW_SECS,
+            );
+            plan_agent_final_delivery(anchor, &indicated)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "channel",
+                error = %e,
+                "recent messages lookup failed; delivering full agent final"
+            );
+            AgentFinalDeliveryPlan::DeliverFull
+        }
+    };
+
+    match plan {
+        AgentFinalDeliveryPlan::DeliverFull => {
+            deliver_to_contact(
+                db.clone(),
+                telegram_bots,
+                discord_http,
+                bot_username,
+                canonical_chat_id,
+                persona_id,
+                raw_final,
+                workspace_root,
+            )
+            .await?;
+            Ok(AgentFinalDeliveryOutcome {
+                response_for_client: raw_final.to_string(),
+            })
+        }
+        AgentFinalDeliveryPlan::DeliverSuffixOnly(suffix) => {
+            deliver_to_contact(
+                db.clone(),
+                telegram_bots,
+                discord_http,
+                bot_username,
+                canonical_chat_id,
+                persona_id,
+                &suffix,
+                workspace_root,
+            )
+            .await?;
+            Ok(AgentFinalDeliveryOutcome {
+                response_for_client: suffix,
+            })
+        }
+        AgentFinalDeliveryPlan::Skip => {
+            tracing::info!(
+                target: "channel",
+                chat_id = canonical_chat_id,
+                "Skipping agent final delivery as redundant vs recent send_message"
+            );
+            Ok(AgentFinalDeliveryOutcome {
+                response_for_client: String::new(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

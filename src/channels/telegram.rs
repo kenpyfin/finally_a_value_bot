@@ -1281,33 +1281,7 @@ async fn handle_message(
                     to_send.len()
                 );
                 let ws_root = state_spawn.config.workspace_root_absolute();
-                const DEDUPE_WINDOW_SECS: i64 = 120;
-                let dedupe_text = crate::channel::with_persona_indicator(
-                    state_spawn.db.clone(),
-                    persona_id,
-                    &to_send,
-                )
-                .await;
-                let skip_dup = match crate::db::call_blocking(state_spawn.db.clone(), {
-                    let text = dedupe_text;
-                    let cid = canonical_chat_id_spawn;
-                    move |db| db.should_skip_duplicate_final_delivery(cid, &text, DEDUPE_WINDOW_SECS)
-                })
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(target: "channel", error = %e, "duplicate-final check failed; delivering anyway");
-                        false
-                    }
-                };
-                if skip_dup {
-                    info!(
-                        target: "channel",
-                        chat_id = canonical_chat_id_spawn,
-                        "Skipping duplicate final delivery: latest stored message already matches this reply (likely send_message + final)"
-                    );
-                } else if let Err(e) = crate::channel::deliver_to_contact(
+                match crate::channel::deliver_agent_final_to_contact(
                     state_spawn.db.clone(),
                     state_spawn.telegram_bots.as_ref(),
                     state_spawn.discord_http.as_ref(),
@@ -1319,15 +1293,18 @@ async fn handle_message(
                 )
                 .await
                 {
-                    tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Telegram only");
-                    send_response(
-                        &bot_spawn,
-                        chat_id_spawn,
-                        &to_send,
-                        thread_id_spawn,
-                        Some(ws_root.as_path()),
-                    )
-                    .await;
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Telegram only");
+                        send_response(
+                            &bot_spawn,
+                            chat_id_spawn,
+                            &to_send,
+                            thread_id_spawn,
+                            Some(ws_root.as_path()),
+                        )
+                        .await;
+                    }
                 }
             }
             Err(e) => {
@@ -3734,6 +3711,7 @@ For serving files to users:
 - For any generated artifact that users should open/download (PDF, image, markdown, zip, etc.), call `send_message` with `attachment_path` using an absolute local file path.
 - Never fabricate `/api/uploads/...` links in plain text. The upload URL must come from the attachment flow.
 - If your final response references a file, send the attachment first so the returned URL is valid immediately.
+- If `send_message` already delivered the substantive user-facing explanation (especially with an attachment), do **not** restate that narrative in your final assistant message; put only genuinely new information (brief confirmation, a memory/tier update block, or nothing).
 
 When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. Use read_tiered_memory/write_tiered_memory for tier-level edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits and conflict-safe updates. Tier 1 only on explicit user ask or strong long-term patterns; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
 

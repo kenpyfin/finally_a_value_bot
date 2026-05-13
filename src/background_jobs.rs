@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
-use crate::channel::deliver_to_contact;
+use crate::channel::deliver_agent_final_to_contact;
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::db::call_blocking;
 use crate::job_heartbeat::{
@@ -374,7 +374,7 @@ pub fn spawn_background_job(
                     response_len = final_text.len(),
                     "Background job: main agent produced final response"
                 );
-                if let Err(e) = deliver_to_contact(
+                if let Err(e) = deliver_agent_final_to_contact(
                     state.db.clone(),
                     state.telegram_bots.as_ref(),
                     state.discord_http.as_ref(),
@@ -420,7 +420,7 @@ pub fn spawn_background_job(
                 } else {
                     format!("Your background task failed: {}", raw_output)
                 };
-                let _ = deliver_to_contact(
+                let _ = deliver_agent_final_to_contact(
                     state.db.clone(),
                     state.telegram_bots.as_ref(),
                     state.discord_http.as_ref(),

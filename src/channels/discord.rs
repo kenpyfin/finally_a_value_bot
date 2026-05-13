@@ -380,8 +380,8 @@ impl EventHandler for Handler {
                 {
                     Ok(response) => {
                         drop(typing);
-                        if !response.is_empty() {
-                            if let Err(e) = crate::channel::deliver_to_contact(
+                            if !response.is_empty() {
+                            match crate::channel::deliver_agent_final_to_contact(
                                 app_state.db.clone(),
                                 app_state.telegram_bots.as_ref(),
                                 app_state.discord_http.as_ref(),
@@ -393,8 +393,12 @@ impl EventHandler for Handler {
                             )
                             .await
                             {
-                                tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Discord only");
-                                send_discord_response_to_http(&http, channel_id_for_send, &response).await;
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Discord only");
+                                    send_discord_response_to_http(&http, channel_id_for_send, &response)
+                                        .await;
+                                }
                             }
                         }
                     }

@@ -11,7 +11,7 @@ use crate::background_jobs::{
     await_handoff_startup_ack, is_background_handoff_response, try_enqueue_background_handoff,
     HandoffEnqueueOutcome,
 };
-use crate::channel::deliver_to_contact;
+use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::{call_blocking, ScheduledTask};
 use crate::error::FinallyAValueBotError;
@@ -503,90 +503,65 @@ async fn run_scheduled_agent_and_finalize(
             }
 
             let response_text = redact_secrets_user_visible(&response_text);
-            const DEDUPE_WINDOW_SECS: i64 = 120;
-            let dedupe_text = crate::channel::with_persona_indicator(
+            match deliver_agent_final_to_contact(
                 state.db.clone(),
+                state.telegram_bots.as_ref(),
+                state.discord_http.as_ref(),
+                &state.config.bot_username,
+                chat_id,
                 persona_id,
                 &response_text,
+                Some(state.config.workspace_root_absolute()),
             )
-            .await;
-            let skip_dup = match call_blocking(state.db.clone(), {
-                let text = dedupe_text;
-                move |db| {
-                    db.should_skip_duplicate_final_delivery(chat_id, &text, DEDUPE_WINDOW_SECS)
-                }
-            })
             .await
             {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "scheduler",
-                        task_id = task_id,
-                        error = %e,
-                        "duplicate-final check failed; delivering anyway"
-                    );
-                    false
-                }
-            };
-            if skip_dup {
-                info!(
-                    target: "scheduler",
-                    task_id = task_id,
-                    chat_id = chat_id,
-                    "Skipping duplicate scheduled delivery: latest stored message already matches"
-                );
-                let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
-                    "scheduled task #{} completed (duplicate delivery skipped)",
-                    task_id
-                )));
-                (true, Some("Skipped duplicate final delivery".to_string()))
-            } else {
-                match deliver_to_contact(
-                    state.db.clone(),
-                    state.telegram_bots.as_ref(),
-                    state.discord_http.as_ref(),
-                    &state.config.bot_username,
-                    chat_id,
-                    persona_id,
-                    &response_text,
-                    Some(state.config.workspace_root_absolute()),
-                )
-                .await
-                {
-                    Ok(()) => {
+                Ok(outcome) => {
+                    if outcome.response_for_client.is_empty() {
+                        info!(
+                            target: "scheduler",
+                            task_id = task_id,
+                            chat_id = chat_id,
+                            "Skipping duplicate scheduled delivery: agent final redundant vs recent send_message"
+                        );
+                        let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
+                            "scheduled task #{} completed (duplicate delivery skipped)",
+                            task_id
+                        )));
+                        (true, Some("Skipped duplicate final delivery".to_string()))
+                    } else {
                         let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
                             "scheduled task #{} completed",
                             task_id
                         )));
-                        let summary = if response_text.len() > 200 {
+                        let summary_text = outcome.response_for_client;
+                        let summary = if summary_text.len() > 200 {
                             format!(
                                 "{}...",
-                                &response_text[..response_text.floor_char_boundary(200)]
+                                &summary_text[..summary_text.floor_char_boundary(200)]
                             )
                         } else {
-                            response_text
+                            summary_text
                         };
                         (true, Some(summary))
                     }
-                    Err(e) => {
-                        let redacted_error = redact_secrets_internal(&e.to_string());
-                        let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
-                            "scheduled task #{} delivery failed: {}",
-                            task_id, redacted_error
-                        )));
-                        error!(
-                            "Scheduler: task #{} produced a response but delivery failed: {}",
-                            task_id, redacted_error
-                        );
-                        (
-                            false,
-                            Some(format!(
-                                "Delivery error after successful execution: {}",
-                                redacted_error
-                            )),
-                        )
-                    }
+                }
+                Err(e) => {
+                    let redacted_error = redact_secrets_internal(&e.to_string());
+                    let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
+                        "scheduled task #{} delivery failed: {}",
+                        task_id, redacted_error
+                    )));
+                    error!(
+                        "Scheduler: task #{} produced a response but delivery failed: {}",
+                        task_id, redacted_error
+                    );
+                    (
+                        false,
+                        Some(format!(
+                            "Delivery error after successful execution: {}",
+                            redacted_error
+                        )),
+                    )
                 }
             }
         }

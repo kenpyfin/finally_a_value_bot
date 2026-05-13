@@ -10,6 +10,7 @@ pub mod config_wizard;
 pub mod db;
 pub mod doctor;
 pub mod error;
+pub mod final_delivery_dedupe;
 pub mod gateway;
 pub mod job_heartbeat;
 pub mod llm;
