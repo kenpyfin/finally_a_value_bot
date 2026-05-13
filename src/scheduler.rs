@@ -7,6 +7,10 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::Semaphore;
 use tracing::{error, info};
 
+use crate::background_jobs::{
+    await_handoff_startup_ack, is_background_handoff_response, try_enqueue_background_handoff,
+    HandoffEnqueueOutcome,
+};
 use crate::channel::deliver_to_contact;
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::{call_blocking, ScheduledTask};
@@ -386,6 +390,7 @@ async fn run_scheduled_agent_and_finalize(
         persona_id,
         JobType::Scheduled,
         None,
+        false,
     );
     let _ = hb_tx.send(HeartbeatSignal::Started(format!(
         "scheduled task #{} started",
@@ -465,11 +470,38 @@ async fn run_scheduled_agent_and_finalize(
         Ok(Ok(response)) => {
             drop(evt_tx);
             let _ = hb_forward.await;
-            let response_text = if response.trim().is_empty() {
+            let mut response_text = if response.trim().is_empty() {
                 format!("Scheduled task #{} completed.", task_id)
             } else {
                 response
             };
+
+            if is_background_handoff_response(&response_text) {
+                response_text = match try_enqueue_background_handoff(
+                    state.clone(),
+                    chat_id,
+                    persona_id,
+                    prompt.clone(),
+                    "scheduler",
+                )
+                .await
+                {
+                    HandoffEnqueueOutcome::Queued { job_id, start_ack } => {
+                        let base = await_handoff_startup_ack(start_ack).await;
+                        format!("{base} (scheduled task #{task_id}, background job {job_id})")
+                    }
+                    HandoffEnqueueOutcome::BlockedAlreadyRunning => {
+                        "A background task is already running for this chat. Please wait for it to finish before starting another long-running background task.".into()
+                    }
+                    HandoffEnqueueOutcome::ActiveLookupFailed(msg) => {
+                        format!("Failed to check active background jobs: {msg}")
+                    }
+                    HandoffEnqueueOutcome::DbCreateFailed(e) => {
+                        format!("Failed to queue background task: {e}")
+                    }
+                };
+            }
+
             let response_text = redact_secrets_user_visible(&response_text);
             const DEDUPE_WINDOW_SECS: i64 = 120;
             let dedupe_text = crate::channel::with_persona_indicator(

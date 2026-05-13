@@ -498,6 +498,7 @@ fn default_config() -> Config {
         background_job_lease_ttl_secs: 120,
         background_job_lease_fallback_renew_secs: 180,
         background_job_pending_start_timeout_secs: 120,
+        background_job_notify_chat_progress: false,
         runtime_reliability_profile: "balanced".into(),
         workflow_auto_learn: true,
         workflow_min_success_repetitions: 2,

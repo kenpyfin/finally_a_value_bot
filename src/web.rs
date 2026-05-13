@@ -18,7 +18,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
-use crate::background_jobs::BackgroundStartAck;
+use crate::background_jobs::{
+    await_handoff_startup_ack, handoff_trigger_for_db, is_background_handoff_response,
+    try_enqueue_background_handoff, HandoffEnqueueOutcome,
+};
 use crate::channel::deliver_to_contact;
 use crate::chat_queue::{QueueEnqueueMeta, QueueRemoveOutcome, QueueSource};
 use crate::claude::{Message, MessageContent};
@@ -30,8 +33,7 @@ use crate::db::{
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext,
-    AppState, BACKGROUND_JOB_HANDOFF_PREFIX,
+    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
 };
 use std::time::SystemTime;
 
@@ -891,18 +893,41 @@ async fn api_send(
             .await
             {
                 Ok(resp) => {
-                    let response_text = resp
-                        .0
+                    let v = resp.0;
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            state_for_task
+                                .run_hub
+                                .publish(
+                                    &run_id_for_task,
+                                    "background_job",
+                                    json!({
+                                        "job_id": jid,
+                                        "message": "Task queued in background."
+                                    })
+                                    .to_string(),
+                                    limits.run_history_limit,
+                                )
+                                .await;
+                        }
+                    }
+                    let response_text = v
                         .get("response")
-                        .and_then(|v| v.as_str())
+                        .and_then(|x| x.as_str())
                         .unwrap_or_default()
                         .to_string();
+                    let mut done_payload = json!({ "response": response_text });
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            done_payload["background_job_id"] = json!(jid);
+                        }
+                    }
                     state_for_task
                         .run_hub
                         .publish(
                             &run_id_for_task,
                             "done",
-                            json!({"response": response_text}).to_string(),
+                            done_payload.to_string(),
                             limits.run_history_limit,
                         )
                         .await;
@@ -1015,341 +1040,192 @@ async fn api_send_stream(
         .app_state
         .chat_queue
         .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {
-        let run_start = Instant::now();
-        state_for_task
-            .run_hub
-            .publish(
-                &run_id_for_task,
-                "status",
-                json!({"message": "running"}).to_string(),
-                limits.run_history_limit,
-            )
-            .await;
+            let run_start = Instant::now();
+            state_for_task
+                .run_hub
+                .publish(
+                    &run_id_for_task,
+                    "status",
+                    json!({"message": "running"}).to_string(),
+                    limits.run_history_limit,
+                )
+                .await;
 
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let run_hub = state_for_task.run_hub.clone();
-        let run_id_for_events = run_id_for_task.clone();
-        let run_history_limit = limits.run_history_limit;
-        let forward = tokio::spawn(async move {
-            while let Some(evt) = evt_rx.recv().await {
-                match evt {
-                    AgentEvent::Iteration { iteration } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "status",
-                                json!({"message": format!("iteration {iteration}")}).to_string(),
-                                run_history_limit,
-                            )
-                            .await;
+            let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            let run_hub = state_for_task.run_hub.clone();
+            let run_id_for_events = run_id_for_task.clone();
+            let run_history_limit = limits.run_history_limit;
+            let forward = tokio::spawn(async move {
+                while let Some(evt) = evt_rx.recv().await {
+                    match evt {
+                        AgentEvent::Iteration { iteration } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "status",
+                                    json!({"message": format!("iteration {iteration}")})
+                                        .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::WorkflowSelected {
+                            workflow_id,
+                            confidence,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "workflow_selected",
+                                    json!({
+                                        "workflow_id": workflow_id,
+                                        "confidence": confidence
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::ToolStart {
+                            tool_use_id,
+                            name,
+                            input,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "tool_start",
+                                    json!({
+                                        "tool_use_id": tool_use_id,
+                                        "name": name,
+                                        "input": input
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::ToolResult {
+                            tool_use_id,
+                            name,
+                            is_error,
+                            output,
+                            duration_ms,
+                            status_code,
+                            bytes,
+                            error_type,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "tool_result",
+                                    json!({
+                                        "tool_use_id": tool_use_id,
+                                        "name": name,
+                                        "is_error": is_error,
+                                        "output": output,
+                                        "duration_ms": duration_ms,
+                                        "status_code": status_code,
+                                        "bytes": bytes,
+                                        "error_type": error_type
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::TextDelta { delta } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "delta",
+                                    json!({"delta": delta}).to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::FinalResponse { .. } => {}
                     }
-                    AgentEvent::WorkflowSelected {
-                        workflow_id,
-                        confidence,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "workflow_selected",
-                                json!({
-                                    "workflow_id": workflow_id,
-                                    "confidence": confidence
-                                })
-                                .to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::ToolStart {
-                        tool_use_id,
-                        name,
-                        input,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "tool_start",
-                                json!({
-                                    "tool_use_id": tool_use_id,
-                                    "name": name,
-                                    "input": input
-                                })
-                                .to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::ToolResult {
-                        tool_use_id,
-                        name,
-                        is_error,
-                        output,
-                        duration_ms,
-                        status_code,
-                        bytes,
-                        error_type,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "tool_result",
-                                json!({
-                                    "tool_use_id": tool_use_id,
-                                    "name": name,
-                                    "is_error": is_error,
-                                    "output": output,
-                                    "duration_ms": duration_ms,
-                                    "status_code": status_code,
-                                    "bytes": bytes,
-                                    "error_type": error_type
-                                })
-                                .to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::TextDelta { delta } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "delta",
-                                json!({"delta": delta}).to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::FinalResponse { .. } => {}
                 }
-            }
-        });
+            });
 
-        match send_and_store_response_with_events(
-            state_for_task.clone(),
-            body,
-            Some(&evt_tx),
-            Some(&run_id_for_task),
-            Some(cancel),
-        )
-        .await
-        {
-            Ok(resp) => {
-                let response_text = resp
-                    .0
-                    .get("response")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-
-                if response_text.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
-                    let job_id = uuid::Uuid::new_v4().to_string();
-                    let prompt_text = resp
-                        .0
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
+            match send_and_store_response_with_events(
+                state_for_task.clone(),
+                body,
+                Some(&evt_tx),
+                Some(&run_id_for_task),
+                Some(cancel),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let v = resp.0;
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            state_for_task
+                                .run_hub
+                                .publish(
+                                    &run_id_for_task,
+                                    "background_job",
+                                    json!({
+                                        "job_id": jid,
+                                        "message": "Task queued in background."
+                                    })
+                                    .to_string(),
+                                    limits.run_history_limit,
+                                )
+                                .await;
+                        }
+                    }
+                    let response_text = v
+                        .get("response")
+                        .and_then(|x| x.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let persona_id = resp
-                        .0
-                        .get("persona_id")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-
-                    // Allow only one active background subagent per chat to avoid
-                    // result interleaving and ambiguous follow-up replies.
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let pending_timeout_secs =
-                        state_for_task.app_state.config.background_job_pending_start_timeout_secs
-                            as i64;
-                    let active_jobs = call_blocking(state_for_task.app_state.db.clone(), move |db| {
-                        db.count_active_background_jobs_for_chat(
-                            chat_id,
-                            &now,
-                            pending_timeout_secs,
-                        )
-                    })
-                    .await
-                    .map_err(|e| e.to_string());
-                    let active_jobs = match active_jobs {
-                        Ok(v) => v,
-                        Err(err_text) => {
-                            state_for_task
-                                .run_hub
-                                .publish(
-                                    &run_id_for_task,
-                                    "error",
-                                    json!({
-                                        "error": format!("Failed to check active background jobs: {err_text}")
-                                    })
-                                    .to_string(),
-                                    limits.run_history_limit,
-                                )
-                                .await;
-                            return;
-                        }
-                    };
-                    if active_jobs > 0 {
-                        state_for_task
-                            .run_hub
-                            .publish(
-                                &run_id_for_task,
-                                "done",
-                                json!({
-                                    "response": "A background task is already running for this chat. Please wait for it to finish before starting another long-running background task."
-                                })
-                                .to_string(),
-                                limits.run_history_limit,
-                            )
-                            .await;
-                    } else {
-                        let jid = job_id.clone();
-                        let prompt_for_db = prompt_text.clone();
-                        let create_result = call_blocking(state_for_task.app_state.db.clone(), move |db| {
-                            db.create_background_job(&jid, chat_id, persona_id, &prompt_for_db, "timeout")
-                        })
-                        .await;
-                        if let Err(e) = create_result {
-                            state_for_task
-                                .run_hub
-                                .publish(
-                                    &run_id_for_task,
-                                    "done",
-                                    json!({
-                                        "response": format!("Failed to queue background task: {e}")
-                                    })
-                                    .to_string(),
-                                    limits.run_history_limit,
-                                )
-                                .await;
-                            return;
-                        }
-
-                        state_for_task
-                            .run_hub
-                            .publish(
-                                &run_id_for_task,
-                                "background_job",
-                                json!({
-                                    "job_id": job_id,
-                                    "message": "Task queued in background."
-                                })
-                                .to_string(),
-                                limits.run_history_limit,
-                            )
-                            .await;
-
-                        let start_ack = crate::background_jobs::spawn_background_job(
-                            state_for_task.app_state.clone(),
-                            job_id.clone(),
-                            chat_id,
-                            persona_id,
-                            prompt_text,
-                        );
-
-                        let ack =
-                            tokio::time::timeout(Duration::from_secs(8), start_ack).await;
-                        match ack {
-                            Ok(Ok(BackgroundStartAck::Running)) => {
-                                state_for_task
-                                    .run_hub
-                                    .publish(
-                                        &run_id_for_task,
-                                        "done",
-                                        json!({
-                                            "response": "This task is now running as a background subagent. You can continue chatting; a separate reply will arrive when it finishes.",
-                                            "background_job_id": job_id
-                                        })
-                                        .to_string(),
-                                        limits.run_history_limit,
-                                    )
-                                    .await;
-                            }
-                            Ok(Ok(BackgroundStartAck::Failed(reason))) => {
-                                state_for_task
-                                    .run_hub
-                                    .publish(
-                                        &run_id_for_task,
-                                        "done",
-                                        json!({
-                                            "response": format!("Background task failed to start: {reason}"),
-                                            "background_job_id": job_id
-                                        })
-                                        .to_string(),
-                                        limits.run_history_limit,
-                                    )
-                                    .await;
-                            }
-                            Ok(Err(_)) => {
-                                state_for_task
-                                    .run_hub
-                                    .publish(
-                                        &run_id_for_task,
-                                        "done",
-                                        json!({
-                                            "response": "Background task was queued, but startup confirmation channel closed early. Please check background jobs panel.",
-                                            "background_job_id": job_id
-                                        })
-                                        .to_string(),
-                                        limits.run_history_limit,
-                                    )
-                                    .await;
-                            }
-                            Err(_) => {
-                                state_for_task
-                                    .run_hub
-                                    .publish(
-                                        &run_id_for_task,
-                                        "done",
-                                        json!({
-                                            "response": "Background task was queued. Startup confirmation is delayed; check the background jobs panel for live status.",
-                                            "background_job_id": job_id
-                                        })
-                                        .to_string(),
-                                        limits.run_history_limit,
-                                    )
-                                    .await;
-                            }
+                    let mut done_payload = json!({ "response": response_text });
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            done_payload["background_job_id"] = json!(jid);
                         }
                     }
-                } else {
                     state_for_task
                         .run_hub
                         .publish(
                             &run_id_for_task,
                             "done",
-                            json!({"response": response_text}).to_string(),
+                            done_payload.to_string(),
+                            limits.run_history_limit,
+                        )
+                        .await;
+                }
+                Err((_, err_msg)) => {
+                    state_for_task
+                        .run_hub
+                        .publish(
+                            &run_id_for_task,
+                            "error",
+                            json!({"error": err_msg}).to_string(),
                             limits.run_history_limit,
                         )
                         .await;
                 }
             }
-            Err((_, err_msg)) => {
-                state_for_task
-                    .run_hub
-                    .publish(
-                        &run_id_for_task,
-                        "error",
-                        json!({"error": err_msg}).to_string(),
-                        limits.run_history_limit,
-                    )
-                    .await;
-            }
-        }
-        drop(evt_tx);
-        let _ = forward.await;
-        info!(
-            target: "web",
-            endpoint = "/api/send_stream",
-            chat_id = chat_id,
-            run_id = %run_id_for_task,
-            latency_ms = run_start.elapsed().as_millis(),
-            "Stream run finished"
-        );
+            drop(evt_tx);
+            let _ = forward.await;
+            info!(
+                target: "web",
+                endpoint = "/api/send_stream",
+                chat_id = chat_id,
+                run_id = %run_id_for_task,
+                latency_ms = run_start.elapsed().as_millis(),
+                "Stream run finished"
+            );
 
-        state_for_task
-            .run_hub
-            .remove_later(run_id_for_task, 300)
-            .await;
-    })
+            state_for_task
+                .run_hub
+                .remove_later(run_id_for_task, 300)
+                .await;
+        })
         .await;
 
     state
@@ -1910,6 +1786,7 @@ async fn send_and_store_response_with_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
+    let full_prompt_for_handoff = text.clone();
     let user_msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
         chat_id,
@@ -1944,7 +1821,36 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if !response.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
+    let mut background_job_id: Option<String> = None;
+    let mut background_job_queued = false;
+
+    if is_background_handoff_response(&response) {
+        let trig = handoff_trigger_for_db(&response).unwrap_or("timeout");
+        match try_enqueue_background_handoff(
+            state.app_state.clone(),
+            chat_id,
+            persona_id,
+            full_prompt_for_handoff,
+            trig,
+        )
+        .await
+        {
+            HandoffEnqueueOutcome::Queued { job_id, start_ack } => {
+                background_job_id = Some(job_id.clone());
+                background_job_queued = true;
+                response = await_handoff_startup_ack(start_ack).await;
+            }
+            HandoffEnqueueOutcome::BlockedAlreadyRunning => {
+                response = "A background task is already running for this chat. Please wait for it to finish before starting another long-running background task.".into();
+            }
+            HandoffEnqueueOutcome::ActiveLookupFailed(msg) => {
+                response = format!("Failed to check active background jobs: {msg}");
+            }
+            HandoffEnqueueOutcome::DbCreateFailed(e) => {
+                response = format!("Failed to queue background task: {e}");
+            }
+        }
+    } else {
         response = materialize_response_file_links(&state, chat_id, &response).await?;
         deliver_to_contact(
             state.app_state.db.clone(),
@@ -1960,13 +1866,20 @@ async fn send_and_store_response_with_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
 
-    Ok(Json(json!({
+    let mut out = json!({
         "ok": true,
         "chat_id": chat_id,
         "persona_id": persona_id,
         "prompt": raw_text,
         "response": response,
-    })))
+        "background_job_queued": background_job_queued,
+    });
+    if let Some(id) = background_job_id {
+        out["background_job_id"] = json!(id);
+    } else {
+        out["background_job_id"] = serde_json::Value::Null;
+    }
+    Ok(Json(out))
 }
 
 fn resolve_response_local_file_path(state: &WebState, raw: &str) -> Option<PathBuf> {

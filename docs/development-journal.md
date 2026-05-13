@@ -18,6 +18,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-13 — Background handoff: unified enqueue, scheduler/web fixes, quiet heartbeats
+
+- **Area:** web / scheduler / background jobs / job heartbeat
+- **Summary:** Centralized web handoff handling in `try_enqueue_background_handoff` + `send_and_store_response_with_events` so the `##BACKGROUND_JOB_HANDOFF##` sentinel never appears in JSON, run hub, or delivered chat; scheduler web-typed runs enqueue `background_jobs` the same way. Agent handoff payloads now embed `timeout` vs `pte_handoff` for `trigger_reason`. Manual-background heartbeat no longer spams `deliver_to_contact` by default (`BACKGROUND_JOB_NOTIFY_CHAT_PROGRESS` opt-in).
+- **Rationale:** Scheduler and `/api/send` skipped the stream-only handoff branch, leaving users with a raw sentinel and no DB row; heartbeat progress duplicated chat noise while DB heartbeat + ops APIs already exist.
+- **Key files / symbols:** `src/background_jobs.rs` (`is_background_handoff_response`, `handoff_trigger_for_db`, `try_enqueue_background_handoff`, `await_handoff_startup_ack`), `src/web.rs` (`send_and_store_response_with_events`, `api_send_stream`, `api_send`), `src/scheduler.rs` (`run_scheduled_agent_and_finalize`), `src/channels/telegram.rs` (handoff return format), `src/job_heartbeat.rs` (`spawn_shared_heartbeat` + `notify_chat_progress`), `src/config.rs` (`background_job_notify_chat_progress`).
+- **Follow-ups:** None.
+
+### 2026-05-12 — Internal redaction: preserve long `*.safetensors` / checkpoint basenames
+
+- **Area:** safety redaction / tools / TSA
+- **Summary:** The long-token fallback in `redact_secrets_internal` no longer masks basenames when they are immediately followed by a known model-weight extension (e.g. `.safetensors`, `.ckpt`, `.gguf`), so schedule-tool echoes and other tool results keep readable LoRA filenames.
+- **Rationale:** The heuristic treated long snake_case names with digits and multiple underscores as secrets; tool outputs are always passed through internal redaction, which produced `[REDACTED_SECRET].safetensors` for legitimate workflow text. Rust `regex` does not support look-around here, so matching uses `find_iter` plus a small suffix parser instead of a lookahead regex.
+- **Key files / symbols:** `src/safety_redaction.rs` (`is_followed_by_model_weight_extension`, `apply_long_token_fallback`), new unit test `internal_preserves_long_lora_basename_before_safetensors`.
+- **Follow-ups:** None unless other benign “long token + punctuation” patterns show up in tool echoes (e.g. other dotted artifacts).
+
 ### 2026-05-07 — Framework activation fix: portable validator + routing/telemetry hardening
 
 - **Area:** agent loop / validation / observability

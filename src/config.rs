@@ -143,6 +143,10 @@ fn default_background_job_pending_start_timeout_secs() -> u64 {
     120
 }
 
+fn default_background_job_notify_chat_progress() -> bool {
+    false
+}
+
 fn default_runtime_reliability_profile() -> String {
     "balanced".into()
 }
@@ -489,6 +493,9 @@ pub struct Config {
     /// Maximum age for a pending background job before stale reconciliation fails it. Default 120.
     #[serde(default = "default_background_job_pending_start_timeout_secs")]
     pub background_job_pending_start_timeout_secs: u64,
+    /// Post "Background update: …" chat messages during manual background jobs (very noisy). Default false.
+    #[serde(default = "default_background_job_notify_chat_progress")]
+    pub background_job_notify_chat_progress: bool,
     /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
     #[serde(default = "default_runtime_reliability_profile")]
     pub runtime_reliability_profile: String,
@@ -895,6 +902,10 @@ impl Config {
             background_job_pending_start_timeout_secs: Self::env_u64(
                 "BACKGROUND_JOB_PENDING_START_TIMEOUT_SECS",
                 default_background_job_pending_start_timeout_secs(),
+            ),
+            background_job_notify_chat_progress: Self::env_bool(
+                "BACKGROUND_JOB_NOTIFY_CHAT_PROGRESS",
+                default_background_job_notify_chat_progress(),
             ),
             runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
                 .unwrap_or_else(default_runtime_reliability_profile),
@@ -1389,6 +1400,7 @@ pub fn test_config() -> Config {
         ),
         background_job_pending_start_timeout_secs:
             default_background_job_pending_start_timeout_secs(),
+        background_job_notify_chat_progress: default_background_job_notify_chat_progress(),
         runtime_reliability_profile: default_runtime_reliability_profile(),
         workflow_auto_learn: default_workflow_auto_learn(),
         workflow_min_success_repetitions: default_workflow_min_success_repetitions(),

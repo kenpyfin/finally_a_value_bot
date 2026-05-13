@@ -309,12 +309,12 @@ The scheduler is a `tokio::spawn` task started in `run_bot()`. Every `SCHEDULER_
 2. Queries `scheduled_tasks` for rows where `status = 'active' AND next_run <= NOW()`, ordered by `next_run`, then `id`.
 3. For each due task, spawns work with a semaphore (`SCHEDULER_MAX_CONCURRENT_TASKS`, default 2) so one long run does not block the scheduler loop.
 4. Atomically claims the task (`try_mark_task_running`: only if still `active` and due), then calls `process_with_agent()` with `override_prompt = Some(task.prompt)` and a wall-clock `tokio::time::timeout` of `SCHEDULER_TASK_TIMEOUT_SECS` (default 3600).
-5. Sends the agent's final response via `deliver_to_contact` (scheduled runs inject policy + block `send_message` to the same chat to avoid duplicate Telegram messages).
+5. Sends the agent's final response via `deliver_to_contact` (scheduled runs inject policy + block `send_message` to the same chat to avoid duplicate Telegram messages). If the agent returns a web **background handoff** sentinel (e.g. long tool timeout on web-typed chats), the scheduler enqueues a `background_jobs` row and delivers a normal user-facing summary instead of the internal token.
 6. For cron tasks: finalizes with the precomputed next run; for one-shot tasks: sets `status = 'completed'`
 
 Cron expressions use the `cron` crate's 6-field format: `sec min hour dom month dow`.
 
-Optional env (see `.env.example`): `SCHEDULER_TASK_TIMEOUT_SECS`, `SCHEDULER_STALE_RUNNING_RECLAIM_SECS`, `SCHEDULER_MAX_CONCURRENT_TASKS`, `SCHEDULER_POLL_INTERVAL_SECS`. When any task is due on a tick, an `info` line logs `due_count`, `claimed` (atomic claims), and `spawned` (tasks actually spawned).
+Optional env (see `.env.example`): `SCHEDULER_TASK_TIMEOUT_SECS`, `SCHEDULER_STALE_RUNNING_RECLAIM_SECS`, `SCHEDULER_MAX_CONCURRENT_TASKS`, `SCHEDULER_POLL_INTERVAL_SECS`. When any task is due on a tick, an `info` line logs `due_count`, `claimed` (atomic claims), and `spawned` (tasks actually spawned). Web handoff enqueue shares the same path as interactive web; `BACKGROUND_JOB_NOTIFY_CHAT_PROGRESS=1` opt-in re-enables per-tool “Background update” chat lines for manual background jobs (default off).
 
 ## Debugging
 

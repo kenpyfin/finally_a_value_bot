@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use crate::channel::deliver_to_contact;
@@ -13,7 +15,9 @@ use crate::db::call_blocking;
 use crate::job_heartbeat::{
     signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
 };
-use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
+use crate::telegram::{
+    process_with_agent_with_events, AgentRequestContext, AppState, BACKGROUND_JOB_HANDOFF_PREFIX,
+};
 
 type JobCancel = Arc<AtomicBool>;
 type JobRegistryValue = (i64, JobCancel);
@@ -65,6 +69,102 @@ impl BackgroundJobControl {
         let mut guard = self.jobs.lock().await;
         guard.remove(job_id);
     }
+}
+
+/// True if the main agent returned a web background handoff sentinel.
+pub fn is_background_handoff_response(s: &str) -> bool {
+    s.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX)
+}
+
+/// Maps agent handoff payload to a `background_jobs.trigger_reason` value.
+/// Legacy payloads (`PREFIX` + preview only) map to `timeout`.
+pub fn handoff_trigger_for_db(agent_response: &str) -> Option<&'static str> {
+    let rest = agent_response.strip_prefix(BACKGROUND_JOB_HANDOFF_PREFIX)?;
+    if rest.is_empty() {
+        return Some("timeout");
+    }
+    if let Some(body) = rest.strip_prefix('\n') {
+        let (tag, _) = body.split_once('\n').unwrap_or((body, ""));
+        return Some(match tag.trim() {
+            "pte_handoff" => "pte_handoff",
+            _ => "timeout",
+        });
+    }
+    Some("timeout")
+}
+
+#[derive(Debug)]
+pub enum HandoffEnqueueOutcome {
+    Queued {
+        job_id: String,
+        start_ack: oneshot::Receiver<BackgroundStartAck>,
+    },
+    BlockedAlreadyRunning,
+    ActiveLookupFailed(String),
+    DbCreateFailed(String),
+}
+
+/// Count active jobs, insert `background_jobs` row, spawn worker. Used by web and scheduler.
+pub async fn try_enqueue_background_handoff(
+    state: Arc<AppState>,
+    chat_id: i64,
+    persona_id: i64,
+    full_prompt: String,
+    trigger_reason_db: &str,
+) -> HandoffEnqueueOutcome {
+    let now = chrono::Utc::now().to_rfc3339();
+    let pending_timeout_secs = state.config.background_job_pending_start_timeout_secs as i64;
+    match call_blocking(state.db.clone(), move |db| {
+        db.count_active_background_jobs_for_chat(chat_id, &now, pending_timeout_secs)
+    })
+    .await
+    {
+        Ok(count) => {
+            if count > 0 {
+                return HandoffEnqueueOutcome::BlockedAlreadyRunning;
+            }
+        }
+        Err(e) => {
+            return HandoffEnqueueOutcome::ActiveLookupFailed(e.to_string());
+        }
+    }
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let jid = job_id.clone();
+    let prompt_for_db = full_prompt.clone();
+    let reason = trigger_reason_db.to_string();
+    match call_blocking(state.db.clone(), move |db| {
+        db.create_background_job(&jid, chat_id, persona_id, &prompt_for_db, &reason)
+    })
+    .await
+    {
+        Ok(()) => {
+            let start_ack =
+                spawn_background_job(state, job_id.clone(), chat_id, persona_id, full_prompt);
+            HandoffEnqueueOutcome::Queued { job_id, start_ack }
+        }
+        Err(e) => HandoffEnqueueOutcome::DbCreateFailed(e.to_string()),
+    }
+}
+
+/// User-facing text after waiting (up to 8s) for background worker startup ack.
+pub fn user_message_after_handoff_startup_ack(
+    ack: Result<Result<BackgroundStartAck, oneshot::error::RecvError>, tokio::time::error::Elapsed>,
+) -> String {
+    match ack {
+        Ok(Ok(BackgroundStartAck::Running)) => "This task is now running as a background subagent. You can continue chatting; a separate reply will arrive when it finishes.".into(),
+        Ok(Ok(BackgroundStartAck::Failed(reason))) => {
+            format!("Background task failed to start: {reason}")
+        }
+        Ok(Err(_)) => "Background task was queued, but startup confirmation channel closed early. Please check background jobs panel.".into(),
+        Err(_) => "Background task was queued. Startup confirmation is delayed; check the background jobs panel for live status.".into(),
+    }
+}
+
+/// Await startup ack with the same wall-clock bound as the web stream path.
+pub async fn await_handoff_startup_ack(start_ack: oneshot::Receiver<BackgroundStartAck>) -> String {
+    let ack_result = timeout(Duration::from_secs(8), start_ack).await;
+    user_message_after_handoff_startup_ack(ack_result)
 }
 
 /// Spawn a background job and deliver the final result asynchronously.
@@ -151,6 +251,7 @@ pub fn spawn_background_job(
             persona_id,
             JobType::ManualBackground,
             Some(lease_owner),
+            state.config.background_job_notify_chat_progress,
         );
         let _ = hb_tx.send(HeartbeatSignal::Started(
             "background job started".to_string(),

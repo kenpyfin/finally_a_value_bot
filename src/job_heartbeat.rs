@@ -67,6 +67,7 @@ pub fn spawn_shared_heartbeat(
     persona_id: i64,
     job_type: JobType,
     _lease_owner: Option<String>,
+    notify_chat_progress: bool,
 ) -> UnboundedSender<HeartbeatSignal> {
     let (tx, mut rx) = mpsc::unbounded_channel::<HeartbeatSignal>();
     tokio::spawn(async move {
@@ -225,7 +226,11 @@ pub fn spawn_shared_heartbeat(
                     })
                     .await;
 
-                    if job_type.notify_user_periodically() && stage != "completed" && stage != "failed" {
+                    if job_type.notify_user_periodically()
+                        && notify_chat_progress
+                        && stage != "completed"
+                        && stage != "failed"
+                    {
                         let _ = deliver_to_contact(
                             state.db.clone(),
                             state.telegram_bots.as_ref(),
@@ -265,6 +270,7 @@ pub fn spawn_shared_heartbeat(
 
                     if active
                         && job_type.notify_user_periodically()
+                        && notify_chat_progress
                         && last_user_notify.elapsed() >= heartbeat_period
                     {
                         let _ = deliver_to_contact(

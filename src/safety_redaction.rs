@@ -46,6 +46,27 @@ fn long_token_like_regex() -> &'static Regex {
     REGEX.get_or_init(|| Regex::new(r"\b[A-Za-z0-9_-]{40,}\b").expect("valid long token regex"))
 }
 
+/// True when `rest` begins (after optional ASCII whitespace) with a known model-weight extension.
+/// Used so long-token redaction does not strip LoRA / checkpoint basenames in tool echoes.
+fn is_followed_by_model_weight_extension(rest: &str) -> bool {
+    let s = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let Some(after_dot) = s.strip_prefix('.') else {
+        return false;
+    };
+    let end = after_dot
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(after_dot.len());
+    let ext = &after_dot[..end];
+    ext.eq_ignore_ascii_case("safetensors")
+        || ext.eq_ignore_ascii_case("ckpt")
+        || ext.eq_ignore_ascii_case("pth")
+        || ext.eq_ignore_ascii_case("bin")
+        || ext.eq_ignore_ascii_case("onnx")
+        || ext.eq_ignore_ascii_case("gguf")
+        || ext.eq_ignore_ascii_case("ggml")
+        || ext.eq_ignore_ascii_case("pt")
+}
+
 fn likely_secret_token(token: &str) -> bool {
     let has_letter = token.chars().any(|c| c.is_ascii_alphabetic());
     let has_digit = token.chars().any(|c| c.is_ascii_digit());
@@ -94,16 +115,22 @@ fn redact_targeted_secrets(text: &str) -> String {
 }
 
 fn apply_long_token_fallback(redacted: &str) -> String {
-    long_token_like_regex()
-        .replace_all(redacted, |caps: &Captures<'_>| {
-            let token = &caps[0];
-            if likely_secret_token(token) {
-                REDACTED.to_string()
-            } else {
-                token.to_string()
-            }
-        })
-        .into_owned()
+    let re = long_token_like_regex();
+    let mut out = String::with_capacity(redacted.len());
+    let mut last_end = 0usize;
+    for m in re.find_iter(redacted) {
+        out.push_str(&redacted[last_end..m.start()]);
+        let token = m.as_str();
+        let after = &redacted[m.end()..];
+        if is_followed_by_model_weight_extension(after) || !likely_secret_token(token) {
+            out.push_str(token);
+        } else {
+            out.push_str(REDACTED);
+        }
+        last_end = m.end();
+    }
+    out.push_str(&redacted[last_end..]);
+    out
 }
 
 #[cfg(test)]
@@ -144,6 +171,20 @@ mod tests {
         assert!(out.contains(".pdf")); // punctuation splits word boundary typically before .
         assert!(!out.contains(name));
         assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn internal_preserves_long_lora_basename_before_safetensors() {
+        let basename = "pz_face_character_lora_v3_final_mix_abc123def456ghi789jkl012mno";
+        assert!(basename.len() >= 40);
+        let input = format!("remember the correct LoRA is {basename}.safetensors for the swap job");
+        let out = redact_secrets_internal(&input);
+        assert!(
+            out.contains(basename),
+            "expected LoRA basename preserved, got: {out}"
+        );
+        assert!(out.contains(".safetensors"));
+        assert!(!out.contains(REDACTED));
     }
 
     #[test]

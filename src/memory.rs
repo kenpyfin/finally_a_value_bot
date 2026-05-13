@@ -1007,7 +1007,9 @@ mod tests {
         let ctx = mm.build_memory_context(100, 1);
         assert!(ctx.contains("<memory_field_legend>"));
         assert!(ctx.contains("meta.version: schema version; normalized to current version."));
-        assert!(ctx.contains("workflow_memory.intents[].confidence: confidence score in [0.0, 1.0]."));
+        assert!(
+            ctx.contains("workflow_memory.intents[].confidence: confidence score in [0.0, 1.0].")
+        );
         assert!(ctx.contains("<memory_this_persona>"));
         assert!(ctx.contains("persona memory"));
         assert!(ctx.contains("<memory_state_json>"));
@@ -1035,7 +1037,9 @@ mod tests {
         let legend_b = render_memory_field_legend_compact();
         assert_eq!(legend_a, legend_b);
         assert!(legend_a.contains("meta.version: schema version; normalized to current version."));
-        assert!(legend_a.contains("links.mem_palace_refs[]: retrieval alignment references to mem-palace artifacts."));
+        assert!(legend_a.contains(
+            "links.mem_palace_refs[]: retrieval alignment references to mem-palace artifacts."
+        ));
         assert!(legend_a.len() <= MEMORY_FIELD_LEGEND_MAX_CHARS);
     }
 

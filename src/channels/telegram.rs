@@ -2891,7 +2891,7 @@ pub async fn process_with_agent_with_events(
                         if context.caller_channel == "web" && !context.is_background_job {
                             save_run_history!("pte_background_handoff");
                             return Ok(format!(
-                                "{}{}",
+                                "{}\npte_handoff\n{}",
                                 BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview
                             ));
                         }
@@ -2933,7 +2933,7 @@ pub async fn process_with_agent_with_events(
                     );
                     save_run_history!("background_handoff");
                     return Ok(format!(
-                        "{}{}",
+                        "{}\ntimeout\n{}",
                         BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview
                     ));
                 }
