@@ -18,6 +18,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-13 — Conversation continuity: configurable history tail + operator memo
+
+- **Area:** agent / DB / web / config / docs
+- **Summary:** Added per-persona nullable `recent_history_min_user`, `recent_history_min_assistant`, and `operator_memo` (SQLite migration). Global defaults `RECENT_HISTORY_MIN_USER_MESSAGES` / `RECENT_HISTORY_MIN_ASSISTANT_MESSAGES` (default 2, clamp 1–25) feed `trim_to_recent_balanced` when overrides are unset. `build_system_prompt` accepts optional operator memo (redacted, length-capped) inserted after `# Principles`, before `# Memory`. Web `GET`/`PATCH /api/personas/:id/bulletin` exposes `history_suffix` and `operator_memo`; cockpit expanded strip adds depth presets and memo editor.
+- **Rationale:** The prior fixed 2+2 balanced tail often hid most of `MAX_HISTORY_MESSAGES` from the model; operators need a steering field separate from tiered memory and the header Memory JSON editor.
+- **Key files / symbols:** `src/db.rs` (`migrate_personas_prompt_context`, `Persona`, `set_persona_prompt_overrides`, `OPERATOR_MEMO_MAX_CHARS`), `src/config.rs` / `src/config_wizard.rs`, `src/channels/telegram.rs` (`trim_to_recent_balanced`, `build_system_prompt`, persona load in `process_with_agent_with_events`), `src/web.rs` (`api_persona_bulletin_get` / `_patch`), `web/src/main.tsx`, `web/src/components/cockpit-bar.tsx`, `web/src/types.ts`, `src/setup.rs`, `.env.example`, `DEVELOP.md`, `docs/architecture_review.md`.
+- **Follow-ups:** Telegram-native editing of memo/overrides; token-budget trim (plan out of scope).
+
+### 2026-05-13 — Learned workflows: remove run-start SQL hint from system prompt
+
+- **Area:** agent / channels / memory / docs
+- **Summary:** Removed the pre-loop `get_best_workflow_for_intent(..., 0.6)` lookup that appended `# Learned Workflow Hint` and emitted `AgentEvent::WorkflowSelected`. `save_run_history!` no longer passes a run-selected `workflow_id` into `log_workflow_execution`. Post-run `upsert_workflow_learning` and promotion into `tier1.workflow_principles` are unchanged.
+- **Rationale:** Recurring workflow guidance is carried in tiered memory (`WorkflowPrinciple|` lines); the duplicate SQL-sourced hint block was redundant and added prompt noise.
+- **Key files / symbols:** `src/channels/telegram.rs` (`process_with_agent_with_events` prompt assembly, `save_run_history!` `selected_workflow_id`), `docs/workflow.md`, `ARCHITECTURE.md`, `docs/architecture_review.md`.
+- **Follow-ups:** None unless operators want to drop `workflow_executions` / unused `AgentEvent::WorkflowSelected` handling entirely.
+
 ### 2026-05-13 — Agent final vs `send_message`: fuzzy dedupe + memory-tail-only delivery
 
 - **Area:** agent loop / channels / web / scheduler / WhatsApp

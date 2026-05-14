@@ -432,6 +432,8 @@ fn default_config() -> Config {
         max_tokens: 8192,
         max_tool_iterations: 100,
         max_history_messages: 50,
+        recent_history_min_user_messages: 2,
+        recent_history_min_assistant_messages: 2,
         max_document_size_mb: 100,
         workspace_dir: "./workspace".into(),
         openai_api_key: None,

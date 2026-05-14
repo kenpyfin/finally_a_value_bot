@@ -39,7 +39,16 @@ pub struct Persona {
     pub chat_id: i64,
     pub name: String,
     pub model_override: Option<String>,
+    /// When set, overrides global default for `trim_to_recent_balanced` minimum user messages.
+    pub recent_history_min_user: Option<i64>,
+    /// When set, overrides global default for `trim_to_recent_balanced` minimum assistant messages.
+    pub recent_history_min_assistant: Option<i64>,
+    /// Operator-authored steering note injected into the system prompt (web cockpit).
+    pub operator_memo: Option<String>,
 }
+
+/// Maximum `operator_memo` length (characters) for storage and prompt injection.
+pub const OPERATOR_MEMO_MAX_CHARS: usize = 4000;
 
 #[derive(Debug, Clone)]
 pub struct ChatSummary {
@@ -539,6 +548,7 @@ impl Database {
         Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
         Self::migrate_workflow_learning_schema(&conn)?;
         Self::migrate_background_jobs_lease_schema(&conn)?;
+        Self::migrate_personas_prompt_context(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -959,6 +969,25 @@ impl Database {
                 "ALTER TABLE workflows ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
                 [],
             )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_personas_prompt_context(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "personas", "recent_history_min_user")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN recent_history_min_user INTEGER",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "recent_history_min_assistant")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN recent_history_min_assistant INTEGER",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "operator_memo")? {
+            conn.execute("ALTER TABLE personas ADD COLUMN operator_memo TEXT", [])?;
         }
         Ok(())
     }
@@ -4058,7 +4087,7 @@ impl Database {
     pub fn list_personas(&self, chat_id: i64) -> Result<Vec<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 ORDER BY id",
+            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE chat_id = ?1 ORDER BY id",
         )?;
         let personas = stmt
             .query_map(params![chat_id], |row| {
@@ -4067,6 +4096,9 @@ impl Database {
                     chat_id: row.get(1)?,
                     name: row.get(2)?,
                     model_override: row.get(3)?,
+                    recent_history_min_user: row.get(4)?,
+                    recent_history_min_assistant: row.get(5)?,
+                    operator_memo: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -4113,7 +4145,7 @@ impl Database {
     ) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 AND name = ?2",
+            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE chat_id = ?1 AND name = ?2",
             params![chat_id, name],
             |row| {
                 Ok(Persona {
@@ -4121,6 +4153,9 @@ impl Database {
                     chat_id: row.get(1)?,
                     name: row.get(2)?,
                     model_override: row.get(3)?,
+                    recent_history_min_user: row.get(4)?,
+                    recent_history_min_assistant: row.get(5)?,
+                    operator_memo: row.get(6)?,
                 })
             },
         );
@@ -4134,7 +4169,7 @@ impl Database {
     pub fn get_persona(&self, id: i64) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, name, model_override FROM personas WHERE id = ?1",
+            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Persona {
@@ -4142,6 +4177,9 @@ impl Database {
                     chat_id: row.get(1)?,
                     name: row.get(2)?,
                     model_override: row.get(3)?,
+                    recent_history_min_user: row.get(4)?,
+                    recent_history_min_assistant: row.get(5)?,
+                    operator_memo: row.get(6)?,
                 })
             },
         );
@@ -4213,6 +4251,35 @@ impl Database {
         let rows = conn.execute(
             "UPDATE personas SET model_override = ?1 WHERE id = ?2 AND chat_id = ?3",
             params![model_override, persona_id, chat_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Sets per-persona prompt controls. `None` for min fields writes SQL NULL (use server defaults).
+    /// `operator_memo` `None` clears memo to NULL; `Some("")` also clears.
+    pub fn set_persona_prompt_overrides(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        recent_history_min_user: Option<i64>,
+        recent_history_min_assistant: Option<i64>,
+        operator_memo: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let memo_db: Option<String> = match operator_memo {
+            None => None,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.to_string()),
+        };
+        let rows = conn.execute(
+            "UPDATE personas SET recent_history_min_user = ?1, recent_history_min_assistant = ?2, operator_memo = ?3 WHERE id = ?4 AND chat_id = ?5",
+            params![
+                recent_history_min_user,
+                recent_history_min_assistant,
+                memo_db,
+                persona_id,
+                chat_id
+            ],
         )?;
         Ok(rows > 0)
     }

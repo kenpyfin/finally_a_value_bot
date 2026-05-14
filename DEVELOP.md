@@ -78,7 +78,7 @@ src/
 
 | Topic | Doc |
 | --- | --- |
-| Learned workflows (SQLite hints, post-run learning, confidence) | [`docs/workflow.md`](docs/workflow.md) |
+| Learned workflows (SQLite persistence, post-run learning, memory promotion) | [`docs/workflow.md`](docs/workflow.md) |
 | Runtime parity / deferred agent-runtime items | [`docs/runtime-gap-analysis.md`](docs/runtime-gap-analysis.md) |
 
 ### Data flow
@@ -104,12 +104,11 @@ Telegram message
            - Group: all messages since last bot response (catch-up)
        |
        v
-    Build system prompt (bot identity + memory context + chat_id)
+    Build system prompt (bot identity + memory context + optional operator memo + chat_id)
        |
        v
-    Compact if needed (messages > max_session_messages):
-       - Summarize old messages via Claude
-       - Keep recent messages verbatim
+    Trim loaded history to a balanced suffix (at least N user + N assistant text
+    messages; defaults from config, optional per-persona overrides via DB / web bulletin)
        |
        v
     Agentic loop (up to max_tool_iterations):
@@ -338,12 +337,12 @@ sqlite> SELECT * FROM chats;
 | Task                       | How                                                                                                                                         |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | Change the model           | Set `model: "claude-sonnet-4-20250514"` in `finally-a-value-bot.config.yaml`                                                                |
-| Increase context window    | Set `max_history_messages: 100` in `finally-a-value-bot.config.yaml` (uses more tokens)                                                     |
+| Increase context window    | Raise `max_history_messages` / `MAX_HISTORY_MESSAGES` (more DB rows eligible for the prompt; uses more tokens). Ensure it is ≥ user + assistant suffix minimums when turns alternate. |
+| More dialogue at the tail  | Set `recent_history_min_user_messages` / `recent_history_min_assistant_messages` (env `RECENT_HISTORY_MIN_USER_MESSAGES` / `RECENT_HISTORY_MIN_ASSISTANT_MESSAGES`, default 2) or per-persona overrides via web cockpit → `GET`/`PATCH /api/personas/:id/bulletin` (`history_suffix`). |
+| Operator steering note     | Per-persona `operator_memo` (web cockpit bulletin PATCH, injected in the system prompt). Distinct from the header Memory JSON editor (`memory_state`). |
 | Increase tool iterations   | Set `max_tool_iterations: 200` in `finally-a-value-bot.config.yaml`                                                                         |
 | Reset memory               | Delete files under `finally-a-value-bot.data/runtime/groups/`                                                                               |
 | Reset all data             | Delete the `finally-a-value-bot.data/` directory                                                                                            |
-| Tune compaction threshold  | Set `max_session_messages: 60` in `finally-a-value-bot.config.yaml` (higher = more context before compaction)                               |
-| Keep more recent messages  | Set `compact_keep_recent: 30` in `finally-a-value-bot.config.yaml` (more recent messages kept verbatim)                                     |
 | Reset a chat session       | Send `/reset` in the chat, or: `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "DELETE FROM sessions WHERE chat_id=XXXX;"` |
 | Cancel all scheduled tasks | `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "UPDATE scheduled_tasks SET status='cancelled' WHERE status='active';"`    |
 

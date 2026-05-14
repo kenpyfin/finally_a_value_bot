@@ -1,15 +1,39 @@
-import React, { useEffect, useId, useRef, useState } from 'react'
-import { Button, Dialog, Flex, Text } from '@radix-ui/themes'
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { Button, Dialog, Flex, Select, Text, TextArea } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api/client'
-import type {
-  BackendMessage,
-  InstallationStatus,
-  PersonaBulletinFocus,
-  PersonaMessageBookmark,
-  QueueLane,
+import {
+  OPERATOR_MEMO_MAX_CHARS,
+  type BackendMessage,
+  type InstallationStatus,
+  type PersonaBulletinFocus,
+  type PersonaBulletinHistorySuffix,
+  type PersonaMessageBookmark,
+  type QueueLane,
 } from '../types'
+
+function historyDepthSelectValue(hs: PersonaBulletinHistorySuffix | null): string {
+  if (hs == null) return 'server'
+  if (hs.min_user.uses_default && hs.min_assistant.uses_default) return 'server'
+  const u = hs.min_user.effective
+  const a = hs.min_assistant.effective
+  if (u === a && (u === 2 || u === 6 || u === 10)) return String(u)
+  return 'custom'
+}
+
+function operatorMemoCharCount(s: string): number {
+  return Array.from(s.trim()).length
+}
+
+/** Radix Select portals its listbox to `document.body`; clicks there are outside `expandedRootRef`. */
+function isPointerOnRadixSelectOverlay(target: EventTarget | null): boolean {
+  if (!target || !(target instanceof Element)) return false
+  return (
+    target.closest('[data-radix-popper-content-wrapper]') != null ||
+    target.closest('[data-radix-select-viewport]') != null
+  )
+}
 
 export type CockpitBarProps = {
   appearance: 'dark' | 'light'
@@ -24,6 +48,14 @@ export type CockpitBarProps = {
   activePersonaId: number | null
   /** Persisted removal via DELETE bookmark; return true when the bookmark was removed. */
   onRemoveBookmark?: (messageId: string) => Promise<boolean>
+  /** GET bulletin `history_suffix`; null when unavailable. */
+  historySuffix: PersonaBulletinHistorySuffix | null
+  /** Server-stored operator memo (may be null). */
+  operatorMemoServer: string | null
+  /** Reload bulletin after PATCH (same persona). */
+  reloadBulletin: () => Promise<void>
+  /** Short status line updates after successful saves. */
+  onBulletinStatus?: (message: string) => void
   floating?: boolean
 }
 
@@ -42,6 +74,10 @@ export function CockpitBar({
   bookmarks,
   activePersonaId,
   onRemoveBookmark,
+  historySuffix,
+  operatorMemoServer,
+  reloadBulletin,
+  onBulletinStatus,
   floating = false,
 }: CockpitBarProps) {
   const [expanded, setExpanded] = useState(false)
@@ -51,6 +87,11 @@ export function CockpitBar({
   const [bookmarkMessageError, setBookmarkMessageError] = useState('')
   const [removeBookmarkBusy, setRemoveBookmarkBusy] = useState(false)
   const [removeBookmarkError, setRemoveBookmarkError] = useState('')
+  const [depthBusy, setDepthBusy] = useState(false)
+  const [depthError, setDepthError] = useState('')
+  const [memoDraft, setMemoDraft] = useState('')
+  const [memoBusy, setMemoBusy] = useState(false)
+  const [memoError, setMemoError] = useState('')
   const expandedRootRef = useRef<HTMLDivElement | null>(null)
   const panelId = useId()
   const toggleId = `${panelId}-toggle`
@@ -58,6 +99,79 @@ export function CockpitBar({
   const pending = queueLane?.pending ?? 0
   const oldestWaitMs = queueLane?.oldest_wait_ms ?? 0
   const queueError = queueLane?.last_error
+
+  const depthSelectValue = useMemo(() => historyDepthSelectValue(historySuffix), [historySuffix])
+
+  useEffect(() => {
+    setMemoDraft(operatorMemoServer ?? '')
+  }, [operatorMemoServer])
+
+  const serverMemoTrimmed = (operatorMemoServer ?? '').trim()
+  const memoDraftTrimmed = memoDraft.trim()
+  const memoDirty = memoDraftTrimmed !== serverMemoTrimmed
+  const memoCharCount = operatorMemoCharCount(memoDraft)
+  const memoTooLong = memoCharCount > OPERATOR_MEMO_MAX_CHARS
+
+  const applyDepthPreset = useCallback(
+    async (v: string) => {
+      if (activePersonaId == null || v === 'custom') return
+      setDepthBusy(true)
+      setDepthError('')
+      try {
+        const body: Record<string, unknown> =
+          v === 'server'
+            ? { recent_history_min_user: null, recent_history_min_assistant: null }
+            : { recent_history_min_user: Number(v), recent_history_min_assistant: Number(v) }
+        await api(`/api/personas/${activePersonaId}/bulletin`, {
+          method: 'PATCH',
+          body: JSON.stringify(body),
+        })
+        await reloadBulletin()
+        onBulletinStatus?.('Chat context depth updated')
+      } catch (e) {
+        setDepthError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setDepthBusy(false)
+      }
+    },
+    [activePersonaId, reloadBulletin, onBulletinStatus],
+  )
+
+  const saveMemo = useCallback(async () => {
+    if (activePersonaId == null) return
+    if (memoTooLong) {
+      setMemoError(`Memo exceeds ${OPERATOR_MEMO_MAX_CHARS} characters (after trimming).`)
+      return
+    }
+    setMemoBusy(true)
+    setMemoError('')
+    try {
+      const payload =
+        memoDraftTrimmed.length === 0 ? null : memoDraft
+      await api(`/api/personas/${activePersonaId}/bulletin`, {
+        method: 'PATCH',
+        body: JSON.stringify({ operator_memo: payload }),
+      })
+      await reloadBulletin()
+      onBulletinStatus?.('Operator memo saved')
+    } catch (e) {
+      setMemoError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMemoBusy(false)
+    }
+  }, [
+    activePersonaId,
+    memoDraft,
+    memoDraftTrimmed,
+    memoTooLong,
+    reloadBulletin,
+    onBulletinStatus,
+  ])
+
+  const onMemoBlur = useCallback(() => {
+    if (!memoDirty || memoBusy || memoTooLong) return
+    void saveMemo()
+  }, [memoBusy, memoDirty, memoTooLong, saveMemo])
 
   const queueLabel =
     pending > 0
@@ -115,6 +229,7 @@ export function CockpitBar({
       const target = event.target as Node | null
       if (!target) return
       if (expandedRootRef.current?.contains(target)) return
+      if (isPointerOnRadixSelectOverlay(target)) return
       setExpanded(false)
     }
     window.addEventListener('pointerdown', onPointerDown)
@@ -306,6 +421,135 @@ export function CockpitBar({
               </>
             )}
           </Flex>
+          <div
+            className={
+              isDark
+                ? 'rounded-md border border-[color:var(--mc-border-soft)] p-2'
+                : 'rounded-md border border-slate-300 p-2'
+            }
+          >
+            <Text size="1" weight="medium">
+              Chat context depth
+            </Text>
+            <Text size="1" color="gray" className="mt-1 block leading-snug">
+              Minimum user and assistant turns kept at the tail of the trimmed history for each run. Set{' '}
+              <code className="text-[11px]">MAX_HISTORY_MESSAGES</code> ≥ user + assistant mins when turns alternate.
+            </Text>
+            {historySuffix ? (
+              <Flex mt="2" direction="column" gap="1">
+                <Select.Root
+                  value={depthSelectValue}
+                  onValueChange={(v) => void applyDepthPreset(v)}
+                  disabled={activePersonaId == null || depthBusy}
+                >
+                  <Select.Trigger className="w-full max-w-xs" />
+                  <Select.Content position="popper">
+                    <Select.Item value="server">
+                      Server defaults ({historySuffix.defaults.min_user} / {historySuffix.defaults.min_assistant})
+                    </Select.Item>
+                    <Select.Item value="2">Compact (2 / 2)</Select.Item>
+                    <Select.Item value="6">Standard (6 / 6)</Select.Item>
+                    <Select.Item value="10">Deep (10 / 10)</Select.Item>
+                    {depthSelectValue === 'custom' ? (
+                      <Select.Item value="custom">
+                        Custom ({historySuffix.min_user.effective} / {historySuffix.min_assistant.effective})
+                      </Select.Item>
+                    ) : null}
+                  </Select.Content>
+                </Select.Root>
+                {depthError ? (
+                  <Text size="1" color="red">
+                    {depthError}
+                  </Text>
+                ) : (
+                  <Text size="1" color="gray">
+                    Effective: {historySuffix.min_user.effective} user · {historySuffix.min_assistant.effective}{' '}
+                    assistant
+                    {historySuffix.min_user.persona_override != null ||
+                    historySuffix.min_assistant.persona_override != null
+                      ? ' (persona override)'
+                      : ''}
+                  </Text>
+                )}
+              </Flex>
+            ) : (
+              <Text size="1" color="gray" className="mt-1">
+                Load bulletin to edit depth.
+              </Text>
+            )}
+          </div>
+          <div
+            className={
+              isDark
+                ? 'rounded-md border border-[color:var(--mc-border-soft)] p-2'
+                : 'rounded-md border border-slate-300 p-2'
+            }
+          >
+            <Text size="1" weight="medium">
+              Operator memo
+            </Text>
+            <Text size="1" color="gray" className="mt-1 block leading-snug">
+              Short steering note for this persona (system prompt). Separate from tiered memory and the header Memory
+              JSON editor.
+            </Text>
+            <TextArea
+              className="mt-2 min-h-[72px] font-mono text-xs"
+              value={memoDraft}
+              onChange={(e) => setMemoDraft(e.target.value)}
+              onBlur={onMemoBlur}
+              disabled={activePersonaId == null || memoBusy}
+              placeholder="What the operator cares about for the next runs…"
+            />
+            <Flex mt="1" justify="between" align="center" wrap="wrap" gap="2">
+              <Text size="1" color={memoTooLong ? 'red' : 'gray'}>
+                {memoCharCount} / {OPERATOR_MEMO_MAX_CHARS}
+              </Text>
+              <Flex gap="2">
+                <Button
+                  type="button"
+                  size="1"
+                  variant="soft"
+                  disabled={activePersonaId == null || memoBusy || !memoDirty || memoTooLong}
+                  onClick={() => void saveMemo()}
+                >
+                  {memoBusy ? 'Saving…' : 'Save memo'}
+                </Button>
+                <Button
+                  type="button"
+                  size="1"
+                  variant="ghost"
+                  disabled={activePersonaId == null || memoBusy || serverMemoTrimmed.length === 0}
+                  onClick={() => {
+                    setMemoDraft('')
+                    void (async () => {
+                      if (activePersonaId == null) return
+                      setMemoBusy(true)
+                      setMemoError('')
+                      try {
+                        await api(`/api/personas/${activePersonaId}/bulletin`, {
+                          method: 'PATCH',
+                          body: JSON.stringify({ operator_memo: null }),
+                        })
+                        await reloadBulletin()
+                        onBulletinStatus?.('Operator memo cleared')
+                      } catch (e) {
+                        setMemoError(e instanceof Error ? e.message : String(e))
+                      } finally {
+                        setMemoBusy(false)
+                      }
+                    })()
+                  }}
+                >
+                  Clear
+                </Button>
+              </Flex>
+            </Flex>
+            {memoError ? (
+              <Text size="1" color="red" className="mt-1">
+                {memoError}
+              </Text>
+            ) : null}
+          </div>
           <div className={isDark ? 'rounded-md border border-[color:var(--mc-border-soft)] p-2' : 'rounded-md border border-slate-300 p-2'}>
             <Text size="1" weight="medium">Bulletin</Text>
             <div className="mt-1 whitespace-pre-wrap text-xs text-[color:var(--gray-11)]">

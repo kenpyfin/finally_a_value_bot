@@ -2357,6 +2357,18 @@ struct PersonaBookmarkUpsertBody {
     note: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct PersonaBulletinPatchBody {
+    /// `null` clears override (server defaults). Omitted = leave unchanged.
+    #[serde(default)]
+    recent_history_min_user: Option<Option<i64>>,
+    #[serde(default)]
+    recent_history_min_assistant: Option<Option<i64>>,
+    /// `null` clears memo. Omitted = leave unchanged.
+    #[serde(default)]
+    operator_memo: Option<Option<String>>,
+}
+
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() > max_chars {
         format!("{}...", input.chars().take(max_chars).collect::<String>())
@@ -2418,12 +2430,154 @@ async fn api_persona_bulletin_get(
         })
         .collect();
 
+    let pid4 = path.persona_id;
+    let persona = call_blocking(state.app_state.db.clone(), move |db| {
+        let p = db.get_persona(pid4)?;
+        Ok(p.filter(|x| x.chat_id == chat_id))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let cfg = &state.app_state.config;
+    let def_u = cfg.recent_history_min_user_messages.clamp(1, 25) as i64;
+    let def_a = cfg.recent_history_min_assistant_messages.clamp(1, 25) as i64;
+    let hs_json = if let Some(ref p) = persona {
+        let o_u = p.recent_history_min_user;
+        let o_a = p.recent_history_min_assistant;
+        let e_u = o_u.unwrap_or(def_u).clamp(1, 25);
+        let e_a = o_a.unwrap_or(def_a).clamp(1, 25);
+        json!({
+            "min_user": {
+                "effective": e_u,
+                "persona_override": o_u,
+                "uses_default": o_u.is_none(),
+            },
+            "min_assistant": {
+                "effective": e_a,
+                "persona_override": o_a,
+                "uses_default": o_a.is_none(),
+            },
+            "defaults": { "min_user": def_u, "min_assistant": def_a },
+        })
+    } else {
+        json!({})
+    };
+
     Ok(Json(json!({
         "ok": true,
         "persona_id": path.persona_id,
         "focus": focus_json,
         "bookmarks": bookmarks_json,
+        "history_suffix": hs_json,
+        "operator_memo": persona.as_ref().and_then(|p| p.operator_memo.clone()),
     })))
+}
+
+async fn api_persona_bulletin_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+    Json(body): Json<PersonaBulletinPatchBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    if body.recent_history_min_user.is_none()
+        && body.recent_history_min_assistant.is_none()
+        && body.operator_memo.is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "no fields to update (send recent_history_min_user, recent_history_min_assistant, and/or operator_memo)"
+                .into(),
+        ));
+    }
+
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let pid2 = path.persona_id;
+    let current = call_blocking(state.app_state.db.clone(), move |db| db.get_persona(pid2))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "persona not found".into()))?;
+    if current.chat_id != chat_id {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let mut nu = current.recent_history_min_user;
+    let mut na = current.recent_history_min_assistant;
+    let mut memo = current.operator_memo.clone();
+
+    if let Some(v) = body.recent_history_min_user {
+        if let Some(n) = v {
+            if !(1..=25).contains(&n) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "recent_history_min_user must be between 1 and 25".into(),
+                ));
+            }
+            nu = Some(n);
+        } else {
+            nu = None;
+        }
+    }
+    if let Some(v) = body.recent_history_min_assistant {
+        if let Some(n) = v {
+            if !(1..=25).contains(&n) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "recent_history_min_assistant must be between 1 and 25".into(),
+                ));
+            }
+            na = Some(n);
+        } else {
+            na = None;
+        }
+    }
+    if let Some(v) = body.operator_memo {
+        memo = match v {
+            None => None,
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else if t.chars().count() > crate::db::OPERATOR_MEMO_MAX_CHARS {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "operator_memo exceeds {} characters",
+                            crate::db::OPERATOR_MEMO_MAX_CHARS
+                        ),
+                    ));
+                } else {
+                    Some(s)
+                }
+            }
+        };
+    }
+
+    let ok = call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_persona_prompt_overrides(chat_id, pid, nu, na, memo.as_deref())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !ok {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to update persona".into(),
+        ));
+    }
+
+    Ok(Json(json!({ "ok": true, "persona_id": path.persona_id })))
 }
 
 async fn api_persona_bookmarks_get(
@@ -4187,7 +4341,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/personas/delete", post(api_personas_delete))
         .route(
             "/api/personas/:persona_id/bulletin",
-            get(api_persona_bulletin_get),
+            get(api_persona_bulletin_get).patch(api_persona_bulletin_patch),
         )
         .route(
             "/api/personas/:persona_id/bookmarks",

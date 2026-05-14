@@ -1,13 +1,13 @@
 # Learned workflows
 
-This document describes **auto-learned workflows**: rows in SQLite that record which **tools** ran successfully for a **normalized user intent**, and optionally inject a **hint** into the agent system prompt. It is **not** GitHub Actions CI (`.github/workflows/`).
+This document describes **auto-learned workflows**: rows in SQLite that record which **tools** ran successfully for a **normalized user intent**, updated after tool-using runs. **Run-start injection** of a `# Learned Workflow Hint` block into the system prompt is **disabled**; recurring patterns are intended to surface via **tiered memory** (`tier1.workflow_principles`, promoted after successful runs when thresholds are met). This is **not** GitHub Actions CI (`.github/workflows/`).
 
 ## What this feature is (and is not)
 
 | | |
 | --- | --- |
 | **Is** | Per-chat, per-intent **memory of approach patterns** (tool order + structured step traces + outcome metadata), learned after agent runs that used tools. |
-| **Is** | A **soft hint** appended to the system prompt when confidence is high enough. |
+| **Is** | A promotion path into **`tier1.workflow_principles`** (MEMORY) after repeated successful runs, using DB row stats read post-upsert. |
 | **Is not** | A user-authored workflow file in the workspace, a skill, or a deterministic executor that forces tool order. |
 | **Is not** | Updated by parsing the system prompt; learning uses **post-run facts** from the agent trace. |
 
@@ -18,7 +18,7 @@ All channels that use `process_with_agent` / `process_with_agent_with_events` in
 - **Database file:** `{workspace_dir}/runtime/finally_a_value_bot.db` (see `Database::new` in [`src/db.rs`](../src/db.rs)).
 - **Tables:**
   - **`workflows`** — one row per `(owner_chat_id, intent_signature)` with `steps_json`, `confidence`, `version`, counts, timestamps.
-  - **`workflow_executions`** — audit log when a workflow row was **selected** for a run (`workflow_id`, `run_key`, outcome, score).
+  - **`workflow_executions`** — audit log keyed to a `workflow_id` + `run_key` (`outcome`, `score`). The shared agent path **no longer** selects a workflow at run start, so **new** rows from that selection path are not written; legacy rows may remain.
 
 `steps_json` remains a JSON array of tool names for compatibility. Newer rows also persist:
 - `step_trace_json`: structured per-call trace (iteration/tool/duration/error/input preview).
@@ -30,20 +30,11 @@ All channels that use `process_with_agent` / `process_with_agent_with_events` in
 
 Before the agent loop, `normalize_intent_signature` derives a key from the **latest user text** (after scheduler/runtime prepends): lowercase, split on non-alphanumeric, words with length ≥ 3, up to 12 words, joined with `_`. Empty input becomes `general`.
 
-The same string is used for **lookup** and for **learning** on that run.
+The same string is used for **learning** on that run and for **post-run promotion** (re-read after upsert).
 
-## Selection and system prompt
+## Run-start system prompt (disabled)
 
-1. `get_best_workflow_for_intent(owner_chat_id, intent_signature, min_confidence)` reads from `workflows`.
-2. Call sites use **`min_confidence = 0.6`** (hardcoded in `telegram.rs` next to workflow selection).
-3. If a row is returned, the system prompt gains a structured hint with:
-- intent signature
-- confidence
-- approach summary
-- tool-order memory
-- recent outcome/failure reason (when available)
-
-If confidence is below the threshold, **no hint** is added (table may still be updated by learning on tool-using runs).
+Previously, `process_with_agent` / `process_with_agent_with_events` queried `get_best_workflow_for_intent(..., min_confidence = 0.6)` and appended `# Learned Workflow Hint` plus emitted `AgentEvent::WorkflowSelected`. **That path is removed.** The `workflows` table is still updated by post-run learning (below), and successful patterns can be promoted into **`tier1.workflow_principles`** in tiered memory (see [`src/channels/telegram.rs`](../src/channels/telegram.rs) `save_run_history!` and [`src/memory.rs`](../src/memory.rs) memory rendering).
 
 ## Learning trigger (after each run)
 
@@ -57,7 +48,7 @@ The system prompt text does **not** drive `upsert_workflow_learning`; only the *
 
 ## Confidence and evolution
 
-**`workflows.confidence`** (used for hint selection):
+**`workflows.confidence`** (evolves on each `upsert_workflow_learning`; used when re-reading the row for **memory promotion** after a successful run):
 
 - **First insert:** `confidence = score` if the run is a success (`1.0`), else `0.0`.
 - **On conflict** (same chat + intent): exponential smoothing, clamped to `[0, 1]`:
@@ -66,11 +57,11 @@ The system prompt text does **not** drive `upsert_workflow_learning`; only the *
 
 **Latest-run overwrite behavior:** compatibility `steps_json` and richer payload fields are replaced by latest run evidence on upsert conflict. **`version`** increments on each upsert conflict.
 
-**`workflow_min_success_repetitions`** (`WORKFLOW_MIN_SUCCESS_REPETITIONS`) is defined in config but **not** applied inside `upsert_workflow_learning` or selection today; promotion is entirely the formula above plus the **0.6** hint threshold.
+**`workflow_min_success_repetitions`** (`WORKFLOW_MIN_SUCCESS_REPETITIONS`) is applied when promoting a line into **`tier1.workflow_principles`**: after a successful tool-using run, code loads the row with `get_best_workflow_for_intent(..., min_confidence = 0.0)` and compares `success_count` to this threshold before appending a principle string.
 
 ## `workflow_executions` vs `confidence`
 
-When a workflow was **selected** at the start of a run, `log_workflow_execution` records outcome and a score (`1.0` success / `0.2` failure). That **does not** update `workflows.confidence`; it is a per-run log tied to `workflow_id`.
+`log_workflow_execution` (outcome + score `1.0` / `0.2`) **does not** update `workflows.confidence`; it is a per-run log tied to `workflow_id`. With run-start selection removed, the shared agent path no longer calls it for new runs.
 
 ## Configuration (env)
 
@@ -95,8 +86,8 @@ Relevant env toggles in `.env`:
 
 ## Interaction with skills and scheduled tasks
 
-- **Skills:** Loaded into the base system prompt; the learned hint is a **separate** append. Both can coexist; the model may need to reconcile conflicting guidance.
-- **Scheduled tasks:** User text often includes `[scheduler]: …`; intent normalization may differ from interactive phrasing, so a different or no workflow row may match. Scheduler policy messages (e.g. avoid `send_message`) are separate user/assistant turns; the model should follow policy even if a hint lists a tool that is inappropriate for that run.
+- **Skills:** Loaded into the base system prompt alongside tiered memory; reconcile any conflicting guidance with current constraints.
+- **Scheduled tasks:** User text often includes `[scheduler]: …`; intent normalization may differ from interactive phrasing for the same underlying task. Scheduler policy messages (e.g. avoid `send_message`) are separate user/assistant turns.
 
 ## New machine / empty workspace
 
@@ -108,9 +99,9 @@ Workflows are **not** installed from the repo. A fresh DB has an empty `workflow
 | --- | --- |
 | Schema | [`src/db.rs`](../src/db.rs) — `CREATE TABLE workflows`, `workflow_executions` |
 | Lookup / upsert / execution log | [`src/db.rs`](../src/db.rs) — `get_best_workflow_for_intent`, `upsert_workflow_learning`, `log_workflow_execution` |
-| Intent normalization, hint injection, learning | [`src/channels/telegram.rs`](../src/channels/telegram.rs) — `normalize_intent_signature`, `latest_user_text`, `save_run_history!` |
+| Intent normalization, post-run learning, promotion | [`src/channels/telegram.rs`](../src/channels/telegram.rs) — `normalize_intent_signature`, `latest_user_text`, `save_run_history!` |
 | Config defaults | [`src/config.rs`](../src/config.rs), [`src/config_wizard.rs`](../src/config_wizard.rs) |
-| Events / UI | `AgentEvent::WorkflowSelected`, [`src/web.rs`](../src/web.rs), [`src/job_heartbeat.rs`](../src/job_heartbeat.rs) |
+| Events / UI | `AgentEvent::WorkflowSelected` (handled in [`src/web.rs`](../src/web.rs), [`src/job_heartbeat.rs`](../src/job_heartbeat.rs); **not** emitted for workflow selection on new runs) |
 
 ## Related docs
 

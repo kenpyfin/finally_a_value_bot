@@ -380,6 +380,26 @@ impl SetupApp {
                     required: false,
                     secret: false,
                 },
+                Field {
+                    key: "RECENT_HISTORY_MIN_USER_MESSAGES",
+                    label: "Min user messages in balanced history tail",
+                    value: existing
+                        .get("RECENT_HISTORY_MIN_USER_MESSAGES")
+                        .cloned()
+                        .unwrap_or_else(|| "2".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES",
+                    label: "Min assistant messages in balanced history tail",
+                    value: existing
+                        .get("RECENT_HISTORY_MIN_ASSISTANT_MESSAGES")
+                        .cloned()
+                        .unwrap_or_else(|| "2".into()),
+                    required: false,
+                    secret: false,
+                },
                 // ── Orchestrator ──
                 Field {
                     key: "ORCHESTRATOR_ENABLED",
@@ -935,6 +955,8 @@ impl SetupApp {
             "MAX_TOKENS" => "8192".into(),
             "MAX_TOOL_ITERATIONS" => "100".into(),
             "MAX_HISTORY_MESSAGES" => "50".into(),
+            "RECENT_HISTORY_MIN_USER_MESSAGES" => "2".into(),
+            "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES" => "2".into(),
             "ORCHESTRATOR_ENABLED" => "true".into(),
             "WHATSAPP_WEBHOOK_PORT" => "8080".into(),
             "WEB_ENABLED" => "true".into(),
@@ -978,7 +1000,9 @@ impl SetupApp {
                 | "TIMEZONE"
                 | "MAX_TOKENS"
                 | "MAX_TOOL_ITERATIONS"
-                | "MAX_HISTORY_MESSAGES" => "Runtime",
+                | "MAX_HISTORY_MESSAGES"
+                | "RECENT_HISTORY_MIN_USER_MESSAGES"
+                | "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES" => "Runtime",
                 "ORCHESTRATOR_ENABLED" | "ORCHESTRATOR_MODEL" => "Orchestrator",
                 "DISCORD_BOT_TOKEN" | "DISCORD_ALLOWED_CHANNELS" => "Discord",
                 "WHATSAPP_ACCESS_TOKEN"
@@ -1258,6 +1282,18 @@ fn save_config_env(
         "",
         "MAX_HISTORY_MESSAGES",
         get("MAX_HISTORY_MESSAGES"),
+        false
+    );
+    emit!(
+        "",
+        "RECENT_HISTORY_MIN_USER_MESSAGES",
+        get("RECENT_HISTORY_MIN_USER_MESSAGES"),
+        false
+    );
+    emit!(
+        "",
+        "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES",
+        get("RECENT_HISTORY_MIN_ASSISTANT_MESSAGES"),
         false
     );
 

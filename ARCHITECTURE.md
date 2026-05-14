@@ -63,7 +63,7 @@ The main chat agent is the single orchestrator: it decides when to reply directl
 
 ### Learned workflows (SQLite)
 
-After the base system prompt is built (principles, memory, skills catalog, etc.), the shared agent path may append a **Learned Workflow Hint** when a `workflows` row matches the chat and normalized user intent with sufficient confidence. This stores **tool-name order** learned from past runs; it is not a separate planner and does not replace skills. See [`docs/workflow.md`](docs/workflow.md).
+The `workflows` table still receives **post-run** updates when `WORKFLOW_AUTO_LEARN` is on and the run used tools (`upsert_workflow_learning`). After repeated successes, a line may be promoted into **tiered memory** as `tier1.workflow_principles` (rendered in the memory section of the prompt). There is **no** run-start `# Learned Workflow Hint` append from SQL. See [`docs/workflow.md`](docs/workflow.md).
 
 ### Stop Reason
 

@@ -29,6 +29,12 @@ fn default_max_tool_iterations() -> usize {
 fn default_max_history_messages() -> usize {
     50
 }
+fn default_recent_history_min_user_messages() -> usize {
+    2
+}
+fn default_recent_history_min_assistant_messages() -> usize {
+    2
+}
 fn default_max_document_size_mb() -> u64 {
     100
 }
@@ -229,6 +235,8 @@ pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
             | "MAX_TOKENS"
             | "MAX_TOOL_ITERATIONS"
             | "MAX_HISTORY_MESSAGES"
+            | "RECENT_HISTORY_MIN_USER_MESSAGES"
+            | "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES"
             | "MAX_DOCUMENT_SIZE_MB"
             | "ORCHESTRATOR_MODEL"
             | "ORCHESTRATOR_ENABLED"
@@ -336,6 +344,12 @@ pub struct Config {
     pub max_tool_iterations: usize,
     #[serde(default = "default_max_history_messages")]
     pub max_history_messages: usize,
+    /// Default minimum user messages kept in the trimmed chat suffix when persona has no override.
+    #[serde(default = "default_recent_history_min_user_messages")]
+    pub recent_history_min_user_messages: usize,
+    /// Default minimum assistant messages in that suffix when persona has no override.
+    #[serde(default = "default_recent_history_min_assistant_messages")]
+    pub recent_history_min_assistant_messages: usize,
     #[serde(default = "default_max_document_size_mb")]
     pub max_document_size_mb: u64,
     /// Single root for runtime, skills, and tool workspace (shared). Layout: workspace_dir/runtime, workspace_dir/skills, workspace_dir/shared. Copy this folder to migrate.
@@ -754,6 +768,14 @@ impl Config {
                 "MAX_HISTORY_MESSAGES",
                 default_max_history_messages(),
             ),
+            recent_history_min_user_messages: Self::env_usize(
+                "RECENT_HISTORY_MIN_USER_MESSAGES",
+                default_recent_history_min_user_messages(),
+            ),
+            recent_history_min_assistant_messages: Self::env_usize(
+                "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES",
+                default_recent_history_min_assistant_messages(),
+            ),
             max_document_size_mb: Self::env_u64(
                 "MAX_DOCUMENT_SIZE_MB",
                 default_max_document_size_mb(),
@@ -1010,6 +1032,19 @@ impl Config {
         if self.max_document_size_mb == 0 {
             self.max_document_size_mb = default_max_document_size_mb();
         }
+        if self.max_history_messages == 0 {
+            self.max_history_messages = default_max_history_messages();
+        }
+        if self.recent_history_min_user_messages == 0 {
+            self.recent_history_min_user_messages = default_recent_history_min_user_messages();
+        }
+        if self.recent_history_min_assistant_messages == 0 {
+            self.recent_history_min_assistant_messages =
+                default_recent_history_min_assistant_messages();
+        }
+        self.recent_history_min_user_messages = self.recent_history_min_user_messages.min(25);
+        self.recent_history_min_assistant_messages =
+            self.recent_history_min_assistant_messages.min(25);
         if self.safety_max_emojis_per_response == 0 {
             self.safety_max_emojis_per_response = default_safety_max_emojis_per_response();
         }
@@ -1175,6 +1210,14 @@ impl Config {
             self.max_history_messages
         ));
         lines.push(format!(
+            "RECENT_HISTORY_MIN_USER_MESSAGES={}",
+            self.recent_history_min_user_messages
+        ));
+        lines.push(format!(
+            "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES={}",
+            self.recent_history_min_assistant_messages
+        ));
+        lines.push(format!(
             "RUNTIME_RELIABILITY_PROFILE={}",
             esc(&self.runtime_reliability_profile)
         ));
@@ -1332,6 +1375,8 @@ pub fn test_config() -> Config {
         max_tokens: 8192,
         max_tool_iterations: 100,
         max_history_messages: 50,
+        recent_history_min_user_messages: 2,
+        recent_history_min_assistant_messages: 2,
         max_document_size_mb: 100,
         workspace_dir: "./workspace".into(),
         openai_api_key: None,

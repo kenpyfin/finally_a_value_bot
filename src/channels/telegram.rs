@@ -1565,6 +1565,43 @@ pub async fn process_with_agent_with_events(
             ),
         },
     }
+    let persona_row = call_blocking(state.db.clone(), move |db| db.get_persona(persona_id))
+        .await?
+        .filter(|p| p.chat_id == chat_id);
+
+    let min_user_suffix = persona_row
+        .as_ref()
+        .and_then(|p| p.recent_history_min_user)
+        .map(|n| (n as usize).clamp(1, 25))
+        .unwrap_or_else(|| state.config.recent_history_min_user_messages.clamp(1, 25));
+    let min_asst_suffix = persona_row
+        .as_ref()
+        .and_then(|p| p.recent_history_min_assistant)
+        .map(|n| (n as usize).clamp(1, 25))
+        .unwrap_or_else(|| {
+            state
+                .config
+                .recent_history_min_assistant_messages
+                .clamp(1, 25)
+        });
+
+    let operator_memo_redacted: Option<String> = persona_row
+        .as_ref()
+        .and_then(|p| p.operator_memo.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|raw| {
+            let capped: String = if raw.chars().count() > crate::db::OPERATOR_MEMO_MAX_CHARS {
+                raw.chars()
+                    .take(crate::db::OPERATOR_MEMO_MAX_CHARS)
+                    .collect()
+            } else {
+                raw.to_string()
+            };
+            redact_secrets_internal(&capped)
+        })
+        .filter(|s| !s.trim().is_empty());
+
     let tz: chrono_tz::Tz = state.config.timezone.parse().unwrap_or(chrono_tz::Tz::UTC);
     let current_time_in_tz = chrono::Utc::now()
         .with_timezone(&tz)
@@ -1584,6 +1621,7 @@ pub async fn process_with_agent_with_events(
         &state.config.timezone,
         &workspace_data_root_display,
         &config_env_summary,
+        operator_memo_redacted.as_deref(),
     );
     if let Some(identity_name) = runtime_identity.as_deref() {
         system_prompt.push_str(&format!(
@@ -1642,8 +1680,8 @@ pub async fn process_with_agent_with_events(
         }
     }
 
-    // Keep smallest suffix with at least 3 user and 3 assistant messages (chronological)
-    messages = trim_to_recent_balanced(messages);
+    // Keep smallest suffix with at least N user and N assistant messages (see config / persona overrides).
+    messages = trim_to_recent_balanced(messages, min_user_suffix, min_asst_suffix);
 
     // Ensure we have at least one message
     if messages.is_empty() {
@@ -1727,47 +1765,6 @@ pub async fn process_with_agent_with_events(
     }
 
     let intent_signature = normalize_intent_signature(&latest_user_text);
-    let selected_workflow = match call_blocking(state.db.clone(), {
-        let intent_signature = intent_signature.clone();
-        move |db| db.get_best_workflow_for_intent(chat_id, &intent_signature, 0.6)
-    })
-    .await
-    {
-        Ok(Some(wf)) => {
-            let failure_tail = wf
-                .failure_reason
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| format!("\n- Recent failure reason to avoid: {}", s))
-                .unwrap_or_default();
-            let approach = if wf.approach_summary.trim().is_empty() {
-                "(no approach summary yet)"
-            } else {
-                wf.approach_summary.as_str()
-            };
-            system_prompt.push_str(&format!(
-                "\n# Learned Workflow Hint\n\nUse this as a starting point and adapt to current constraints.\n- Intent signature: {}\n- Confidence: {:.2}\n- Approach: {}\n- Tool order memory: {}\n{}{}\n",
-                wf.intent_signature,
-                wf.confidence,
-                approach,
-                wf.steps_json,
-                if wf.last_outcome.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\n- Last outcome: {}", wf.last_outcome)
-                },
-                failure_tail
-            ));
-            if let Some(tx) = event_tx {
-                let _ = tx.send(AgentEvent::WorkflowSelected {
-                    workflow_id: wf.id,
-                    confidence: wf.confidence,
-                });
-            }
-            Some(wf)
-        }
-        _ => None,
-    };
     let bookmarks_for_prompt = call_blocking(state.db.clone(), {
         move |db| db.list_persona_message_bookmarks(chat_id, persona_id, 8)
     })
@@ -1912,7 +1909,7 @@ pub async fn process_with_agent_with_events(
             );
             let run_key_for_db = run_key.clone();
             let intent_for_db = intent_signature.clone();
-            let selected_workflow_id = selected_workflow.as_ref().map(|w| w.id);
+            let selected_workflow_id: Option<i64> = None;
             let project_id_for_db = project_id;
             let workflow_learning_enabled = state.config.workflow_auto_learn;
             let workflow_min_success_repetitions = state.config.workflow_min_success_repetitions;
@@ -3668,6 +3665,7 @@ fn build_system_prompt(
     timezone: &str,
     workspace_data_root_display: &str,
     config_env_summary: &str,
+    operator_memo: Option<&str>,
 ) -> String {
     let caps = format!(
         r#"- Execute bash commands
@@ -3691,7 +3689,7 @@ fn build_system_prompt(
 - Review agent run history (read_agent_history) — detailed per-run traces including iterations, tool calls, durations, and outcomes. Use this when asked to optimize your workflow or review past behavior; identify patterns and persist learnings via write_tiered_memory (Tier 1 for long-term workflow principles).
 
 ## Conversation Memory
-- **Working memory (exact)**: The last few turns of this conversation (at least 3 from you and 3 from the user when available) are provided verbatim above. When the most recent message is from the user, treat it as often being a direct reply to your last message; use it to continue the conversation coherently.
+- **Working memory (exact)**: The last segment of this conversation is trimmed to include at least the configured minimum counts of user and assistant messages (see server defaults and per-persona cockpit overrides). When the most recent message is from the user, treat it as often being a direct reply to your last message; use it to continue the conversation coherently.
 - **Long-term conversation recall**: Use `search_chat_history` to search ALL past messages in this chat by keyword/phrase. Always search before saying "I don't remember" or asking the user to repeat something.
 - **Vault knowledge base**: Use the `search_vault` tool (when available) to semantically search the ORIGIN vault. Do NOT use grep, read_file, or other file tools for vault retrieval — search_vault is the correct tool. The vault is a knowledge base, NOT conversation history.
 - **Skills directory**: {skills_dir_display}"#,
@@ -3785,6 +3783,20 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         prompt.push_str("**. These are your principles and rules; follow them over conversation when they conflict. They survive session resets.\n\n");
         prompt.push_str(principles_content);
         prompt.push_str("\n\n");
+    }
+
+    if let Some(memo) = operator_memo {
+        let memo = memo.trim();
+        if !memo.is_empty() {
+            prompt.push_str("\n# Operator memo (operator focus for this run)\n\n");
+            prompt.push_str(
+                "The following is set by the operator in the web cockpit for this persona. It expresses current steering intent for ambiguous work (priorities, tone, what \"done\" means), not a full task dump.\n\n",
+            );
+            prompt.push_str(memo);
+            prompt.push_str(
+                "\n\nConflict rules: If any part of this memo conflicts with the **latest user message** in the conversation, follow the user. If it conflicts with **workspace principles (AGENTS.md)** or safety rules, follow principles. Do not treat the memo as a license to override refusals or safety policy.\n\n",
+            );
+        }
     }
 
     // Memory (this persona): canonical state projection + JSON payload
@@ -3973,12 +3985,18 @@ fn format_tool_status(name: &str, input: &serde_json::Value) -> String {
 /// Keep the smallest suffix of the message list that contains at least 2 user and 2 assistant
 /// messages (chronological order). If no such suffix exists (e.g. only one user or one assistant
 /// in the whole thread), return the whole list. Caller must pass text-only messages.
-pub(crate) fn trim_to_recent_balanced(messages: Vec<Message>) -> Vec<Message> {
+pub(crate) fn trim_to_recent_balanced(
+    messages: Vec<Message>,
+    min_user: usize,
+    min_assistant: usize,
+) -> Vec<Message> {
+    let min_user = min_user.max(1);
+    let min_asst = min_assistant.max(1);
     for start in (0..messages.len()).rev() {
         let suffix = &messages[start..];
         let n_user = suffix.iter().filter(|m| m.role == "user").count();
         let n_asst = suffix.iter().filter(|m| m.role == "assistant").count();
-        if n_user >= 2 && n_asst >= 2 {
+        if n_user >= min_user && n_asst >= min_asst {
             return suffix.to_vec();
         }
     }
@@ -5014,6 +5032,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("testbot"));
         assert!(prompt.contains("12345"));
@@ -5039,10 +5058,41 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("finally_a_value_bot.data/AGENTS.md"));
         assert!(prompt.contains("User likes Rust"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_operator_memo_between_principles_and_memory() {
+        let principles = "Always be polite.";
+        let memory_ctx = "<memory_this_persona>\n# Memory\n</memory_this_persona>";
+        let memo = "Prioritize brevity.";
+        let prompt = build_system_prompt(
+            "testbot",
+            principles,
+            "finally_a_value_bot.data/AGENTS.md",
+            memory_ctx,
+            42,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+            Some(memo),
+        );
+        let p_principles = prompt.find("# Principles").unwrap();
+        let p_memo = prompt.find("# Operator memo").unwrap();
+        let p_memory = prompt.find("# Memory (this persona)").unwrap();
+        assert!(p_principles < p_memo);
+        assert!(p_memo < p_memory);
+        assert!(prompt.contains("Prioritize brevity."));
+        assert!(prompt.contains("Conflict rules:"));
     }
 
     #[test]
@@ -5062,6 +5112,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("# Agent Skills"));
         assert!(prompt.contains("activate_skill"));
@@ -5084,6 +5135,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(!prompt.contains("# Agent Skills"));
     }
@@ -5104,6 +5156,7 @@ mod tests {
             "UTC",
             "/home/user/tmp",
             "/home/user — bot loads `/home/user/.env`",
+            None,
         );
         assert!(prompt.contains("Your workspace path is: /home/user/tmp/shared"));
     }
@@ -5124,6 +5177,7 @@ mod tests {
             "UTC",
             "/abs/workspace_data_root",
             "/abs — bot loads `/abs/.env`",
+            None,
         );
         assert!(prompt.contains("## Repository layout and environment variables"));
         assert!(prompt.contains("/abs/workspace_data_root"));
@@ -5146,6 +5200,7 @@ mod tests {
             "UTC",
             "./workspace",
             ". — bot loads `unit-test`",
+            None,
         );
         assert!(prompt.contains("Your workspace path is: ./workspace/shared"));
         assert!(prompt.contains("./workspace/skills"));
@@ -5167,6 +5222,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("persona_id is 1"));
         assert!(prompt.contains("read_tiered_memory"));
@@ -5439,6 +5495,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("user_message"));
         assert!(prompt.contains("untrusted"));
@@ -5648,6 +5705,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("Test"));
@@ -5674,6 +5732,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("read_tiered_memory"));
         assert!(prompt.contains("write_tiered_memory"));
@@ -5695,6 +5754,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("export_chat"));
     }
@@ -5715,6 +5775,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("schedule_task"));
         assert!(prompt.contains("6-field cron"));
@@ -5736,6 +5797,7 @@ mod tests {
             "US/Eastern",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            None,
         );
         assert!(prompt.contains("Time and timezone"));
         assert!(prompt.contains("US/Eastern"));
@@ -5757,6 +5819,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp/.env",
+            None,
         );
         assert!(prompt.contains("For serving files to users:"));
         assert!(prompt.contains("Never fabricate `/api/uploads/...` links"));
@@ -5807,7 +5870,7 @@ mod tests {
     fn test_trim_to_recent_balanced_asst_user_unchanged() {
         // Cannot satisfy 2+2; return whole list
         let messages = vec![msg("assistant", "q?"), msg("user", "3pm")];
-        let out = trim_to_recent_balanced(messages.clone());
+        let out = trim_to_recent_balanced(messages.clone(), 2, 2);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].role, "assistant");
         assert_eq!(out[1].role, "user");
@@ -5822,7 +5885,7 @@ mod tests {
             msg("user", "c"),
             msg("assistant", "d"),
         ];
-        let out = trim_to_recent_balanced(messages.clone());
+        let out = trim_to_recent_balanced(messages.clone(), 2, 2);
         assert_eq!(out.len(), 4);
         assert_eq!(out[0].role, "user");
         assert_eq!(out[3].role, "assistant");
@@ -5839,7 +5902,7 @@ mod tests {
             msg("user", "5"),
             msg("user", "6"),
         ];
-        let out = trim_to_recent_balanced(messages);
+        let out = trim_to_recent_balanced(messages, 2, 2);
         // Smallest suffix with >=2 user and >=2 asst: from index 0 we have 3 user, 2 asst -> full 6. From index 1: [a, u, a, u, u] = 2 asst, 3 user -> len 5. So we want start=1, len 5.
         assert_eq!(out.len(), 5);
         assert_eq!(out[0].role, "assistant");
@@ -5849,7 +5912,7 @@ mod tests {
     #[test]
     fn test_trim_to_recent_balanced_empty() {
         let messages: Vec<Message> = vec![];
-        let out = trim_to_recent_balanced(messages);
+        let out = trim_to_recent_balanced(messages, 2, 2);
         assert!(out.is_empty());
     }
 
@@ -5866,7 +5929,7 @@ mod tests {
             msg("user", "7"),
             msg("assistant", "8"),
         ];
-        let out = trim_to_recent_balanced(messages);
+        let out = trim_to_recent_balanced(messages, 2, 2);
         assert_eq!(out.len(), 4);
         assert_eq!(out[0].role, "user");
         if let MessageContent::Text(t) = &out[0].content {
@@ -5875,6 +5938,25 @@ mod tests {
         assert_eq!(out[3].role, "assistant");
         if let MessageContent::Text(t) = &out[3].content {
             assert_eq!(t.as_str(), "8");
+        }
+    }
+
+    #[test]
+    fn test_trim_to_recent_balanced_min_three_keeps_six() {
+        let messages = vec![
+            msg("user", "1"),
+            msg("assistant", "2"),
+            msg("user", "3"),
+            msg("assistant", "4"),
+            msg("user", "5"),
+            msg("assistant", "6"),
+            msg("user", "7"),
+            msg("assistant", "8"),
+        ];
+        let out = trim_to_recent_balanced(messages, 3, 3);
+        assert_eq!(out.len(), 6);
+        if let MessageContent::Text(t) = &out[0].content {
+            assert_eq!(t.as_str(), "3");
         }
     }
 

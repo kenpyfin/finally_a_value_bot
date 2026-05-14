@@ -31,18 +31,50 @@ import { useOpsPoll } from './hooks/use-ops-poll'
 import { queryClient } from './query-client'
 import { historiesEqual, mapBackendHistory } from './lib/history-sync'
 import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
-import type {
-  ArtifactItem,
-  BackgroundJobItem,
-  BackendMessage,
-  BotInstanceRow,
-  ChannelBinding,
-  InstallationStatus,
-  Persona,
-  PersonaBulletinFocus,
-  PersonaMessageBookmark,
-  ScheduleTask,
+import {
+  OPERATOR_MEMO_MAX_CHARS,
+  type ArtifactItem,
+  type BackgroundJobItem,
+  type BackendMessage,
+  type BotInstanceRow,
+  type ChannelBinding,
+  type InstallationStatus,
+  type Persona,
+  type PersonaBulletinFocus,
+  type PersonaBulletinHistorySuffix,
+  type PersonaHistorySuffixSide,
+  type PersonaMessageBookmark,
+  type ScheduleTask,
 } from './types'
+
+function parsePersonaBulletinHistorySuffix(raw: unknown): PersonaBulletinHistorySuffix | null {
+  if (raw == null || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const parseSide = (side: unknown): PersonaHistorySuffixSide | null => {
+    if (side == null || typeof side !== 'object') return null
+    const s = side as Record<string, unknown>
+    const effective = typeof s.effective === 'number' ? s.effective : NaN
+    const uses_default = typeof s.uses_default === 'boolean' ? s.uses_default : null
+    if (!Number.isFinite(effective) || uses_default == null) return null
+    const po = s.persona_override
+    const persona_override =
+      po === null || typeof po === 'number' ? (po as number | null) : null
+    return { effective, persona_override, uses_default }
+  }
+  const min_user = parseSide(o.min_user)
+  const min_assistant = parseSide(o.min_assistant)
+  const def = o.defaults
+  if (min_user == null || min_assistant == null || def == null || typeof def !== 'object') return null
+  const dr = def as Record<string, unknown>
+  const du = dr.min_user
+  const da = dr.min_assistant
+  if (typeof du !== 'number' || typeof da !== 'number') return null
+  return {
+    min_user,
+    min_assistant,
+    defaults: { min_user: du, min_assistant: da },
+  }
+}
 
 type Appearance = 'dark' | 'light'
 type UiTheme =
@@ -405,6 +437,8 @@ function App() {
   const [personas, setPersonas] = useState<Persona[]>([])
   const [bulletinFocus, setBulletinFocus] = useState<PersonaBulletinFocus | null>(null)
   const [personaBookmarks, setPersonaBookmarks] = useState<PersonaMessageBookmark[]>([])
+  const [bulletinHistorySuffix, setBulletinHistorySuffix] = useState<PersonaBulletinHistorySuffix | null>(null)
+  const [bulletinOperatorMemo, setBulletinOperatorMemo] = useState<string | null>(null)
   const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
   const [schedulesDialogOpen, setSchedulesDialogOpen] = useState<boolean>(false)
@@ -744,19 +778,30 @@ function App() {
     }
   }, [activePersonaId, chatId, historyLoadingMore])
 
-  async function loadPersonaBulletin(pid: number): Promise<void> {
+  const loadPersonaBulletin = useCallback(async (pid: number): Promise<void> => {
     try {
       const data = await api<{
         focus?: PersonaBulletinFocus | null
         bookmarks?: PersonaMessageBookmark[]
+        history_suffix?: unknown
+        operator_memo?: string | null
       }>(`/api/personas/${pid}/bulletin`)
       setBulletinFocus(data.focus ?? null)
       setPersonaBookmarks(Array.isArray(data.bookmarks) ? data.bookmarks : [])
+      setBulletinHistorySuffix(parsePersonaBulletinHistorySuffix(data.history_suffix))
+      setBulletinOperatorMemo(typeof data.operator_memo === 'string' ? data.operator_memo : null)
     } catch {
       setBulletinFocus(null)
       setPersonaBookmarks([])
+      setBulletinHistorySuffix(null)
+      setBulletinOperatorMemo(null)
     }
-  }
+  }, [])
+
+  const reloadPersonaBulletin = useCallback(async () => {
+    if (activePersonaId == null) return
+    await loadPersonaBulletin(activePersonaId)
+  }, [activePersonaId, loadPersonaBulletin])
 
   const toggleMessageBookmark = useCallback(async (messageId: string, role: 'user' | 'assistant'): Promise<void> => {
     if (activePersonaId == null) return
@@ -2988,6 +3033,10 @@ function App() {
                     bookmarks={personaBookmarks}
                     activePersonaId={activePersonaId}
                     onRemoveBookmark={removePersonaBookmark}
+                    historySuffix={bulletinHistorySuffix}
+                    operatorMemoServer={bulletinOperatorMemo}
+                    reloadBulletin={reloadPersonaBulletin}
+                    onBulletinStatus={(msg) => setStatusText(msg)}
                     floating
                   />
                 </div>

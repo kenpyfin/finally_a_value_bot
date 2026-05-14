@@ -39,7 +39,7 @@ Before the loop starts, the system builds everything the LLM needs to know.
 | Vault paths         | Config                       | Vector DB endpoints, search tools             |
 
 
-**Learned workflow hint (if any):** After the base prompt is built, the shared agent path may append a `# Learned Workflow Hint` section when a row in the `workflows` table matches the chat and normalized intent with sufficient confidence. This is **not** part of `build_system_prompt()` itself; see `[docs/workflow.md](workflow.md)`.
+**Learned workflows (SQLite, post-run only):** The shared agent path does **not** append a `# Learned Workflow Hint` from the DB at run start. Tool-using runs may still update `workflows` and promote recurring successes into tiered memory `workflow_principles`. See [`docs/workflow.md`](workflow.md).
 
 ### 1.2 Conversation History
 
@@ -48,7 +48,7 @@ Two paths to load history:
 - **Session resume** — deserialize saved session JSON, append new messages since last save
 - **DB history** — load from stored messages table, convert to LLM message format
 
-Then: `trim_to_recent_balanced()` keeps a small recent window, and `compact_messages()` summarizes old messages if the session exceeds `max_session_messages`.
+Then: non-text tool turns are stripped, and `trim_to_recent_balanced()` keeps the shortest suffix that still has at least **N** user and **N** assistant text messages (global defaults from config with optional per-persona overrides from the `personas` row; see `MAX_HISTORY_MESSAGES` and `RECENT_HISTORY_MIN_*` in `src/config.rs`). There is no separate `compact_messages()` / `max_session_messages` pass in the current codebase.
 
 ### 1.3 Tool Registry
 

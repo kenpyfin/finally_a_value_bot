@@ -103,6 +103,23 @@ export type PersonaBulletinFocus = {
   updated_at: string
 }
 
+/** One side of history-suffix trim (user or assistant message counts). */
+export type PersonaHistorySuffixSide = {
+  effective: number
+  persona_override: number | null
+  uses_default: boolean
+}
+
+/** GET /api/personas/:id/bulletin `history_suffix` object. */
+export type PersonaBulletinHistorySuffix = {
+  min_user: PersonaHistorySuffixSide
+  min_assistant: PersonaHistorySuffixSide
+  defaults: { min_user: number; min_assistant: number }
+}
+
+/** Must match `OPERATOR_MEMO_MAX_CHARS` on the server. */
+export const OPERATOR_MEMO_MAX_CHARS = 4000
+
 export type PersonaMessageBookmark = {
   message_id: string
   role: 'user' | 'assistant' | string
