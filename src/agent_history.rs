@@ -2,8 +2,17 @@
 //! can later read them for self-improvement and workflow optimization.
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use tracing::info;
+
+use crate::claude::{ContentBlock, Message, MessageContent};
+
+/// Max UTF-8 bytes for the JSON blob appended under [`SNAPSHOT_SECTION_START`] in run markdown.
+pub const MAX_INITIAL_LLM_SNAPSHOT_BYTES: usize = 800 * 1024;
+
+/// Markdown delimiter between the iteration trace and the optional first-turn LLM snapshot (web + debugging).
+pub const SNAPSHOT_SECTION_START: &str = "\n## Initial LLM prompt (debug snapshot)\n";
 
 /// Max bytes read for a single agent history file (web UI / API).
 pub const MAX_AGENT_HISTORY_READ_BYTES: u64 = 4 * 1024 * 1024;
@@ -138,6 +147,8 @@ pub struct AgentRunRecord {
     pub total_iterations: usize,
     pub stop_reason: String,
     pub total_duration_ms: u128,
+    /// JSON (pretty) of `system_prompt`, `tool_names_first_turn`, and `messages` as sent on the first LLM call.
+    pub initial_llm_snapshot: Option<String>,
 }
 
 fn history_dir(data_dir: &str, chat_id: i64, persona_id: i64) -> PathBuf {
@@ -188,8 +199,87 @@ impl AgentRunRecord {
             }
         }
 
+        if let Some(ref snap) = self.initial_llm_snapshot {
+            if !snap.trim().is_empty() {
+                md.push_str(SNAPSHOT_SECTION_START);
+                md.push_str(snap);
+            }
+        }
+
         md
     }
+}
+
+fn snap_block(b: &ContentBlock) -> serde_json::Value {
+    match b {
+        ContentBlock::Text { text } => json!({"type": "text", "text": text}),
+        ContentBlock::Image { source } => json!({
+            "type": "image_omitted",
+            "media_type": &source.media_type,
+            "approx_base64_chars": source.data.len(),
+        }),
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            thought_signature,
+        } => json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input,
+            "thought_signature": thought_signature,
+        }),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        }),
+    }
+}
+
+fn snap_message_content(c: &MessageContent) -> serde_json::Value {
+    match c {
+        MessageContent::Text(t) => json!(t),
+        MessageContent::Blocks(blocks) => json!(blocks.iter().map(snap_block).collect::<Vec<_>>()),
+    }
+}
+
+fn snap_message(m: &Message) -> serde_json::Value {
+    json!({
+        "role": &m.role,
+        "content": snap_message_content(&m.content),
+    })
+}
+
+/// Pretty JSON: system prompt, tool names for the first turn, and messages (image payloads summarized).
+pub fn format_initial_llm_snapshot_json(
+    system_prompt: &str,
+    messages: &[Message],
+    tool_names: &[String],
+) -> String {
+    let messages_json: Vec<serde_json::Value> = messages.iter().map(snap_message).collect();
+    let root = json!({
+        "schema": "initial_llm_request_v1",
+        "system_prompt": system_prompt,
+        "tool_names_first_turn": tool_names,
+        "messages": messages_json,
+    });
+    let mut s = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
+    if s.len() > MAX_INITIAL_LLM_SNAPSHOT_BYTES {
+        let mut end = MAX_INITIAL_LLM_SNAPSHOT_BYTES.saturating_sub(120);
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push_str("\n…\n(snapshot truncated for storage)\n");
+    }
+    s
 }
 
 /// Persist a run record to disk. Rotates old files if count exceeds MAX_HISTORY_FILES.

@@ -16,7 +16,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 
 use crate::agent_history::{
-    truncate_preview, write_agent_history_run, AgentRunRecord, IterationRecord, ToolCallRecord,
+    format_initial_llm_snapshot_json, truncate_preview, write_agent_history_run, AgentRunRecord,
+    IterationRecord, ToolCallRecord,
 };
 use crate::background_jobs::BackgroundJobControl;
 use crate::chat_queue::{ChatRunQueue, QueueEnqueueMeta, QueueSource};
@@ -1821,8 +1822,16 @@ pub async fn process_with_agent_with_events(
         is_scheduled_task: context.is_scheduled_task,
     };
 
-    // Token-aware trimming safety net (keeps at least 6 latest messages).
-    trim_to_token_budget(&mut messages, &system_prompt, &tool_defs, 12_000, 6);
+    // Token-aware trimming: drop oldest messages only while over budget and only if the
+    // remainder still has at least the same minimum user/assistant counts as `trim_to_recent_balanced`.
+    trim_to_token_budget(
+        &mut messages,
+        &system_prompt,
+        &tool_defs,
+        12_000,
+        min_user_suffix,
+        min_asst_suffix,
+    );
     let _ = call_blocking(state.db.clone(), {
         let run_key = run_key.clone();
         move |db| {
@@ -1849,6 +1858,8 @@ pub async fn process_with_agent_with_events(
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
+    let initial_llm_snapshot_json =
+        format_initial_llm_snapshot_json(&system_prompt, &messages, &tool_names_list);
     info!(
         "Main agent loop starting: chat_id={}, persona_id={}, channel={}, max_iterations={}, tools=[{}], messages_in_context={}, system_prompt_len={}",
         chat_id,
@@ -1900,6 +1911,7 @@ pub async fn process_with_agent_with_events(
                 iterations: std::mem::take(&mut history_iterations),
                 stop_reason: stop_reason_owned.clone(),
                 total_duration_ms: run_start.elapsed().as_millis(),
+                initial_llm_snapshot: Some(initial_llm_snapshot_json.clone()),
             };
             write_agent_history_run(
                 &state.config.runtime_data_dir(),
@@ -3339,7 +3351,8 @@ fn trim_to_token_budget(
     system_prompt: &str,
     tool_defs: &[crate::claude::ToolDefinition],
     budget_tokens: usize,
-    min_messages_to_keep: usize,
+    min_user_remaining: usize,
+    min_asst_remaining: usize,
 ) {
     let mut total = system_prompt.chars().count() / 4 + 16;
     for d in tool_defs {
@@ -3356,7 +3369,13 @@ fn trim_to_token_budget(
         total += estimate_message_tokens(m);
     }
 
-    while total > budget_tokens && messages.len() > min_messages_to_keep {
+    while total > budget_tokens && messages.len() > 1 {
+        let rest = &messages[1..];
+        let nu = rest.iter().filter(|m| m.role == "user").count();
+        let na = rest.iter().filter(|m| m.role == "assistant").count();
+        if nu < min_user_remaining || na < min_asst_remaining {
+            break;
+        }
         let removed = messages.remove(0);
         total = total.saturating_sub(estimate_message_tokens(&removed));
     }
@@ -3982,9 +4001,9 @@ fn format_tool_status(name: &str, input: &serde_json::Value) -> String {
     format!("⚙️ {name}…")
 }
 
-/// Keep the smallest suffix of the message list that contains at least 2 user and 2 assistant
-/// messages (chronological order). If no such suffix exists (e.g. only one user or one assistant
-/// in the whole thread), return the whole list. Caller must pass text-only messages.
+/// Keep the smallest suffix of the message list that contains at least `min_user` user and
+/// `min_assistant` assistant messages (chronological order). If no such suffix exists (e.g. only
+/// one user or one assistant in the whole thread), return the whole list. Caller must pass text-only messages.
 pub(crate) fn trim_to_recent_balanced(
     messages: Vec<Message>,
     min_user: usize,
@@ -5958,6 +5977,31 @@ mod tests {
         if let MessageContent::Text(t) = &out[0].content {
             assert_eq!(t.as_str(), "3");
         }
+    }
+
+    #[test]
+    fn test_trim_to_token_budget_respects_min_user_assistant() {
+        let pad = "x".repeat(2500);
+        let messages: Vec<Message> = (0..8)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                msg(role, &format!("{i}-{pad}"))
+            })
+            .collect();
+
+        // Tiny budget: must not drop below 4 user + 4 assistant in the retained suffix.
+        let mut m = messages.clone();
+        trim_to_token_budget(&mut m, "", &[], 500, 4, 4);
+        assert_eq!(m.len(), 8);
+        assert_eq!(m.iter().filter(|x| x.role == "user").count(), 4);
+        assert_eq!(m.iter().filter(|x| x.role == "assistant").count(), 4);
+
+        // Same pressure with 2+2 minimum: can trim prefix until the smallest suffix with 2+2 remains.
+        let mut m2 = messages;
+        trim_to_token_budget(&mut m2, "", &[], 500, 2, 2);
+        assert_eq!(m2.len(), 4);
+        assert_eq!(m2.iter().filter(|x| x.role == "user").count(), 2);
+        assert_eq!(m2.iter().filter(|x| x.role == "assistant").count(), 2);
     }
 
     #[test]

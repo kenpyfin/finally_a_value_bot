@@ -24,13 +24,14 @@ import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { api, AUTH_REQUIRED_EVENT, makeHeaders, sanitizeHttpHeaderValue, WEB_AUTH_STORAGE_KEY } from './api/client'
 import { CockpitBar } from './components/cockpit-bar'
+import { InitialRunPromptView } from './components/initial-run-prompt-view'
 import { SessionSidebar } from './components/session-sidebar'
 import { ThreadPane } from './components/thread-pane'
 import { useDocumentVisible } from './hooks/use-document-visible'
 import { useOpsPoll } from './hooks/use-ops-poll'
 import { queryClient } from './query-client'
 import { historiesEqual, mapBackendHistory } from './lib/history-sync'
-import { parseAgentHistoryMarkdown, type ParsedAgentHistory } from './parse-agent-history'
+import { parseAgentHistoryMarkdown, splitAgentHistoryRaw, type ParsedAgentHistory } from './parse-agent-history'
 import {
   OPERATOR_MEMO_MAX_CHARS,
   type ArtifactItem,
@@ -459,6 +460,7 @@ function App() {
   const [memoryBusy, setMemoryBusy] = useState<boolean>(false)
   const [memoryError, setMemoryError] = useState<string>('')
   const [agentHistoryDialogOpen, setAgentHistoryDialogOpen] = useState(false)
+  const [agentHistoryTab, setAgentHistoryTab] = useState<'trace' | 'prompt'>('trace')
   const [agentHistoryBusy, setAgentHistoryBusy] = useState(false)
   const [agentHistoryError, setAgentHistoryError] = useState('')
   const [agentHistoryRaw, setAgentHistoryRaw] = useState('')
@@ -900,9 +902,14 @@ function App() {
       setAgentHistoryPathHint(typeof data.path === 'string' ? data.path : '')
       setAgentHistoryFilename(typeof data.filename === 'string' ? data.filename : '')
       setAgentHistoryMtimeMs(typeof data.mtime_ms === 'number' ? data.mtime_ms : null)
-      setAgentHistoryRaw(raw)
-      setAgentHistoryParsed(parseAgentHistoryMarkdown(raw))
+      const { traceMarkdown, initialPromptJson } = splitAgentHistoryRaw(raw)
+      setAgentHistoryRaw(traceMarkdown)
+      setAgentHistoryParsed({
+        ...parseAgentHistoryMarkdown(traceMarkdown),
+        initialPromptJson,
+      })
       setAgentHistoryIterationIdx(0)
+      setAgentHistoryTab((prev) => (prev === 'prompt' && initialPromptJson == null ? 'trace' : prev))
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const isEmpty = /no agent history for this persona/i.test(msg)
@@ -1146,7 +1153,7 @@ function App() {
   useEffect(() => {
     if (!agentHistoryDialogOpen) return
     const n = agentHistoryParsed?.iterations.length ?? 0
-    if (n === 0) return
+    if (n === 0 || agentHistoryTab !== 'trace') return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'ArrowLeft') {
         e.preventDefault()
@@ -1158,7 +1165,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [agentHistoryDialogOpen, agentHistoryParsed?.iterations.length])
+  }, [agentHistoryDialogOpen, agentHistoryParsed?.iterations.length, agentHistoryTab])
 
   async function loadBindings(cid: number | null = chatId): Promise<void> {
     if (cid == null) return
@@ -2866,6 +2873,9 @@ function App() {
                     open={agentHistoryDialogOpen}
                     onOpenChange={(open) => {
                       setAgentHistoryDialogOpen(open)
+                      if (open) {
+                        setAgentHistoryTab('trace')
+                      }
                       if (!open) {
                         setAgentHistoryError('')
                         setAgentHistoryBusy(false)
@@ -2877,10 +2887,12 @@ function App() {
                         Last agent run
                       </Button>
                     </Dialog.Trigger>
-                    <Dialog.Content style={{ maxWidth: 900 }}>
-                      <Dialog.Title>Last agent run</Dialog.Title>
+                    <Dialog.Content style={{ maxWidth: 960 }}>
+                      <Dialog.Title>Agent run debug</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
-                        Latest saved trace for this persona (iterations and tool calls). Use Prev/Next or arrow keys to step through iterations.
+                        Latest saved run for this persona: tool/iteration trace and the system prompt plus messages
+                        sent on the first LLM call (new runs only). On Run trace, use Prev/Next or ← → to step
+                        through iterations.
                       </Dialog.Description>
 
                       {agentHistoryPathHint ? (
@@ -2908,81 +2920,110 @@ function App() {
                       ) : null}
 
                       {!agentHistoryBusy && !agentHistoryError && agentHistoryParsed != null ? (
-                        <>
-                          {agentHistoryParsed.runHeader.trim() ? (
-                            <div
-                              className={
-                                appearance === 'dark'
-                                  ? 'mb-3 max-h-32 overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-2'
-                                  : 'mb-3 max-h-32 overflow-auto rounded-md border border-slate-300 bg-slate-50 p-2'
-                              }
-                            >
-                              <AgentHistoryMarkdownBody markdown={agentHistoryParsed.runHeader} />
-                            </div>
-                          ) : null}
-
-                          {agentHistoryParsed.iterations.length > 0 ? (
+                        <Tabs.Root
+                          value={agentHistoryTab}
+                          onValueChange={(v) => setAgentHistoryTab(v === 'prompt' ? 'prompt' : 'trace')}
+                        >
+                          <Tabs.List size="1" className="mb-3 flex-wrap">
+                            <Tabs.Trigger value="trace">Run trace</Tabs.Trigger>
+                            <Tabs.Trigger value="prompt" disabled={agentHistoryParsed.initialPromptJson == null}>
+                              First-turn prompt
+                            </Tabs.Trigger>
+                          </Tabs.List>
+                          <Tabs.Content value="trace">
                             <>
-                              <Flex justify="between" align="center" mb="2" wrap="wrap" gap="2">
-                                <Text size="2">
-                                  Iteration {agentHistoryIterationIdx + 1} of {agentHistoryParsed.iterations.length}
-                                </Text>
-                                <Flex gap="2">
-                                  <Button
-                                    size="1"
-                                    variant="soft"
-                                    disabled={agentHistoryIterationIdx <= 0}
-                                    onClick={() =>
-                                      setAgentHistoryIterationIdx((i) => Math.max(0, i - 1))
-                                    }
-                                  >
-                                    Prev
-                                  </Button>
-                                  <Button
-                                    size="1"
-                                    variant="soft"
-                                    disabled={
-                                      agentHistoryIterationIdx >= agentHistoryParsed.iterations.length - 1
-                                    }
-                                    onClick={() =>
-                                      setAgentHistoryIterationIdx((i) =>
-                                        Math.min(agentHistoryParsed.iterations.length - 1, i + 1),
-                                      )
-                                    }
-                                  >
-                                    Next
-                                  </Button>
-                                </Flex>
-                              </Flex>
-                              <Text size="1" color="gray" mb="2" className="block">
-                                Keyboard: ← →
-                              </Text>
-                              <div
-                                className={
-                                  appearance === 'dark'
-                                    ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
-                                    : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
-                                }
-                              >
-                                <AgentHistoryMarkdownBody
-                                  markdown={
-                                    agentHistoryParsed.iterations[agentHistoryIterationIdx]?.body ?? ''
+                              {agentHistoryParsed.runHeader.trim() ? (
+                                <div
+                                  className={
+                                    appearance === 'dark'
+                                      ? 'mb-3 max-h-32 overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-2'
+                                      : 'mb-3 max-h-32 overflow-auto rounded-md border border-slate-300 bg-slate-50 p-2'
                                   }
-                                />
-                              </div>
+                                >
+                                  <AgentHistoryMarkdownBody markdown={agentHistoryParsed.runHeader} />
+                                </div>
+                              ) : null}
+
+                              {agentHistoryParsed.iterations.length > 0 ? (
+                                <>
+                                  <Flex justify="between" align="center" mb="2" wrap="wrap" gap="2">
+                                    <Text size="2">
+                                      Iteration {agentHistoryIterationIdx + 1} of{' '}
+                                      {agentHistoryParsed.iterations.length}
+                                    </Text>
+                                    <Flex gap="2">
+                                      <Button
+                                        size="1"
+                                        variant="soft"
+                                        disabled={agentHistoryIterationIdx <= 0}
+                                        onClick={() =>
+                                          setAgentHistoryIterationIdx((i) => Math.max(0, i - 1))
+                                        }
+                                      >
+                                        Prev
+                                      </Button>
+                                      <Button
+                                        size="1"
+                                        variant="soft"
+                                        disabled={
+                                          agentHistoryIterationIdx >= agentHistoryParsed.iterations.length - 1
+                                        }
+                                        onClick={() =>
+                                          setAgentHistoryIterationIdx((i) =>
+                                            Math.min(agentHistoryParsed.iterations.length - 1, i + 1),
+                                          )
+                                        }
+                                      >
+                                        Next
+                                      </Button>
+                                    </Flex>
+                                  </Flex>
+                                  <Text size="1" color="gray" mb="2" className="block">
+                                    Keyboard: ← →
+                                  </Text>
+                                  <div
+                                    className={
+                                      appearance === 'dark'
+                                        ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
+                                        : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
+                                    }
+                                  >
+                                    <AgentHistoryMarkdownBody
+                                      markdown={
+                                        agentHistoryParsed.iterations[agentHistoryIterationIdx]?.body ?? ''
+                                      }
+                                    />
+                                  </div>
+                                </>
+                              ) : (
+                                <div
+                                  className={
+                                    appearance === 'dark'
+                                      ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
+                                      : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
+                                  }
+                                >
+                                  <AgentHistoryMarkdownBody markdown={agentHistoryRaw} />
+                                </div>
+                              )}
                             </>
-                          ) : (
-                            <div
-                              className={
-                                appearance === 'dark'
-                                  ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
-                                  : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
-                              }
-                            >
-                              <AgentHistoryMarkdownBody markdown={agentHistoryRaw} />
-                            </div>
-                          )}
-                        </>
+                          </Tabs.Content>
+                          <Tabs.Content value="prompt">
+                            {agentHistoryParsed.initialPromptJson ? (
+                              <InitialRunPromptView
+                                jsonText={agentHistoryParsed.initialPromptJson}
+                                appearance={appearance}
+                              />
+                            ) : (
+                              <Callout.Root color="blue" size="1" variant="soft">
+                                <Callout.Text>
+                                  No first-turn prompt snapshot in this file. Run a new agent turn after upgrading
+                                  the gateway; older history files only contain the iteration trace.
+                                </Callout.Text>
+                              </Callout.Root>
+                            )}
+                          </Tabs.Content>
+                        </Tabs.Root>
                       ) : null}
 
                       <Flex justify="end" mt="3" gap="2">

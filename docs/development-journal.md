@@ -18,6 +18,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 
 ---
 
+### 2026-05-14 — Token-budget trim honored cockpit history mins
+
+- **Area:** channels / agent prompt assembly
+- **Summary:** `trim_to_token_budget` previously kept a hard minimum of **6** messages, so after `trim_to_recent_balanced` (persona/env depth) a second pass could still drop the thread to six turns—making cockpit depth and prompt-debug snapshots look ineffective. The safety net now stops removing from the front when the remainder would have fewer than the configured minimum **user** or **assistant** text messages (same `min_user_suffix` / `min_asst_suffix` as balanced trim).
+- **Rationale:** Operators tune depth for continuity; the 12k-token heuristic must not silently override that.
+- **Key files / symbols:** `src/channels/telegram.rs` (`trim_to_token_budget`, `process_with_agent_with_events`), unit test `test_trim_to_token_budget_respects_min_user_assistant`.
+- **Follow-ups:** If prompts still exceed provider limits, raise `budget_tokens` or add a separate token cap knob; tool schema size still counts toward the estimate.
+
+### 2026-05-14 — Web: view last run’s first-turn system prompt + messages
+
+- **Area:** agent history / web UI / channels
+- **Summary:** Persist a JSON snapshot (`initial_llm_request_v1`: `system_prompt`, `tool_names_first_turn`, `messages` with image payloads summarized) at the end of each `AgentRunRecord` markdown file under `SNAPSHOT_SECTION_START`. Web loads it via existing `GET /api/personas/:id/agent_history/latest`; dialog adds tabs **Run trace** / **First-turn prompt**, a desktop **Last run prompt** button, and mobile menu entry.
+- **Rationale:** Operators need to inspect the exact first LLM request for debugging and prompt tuning without spelunking disk.
+- **Key files / symbols:** `src/agent_history.rs` (`SNAPSHOT_SECTION_START`, `format_initial_llm_snapshot_json`, `AgentRunRecord::initial_llm_snapshot`), `src/channels/telegram.rs` (`save_run_history!`), `web/src/parse-agent-history.ts` (`splitAgentHistoryRaw`), `web/src/main.tsx`.
+- **Follow-ups:** Optional redaction pass on snapshot JSON for shared exports; cap tuning if prompts grow further.
+
 ### 2026-05-13 — Conversation continuity: configurable history tail + operator memo
 
 - **Area:** agent / DB / web / config / docs
