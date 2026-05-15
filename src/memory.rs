@@ -10,6 +10,85 @@ const MEMORY_STATE_FILE: &str = "memory_state.json";
 const MEMORY_EVENTS_FILE: &str = "memory_events.jsonl";
 const MEMORY_FIELD_LEGEND_MAX_CHARS: usize = 2400;
 
+/// How persona memory is embedded in the system prompt (`MEMORY_PROMPT_MODE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPromptMode {
+    /// Pretty JSON only (default). Best for `patch_memory_state`; use `read_memory_state` for the on-disk file, field legend, or uncapped lists.
+    Json,
+    /// Markdown projection only (no JSON in the prompt).
+    Markdown,
+    /// Legend + markdown + JSON (highest token cost; legacy layout).
+    Both,
+}
+
+/// Controls `MemoryManager::build_memory_context` output shape and caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPromptBuildOptions {
+    pub mode: MemoryPromptMode,
+    /// When true, emits `<memory_field_legend>` (compact schema prose). For `Both` mode this defaults on from [`Self::from_env`] unless overridden by env.
+    pub include_legend: bool,
+    /// Max `tier1.workflow_principles` entries in the **prompt** projection. `0` means no cap (full list). Disk state is never truncated.
+    pub workflow_principles_prompt_max: usize,
+}
+
+impl MemoryPromptBuildOptions {
+    /// Reads `MEMORY_PROMPT_MODE`, `MEMORY_PROMPT_INCLUDE_LEGEND`, and `WORKFLOW_PRINCIPLES_PROMPT_MAX`.
+    pub fn from_env() -> Self {
+        let mode = match std::env::var("MEMORY_PROMPT_MODE").ok().as_deref() {
+            Some(s) if s.trim().eq_ignore_ascii_case("markdown") => MemoryPromptMode::Markdown,
+            Some(s) if s.trim().eq_ignore_ascii_case("both") => MemoryPromptMode::Both,
+            _ => MemoryPromptMode::Json,
+        };
+        let include_legend = match std::env::var("MEMORY_PROMPT_INCLUDE_LEGEND")
+            .ok()
+            .as_deref()
+        {
+            Some(s)
+                if s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes") =>
+            {
+                true
+            }
+            _ => matches!(mode, MemoryPromptMode::Both),
+        };
+        let workflow_principles_prompt_max = std::env::var("WORKFLOW_PRINCIPLES_PROMPT_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(25);
+        Self {
+            mode,
+            include_legend,
+            workflow_principles_prompt_max,
+        }
+    }
+
+    /// Legend + markdown + JSON with no workflow cap (matches pre-optimization tests).
+    pub fn all_sections_no_workflow_cap() -> Self {
+        Self {
+            mode: MemoryPromptMode::Both,
+            include_legend: true,
+            workflow_principles_prompt_max: 0,
+        }
+    }
+}
+
+fn cap_workflow_principles_for_prompt(
+    state: &PersonaMemoryState,
+    max_entries: usize,
+) -> (PersonaMemoryState, Option<String>) {
+    if max_entries == 0 || state.tier1.workflow_principles.len() <= max_entries {
+        return (state.clone(), None);
+    }
+    let total = state.tier1.workflow_principles.len();
+    let mut s = state.clone();
+    s.tier1.workflow_principles.truncate(max_entries);
+    let omitted = total - max_entries;
+    let note = format!(
+        "tier1.workflow_principles: showing {} of {} entries ({} omitted); use read_memory_state for the full on-disk list.",
+        max_entries, total, omitted
+    );
+    (s, Some(note))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemoryStateMeta {
     #[serde(default = "default_memory_schema_version")]
@@ -396,20 +475,79 @@ impl MemoryManager {
     /// Build memory context for the system prompt from canonical per-persona memory_state.json.
     /// Principles (workspace_dir/AGENTS.md) are loaded separately and injected as the "Principles" section.
     /// Daily logs are intentionally excluded to reduce context pollution.
+    ///
+    /// Shape is controlled by [`MemoryPromptBuildOptions::from_env`] (`MEMORY_PROMPT_MODE`,
+    /// `MEMORY_PROMPT_INCLUDE_LEGEND`, `WORKFLOW_PRINCIPLES_PROMPT_MAX`). Default is JSON-only
+    /// with a cap on `tier1.workflow_principles` in the prompt; `patch_memory_state` should target
+    /// the same JSON paths—use `read_memory_state` first when you need the uncapped file or legend.
     pub fn build_memory_context(&self, chat_id: i64, persona_id: i64) -> String {
+        self.build_memory_context_with_options(
+            chat_id,
+            persona_id,
+            MemoryPromptBuildOptions::from_env(),
+        )
+    }
+
+    /// Same as [`Self::build_memory_context`] with explicit options (tests, custom runners).
+    pub fn build_memory_context_with_options(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        options: MemoryPromptBuildOptions,
+    ) -> String {
         let mut context = String::new();
 
         if let Some(state) = self.read_or_migrate_persona_memory_state(chat_id, persona_id) {
-            if let Ok(state_json) = serde_json::to_string_pretty(&state) {
-                context.push_str("<memory_field_legend>\n");
-                context.push_str(&render_memory_field_legend_compact());
-                context.push_str("\n</memory_field_legend>\n");
-                context.push_str("<memory_this_persona>\n");
-                context.push_str(&render_memory_markdown(&state));
-                context.push_str("\n</memory_this_persona>\n");
-                context.push_str("<memory_state_json>\n");
-                context.push_str(&state_json);
-                context.push_str("\n</memory_state_json>\n");
+            let (prompt_state, trunc_note) =
+                cap_workflow_principles_for_prompt(&state, options.workflow_principles_prompt_max);
+            let Ok(state_json) = serde_json::to_string_pretty(&prompt_state) else {
+                return context;
+            };
+
+            let push_legend = |ctx: &mut String| {
+                ctx.push_str("<memory_field_legend>\n");
+                ctx.push_str(&render_memory_field_legend_compact());
+                ctx.push_str("\n</memory_field_legend>\n");
+            };
+            let push_trunc_note = |ctx: &mut String| {
+                if let Some(ref n) = trunc_note {
+                    ctx.push_str("<memory_prompt_note>\n");
+                    ctx.push_str(n);
+                    ctx.push_str("\n</memory_prompt_note>\n");
+                }
+            };
+
+            match options.mode {
+                MemoryPromptMode::Json => {
+                    if options.include_legend {
+                        push_legend(&mut context);
+                    }
+                    context.push_str("<memory_state_json>\n");
+                    context.push_str(&state_json);
+                    context.push_str("\n</memory_state_json>\n");
+                    push_trunc_note(&mut context);
+                }
+                MemoryPromptMode::Markdown => {
+                    if options.include_legend {
+                        push_legend(&mut context);
+                    }
+                    context.push_str("<memory_this_persona>\n");
+                    context.push_str(&render_memory_markdown(&prompt_state));
+                    context.push_str("\n</memory_this_persona>\n");
+                    push_trunc_note(&mut context);
+                }
+                MemoryPromptMode::Both => {
+                    if options.include_legend {
+                        push_legend(&mut context);
+                    }
+                    context.push_str("<memory_this_persona>\n");
+                    context.push_str(&render_memory_markdown(&prompt_state));
+                    context.push_str("\n</memory_this_persona>\n");
+                    context.push_str("<memory_state_json>\n");
+                    context.push_str(&state_json);
+                    context.push_str("\n</memory_state_json>\n");
+                    push_trunc_note(&mut context);
+                }
             }
         } else if let Some(persona_mem) =
             std::fs::read_to_string(self.persona_memory_path(chat_id, persona_id)).ok()
@@ -776,6 +914,170 @@ fn legacy_markdown_to_state(markdown: &str) -> PersonaMemoryState {
     state
 }
 
+const WORKFLOW_MEMORY_INTENTS_PROMPT_MAX: usize = 10;
+
+/// Compile persona memory into LLM-friendly prose for the main agent `[persona_context]` block.
+/// Omits empty fields and section headings with no content. Never emits raw JSON.
+pub fn render_memory_for_llm(state: &PersonaMemoryState, workflow_principles_max: usize) -> String {
+    let (prompt_state, trunc_note) =
+        cap_workflow_principles_for_prompt(state, workflow_principles_max);
+    let state = &prompt_state;
+
+    let mut sections: Vec<String> = Vec::new();
+
+    let mut identity = Vec::new();
+    if !state.identity.display_name.trim().is_empty() {
+        identity.push(format!("**Name:** {}", state.identity.display_name.trim()));
+    }
+    if !state.identity.self_model.trim().is_empty() {
+        identity.push(state.identity.self_model.trim().to_string());
+    }
+    if !state.identity.voice_style.trim().is_empty() {
+        identity.push(format!("**Voice:** {}", state.identity.voice_style.trim()));
+    }
+    for item in &state.identity.non_negotiables {
+        let t = item.trim();
+        if !t.is_empty() {
+            identity.push(format!("- {t}"));
+        }
+    }
+    if !identity.is_empty() {
+        let mut block = String::from("### Identity\n\n");
+        for line in identity {
+            block.push_str(&line);
+            block.push('\n');
+        }
+        sections.push(block);
+    }
+
+    let mut tier1 = Vec::new();
+    for item in &state.tier1.stable_facts {
+        let t = item.trim();
+        if !t.is_empty() {
+            tier1.push(format!("- {t}"));
+        }
+    }
+    if !state.tier1.workflow_principles.is_empty() {
+        tier1.push("\n**Workflow principles:**".to_string());
+        for item in &state.tier1.workflow_principles {
+            let t = item.trim();
+            if !t.is_empty() {
+                tier1.push(format!("- {t}"));
+            }
+        }
+    }
+    if !tier1.is_empty() {
+        let mut block = String::from("### Long-term context\n\n");
+        for line in tier1 {
+            block.push_str(&line);
+            block.push('\n');
+        }
+        sections.push(block);
+    }
+
+    let mut tier2: Vec<String> = state
+        .tier2
+        .active_projects
+        .iter()
+        .filter(|p| !p.summary.trim().is_empty())
+        .map(|p| {
+            format!(
+                "- [{}] {} — {}",
+                p.status.trim(),
+                p.summary.trim(),
+                p.id.trim()
+            )
+        })
+        .collect();
+    if !tier2.is_empty() {
+        let mut block = String::from("### Active projects\n\n");
+        for line in tier2.drain(..) {
+            block.push_str(&line);
+            block.push('\n');
+        }
+        sections.push(block);
+    }
+
+    let mut tier3: Vec<String> = state
+        .tier3
+        .recent_focus
+        .iter()
+        .filter_map(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(format!("- {t}"))
+            }
+        })
+        .collect();
+    if !tier3.is_empty() {
+        let mut block = String::from("### Recent focus\n\n");
+        for line in tier3.drain(..) {
+            block.push_str(&line);
+            block.push('\n');
+        }
+        sections.push(block);
+    }
+
+    let intents: Vec<_> = state
+        .workflow_memory
+        .intents
+        .iter()
+        .take(WORKFLOW_MEMORY_INTENTS_PROMPT_MAX)
+        .filter(|e| !e.intent_signature.trim().is_empty())
+        .collect();
+    if !intents.is_empty() {
+        let mut block = String::from("### Learned approaches\n\n");
+        for e in intents {
+            let sig = e.intent_signature.trim();
+            let approach = e.approach_summary.trim();
+            let outcome = e.outcome.trim();
+            if approach.is_empty() {
+                block.push_str(&format!("- **{sig}** ({outcome})\n"));
+            } else {
+                block.push_str(&format!("- **{sig}:** {approach} ({outcome})\n"));
+            }
+        }
+        sections.push(block);
+    }
+
+    let refs: Vec<String> = state
+        .links
+        .mem_palace_refs
+        .iter()
+        .filter_map(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(format!("- {t}"))
+            }
+        })
+        .collect();
+    if !refs.is_empty() {
+        let mut block = String::from("### Mem-Palace references\n\n");
+        for line in refs {
+            block.push_str(&line);
+            block.push('\n');
+        }
+        sections.push(block);
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("## Memory\n\n");
+    out.push_str(&sections.join("\n"));
+    if let Some(note) = trunc_note {
+        out.push_str("\n_Note: ");
+        out.push_str(&note);
+        out.push_str("_\n");
+    }
+    out
+}
+
 pub fn render_memory_markdown(state: &PersonaMemoryState) -> String {
     let mut out = String::new();
     out.push_str("# Memory\n\n");
@@ -1004,7 +1306,11 @@ mod tests {
         let mut state = PersonaMemoryState::default();
         state.tier1.stable_facts = vec!["persona memory".to_string()];
         mm.write_persona_memory_state(100, 1, state).unwrap();
-        let ctx = mm.build_memory_context(100, 1);
+        let ctx = mm.build_memory_context_with_options(
+            100,
+            1,
+            MemoryPromptBuildOptions::all_sections_no_workflow_cap(),
+        );
         assert!(ctx.contains("<memory_field_legend>"));
         assert!(ctx.contains("meta.version: schema version; normalized to current version."));
         assert!(
@@ -1025,9 +1331,58 @@ mod tests {
         state.tier2.active_projects = vec![];
         state.tier3.recent_focus = vec![];
         mm.write_persona_memory_state(100, 1, state).unwrap();
-        let ctx = mm.build_memory_context(100, 1);
+        let ctx = mm.build_memory_context_with_options(
+            100,
+            1,
+            MemoryPromptBuildOptions::all_sections_no_workflow_cap(),
+        );
         assert!(ctx.contains("<memory_field_legend>"));
         assert!(ctx.contains("<memory_this_persona>"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_build_memory_context_json_mode_omits_markdown_and_legend_by_default() {
+        let (mm, dir) = test_memory_manager();
+        let mut state = PersonaMemoryState::default();
+        state.tier1.stable_facts = vec!["fact a".into()];
+        mm.write_persona_memory_state(7, 2, state).unwrap();
+        let ctx = mm.build_memory_context_with_options(
+            7,
+            2,
+            MemoryPromptBuildOptions {
+                mode: MemoryPromptMode::Json,
+                include_legend: false,
+                workflow_principles_prompt_max: 0,
+            },
+        );
+        assert!(ctx.contains("<memory_state_json>"));
+        assert!(!ctx.contains("<memory_this_persona>"));
+        assert!(!ctx.contains("<memory_field_legend>"));
+        assert!(ctx.contains("fact a"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_build_memory_context_truncates_workflow_principles_in_prompt() {
+        let (mm, dir) = test_memory_manager();
+        let mut state = PersonaMemoryState::default();
+        state.tier1.workflow_principles = (0..12).map(|i| format!("wf-{i}")).collect();
+        mm.write_persona_memory_state(3, 4, state).unwrap();
+        let ctx = mm.build_memory_context_with_options(
+            3,
+            4,
+            MemoryPromptBuildOptions {
+                mode: MemoryPromptMode::Json,
+                include_legend: false,
+                workflow_principles_prompt_max: 5,
+            },
+        );
+        assert!(ctx.contains("<memory_prompt_note>"));
+        assert!(ctx.contains("wf-4"));
+        assert!(!ctx.contains("wf-11"));
+        let disk = mm.read_persona_memory_state(3, 4).unwrap();
+        assert_eq!(disk.tier1.workflow_principles.len(), 12);
         cleanup(&dir);
     }
 
@@ -1148,5 +1503,33 @@ mod tests {
         let err = mm.validate_memory_state(&state).unwrap_err();
         assert!(err.contains("confidence"));
         cleanup(&dir);
+    }
+
+    #[test]
+    fn test_render_memory_for_llm_empty_state() {
+        let state = PersonaMemoryState::default();
+        assert!(render_memory_for_llm(&state, 25).is_empty());
+    }
+
+    #[test]
+    fn test_render_memory_for_llm_omits_empty_sections() {
+        let mut state = PersonaMemoryState::default();
+        state.tier3.recent_focus = vec!["finish report".to_string()];
+        let out = render_memory_for_llm(&state, 25);
+        assert!(out.contains("## Memory"));
+        assert!(out.contains("Recent focus"));
+        assert!(out.contains("finish report"));
+        assert!(!out.contains("### Identity"));
+        assert!(!out.contains("### Active projects"));
+        assert!(!out.contains("<memory_state_json>"));
+    }
+
+    #[test]
+    fn test_render_memory_for_llm_truncation_note() {
+        let mut state = PersonaMemoryState::default();
+        state.tier1.workflow_principles = (0..30).map(|i| format!("principle {i}")).collect();
+        let out = render_memory_for_llm(&state, 5);
+        assert!(out.contains("Workflow principles"));
+        assert!(out.contains("showing 5 of 30"));
     }
 }

@@ -1,6 +1,24 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// How much routing detail is included in `<available_skills>` (`SKILLS_CATALOG_MODE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillsCatalogMode {
+    /// Description + `when_to_use` excerpt + meta (default).
+    Full,
+    /// Name + one-line description + meta only (no `when_to_use` in the system prompt).
+    Compact,
+}
+
+impl SkillsCatalogMode {
+    pub fn from_env() -> Self {
+        match std::env::var("SKILLS_CATALOG_MODE").ok().as_deref() {
+            Some(s) if s.trim().eq_ignore_ascii_case("compact") => Self::Compact,
+            _ => Self::Full,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SkillMetadata {
     pub name: String,
@@ -201,7 +219,13 @@ impl SkillManager {
     /// Returns empty string if no skills are available.
     /// YAML frontmatter only (name, description, when_to_use, constraints). Full SKILL.md body is loaded via `activate_skill`.
     pub fn build_skills_catalog(&self) -> String {
+        self.build_skills_catalog_with_mode(SkillsCatalogMode::from_env())
+    }
+
+    /// Same as [`Self::build_skills_catalog`] with an explicit mode (tests; overrides env).
+    pub fn build_skills_catalog_with_mode(&self, mode: SkillsCatalogMode) -> String {
         const WHEN_TO_USE_MAX_CHARS: usize = 800;
+        const COMPACT_DESCRIPTION_MAX_CHARS: usize = 280;
 
         let skills = self.discover_skills();
         if skills.is_empty() {
@@ -209,21 +233,45 @@ impl SkillManager {
         }
         let mut catalog = String::from("<available_skills>\n");
         for skill in &skills {
-            catalog.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
-            if let Some(w) = skill
-                .when_to_use
-                .as_ref()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-            {
-                let excerpt = if w.len() > WHEN_TO_USE_MAX_CHARS {
-                    let boundary = w.floor_char_boundary(WHEN_TO_USE_MAX_CHARS);
-                    format!("{}...", &w[..boundary])
-                } else {
-                    w.to_string()
-                };
-                for line in excerpt.lines() {
-                    catalog.push_str(&format!("  {}\n", line));
+            let description_for_catalog = match mode {
+                SkillsCatalogMode::Full => skill.description.clone(),
+                SkillsCatalogMode::Compact => {
+                    let collapsed: String = skill
+                        .description
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if collapsed.len() <= COMPACT_DESCRIPTION_MAX_CHARS {
+                        collapsed
+                    } else {
+                        let boundary =
+                            collapsed.floor_char_boundary(COMPACT_DESCRIPTION_MAX_CHARS - 3);
+                        format!("{}...", &collapsed[..boundary])
+                    }
+                }
+            };
+            catalog.push_str(&format!(
+                "- **{}**: {}\n",
+                skill.name, description_for_catalog
+            ));
+            if matches!(mode, SkillsCatalogMode::Full) {
+                if let Some(w) = skill
+                    .when_to_use
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    let excerpt = if w.len() > WHEN_TO_USE_MAX_CHARS {
+                        let boundary = w.floor_char_boundary(WHEN_TO_USE_MAX_CHARS);
+                        format!("{}...", &w[..boundary])
+                    } else {
+                        w.to_string()
+                    };
+                    for line in excerpt.lines() {
+                        catalog.push_str(&format!("  {}\n", line));
+                    }
                 }
             }
             let mut meta_parts: Vec<String> = Vec::new();
@@ -580,11 +628,28 @@ Instructions.
         );
         std::fs::write(dir.join("demo").join("SKILL.md"), md).unwrap();
         let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
-        let catalog = sm.build_skills_catalog();
+        let catalog = sm.build_skills_catalog_with_mode(SkillsCatalogMode::Full);
         assert!(catalog.contains("demo"));
         assert!(catalog.contains("Demo skill"));
         assert!(catalog.contains("When testing catalog."));
         assert!(!catalog.contains(unique));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_skills_catalog_compact_omits_when_to_use() {
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_skills_compact_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("tiny")).unwrap();
+        let md = "---\nname: tiny\ndescription: Short desc\nwhen_to_use: |\n  HIDDEN_WHEN_TO_USE_LINE\n---\nbody\n";
+        std::fs::write(dir.join("tiny").join("SKILL.md"), md).unwrap();
+        let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
+        let catalog = sm.build_skills_catalog_with_mode(SkillsCatalogMode::Compact);
+        assert!(catalog.contains("tiny"));
+        assert!(catalog.contains("Short desc"));
+        assert!(!catalog.contains("HIDDEN_WHEN_TO_USE_LINE"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -599,7 +664,7 @@ Instructions.
         let md = format!("---\nname: long\ndescription: x\nwhen_to_use: \"{long}\"\n---\nb\n");
         std::fs::write(dir.join("long").join("SKILL.md"), md).unwrap();
         let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
-        let catalog = sm.build_skills_catalog();
+        let catalog = sm.build_skills_catalog_with_mode(SkillsCatalogMode::Full);
         assert!(catalog.contains("..."));
         assert!(!catalog.contains(&long));
         let _ = std::fs::remove_dir_all(&dir);

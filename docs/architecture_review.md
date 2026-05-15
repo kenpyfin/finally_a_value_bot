@@ -31,12 +31,13 @@ Before the loop starts, the system builds everything the LLM needs to know.
 
 | Section             | Source                       | Purpose                                       |
 | ------------------- | ---------------------------- | --------------------------------------------- |
-| Identity + timezone | Config                       | "You are {bot_username}..." with current time |
+| Identity + timezone | Config                       | Capabilities, tool rules, timezone (clock in messages) |
 | Capabilities        | Hardcoded text               | Lists all tool categories the agent can use   |
 | Agent Skills        | `build_skills_catalog()`     | Per-skill YAML summary (`description`, `when_to_use`, meta); full SKILL.md via `activate_skill` |
 | Principles          | `AGENTS.md`                  | User-defined rules and identity               |
-| Memory              | Tiered MEMORY.md + daily log | Per-persona context from past conversations   |
 | Vault paths         | Config                       | Vector DB endpoints, search tools             |
+
+**Initial messages (prepended):** `[system_runtime_context]`, optional scheduler policy, then **`[persona_context]`** (compiled `memory_state.json` prose via `render_memory_for_llm`, operator memo, bookmarks). No raw JSON in prompts; Active Project Context auto-upsert removed.
 
 
 **Learned workflows (SQLite, post-run only):** The shared agent path does **not** append a `# Learned Workflow Hint` from the DB at run start. Tool-using runs may still update `workflows` and promote recurring successes into tiered memory `workflow_principles`. See [`docs/workflow.md`](workflow.md).

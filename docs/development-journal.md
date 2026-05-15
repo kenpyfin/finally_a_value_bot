@@ -16,6 +16,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-15 — Persona context in messages (compiled memory, not system JSON)
+
+- **Area:** agent / memory / channels
+- **Summary:** Persona memory is no longer injected as raw `memory_state.json` in the system prompt. **`render_memory_for_llm`** compiles non-empty fields into markdown prose (empty sections omitted; `WORKFLOW_PRINCIPLES_PROMPT_MAX` still caps workflow principles). Memory, operator memo, and bookmarks are prepended as **`[persona_context]`** user message + assistant ack (after runtime/scheduler prepends). Removed **Active Project Context** (per-run `upsert_project`, system block, `derive_project_title` / `infer_project_type`). PTE uses the same prose renderer. `build_system_prompt` no longer takes `memory_context` or `operator_memo`.
+- **Rationale:** Smaller cacheable system prompt; LLM-friendly memory text; persona steering grouped with runtime context in messages.
+- **Key files / symbols:** `src/memory.rs` (`render_memory_for_llm`), `src/channels/telegram.rs` (`build_persona_context_message`, `format_bookmarks_section`, `process_with_agent_with_events`), `docs/architecture_review.md`.
+- **Follow-ups:** None required; SQLite `projects` tables remain for future use.
+
+### 2026-05-14 — System prompt: memory modes, workflow cap, vault path display, skills catalog
+
+- **Area:** agent / channels / memory / skills / workspace skills content
+- **Summary:** Persona memory in the system prompt defaults to **JSON-only** (`MEMORY_PROMPT_MODE`, default `json`) with optional legend and `markdown`/`both` modes via `build_memory_context_with_options` / env. **`WORKFLOW_PRINCIPLES_PROMPT_MAX`** (default 25, `0` = unlimited) truncates `tier1.workflow_principles` in the prompt only, with `<memory_prompt_note>` when truncated; disk state unchanged. Vault-related lines use **`workspace_data_path_display`** to avoid `workspace/workspace` doubling. **`SKILLS_CATALOG_MODE=compact`** drops `when_to_use` from `<available_skills>`. Shortened **`workspace/skills/xlsx`** YAML `description`. `build_system_prompt` deduped skills/vault bullets slightly.
+- **Rationale:** Triple-shipping memory and huge skill descriptions dominated tokens; doubled vault paths misled operators; compact catalog is opt-in for routing vs cost.
+- **Key files / symbols:** `src/memory.rs` (`MemoryPromptMode`, `MemoryPromptBuildOptions`, `cap_workflow_principles_for_prompt`, `build_memory_context_with_options`), `src/channels/telegram.rs` (`workspace_data_path_display`, `build_system_prompt`, path tests), `src/skills.rs` (`SkillsCatalogMode`, `build_skills_catalog_with_mode`), `workspace/skills/xlsx/SKILL.md`.
+- **Follow-ups:** Tune defaults per deployment; document env vars in operator-facing config docs if needed.
+
 ### 2026-05-14 — Skills catalog: frontmatter-only + `when_to_use`
 
 - **Area:** agent / skills / system prompt
