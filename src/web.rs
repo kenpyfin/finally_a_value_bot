@@ -1349,6 +1349,33 @@ async fn api_stream(
     ))
 }
 
+fn json_background_job(j: &crate::db::BackgroundJob) -> serde_json::Value {
+    json!({
+        "id": j.id,
+        "chat_id": j.chat_id,
+        "persona_id": j.persona_id,
+        "prompt": j.prompt,
+        "status": j.status,
+        "trigger_reason": j.trigger_reason,
+        "created_at": j.created_at,
+        "started_at": j.started_at,
+        "finished_at": j.finished_at,
+        "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
+        "error_text": j.error_text,
+        "lease_owner": j.lease_owner,
+        "lease_expires_at": j.lease_expires_at,
+        "last_progress_at": j.last_progress_at,
+        "last_stage": j.last_stage,
+        "job_kind": j.job_kind,
+        "shell_command": j.shell_command,
+        "workdir": j.workdir,
+        "tmux_session": j.tmux_session,
+        "output_path": j.output_path,
+        "exit_code": j.exit_code,
+        "label": j.label,
+    })
+}
+
 fn json_job_heartbeat(h: &JobHeartbeat) -> serde_json::Value {
     json!({
         "run_key": h.run_key,
@@ -1384,11 +1411,12 @@ async fn api_run_status(
     .ok()
     .flatten();
 
-    let bg_json = if hb_opt
-        .as_ref()
-        .map(|h| h.job_type.as_str() == "manual_background")
-        .unwrap_or(false)
-    {
+    let bg_json = if hb_opt.as_ref().is_some_and(|h| {
+        matches!(
+            h.job_type.as_str(),
+            "manual_background" | "shell_background"
+        )
+    }) {
         call_blocking(state.app_state.db.clone(), {
             let run_key = run_key.clone();
             move |db| db.get_background_job(&run_key)
@@ -1396,21 +1424,7 @@ async fn api_run_status(
         .await
         .ok()
         .flatten()
-        .map(|j| {
-            json!({
-                "id": j.id,
-                "chat_id": j.chat_id,
-                "persona_id": j.persona_id,
-                "prompt": j.prompt,
-                "status": j.status,
-                "trigger_reason": j.trigger_reason,
-                "created_at": j.created_at,
-                "started_at": j.started_at,
-                "finished_at": j.finished_at,
-                "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
-                "error_text": j.error_text,
-            })
-        })
+        .map(|j| json_background_job(&j))
     } else {
         None
     };
@@ -1452,11 +1466,17 @@ async fn api_queue_diagnostics(
     require_auth(&headers, state.auth_token.as_deref())?;
     let lanes = state.app_state.chat_queue.diagnostics().await;
     let db = state.app_state.db.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let pending_timeout_secs = state
+        .app_state
+        .config
+        .background_job_pending_start_timeout_secs as i64;
+    let mut background_by_chat: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
     let mut rows = Vec::new();
-    for lane in lanes {
+    for lane in &lanes {
         let chat_id = lane.chat_id;
         let mut items = Vec::new();
-        for it in lane.items {
+        for it in &lane.items {
             let cid = chat_id;
             let pid = it.persona_id;
             let persona_name = call_blocking(db.clone(), move |db| {
@@ -1490,10 +1510,29 @@ async fn api_queue_diagnostics(
             "workflow_id": lane.workflow_id,
             "items": items,
         }));
+
+        let cid = lane.chat_id;
+        let now_bg = now.clone();
+        let timeout = pending_timeout_secs;
+        if let Ok(active) = call_blocking(db.clone(), move |database| {
+            database.list_active_background_jobs_for_chat(cid, &now_bg, timeout)
+        })
+        .await
+        {
+            let entries: Vec<serde_json::Value> = active.iter().map(json_background_job).collect();
+            if !entries.is_empty() {
+                background_by_chat.insert(lane.chat_id, entries);
+            }
+        }
     }
+    let bg_map: serde_json::Map<String, serde_json::Value> = background_by_chat
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::Array(v)))
+        .collect();
     Ok(Json(json!({
         "ok": true,
         "lanes": rows,
+        "background_by_chat": bg_map,
     })))
 }
 
@@ -1618,6 +1657,20 @@ async fn api_background_job_cancel(
     }
 
     info!(chat_id, job_id, "web background job cancel requested");
+
+    if job.job_kind == "shell" {
+        if let Err(e) = crate::background_shell::cancel_background_shell_job(
+            &state.app_state,
+            &job,
+            "Cancelled by user",
+        )
+        .await
+        {
+            return Err((StatusCode::CONFLICT, e));
+        }
+        return Ok(Json(json!({ "ok": true })));
+    }
+
     let cancelled = state
         .app_state
         .background_job_control
@@ -3464,24 +3517,15 @@ async fn api_background_jobs_list(
         .into_iter()
         .map(|j| {
             let hb = hb_by_key.get(&j.id);
-            json!({
-                "id": j.id,
-                "chat_id": j.chat_id,
-                "persona_id": j.persona_id,
-                "prompt": j.prompt,
-                "status": j.status,
-                "trigger_reason": j.trigger_reason,
-                "created_at": j.created_at,
-                "started_at": j.started_at,
-                "finished_at": j.finished_at,
-                "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
-                "error_text": j.error_text,
-                "lease_owner": j.lease_owner,
-                "lease_expires_at": j.lease_expires_at,
-                "last_progress_at": j.last_progress_at,
-                "last_stage": j.last_stage,
-                "heartbeat": hb.map(json_job_heartbeat),
-            })
+            let mut row = json_background_job(&j);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "heartbeat".into(),
+                    hb.map(json_job_heartbeat)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            row
         })
         .collect();
 
@@ -3546,25 +3590,16 @@ async fn api_background_job_get(
         })
         .collect();
 
+    let mut job_json = json_background_job(&job);
+    if let Some(obj) = job_json.as_object_mut() {
+        if let Some(rt) = job.result_text {
+            obj.insert("result_text".into(), json!(rt));
+        }
+    }
+
     Ok(Json(json!({
         "ok": true,
-        "job": {
-            "id": job.id,
-            "chat_id": job.chat_id,
-            "persona_id": job.persona_id,
-            "prompt": job.prompt,
-            "status": job.status,
-            "trigger_reason": job.trigger_reason,
-            "created_at": job.created_at,
-            "started_at": job.started_at,
-            "finished_at": job.finished_at,
-            "result_text": job.result_text,
-            "error_text": job.error_text,
-            "lease_owner": job.lease_owner,
-            "lease_expires_at": job.lease_expires_at,
-            "last_progress_at": job.last_progress_at,
-            "last_stage": job.last_stage,
-        },
+        "job": job_json,
         "heartbeat": hb.as_ref().map(json_job_heartbeat),
         "timeline_events_recent": timeline_json,
     })))

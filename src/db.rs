@@ -181,6 +181,45 @@ pub struct BackgroundJob {
     pub lease_expires_at: Option<String>,
     pub last_progress_at: Option<String>,
     pub last_stage: Option<String>,
+    /// `agent` (default) or `shell`.
+    pub job_kind: String,
+    pub shell_command: Option<String>,
+    pub workdir: Option<String>,
+    pub tmux_session: Option<String>,
+    pub output_path: Option<String>,
+    pub exit_code: Option<i32>,
+    pub label: Option<String>,
+}
+
+const BG_JOB_SELECT: &str = "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage, job_kind, shell_command, workdir, tmux_session, output_path, exit_code, label";
+
+fn map_background_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundJob> {
+    Ok(BackgroundJob {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        persona_id: row.get(2)?,
+        prompt: row.get(3)?,
+        status: row.get(4)?,
+        trigger_reason: row.get(5)?,
+        created_at: row.get(6)?,
+        started_at: row.get(7)?,
+        finished_at: row.get(8)?,
+        result_text: row.get(9)?,
+        error_text: row.get(10)?,
+        lease_owner: row.get(11)?,
+        lease_expires_at: row.get(12)?,
+        last_progress_at: row.get(13)?,
+        last_stage: row.get(14)?,
+        job_kind: row
+            .get::<_, Option<String>>(15)?
+            .unwrap_or_else(|| "agent".into()),
+        shell_command: row.get(16)?,
+        workdir: row.get(17)?,
+        tmux_session: row.get(18)?,
+        output_path: row.get(19)?,
+        exit_code: row.get(20)?,
+        label: row.get(21)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -548,6 +587,7 @@ impl Database {
         Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
         Self::migrate_workflow_learning_schema(&conn)?;
         Self::migrate_background_jobs_lease_schema(&conn)?;
+        Self::migrate_background_jobs_shell_schema(&conn)?;
         Self::migrate_personas_prompt_context(&conn)?;
 
         Ok(Database {
@@ -1019,6 +1059,43 @@ impl Database {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_background_jobs_lease_expires_at
              ON background_jobs(lease_expires_at)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_background_jobs_shell_schema(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "background_jobs", "job_kind")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'agent'",
+                [],
+            )?;
+        }
+        for col in [
+            "shell_command",
+            "workdir",
+            "tmux_session",
+            "output_path",
+            "label",
+        ] {
+            if !Self::column_exists(conn, "background_jobs", col)? {
+                conn.execute(
+                    &format!("ALTER TABLE background_jobs ADD COLUMN {col} TEXT"),
+                    [],
+                )?;
+            }
+        }
+        if !Self::column_exists(conn, "background_jobs", "exit_code")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN exit_code INTEGER",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_background_jobs_job_kind_status
+             ON background_jobs(job_kind, status)",
             [],
         )?;
         Ok(())
@@ -3095,11 +3172,238 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending')",
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage, job_kind)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'agent')",
             params![id, chat_id, persona_id, prompt, trigger_reason, now],
         )?;
         Ok(())
+    }
+
+    pub fn create_background_shell_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        label: &str,
+        shell_command: &str,
+        workdir: &str,
+        tmux_session: &str,
+        output_path: &str,
+        trigger_reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO background_jobs (
+                id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage,
+                job_kind, shell_command, workdir, tmux_session, output_path, label
+             ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'shell', ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                chat_id,
+                persona_id,
+                label,
+                trigger_reason,
+                now,
+                shell_command,
+                workdir,
+                tmux_session,
+                output_path,
+                label,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_background_shell_paths(
+        &self,
+        id: &str,
+        tmux_session: &str,
+        output_path: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE background_jobs SET tmux_session = ?1, output_path = ?2 WHERE id = ?3",
+            params![tmux_session, output_path, id],
+        )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "set_background_shell_paths: no job row for id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that the user was notified about a terminal shell job (e.g. after silent reconcile).
+    pub fn record_background_shell_user_notification(
+        &self,
+        id: &str,
+        result_text: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs
+             SET result_text = ?1,
+                 last_progress_at = ?2,
+                 last_stage = 'user_notified'
+             WHERE id = ?3",
+            params![result_text, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_shell_finished(
+        &self,
+        id: &str,
+        exit_code: i32,
+        result_text: &str,
+        success: bool,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        if success {
+            conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'done',
+                     finished_at = ?1,
+                     result_text = ?2,
+                     exit_code = ?3,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'done'
+                 WHERE id = ?4",
+                params![now, result_text, exit_code, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     result_text = ?2,
+                     exit_code = ?3,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
+                 WHERE id = ?4",
+                params![now, result_text, exit_code, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_shell_jobs_needing_notification(
+        &self,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell'
+               AND status = 'failed'
+               AND (result_text IS NULL OR TRIM(result_text) = '')"
+        ))?;
+        let jobs = stmt
+            .query_map([], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn list_running_shell_background_jobs(
+        &self,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell' AND status = 'running' AND tmux_session IS NOT NULL"
+        ))?;
+        let jobs = stmt
+            .query_map([], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    /// Running shell jobs plus prematurely-failed rows still awaiting user notification.
+    pub fn list_shell_jobs_for_monitor(&self) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell'
+               AND tmux_session IS NOT NULL
+               AND (
+                    status = 'running'
+                    OR (
+                        status = 'failed'
+                        AND (result_text IS NULL OR TRIM(result_text) = '')
+                    )
+               )"
+        ))?;
+        let jobs = stmt
+            .query_map([], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn list_shell_jobs_with_expired_lease(
+        &self,
+        now_rfc3339: &str,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell'
+               AND status = 'running'
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < ?1"
+        ))?;
+        let jobs = stmt
+            .query_map(params![now_rfc3339], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn list_active_background_jobs_for_chat(
+        &self,
+        chat_id: i64,
+        now_rfc3339: &str,
+        pending_timeout_secs: i64,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "list_active_background_jobs_for_chat: invalid now timestamp: {e}"
+                ))
+            })?;
+        let pending_cutoff =
+            (now - chrono::Duration::seconds(pending_timeout_secs.max(1))).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE chat_id = ?1
+               AND (
+                    (status = 'pending' AND created_at >= ?2)
+                    OR (
+                        status IN ('running', 'completed_raw', 'main_agent_processing')
+                        AND COALESCE(lease_expires_at, '9999-12-31T23:59:59+00:00') >= ?3
+                    )
+               )
+             ORDER BY created_at ASC"
+        ))?;
+        let jobs = stmt
+            .query_map(
+                params![chat_id, pending_cutoff, now_rfc3339],
+                map_background_job_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
     }
 
     pub fn claim_background_job_running(
@@ -3322,33 +3626,15 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
              FROM background_jobs
              WHERE chat_id = ?1
              ORDER BY created_at DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        ))?;
         let jobs = stmt
-            .query_map(params![chat_id, limit as i64], |row| {
-                Ok(BackgroundJob {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    status: row.get(4)?,
-                    trigger_reason: row.get(5)?,
-                    created_at: row.get(6)?,
-                    started_at: row.get(7)?,
-                    finished_at: row.get(8)?,
-                    result_text: row.get(9)?,
-                    error_text: row.get(10)?,
-                    lease_owner: row.get(11)?,
-                    lease_expires_at: row.get(12)?,
-                    last_progress_at: row.get(13)?,
-                    last_stage: row.get(14)?,
-                })
-            })?
+            .query_map(params![chat_id, limit as i64], map_background_job_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(jobs)
     }
@@ -3359,28 +3645,9 @@ impl Database {
     ) -> Result<Option<BackgroundJob>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage
-             FROM background_jobs WHERE id = ?1",
+            &format!("{BG_JOB_SELECT} FROM background_jobs WHERE id = ?1"),
             params![id],
-            |row| {
-                Ok(BackgroundJob {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    status: row.get(4)?,
-                    trigger_reason: row.get(5)?,
-                    created_at: row.get(6)?,
-                    started_at: row.get(7)?,
-                    finished_at: row.get(8)?,
-                    result_text: row.get(9)?,
-                    error_text: row.get(10)?,
-                    lease_owner: row.get(11)?,
-                    lease_expires_at: row.get(12)?,
-                    last_progress_at: row.get(13)?,
-                    last_stage: row.get(14)?,
-                })
-            },
+            map_background_job_row,
         );
         match result {
             Ok(job) => Ok(Some(job)),
@@ -3672,6 +3939,7 @@ impl Database {
             "SELECT id
              FROM background_jobs
              WHERE status IN ('running', 'completed_raw', 'main_agent_processing')
+               AND COALESCE(job_kind, 'agent') != 'shell'
                AND lease_expires_at IS NOT NULL
                AND lease_expires_at < ?1",
         )?;
@@ -3691,7 +3959,8 @@ impl Database {
                      last_progress_at = ?1,
                      last_stage = 'failed'
                  WHERE id = ?3
-                   AND status IN ('running', 'completed_raw', 'main_agent_processing')",
+                   AND status IN ('running', 'completed_raw', 'main_agent_processing')
+                   AND COALESCE(job_kind, 'agent') != 'shell'",
                 params![now_rfc3339, stale_msg, id],
             )?;
             if n > 0 {

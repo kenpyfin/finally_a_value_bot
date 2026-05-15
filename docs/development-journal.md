@@ -16,6 +16,28 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-15 — Shell background: fix tmux→bot feedback loop
+
+- **Area:** background_shell
+- **Summary:** Fixed wrapper running `command.sh` from the wrong cwd (scripts live in `runtime/background_jobs/{id}/` but wrapper `cd`'d to shared/ first). Added per-job `tmux wait-session` watcher as primary completion signal; poll monitor is backup. Shell jobs no longer get `failed` from expired leases while tmux is still alive; monitor also tracks prematurely-failed rows until notified.
+- **Key files / symbols:** `background_shell::{spawn_tmux_completion_watcher, reconcile_shell_background_job_leases}`, `db::{list_shell_jobs_for_monitor, list_shell_jobs_with_expired_lease}`, `reconcile_expired_background_job_leases` excludes `job_kind=shell`.
+- **Follow-ups:** None.
+
+### 2026-05-15 — Shell background failures: always notify user
+
+- **Area:** background_shell / scheduler
+- **Summary:** Fixed silent `failed` shell jobs: reconcile paths (expired lease, orphan, stale pending, lost tmux session) now call `notify_shell_jobs_by_ids` / `finalize_shell_job` so users get a chat message. `finalize_shell_job` no longer skips delivery when status is already `failed` without `result_text`. Failure messages are clearer (FAILED + retry hint); cancel and enqueue failures also notify.
+- **Key files / symbols:** `background_shell::{shell_job_needs_user_notification, notify_shell_jobs_by_ids, finalize_shell_job}`, `db::record_background_shell_user_notification`, `scheduler::run_due_tasks`.
+- **Follow-ups:** None.
+
+### 2026-05-15 — Shell background jobs: tmux, monitor, core tool
+
+- **Area:** background jobs / tools / web / scheduler
+- **Summary:** Added `spawn_background_command` (core tool) to run long shell work in tmux, persist rows in `background_jobs` (`job_kind=shell`), monitor session exit, and deliver results via `deliver_agent_final_to_contact`. Agent background jobs unchanged (tokio). Queue diagnostics and background APIs expose `job_kind`, tmux session, and `background_by_chat`.
+- **Rationale:** Operators need durable shell/GPU jobs with automatic user notification; prior tmux use was cursor-agent-only with no completion delivery.
+- **Key files / symbols:** `src/background_shell.rs`, `src/tools/spawn_background_command.rs`, `src/tools/bash_safety.rs`, `src/db.rs` (`BackgroundJob` shell fields), `src/job_heartbeat.rs` (`ShellBackground`), `src/web.rs` (`json_background_job`, `api_queue_diagnostics`), `builtin_skills/background-handoff/SKILL.md`, config `BACKGROUND_SHELL_*`.
+- **Follow-ups:** Optional cross-channel agent handoff; unify `cursor_agent_runs` into the same monitor later.
+
 ### 2026-05-15 — Persona context in messages (compiled memory, not system JSON)
 
 - **Area:** agent / memory / channels

@@ -2,9 +2,20 @@ import { api } from './client'
 import type { BackgroundJobItem, Persona, QueueLane } from '../types'
 
 export async function fetchQueueLaneForChat(chatId: number): Promise<QueueLane | null> {
-  const data = await api<{ lanes?: QueueLane[] }>('/api/queue_diagnostics')
+  const data = await api<import('../types').QueueDiagnosticsResponse>('/api/queue_diagnostics')
   const lanes = Array.isArray(data.lanes) ? data.lanes : []
   return lanes.find((l) => l.chat_id === chatId) ?? null
+}
+
+export async function fetchBackgroundLaneForChat(
+  chatId: number,
+): Promise<BackgroundJobItem[]> {
+  const data = await api<import('../types').QueueDiagnosticsResponse>('/api/queue_diagnostics')
+  const map = data.background_by_chat
+  if (!map || typeof map !== 'object') return []
+  const key = String(chatId)
+  const items = map[key]
+  return Array.isArray(items) ? items : []
 }
 
 export type BackgroundJobsSnapshot = {
@@ -17,7 +28,7 @@ export async function fetchBackgroundJobsSnapshot(chatId: number): Promise<Backg
   const data = await api<{ jobs?: BackgroundJobItem[]; active_heartbeats?: unknown[]; active_count?: number }>(
     `/api/background_jobs?${q.toString()}`,
   )
-  const jobs = Array.isArray(data.jobs) ? data.jobs : []
+  const jobs: BackgroundJobItem[] = Array.isArray(data.jobs) ? data.jobs : []
   const activeCountFromApi = typeof data.active_count === 'number' && Number.isFinite(data.active_count)
     ? Math.max(0, Math.floor(data.active_count))
     : null

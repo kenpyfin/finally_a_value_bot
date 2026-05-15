@@ -176,4 +176,13 @@ export type BackgroundJobItem = {
   result_preview?: string | null
   error_text?: string | null
   heartbeat?: BackgroundJobHeartbeat | null
+  job_kind?: string
+  label?: string | null
+  tmux_session?: string | null
+  shell_command?: string | null
+}
+
+export type QueueDiagnosticsResponse = {
+  lanes?: QueueLane[]
+  background_by_chat?: Record<string, BackgroundJobItem[]>
 }

@@ -108,7 +108,7 @@ async fn run_due_tasks(
     }
 
     let pending_timeout_secs = state.config.background_job_pending_start_timeout_secs as i64;
-    match call_blocking(state.db.clone(), {
+    let pending_ids = match call_blocking(state.db.clone(), {
         let now = now.clone();
         move |db| db.reconcile_stale_pending_background_jobs(&now, pending_timeout_secs)
     })
@@ -120,12 +120,17 @@ async fn run_due_tasks(
                 ids.len(),
                 ids
             );
+            ids
         }
-        Err(e) => error!("Scheduler: failed to reconcile stale pending background jobs: {e}"),
-        _ => {}
-    }
+        Err(e) => {
+            error!("Scheduler: failed to reconcile stale pending background jobs: {e}");
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    crate::background_shell::notify_shell_jobs_by_ids(state.clone(), &pending_ids).await;
 
-    match call_blocking(state.db.clone(), {
+    let expired_ids = match call_blocking(state.db.clone(), {
         let now = now.clone();
         move |db| db.reconcile_expired_background_job_leases(&now)
     })
@@ -137,12 +142,17 @@ async fn run_due_tasks(
                 ids.len(),
                 ids
             );
+            ids
         }
-        Err(e) => error!("Scheduler: failed to reconcile expired background leases: {e}"),
-        _ => {}
-    }
+        Err(e) => {
+            error!("Scheduler: failed to reconcile expired background leases: {e}");
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    crate::background_shell::notify_shell_jobs_by_ids(state.clone(), &expired_ids).await;
 
-    match call_blocking(state.db.clone(), {
+    let orphan_ids = match call_blocking(state.db.clone(), {
         let now = now.clone();
         move |db| db.reconcile_orphan_stale_background_jobs(&now, stale_reclaim_secs)
     })
@@ -154,9 +164,24 @@ async fn run_due_tasks(
                 ids.len(),
                 ids
             );
+            ids
         }
-        Err(e) => error!("Scheduler: failed to reconcile orphan background jobs: {e}"),
-        _ => {}
+        Err(e) => {
+            error!("Scheduler: failed to reconcile orphan background jobs: {e}");
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    crate::background_shell::notify_shell_jobs_by_ids(state.clone(), &orphan_ids).await;
+
+    let shell_stale =
+        crate::background_shell::reconcile_stale_shell_background_jobs(state.clone()).await;
+    if !shell_stale.is_empty() {
+        info!(
+            "Scheduler: reconciled {} stale shell background job(s): {:?}",
+            shell_stale.len(),
+            shell_stale
+        );
     }
 
     let tasks = match call_blocking(state.db.clone(), {

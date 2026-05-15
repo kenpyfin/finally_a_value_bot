@@ -91,6 +91,12 @@ The agent loop branches only on these three; any other value is treated like a f
 - **cursor_agent_send**: sends keys to a running cursor-agent tmux session (session name must match the configured prefix).
 - **build_skill**: creates or updates a skill by running cursor-agent with a creation prompt; uses `detach: true` when tmux is available. Use this instead of writing files under the skills directory.
 
+### Background execution
+
+- **Agent background jobs** (`background_jobs` table, `job_kind=agent`): enqueued via web/scheduler handoff (`##BACKGROUND_JOB_HANDOFF##`); worker runs `process_with_agent_with_events` in a Tokio task; final reply via `deliver_agent_final_to_contact`.
+- **Shell background jobs** (`job_kind=shell`): core tool `spawn_background_command` runs the command in tmux (`background_shell_tmux_session_prefix`), logs under `runtime/background_jobs/{job_id}/`, and a monitor loop finalizes when the session ends and delivers results to the user. Not available in Docker when tmux is disabled.
+- **Ops visibility**: `GET /api/queue_diagnostics` returns foreground queue lanes plus `background_by_chat`; `GET /api/background_jobs` lists job rows with heartbeats.
+
 ### Main vs Sub-Agent Tools
 
 | Main agent | Sub-agent |
@@ -98,7 +104,7 @@ The agent loop branches only on these three; any other value is treated like a f
 | bash, browser, read/write/edit file, glob, grep | bash, browser, read/write/edit file, glob, grep |
 | read/write memory, web_fetch, web_search | read_memory, web_fetch, web_search |
 | send_message, schedule_*, export_chat | *(none)* |
-| sub_agent, cursor_agent, cursor_agent_send, build_skill, activate_skill, sync_skills | *(none)* |
+| sub_agent, cursor_agent, cursor_agent_send, build_skill, activate_skill, sync_skills, spawn_background_command | *(none)* |
 | tiered_memory, search_history, search_vault | search_history |
 | MCP tools | *(none)* |
 

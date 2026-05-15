@@ -153,6 +153,18 @@ fn default_background_job_notify_chat_progress() -> bool {
     false
 }
 
+fn default_background_shell_tmux_session_prefix() -> String {
+    "finally_a_value_bot-bg".into()
+}
+
+fn default_background_shell_tmux_enabled() -> bool {
+    true
+}
+
+fn default_background_shell_monitor_poll_secs() -> u64 {
+    8
+}
+
 fn default_runtime_reliability_profile() -> String {
     "balanced".into()
 }
@@ -510,6 +522,14 @@ pub struct Config {
     /// Post "Background update: …" chat messages during manual background jobs (very noisy). Default false.
     #[serde(default = "default_background_job_notify_chat_progress")]
     pub background_job_notify_chat_progress: bool,
+    /// Allow spawning shell commands in tmux for `spawn_background_command`. Default true (false in Docker).
+    #[serde(default = "default_background_shell_tmux_enabled")]
+    pub background_shell_tmux_enabled: bool,
+    #[serde(default = "default_background_shell_tmux_session_prefix")]
+    pub background_shell_tmux_session_prefix: String,
+    /// Poll interval for tmux shell background job monitor. Default 8.
+    #[serde(default = "default_background_shell_monitor_poll_secs")]
+    pub background_shell_monitor_poll_secs: u64,
     /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
     #[serde(default = "default_runtime_reliability_profile")]
     pub runtime_reliability_profile: String,
@@ -928,6 +948,16 @@ impl Config {
             background_job_notify_chat_progress: Self::env_bool(
                 "BACKGROUND_JOB_NOTIFY_CHAT_PROGRESS",
                 default_background_job_notify_chat_progress(),
+            ),
+            background_shell_tmux_enabled: Self::env_bool(
+                "BACKGROUND_SHELL_TMUX_ENABLED",
+                default_background_shell_tmux_enabled(),
+            ),
+            background_shell_tmux_session_prefix: Self::env("BACKGROUND_SHELL_TMUX_SESSION_PREFIX")
+                .unwrap_or_else(default_background_shell_tmux_session_prefix),
+            background_shell_monitor_poll_secs: Self::env_u64(
+                "BACKGROUND_SHELL_MONITOR_POLL_SECS",
+                default_background_shell_monitor_poll_secs(),
             ),
             runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
                 .unwrap_or_else(default_runtime_reliability_profile),
@@ -1446,6 +1476,9 @@ pub fn test_config() -> Config {
         background_job_pending_start_timeout_secs:
             default_background_job_pending_start_timeout_secs(),
         background_job_notify_chat_progress: default_background_job_notify_chat_progress(),
+        background_shell_tmux_enabled: default_background_shell_tmux_enabled(),
+        background_shell_tmux_session_prefix: default_background_shell_tmux_session_prefix(),
+        background_shell_monitor_poll_secs: default_background_shell_monitor_poll_secs(),
         runtime_reliability_profile: default_runtime_reliability_profile(),
         workflow_auto_learn: default_workflow_auto_learn(),
         workflow_min_success_repetitions: default_workflow_min_success_repetitions(),

@@ -2212,8 +2212,9 @@ function App() {
                               <thead>
                                 <tr className={appearance === 'dark' ? 'text-slate-400' : 'text-slate-600'}>
                                   <th className="p-1 pr-2">Status</th>
+                                  <th className="p-1 pr-2">Kind</th>
                                   <th className="p-1 pr-2">ID</th>
-                                  <th className="p-1 pr-2">Prompt</th>
+                                  <th className="p-1 pr-2">Label</th>
                                   <th className="p-1 pr-2">Updated</th>
                                   <th className="p-1 text-right"> </th>
                                 </tr>
@@ -2226,8 +2227,9 @@ function App() {
                                   return (
                                     <tr key={job.id} className="border-t border-[color:var(--gray-6)] align-top">
                                       <td className="p-1 pr-2">{job.status}</td>
+                                      <td className="p-1 pr-2 text-xs">{job.job_kind === 'shell' ? 'shell' : 'agent'}</td>
                                       <td className="p-1 pr-2 font-mono text-xs">{job.id}</td>
-                                      <td className="p-1 pr-2 max-w-[260px] break-words" title={job.prompt}>{job.prompt || '—'}</td>
+                                      <td className="p-1 pr-2 max-w-[260px] break-words" title={job.label || job.prompt}>{job.label || job.prompt || '—'}</td>
                                       <td className="p-1 pr-2 text-xs">{updatedAt ? new Date(updatedAt).toLocaleString() : '—'}</td>
                                       <td className="p-1 text-right">
                                         {isActive ? (
@@ -2265,7 +2267,7 @@ function App() {
                                   >
                                     <Flex justify="between" align="start" gap="2" mb="2">
                                       <Text size="2" weight="bold">
-                                        {job.status}
+                                        {job.status} · {job.job_kind === 'shell' ? 'shell' : 'agent'}
                                       </Text>
                                       {isActive ? (
                                         <Button

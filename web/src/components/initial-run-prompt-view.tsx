@@ -12,11 +12,87 @@ export type InitialLlmRequestV1 = {
 function formatMessageContent(content: unknown): string {
   if (content === null || content === undefined) return ''
   if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue
+      const b = block as Record<string, unknown>
+      const t = b.type
+      if (t === 'text' && typeof b.text === 'string') {
+        parts.push(b.text)
+      } else if (t === 'image_omitted') {
+        const mt = typeof b.media_type === 'string' ? b.media_type : 'image'
+        const chars =
+          typeof b.approx_base64_chars === 'number' ? b.approx_base64_chars : '?'
+        parts.push(`[image: ${mt}, ~${chars} base64 chars omitted from snapshot]`)
+      } else if (t === 'tool_use') {
+        const name = typeof b.name === 'string' ? b.name : 'tool'
+        const input =
+          b.input !== undefined ? JSON.stringify(b.input, null, 2) : '{}'
+        parts.push(`[tool_use: ${name}]\n${input}`)
+      } else if (t === 'tool_result') {
+        const id = typeof b.tool_use_id === 'string' ? b.tool_use_id : '?'
+        const body = typeof b.content === 'string' ? b.content : JSON.stringify(b.content)
+        parts.push(`[tool_result: ${id}]\n${body}`)
+      } else {
+        parts.push(JSON.stringify(block, null, 2))
+      }
+    }
+    return parts.join('\n\n')
+  }
   try {
     return JSON.stringify(content, null, 2)
   } catch {
     return String(content)
   }
+}
+
+/** Human-readable label for synthetic / special user messages in the snapshot. */
+export function messageSectionLabel(body: string, role: string): string | null {
+  if (role !== 'user') return null
+  if (body.includes('[persona_context]')) {
+    return 'persona context — memory, operator focus, bookmarks'
+  }
+  if (body.includes('[system_runtime_context]')) {
+    return 'runtime context (date/time)'
+  }
+  if (body.includes('[scheduler_policy]')) {
+    return 'scheduler policy'
+  }
+  if (body.includes('<user_message')) {
+    return 'chat (user)'
+  }
+  return null
+}
+
+/** Full transcript of the messages array as sent on the first LLM call. */
+export function formatMessagesTranscript(
+  messages: InitialLlmRequestV1['messages'],
+): string {
+  if (!messages?.length) {
+    return '(no messages in snapshot)'
+  }
+  const blocks: string[] = []
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]!
+    const role =
+      typeof m.role === 'string' && m.role.trim() ? m.role.trim().toLowerCase() : 'unknown'
+    const body = formatMessageContent(m.content).trim()
+    const section = messageSectionLabel(body, role)
+    const header = section
+      ? `── Message ${i + 1} · ${role} · ${section} ──`
+      : `── Message ${i + 1} · ${role} ──`
+    blocks.push(`${header}\n\n${body || '(empty)'}`)
+  }
+  return blocks.join('\n\n')
+}
+
+export function snapshotHasPersonaContext(messages: InitialLlmRequestV1['messages']): boolean {
+  if (!messages?.length) return false
+  return messages.some((m) => {
+    const body = formatMessageContent(m.content)
+    return body.includes('[persona_context]')
+  })
 }
 
 type Props = {
@@ -25,7 +101,7 @@ type Props = {
 }
 
 /**
- * Renders the first-turn LLM snapshot JSON as readable sections (system, tools, messages).
+ * Renders the first-turn LLM snapshot: system, tools, and messages as one formatted transcript.
  */
 export function InitialRunPromptView({ jsonText, appearance }: Props) {
   const isDark = appearance === 'dark'
@@ -39,6 +115,16 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
     }
   }, [jsonText])
 
+  const messagesTranscript = useMemo(
+    () => (parsed ? formatMessagesTranscript(parsed.messages) : ''),
+    [parsed],
+  )
+
+  const hasPersonaContext = useMemo(
+    () => (parsed ? snapshotHasPersonaContext(parsed.messages) : false),
+    [parsed],
+  )
+
   const panel =
     isDark
       ? 'rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/80'
@@ -49,23 +135,6 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
       ? 'whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-slate-100'
       : 'whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-slate-800'
 
-  const roleBadge = (role: string) => {
-    const r = role.toLowerCase()
-    if (r === 'assistant') {
-      return isDark
-        ? 'rounded bg-emerald-950/80 px-2 py-0.5 text-[11px] font-medium text-emerald-200'
-        : 'rounded bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-900'
-    }
-    if (r === 'user') {
-      return isDark
-        ? 'rounded bg-sky-950/80 px-2 py-0.5 text-[11px] font-medium text-sky-200'
-        : 'rounded bg-sky-100 px-2 py-0.5 text-[11px] font-medium text-sky-900'
-    }
-    return isDark
-      ? 'rounded bg-slate-800 px-2 py-0.5 text-[11px] font-medium text-slate-300'
-      : 'rounded bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700'
-  }
-
   if (!parsed || typeof parsed !== 'object') {
     return (
       <div className={panel}>
@@ -75,7 +144,7 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
   }
 
   const tools = Array.isArray(parsed.tool_names_first_turn) ? parsed.tool_names_first_turn : []
-  const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+  const messageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 0
 
   return (
     <ScrollArea type="auto" scrollbars="vertical" className="max-h-[min(72vh,560px)] w-full">
@@ -124,45 +193,28 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
         </section>
 
         <section>
-          <Text size="4" weight="bold" className="mb-2 block tracking-tight">
-            Messages
-          </Text>
-          <Flex direction="column" gap="3">
-            {messages.length === 0 ? (
-              <Text size="2" color="gray" className={`${panel} p-3`}>
-                No messages in snapshot.
+          <Flex direction="column" gap="1" className="mb-2">
+            <Text size="4" weight="bold" className="block tracking-tight">
+              Messages
+            </Text>
+            <Text size="1" color="gray">
+              {messageCount} message{messageCount === 1 ? '' : 's'} sent to the model on the first
+              call (full text below). Memory, operator memo, and bookmarks appear inside the
+              message labeled{' '}
+              <code className="text-xs">persona context</code> when they were included.
+            </Text>
+            {!hasPersonaContext && messageCount > 0 ? (
+              <Text size="1" color="amber">
+                No <code className="text-xs">[persona_context]</code> block in this snapshot — memory
+                / memo / bookmarks were empty or removed before the LLM call (e.g. token trim).
               </Text>
-            ) : (
-              messages.map((m, idx) => {
-                const role = typeof m.role === 'string' && m.role.trim() ? m.role.trim() : 'unknown'
-                const body = formatMessageContent(m.content)
-                return (
-                  <Flex
-                    key={`${idx}-${role}`}
-                    direction="column"
-                    gap="2"
-                    className={
-                      idx > 0
-                        ? isDark
-                          ? 'border-t border-[color:var(--mc-border-soft)] pt-4'
-                          : 'border-t border-slate-200 pt-4'
-                        : undefined
-                    }
-                  >
-                    <Flex align="center" gap="2" wrap="wrap">
-                      <span className={roleBadge(role)}>{role}</span>
-                      <Text size="1" color="gray">
-                        Message {idx + 1}
-                      </Text>
-                    </Flex>
-                    <div className={panel}>
-                      <pre className={preBody}>{body || '_(empty)_'}</pre>
-                    </div>
-                  </Flex>
-                )
-              })
-            )}
+            ) : null}
           </Flex>
+          <div className={panel}>
+            <pre className={`max-h-[min(52vh,480px)] overflow-auto ${preBody}`}>
+              {messagesTranscript}
+            </pre>
+          </div>
         </section>
       </Flex>
     </ScrollArea>

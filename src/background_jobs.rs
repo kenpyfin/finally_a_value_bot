@@ -69,6 +69,22 @@ impl BackgroundJobControl {
         let mut guard = self.jobs.lock().await;
         guard.remove(job_id);
     }
+
+    pub async fn is_registered(&self, job_id: &str) -> bool {
+        let guard = self.jobs.lock().await;
+        guard.contains_key(job_id)
+    }
+
+    pub async fn cancel_flag(&self, job_id: &str, chat_id: i64) -> Option<JobCancel> {
+        let guard = self.jobs.lock().await;
+        guard.get(job_id).and_then(|(cid, c)| {
+            if *cid == chat_id {
+                Some(c.clone())
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// True if the main agent returned a web background handoff sentinel.

@@ -2,6 +2,7 @@ pub mod activate_skill;
 pub mod agent_history;
 pub mod apply_search_replace;
 pub mod bash;
+pub mod bash_safety;
 pub mod browser;
 pub mod bulletin;
 pub mod command_runner;
@@ -21,6 +22,7 @@ pub mod search_history;
 pub mod search_vault;
 pub mod send_message;
 pub mod social_feed;
+pub mod spawn_background_command;
 pub mod symbol_edit;
 pub mod sync_skills;
 pub mod tiered_memory;
@@ -106,7 +108,7 @@ impl ToolRisk {
 
 pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
-        "bash" => ToolRisk::High,
+        "bash" | "spawn_background_command" => ToolRisk::High,
         "cursor_agent"
         | "write_file"
         | "edit_file"

@@ -12,6 +12,7 @@ use crate::telegram::{AgentEvent, AppState};
 pub enum JobType {
     ManualBackground,
     Scheduled,
+    ShellBackground,
 }
 
 impl JobType {
@@ -19,11 +20,12 @@ impl JobType {
         match self {
             JobType::ManualBackground => "manual_background",
             JobType::Scheduled => "scheduled",
+            JobType::ShellBackground => "shell_background",
         }
     }
 
     fn notify_user_periodically(self) -> bool {
-        matches!(self, JobType::ManualBackground)
+        matches!(self, JobType::ManualBackground | JobType::ShellBackground)
     }
 }
 

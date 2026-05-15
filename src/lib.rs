@@ -1,5 +1,6 @@
 pub mod agent_history;
 pub mod background_jobs;
+pub mod background_shell;
 pub mod builtin_skills;
 pub mod channel;
 pub mod channels;
