@@ -1,6 +1,9 @@
 ---
 name: schedule-job
-description: Safely plan and validate scheduled jobs with explicit UTC handling before calling schedule_task or update_scheduled_task.
+description: Preflight and validation for cron and one-time scheduled tasks before schedule_task or update_scheduled_task.
+when_to_use: |
+  Always activate before creating or changing timing on scheduled_tasks rows (schedule_task / update_scheduled_task). Use when the user asks about cron expressions, one-time runs, or timezone handling for the bot scheduler.
+  Not for learned workflows / workflow_id hints — those are separate from cron scheduling in this codebase.
 license: MIT
 compatibility:
   os:

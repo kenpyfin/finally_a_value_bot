@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
+    /// Routing hints for the system prompt catalog (full procedures stay in SKILL.md body).
+    pub when_to_use: Option<String>,
     pub dir_path: PathBuf,
     pub platforms: Vec<String>,
     pub deps: Vec<String>,
@@ -21,6 +23,9 @@ struct SkillFrontmatter {
     title: Option<String>,
     #[serde(default)]
     description: String,
+    /// When the agent should call `activate_skill` for this skill (catalog only; optional for third-party skills).
+    #[serde(default)]
+    when_to_use: Option<String>,
     #[serde(default)]
     platforms: Vec<String>,
     #[serde(default)]
@@ -194,8 +199,10 @@ impl SkillManager {
 
     /// Build a compact skills catalog for the system prompt.
     /// Returns empty string if no skills are available.
-    /// Includes truncated usage instructions so the agent knows how to invoke each skill.
+    /// YAML frontmatter only (name, description, when_to_use, constraints). Full SKILL.md body is loaded via `activate_skill`.
     pub fn build_skills_catalog(&self) -> String {
+        const WHEN_TO_USE_MAX_CHARS: usize = 800;
+
         let skills = self.discover_skills();
         if skills.is_empty() {
             return String::new();
@@ -203,19 +210,40 @@ impl SkillManager {
         let mut catalog = String::from("<available_skills>\n");
         for skill in &skills {
             catalog.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
-            // Include invocation details from SKILL.md body
-            if let Some((_meta, body)) = self.load_skill(&skill.name) {
-                if !body.is_empty() {
-                    let truncated = if body.len() > 500 {
-                        let boundary = body.floor_char_boundary(500);
-                        format!("{}...", &body[..boundary])
-                    } else {
-                        body
-                    };
-                    for line in truncated.lines() {
-                        catalog.push_str(&format!("  {}\n", line));
-                    }
+            if let Some(w) = skill
+                .when_to_use
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let excerpt = if w.len() > WHEN_TO_USE_MAX_CHARS {
+                    let boundary = w.floor_char_boundary(WHEN_TO_USE_MAX_CHARS);
+                    format!("{}...", &w[..boundary])
+                } else {
+                    w.to_string()
+                };
+                for line in excerpt.lines() {
+                    catalog.push_str(&format!("  {}\n", line));
                 }
+            }
+            let mut meta_parts: Vec<String> = Vec::new();
+            if !skill.platforms.is_empty() {
+                meta_parts.push(format!("platforms={}", skill.platforms.join(",")));
+            }
+            if !skill.deps.is_empty() {
+                meta_parts.push(format!("deps={}", skill.deps.join(",")));
+            }
+            if skill.source != "local" {
+                meta_parts.push(format!("source={}", skill.source));
+            }
+            if let Some(v) = &skill.version {
+                meta_parts.push(format!("version={v}"));
+            }
+            if let Some(u) = &skill.updated_at {
+                meta_parts.push(format!("updated_at={u}"));
+            }
+            if !meta_parts.is_empty() {
+                catalog.push_str(&format!("  Meta: {}\n", meta_parts.join("; ")));
             }
         }
         catalog.push_str("</available_skills>");
@@ -434,10 +462,16 @@ fn parse_skill_md(content: &str, dir_path: &std::path::Path) -> Option<(SkillMet
         .trim()
         .to_string();
 
+    let when_to_use = fm
+        .when_to_use
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     Some((
         SkillMetadata {
             name,
             description: fm.description,
+            when_to_use,
             dir_path: dir_path.to_path_buf(),
             platforms,
             deps,
@@ -468,6 +502,7 @@ mod tests {
         let content = r#"---
 name: pdf
 description: Convert documents to PDF
+when_to_use: "User asks to create or modify PDFs."
 platforms: [linux, darwin]
 deps: [pandoc]
 ---
@@ -479,6 +514,10 @@ Use this skill to convert documents.
         let (meta, body) = result.unwrap();
         assert_eq!(meta.name, "pdf");
         assert_eq!(meta.description, "Convert documents to PDF");
+        assert_eq!(
+            meta.when_to_use.as_deref(),
+            Some("User asks to create or modify PDFs.")
+        );
         assert_eq!(meta.platforms, vec!["darwin", "linux"]);
         assert_eq!(meta.deps, vec!["pandoc"]);
         assert_eq!(meta.source, "local");
@@ -525,6 +564,44 @@ Instructions.
         let sm = SkillManager::new(dir.to_str().unwrap());
         let catalog = sm.build_skills_catalog();
         assert!(catalog.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_skills_catalog_excludes_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_skills_catalog_body_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        let unique = "UNIQUE_BODY_TOKEN_XYZ789";
+        let md = format!(
+            "---\nname: demo\ndescription: Demo skill\nwhen_to_use: |\n  When testing catalog.\n---\n{unique}\n"
+        );
+        std::fs::write(dir.join("demo").join("SKILL.md"), md).unwrap();
+        let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
+        let catalog = sm.build_skills_catalog();
+        assert!(catalog.contains("demo"));
+        assert!(catalog.contains("Demo skill"));
+        assert!(catalog.contains("When testing catalog."));
+        assert!(!catalog.contains(unique));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_skills_catalog_truncates_long_when_to_use() {
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_skills_when_long_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("long")).unwrap();
+        let long = "a".repeat(900);
+        let md = format!("---\nname: long\ndescription: x\nwhen_to_use: \"{long}\"\n---\nb\n");
+        std::fs::write(dir.join("long").join("SKILL.md"), md).unwrap();
+        let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
+        let catalog = sm.build_skills_catalog();
+        assert!(catalog.contains("..."));
+        assert!(!catalog.contains(&long));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

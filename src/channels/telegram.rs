@@ -3790,7 +3790,7 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
 
     // Agent Skills (section 2: immediately after capabilities)
     if !skills_catalog.is_empty() {
-        prompt.push_str("\n# Agent Skills\n\nThe following skills are available. When a task matches a skill, use the `activate_skill` tool to load its full instructions before proceeding.\n\n");
+        prompt.push_str("\n# Agent Skills\n\nThe list below is **metadata only** (YAML from each skill: description, when-to-use hints, constraints). It is not the full skill. When a task matches a skill, call **`activate_skill`** with `skill_name` set to that skill’s name to load **full** `SKILL.md` instructions before following procedural steps.\n\n");
         prompt.push_str(skills_catalog);
         prompt.push_str("\n\n");
     }

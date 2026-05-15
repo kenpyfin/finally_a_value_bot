@@ -1,6 +1,9 @@
 ---
 name: weather
-description: Get current weather and short forecasts quickly using `wttr.in` (no API key required). Use when users ask for weather by city/region.
+description: Current weather and short forecasts via wttr.in over curl (no API key).
+when_to_use: |
+  Use when the user asks for current conditions, a quick forecast, or weather by city or region and a lightweight curl-based answer is acceptable.
+  Not a substitute for aviation/marine alerts or paid hyperlocal APIs unless the user accepts wttr.in limitations.
 license: Proprietary. LICENSE.txt has complete terms
 compatibility:
   deps:

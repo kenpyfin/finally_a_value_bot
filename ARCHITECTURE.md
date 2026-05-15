@@ -124,14 +124,14 @@ Skills are extensible instruction sets the LLM can load on demand. They are **on
 
 - **Location**: `workspace/skills/<name>/` and `workspace/shared/skills/<name>/`.
 - **Entry file**: `SKILL.md` or `skill.md` with YAML frontmatter.
-- **Frontmatter**: `name`, `description`, `platforms`, `deps`, `source`, `version`, `updated_at`.
-- **Body**: Markdown instructions the agent follows after loading.
+- **Frontmatter**: `name`, `description`, `when_to_use` (routing for the catalog), `platforms`, `deps`, `source`, `version`, `updated_at`, etc.
+- **Body**: Markdown instructions the agent follows **after** `activate_skill` loads the file (not injected into the catalog).
 
 ### Flow
 
 1. **Discovery**: `SkillManager::discover_skills()` scans dirs, parses frontmatter, filters by platform/deps.
-2. **Catalog in prompt**: `skills.build_skills_catalog()` produces `<available_skills>…</available_skills>` injected into the system prompt.
-3. **Activation**: The LLM calls the `activate_skill` tool with `skill_name`; the tool loads the full `SKILL.md` and returns metadata + instructions.
+2. **Catalog in prompt**: `skills.build_skills_catalog()` produces `<available_skills>…</available_skills>` from **YAML only** (description, `when_to_use`, compact meta). No SKILL.md body text.
+3. **Activation**: The LLM calls the `activate_skill` tool with `skill_name`; the tool loads the full `SKILL.md` and returns metadata + instructions body.
 4. **Usage**: The LLM uses the returned instructions to perform the task (e.g. API calls via bash, file ops).
 
 ### Key Files

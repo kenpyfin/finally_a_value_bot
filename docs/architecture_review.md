@@ -33,7 +33,7 @@ Before the loop starts, the system builds everything the LLM needs to know.
 | ------------------- | ---------------------------- | --------------------------------------------- |
 | Identity + timezone | Config                       | "You are {bot_username}..." with current time |
 | Capabilities        | Hardcoded text               | Lists all tool categories the agent can use   |
-| Agent Skills        | `build_skills_catalog()`     | Available skills with invocation commands     |
+| Agent Skills        | `build_skills_catalog()`     | Per-skill YAML summary (`description`, `when_to_use`, meta); full SKILL.md via `activate_skill` |
 | Principles          | `AGENTS.md`                  | User-defined rules and identity               |
 | Memory              | Tiered MEMORY.md + daily log | Per-persona context from past conversations   |
 | Vault paths         | Config                       | Vector DB endpoints, search tools             |

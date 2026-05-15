@@ -1,6 +1,8 @@
 ---
 name: find-skills
-description: Find reusable skills from the vercel-labs/skills registry (especially by task keywords), evaluate fit, and suggest how to install/adapt them for FinallyAValueBot.
+description: Find reusable skills in the vercel-labs/skills registry and suggest how to install or adapt them for FinallyAValueBot.
+when_to_use: |
+  Use when the user asks whether a skill already exists for a task, wants to discover upstream skills by keyword, or wants to reuse instead of authoring from scratch. Requires curl for GitHub/raw lookups.
 license: Proprietary. LICENSE.txt has complete terms
 compatibility:
   os:

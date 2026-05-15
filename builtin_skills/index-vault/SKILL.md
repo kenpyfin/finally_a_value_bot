@@ -1,15 +1,15 @@
 ---
-
 name: index-vault
-description: Index ORIGIN vault markdown files into ChromaDB for semantic search.
+description: Index ORIGIN vault markdown into ChromaDB for semantic search (run before search_vault or after large vault edits).
+when_to_use: |
+  Use when the vault must be (re)indexed for search_vault, after bulk vault imports, or when embeddings/collection are stale. Requires python3 and the skill venv per setup_vault_env.sh; VAULT_EMBEDDING_SERVER_URL must be set (skill .env or process env).
 license: MIT
 compatibility:
   os:
     - darwin
     - linux
   deps:
-- python3
-
+    - python3
 ---
 
 # Index Vault

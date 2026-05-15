@@ -1,28 +1,19 @@
 ---
 name: create-skill
-description: Guide for creating well-structured FinallyAValueBot skills that the agent can discover, activate, and use. Now with guidance on API rate limits and efficiency.
+description: Authoring guide for FinallyAValueBot skills (YAML catalog + full body after activate_skill).
+when_to_use: |
+  Use when the user asks to create or redesign a skill, define skill frontmatter, or integrate a new capability via SKILL.md and build_skill. Also use when you need the canonical checklist for rate limits, credentials layout, and discovery rules.
+license: MIT
 platforms:
   - linux
   - darwin
+  - windows
 deps: []
 ---
 
-# create-skill
+# Create skill
 
----
-name: create-skill
-description: Guide for creating well-structured FinallyAValueBot skills that the agent can discover, activate, and use.
-license: MIT
-compatibility:
-  os:
-    - darwin
-    - linux
-    - windows
----
-
-# Create Skill
-
-Use this skill when the user asks you to create a new skill, build a skill, add a capability, or when you need to create a skill yourself. Follow this guide to produce a skill that integrates correctly with the FinallyAValueBot skill system.
+Use this skill when the user asks you to create a new skill, build a skill, add a capability, or when you need to create a skill yourself. Follow this guide so skills integrate with discovery, the **frontmatter-only** system prompt catalog, and `activate_skill`.
 
 ## Skill structure
 
@@ -40,12 +31,14 @@ The only required file is `SKILL.md`. The skill manager discovers skills by scan
 
 ## SKILL.md format
 
-The file must start with YAML frontmatter between `---` fences, followed by a markdown body:
+The file must start with YAML frontmatter between `---` fences, followed by a markdown body. The **system prompt lists only frontmatter** (plus optional compact meta). The **full body** loads when the agent calls `activate_skill` for that skill name.
 
 ```markdown
 ---
 name: my-skill
-description: One-line description of what this skill does and when to use it.
+description: One-line summary of what the skill does (shown in the catalog).
+when_to_use: |
+  Bullet or short paragraph: user intents, tools involved, and when not to use this skill.
 license: MIT
 compatibility:
   os:
@@ -58,7 +51,7 @@ compatibility:
 
 # My Skill
 
-Instructions for the agent on how to use this skill.
+Instructions for the agent on how to use this skill (procedures, commands, examples).
 ```
 
 ### Required frontmatter fields
@@ -66,7 +59,8 @@ Instructions for the agent on how to use this skill.
 | Field | Type | Description |
 |---|---|---|
 | `name` | string | Skill name (should match the directory name). Lowercase, hyphens for spaces. |
-| `description` | string | What the skill does. This is shown in skill listings and used for matching when the agent decides which skill to activate. Make it specific and action-oriented. |
+| `description` | string | Tight one-line summary for the `<available_skills>` catalog. |
+| `when_to_use` | string | Routing hints: when to call `activate_skill` for this skill, typical user asks, platform/deps assumptions, and explicit non-goals. May be a YAML block (`|`) for multiple lines. |
 
 ### Optional frontmatter fields
 
@@ -76,22 +70,24 @@ Instructions for the agent on how to use this skill.
 | `compatibility.os` | list | Target platforms: `darwin`, `linux`, `windows`. Omit to mean all. |
 | `compatibility.deps` | list | Required external tools (e.g. `curl`, `python3`, `ffmpeg`). |
 | `source` | string | URL for the upstream source, if adapted from elsewhere. |
+| `version` / `updated_at` | string | Optional semver / ISO-style stamp for operator visibility in catalog meta. |
 
 ### Body content
 
-The markdown body after the frontmatter is what the agent reads when the skill is activated. Write it as instructions **for the agent**, not for a human. Include:
+The markdown body after the frontmatter is what the agent reads **after** `activate_skill`. Write it as instructions **for the agent**, not for a human. Include:
 
-1. **When to use** — What kind of user requests trigger this skill.
-2. **How to use** — Step-by-step instructions with concrete commands, code snippets, or tool invocations.
-3. **Environment / prerequisites** — What needs to be installed or configured.
-4. **Examples** — Realistic usage examples.
-5. **Troubleshooting** — Common failure modes and fixes.
+1. **How to use** — Step-by-step instructions with concrete commands, code snippets, or tool invocations.
+2. **Environment / prerequisites** — What needs to be installed or configured.
+3. **Examples** — Realistic usage examples.
+4. **Troubleshooting** — Common failure modes and fixes.
+
+Put **when-to-activate** guidance in frontmatter (`when_to_use`), not only here, so the catalog stays accurate without pasting the body into the system prompt.
 
 ## Best practices
 
-- **Write for the agent.** The SKILL.md is read by the AI agent, not a human developer. Be direct: "Run this command", "Use this tool", "Return this format".
+- **Write for the agent.** The SKILL.md body is loaded for the model after `activate_skill`. Be direct: "Run this command", "Use this tool", "Return this format".
 - **Be specific.** Include exact commands, file paths, API patterns. Avoid vague instructions like "configure as needed".
-- **Include the description trigger.** The `description` field determines when the skill gets activated. Use action words that match user intent: "Use this skill when the user wants to..." or "Use when the user asks to...".
+- **Split routing vs procedures.** Keep matchable triggers in `when_to_use` and `description`; keep long procedures in the body.
 - **Bundle scripts.** If the skill needs helper scripts (Python, bash, etc.), put them in the skill directory. Reference them with relative paths: `skills/my-skill/helper.py`.
 - **Credentials in .env.** If the skill needs API keys or secrets, instruct the user to create `skills/my-skill/.env` with the required variables. Never hardcode secrets.
 - **API Caution.** For any skill that makes API calls, you MUST be cautious about rate limits and usage. Optimize the call efficiency (e.g. batching, caching, or avoiding redundant calls) and include error handling for rate limit hits (e.g. 429 status codes).
@@ -119,7 +115,9 @@ After creating the skill, it becomes available immediately for activation via `a
 ```markdown
 ---
 name: translate
-description: Translate text between languages using the `trans` CLI tool. Use when the user asks to translate text.
+description: Translate text between languages using the trans CLI.
+when_to_use: |
+  Use when the user asks to translate words, sentences, or files between natural languages and trans is an acceptable backend.
 license: MIT
 compatibility:
   deps:
@@ -157,7 +155,9 @@ Flags:
 ```markdown
 ---
 name: image-resize
-description: Resize and optimize images. Use when the user wants to resize, compress, or convert image files.
+description: Resize and optimize images via a bundled Python script.
+when_to_use: |
+  Use when the user wants to resize, compress, or convert raster images and a local python3 script is appropriate.
 compatibility:
   deps:
     - python3
@@ -176,6 +176,4 @@ Supported formats: PNG, JPEG, WebP, GIF.
 
 Then also create `skills/image-resize/resize.py` with the actual implementation.
 
----
-
-Put credentials in `/home/ken/big_storage/projects/finally-a-value-bot/./workspace/skills/create-skill/.env` if needed.
+Put credentials in `skills/<skill-name>/.env` when needed (never commit secrets).

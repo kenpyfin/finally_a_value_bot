@@ -16,7 +16,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
----
+### 2026-05-14 — Skills catalog: frontmatter-only + `when_to_use`
+
+- **Area:** agent / skills / system prompt
+- **Summary:** `<available_skills>` is built from YAML metadata only (no SKILL.md body truncation). Added optional `when_to_use` in frontmatter, surfaced in the catalog (capped) and in `activate_skill` output. Standardized in-repo `SKILL.md` files (built-ins + `workspace/skills/background-handoff`) with `description` + `when_to_use` + existing compatibility fields; updated `create-skill` authoring guide.
+- **Rationale:** Loading partial bodies into the system prompt duplicated `activate_skill`, inflated tokens, and drifted from the canonical skill text.
+- **Key files / symbols:** `src/skills.rs` (`SkillMetadata::when_to_use`, `build_skills_catalog`, `parse_skill_md`), `src/channels/telegram.rs` (`build_system_prompt` Agent Skills blurb), `src/tools/activate_skill.rs`, `builtin_skills/*/SKILL.md`, `workspace/skills/background-handoff/SKILL.md`, `builtin_skills/create-skill/SKILL.md`, `ARCHITECTURE.md`, `docs/architecture_review.md`.
+- **Follow-ups:** Optional frontmatter-only reads during discovery for very large SKILL files. All `workspace/skills/*/SKILL.md` copies now include `when_to_use` (and `read-email` / `reddit-ninja-search` gained valid YAML discovery headers).
 
 ### 2026-05-14 — Token-budget trim honored cockpit history mins
 

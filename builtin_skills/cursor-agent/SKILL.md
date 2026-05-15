@@ -1,6 +1,10 @@
 ---
 name: cursor-agent
-description: Guide for using the Cursor Agent CLI for advanced development, refactoring, and codebase-wide changes.
+description: Guide for using the Cursor Agent CLI for code development only—multi-file implementation, refactors, and codebase-wide code changes.
+when_to_use: |
+  Use only for software development in the repo: features, refactors, bug fixes, and coordinated code edits that are too large or cross-cutting for single-file edits.
+  Do not delegate non-code work (copywriting, research-only, ops without code changes, etc.) to cursor-agent.
+  Prefer the built-in file tools for tiny one-off edits unless the user explicitly wants cursor-agent.
 license: MIT
 compatibility:
   os:
@@ -12,20 +16,25 @@ compatibility:
 
 # Cursor Agent
 
-Use this skill when you need to perform complex, multi-file development tasks that exceed the typical capabilities of single-file edits. This skill guides the agent on how to use the `cursor-agent` CLI tool efficiently.
+Use this skill only for **code development**: complex, multi-file programming work that exceeds comfortable single-file edits. This skill guides how to use the `cursor-agent` CLI for that scope—not for general-purpose delegation.
 
-## Capabilities
+## Capabilities (code only)
 
-- **Codebase-wide Refactoring**: Apply changes across many files at once.
-- **New Feature Implementation**: Scaffold and implement entire modules.
-- **Bug Discovery and Fixing**: Search for patterns and fix them globally.
-- **Documentation Updates**: Synchronize docs with code changes.
+- **Codebase-wide refactoring**: coordinated changes across many source files.
+- **Feature implementation**: scaffold and implement modules, APIs, and behavior in code.
+- **Bug discovery and fixing**: search for patterns and fix defects in the codebase.
+
+Doc or comment tweaks are in scope only when they are part of a code change (e.g. updating a docstring or README section tied to the implementation).
 
 ## When to use
 
-- When the task is too large for the main agent's context.
-- When you need a specialized sub-agent that is optimized for codebase research and modification.
-- When the user explicitly asks to "use cursor-agent" for a task.
+- When a **development** task is too large for the main agent's context.
+- When you need deep repo exploration plus coordinated **code** edits.
+- When the user explicitly asks to use cursor-agent for a **coding** task.
+
+## Out of scope
+
+Do not use cursor-agent for work whose primary output is not code: standalone writing, research summaries, data analysis, infrastructure runbooks with no repo edits, or other non-development tasks—even if they are large or cross-cutting.
 
 ## How to use
 
@@ -36,6 +45,8 @@ Invoke the `cursor_agent` tool or call the CLI directly via `bash`.
 ```bash
 cursor-agent "Implement a new authentication layer in src/auth"
 ```
+
+Prompts should describe **what to build or change in code** (paths, behavior, constraints)—not open-ended non-development tasks.
 
 ### Detached mode (for long-running tasks)
 
@@ -57,5 +68,6 @@ If tmux is available and supported, use `detach: true` in the `cursor_agent` too
 
 ## Limitations
 
+- For **code development** only; see Out of scope above.
 - The agent is an external process and does not share your immediate conversational memory unless explicitly provided in the prompt.
 - Do not use for tasks requiring interactive user input.

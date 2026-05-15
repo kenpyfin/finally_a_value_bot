@@ -1,6 +1,9 @@
 ---
 name: apple-notes
-description: Manage Apple Notes on macOS using the `memo` CLI. Use this when users ask to create, list, search, edit, move, or export Apple Notes.
+description: Manage Apple Notes on macOS using the memo CLI.
+when_to_use: |
+  macOS only, with memo installed. Use when the user wants to create, list, search, edit, move, export, or organize Apple Notes (Notes.app) from the terminal.
+  Not for Apple Reminders, Calendar, or third-party note apps unless the user names Notes.app / Apple Notes.
 license: Proprietary. LICENSE.txt has complete terms
 compatibility:
   os:

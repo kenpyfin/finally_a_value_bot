@@ -1,16 +1,15 @@
 ---
-
 name: search-vault
-description: Semantically search the ORIGIN vault (Obsidian/markdown knowledge base) using vector similarity via ChromaDB.
+description: Semantic search over the ORIGIN vault via ChromaDB and the embedding server (query_vault.py).
+when_to_use: |
+  Use when the user wants meaning-based retrieval from their Obsidian/ORIGIN vault after indexing. Prefer the built-in search_vault tool path described in this skill; do not grep the vault for semantic questions. Requires python3 and VAULT_EMBEDDING_SERVER_URL.
 license: MIT
 compatibility:
   os:
     - darwin
     - linux
   deps:
-
-- python3
-
+    - python3
 ---
 
 # Search Vault

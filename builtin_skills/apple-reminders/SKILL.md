@@ -1,6 +1,9 @@
 ---
 name: apple-reminders
-description: Manage Apple Reminders on macOS using `remindctl` (list, add, edit, complete, delete, and list management). Use when users ask for reminders or task-list operations in Apple Reminders.
+description: Manage Apple Reminders on macOS using remindctl (lists, tasks, completion, deletion).
+when_to_use: |
+  macOS only, with remindctl installed. Use when the user asks to add, list, complete, edit, or remove items in Apple Reminders (Reminders.app) or manage reminder lists.
+  Not for Apple Notes, Calendar-only workflows, or generic todo apps unless the user means Apple Reminders.
 license: Proprietary. LICENSE.txt has complete terms
 compatibility:
   os:

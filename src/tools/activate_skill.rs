@@ -63,6 +63,14 @@ impl Tool for ActivateSkillTool {
             Ok((meta, body)) => {
                 let mut result = format!("# Skill: {}\n\n", meta.name);
                 result.push_str(&format!("Description: {}\n", meta.description));
+                if let Some(w) = meta
+                    .when_to_use
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    result.push_str(&format!("When to use:\n{w}\n"));
+                }
                 result.push_str(&format!("Skill directory: {}\n", meta.dir_path.display()));
                 result.push_str(&format!("Source: {}\n", meta.source));
                 if let Some(version) = &meta.version {
@@ -102,7 +110,9 @@ mod tests {
     fn create_skill(base_dir: &std::path::Path, name: &str, desc: &str, body: &str) {
         let skill_dir = base_dir.join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
-        let content = format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n");
+        let content = format!(
+            "---\nname: {name}\ndescription: {desc}\nwhen_to_use: |\n  When testing activation output.\n---\n{body}\n"
+        );
         std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
     }
 
@@ -140,6 +150,8 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("# Skill: pdf"));
         assert!(result.content.contains("Convert to PDF"));
+        assert!(result.content.contains("When to use:"));
+        assert!(result.content.contains("When testing activation output."));
         assert!(result
             .content
             .contains("Use pdflatex to convert documents."));

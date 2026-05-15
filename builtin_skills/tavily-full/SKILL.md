@@ -1,6 +1,9 @@
 ---
 name: tavily-full
-description: This a a tool to do deep research, search, and detailed web extraction. Use Tavily beyond built-in web_search — Extract, Crawl, Map, Research (async + poll), and Usage. Activate for deep page extraction, site mapping, multi-page crawls, or long-form research reports.
+description: Tavily APIs beyond built-in web_search — extract, crawl, map, research (async), and usage reporting via the bundled Python CLI.
+when_to_use: |
+  Use after activating when the user needs deep page extraction, site mapping, multi-page crawls, or long-form research beyond a simple web_search call. Requires TAVILY_API_KEY in the environment (same as web_search).
+  Skip when web_search + web_fetch are enough for shallow discovery.
 compatibility:
   os: [linux, darwin, windows]
   deps: []
