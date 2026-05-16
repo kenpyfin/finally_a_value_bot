@@ -13,7 +13,7 @@ Use this skill when a request is likely to exceed normal foreground latency, or 
 
 ## Shell vs agent background
 
-- **Shell/code** (scripts, builds, GPU CLI, long `bash` work): use the core tool `spawn_background_command`. It runs in tmux and sends a separate completion message when done.
+- **Shell/code** (scripts, builds, GPU CLI, long `bash` work): use the core tool `spawn_background_command`. It runs in tmux and sends a separate completion message when done. On failure, the server may auto-enqueue an agent run with the log output to fix and retry.
 - **Full agent re-run** (after web timeout or PTE handoff): return the `##BACKGROUND_JOB_HANDOFF##` sentinel so the server enqueues an agent background job (tokio worker, not tmux).
 
 ## Decision rule

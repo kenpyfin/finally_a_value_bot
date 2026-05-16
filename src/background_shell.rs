@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 
+use crate::background_jobs::{try_enqueue_background_handoff, HandoffEnqueueOutcome};
 use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact};
 use crate::config::Config;
 use crate::db::{call_blocking, BackgroundJob};
@@ -40,9 +41,56 @@ pub async fn tmux_session_exists(session: &str) -> Result<bool, String> {
 }
 
 pub fn shell_job_dir(config: &Config, job_id: &str) -> PathBuf {
-    PathBuf::from(config.runtime_data_dir())
+    config
+        .workspace_root_absolute()
+        .join("runtime")
         .join("background_jobs")
         .join(job_id)
+}
+
+/// Join `workspace_root` with a relative working-directory path for shell jobs.
+///
+/// Repeatedly drops a leading path segment when it duplicates `workspace_root`'s final segment
+/// (same idea as `workspace_data_path_display` in `telegram.rs`). Avoids `./workspace` plus
+/// `workspace/shared` resolving to `workspace/workspace/shared`.
+fn join_workspace_relative_dir(workspace_root: &Path, relative: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let trimmed = relative.to_string_lossy();
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        return workspace_root.to_path_buf();
+    }
+    let rel = trimmed.trim_start_matches("./");
+    if rel.is_empty() {
+        return workspace_root.to_path_buf();
+    }
+
+    let mut tail = PathBuf::from(rel);
+    while let (Some(root_leaf), Some(Component::Normal(first_seg))) =
+        (workspace_root.file_name(), tail.components().next())
+    {
+        if root_leaf != first_seg {
+            break;
+        }
+        tail = tail.components().skip(1).collect();
+    }
+
+    workspace_root.join(tail)
+}
+
+/// Resolve workdir to an absolute path under the workspace root.
+fn resolve_shell_workdir(config: &Config, workdir: &Path) -> PathBuf {
+    let p = if workdir.is_absolute() {
+        workdir.to_path_buf()
+    } else {
+        join_workspace_relative_dir(&config.workspace_root_absolute(), workdir)
+    };
+    std::fs::canonicalize(&p).unwrap_or(p)
+}
+
+fn abs_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn session_name(prefix: &str, job_id: &str) -> String {
@@ -128,14 +176,17 @@ Run the bot on a host with tmux, or use inline bash for short commands."
         ));
     }
 
-    let stdout_path = job_dir.join(STDOUT_LOG);
-    let exit_path = job_dir.join(EXIT_CODE_FILE);
-    let command_script = job_dir.join(COMMAND_SCRIPT);
-    let wrapper_script = job_dir.join(WRAPPER_SCRIPT);
+    let workdir_abs = resolve_shell_workdir(&state.config, &workdir);
+    let job_dir_abs = abs_path(&job_dir);
+    let stdout_path = job_dir_abs.join(STDOUT_LOG);
+    let exit_path = job_dir_abs.join(EXIT_CODE_FILE);
+    let command_script = job_dir_abs.join(COMMAND_SCRIPT);
+    let wrapper_script = job_dir_abs.join(WRAPPER_SCRIPT);
+    let tmux_cwd = state.config.workspace_root_absolute();
 
     let command_body = format!(
         "#!/usr/bin/env bash\nset -uo pipefail\ncd {}\n{}\n",
-        shell_escape_single(&workdir.to_string_lossy()),
+        shell_escape_single(&workdir_abs.to_string_lossy()),
         command.trim()
     );
     if let Err(e) = tokio::fs::write(&command_script, command_body).await {
@@ -178,8 +229,8 @@ Run the bot on a host with tmux, or use inline bash for short commands."
 
     let prefix = state.config.background_shell_tmux_session_prefix.trim();
     let tmux_session = session_name(prefix, &job_id);
-    let workdir_str = workdir.to_string_lossy().to_string();
-    let workdir_for_tmux = workdir_str.clone();
+    let workdir_str = workdir_abs.to_string_lossy().to_string();
+    let workdir_for_tmux = tmux_cwd.to_string_lossy().to_string();
     let output_path_str = stdout_path.to_string_lossy().to_string();
     let reason = trigger_reason.to_string();
     let jid = job_id.clone();
@@ -206,6 +257,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
         Err(e) => return ShellEnqueueOutcome::DbCreateFailed(e.to_string()),
     }
 
+    let wrapper_arg = wrapper_script.to_string_lossy().into_owned();
     let spawn_result = tokio::process::Command::new("tmux")
         .args([
             "new-session",
@@ -216,7 +268,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
             &workdir_for_tmux,
             "--",
             "bash",
-            wrapper_script.to_str().unwrap_or("./wrapper.sh"),
+            &wrapper_arg,
         ])
         .spawn();
 
@@ -351,16 +403,36 @@ Run the bot on a host with tmux, or use inline bash for short commands."
 /// Blocks until the tmux session ends, then finalizes (primary completion path; poll is backup).
 fn spawn_tmux_completion_watcher(state: Arc<AppState>, job_id: String, session: String) {
     tokio::spawn(async move {
-        let wait_status = tokio::process::Command::new("tmux")
+        let wait_out = tokio::process::Command::new("tmux")
             .args(["wait-session", "-t", &session])
-            .status()
+            .output()
             .await;
-        match wait_status {
-            Ok(s) => {
-                info!(job_id = %job_id, session = %session, exit = ?s, "tmux wait-session finished")
+
+        match &wait_out {
+            Ok(out) => {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if !out.status.success() && combined.contains("unknown command") {
+                    warn!(
+                        job_id = %job_id,
+                        session = %session,
+                        "tmux wait-session is not supported on this host; using poll monitor only"
+                    );
+                    return;
+                }
+                info!(
+                    job_id = %job_id,
+                    session = %session,
+                    exit = ?out.status,
+                    "tmux wait-session finished"
+                );
             }
             Err(e) => warn!(job_id = %job_id, session = %session, "tmux wait-session error: {e}"),
         }
+
         let jid = job_id.clone();
         let job = match call_blocking(state.db.clone(), move |db| db.get_background_job(&jid)).await
         {
@@ -442,11 +514,18 @@ async fn read_log_output(job: &BackgroundJob, job_dir: &Path) -> String {
         .output_path
         .as_ref()
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .unwrap_or_else(|| job_dir.join(STDOUT_LOG));
+    let path = abs_path(&path);
     let from_log = match tokio::fs::read_to_string(&path).await {
         Ok(s) if !s.trim().is_empty() => s,
         Ok(_) => String::new(),
-        Err(e) => format!("(could not read log at {}: {e})", path.display()),
+        Err(e) => format!(
+            "(could not read log at {}: {e})\n\
+             Hint: if exit code is -1, the wrapper may not have run; check tmux and job scripts under {})",
+            path.display(),
+            job_dir.display()
+        ),
     };
     if !from_log.is_empty() {
         return from_log;
@@ -473,12 +552,22 @@ pub fn shell_job_needs_user_notification(job: &BackgroundJob) -> bool {
     }
 }
 
-fn format_delivery_message(job: &BackgroundJob, exit_code: i32, output: &str) -> String {
+fn format_delivery_message(
+    job: &BackgroundJob,
+    exit_code: i32,
+    output: &str,
+    agent_retry_scheduled: bool,
+) -> String {
     let label = job.label.as_deref().unwrap_or(job.prompt.as_str());
     let (headline, hint) = if exit_code == 0 {
         (
             format!("completed successfully (exit {exit_code})"),
             "Your background command finished.",
+        )
+    } else if agent_retry_scheduled {
+        (
+            format!("FAILED (exit {exit_code})"),
+            "The background command failed. I'm starting an agent run now to read this output, fix the issue, and retry the command.",
         )
     } else {
         (
@@ -609,7 +698,27 @@ pub async fn finalize_shell_job(
     }
     let output = redact_secrets_user_visible(&output);
     let success = exit_code == 0;
-    let delivery_text = format_delivery_message(&job, exit_code, &output);
+
+    // Persist terminal failure before agent-retry enqueue: `try_enqueue_background_handoff`
+    // counts active jobs and would block while this shell row is still `running`.
+    let mut failure_marked_for_retry_slot = false;
+    if !success && !already_terminal {
+        let jid = job_id.clone();
+        let out = output.clone();
+        let ec = exit_code;
+        let _ = call_blocking(state.db.clone(), move |db| {
+            db.mark_background_shell_finished(&jid, ec, &out, false)
+        })
+        .await;
+        failure_marked_for_retry_slot = true;
+    }
+
+    let agent_retry_scheduled = if success {
+        false
+    } else {
+        maybe_enqueue_shell_failure_agent_retry(state.clone(), &job, exit_code, &output).await
+    };
+    let delivery_text = format_delivery_message(&job, exit_code, &output, agent_retry_scheduled);
 
     if let Err(e) = deliver_agent_final_to_contact(
         state.db.clone(),
@@ -638,9 +747,13 @@ pub async fn finalize_shell_job(
         let jid = job_id.clone();
         let out = output.clone();
         let terminal = already_terminal;
+        let marked_early = failure_marked_for_retry_slot;
         let _ = call_blocking(state.db.clone(), move |db| {
             if terminal {
                 db.record_background_shell_user_notification(&jid, &out)
+            } else if marked_early && !success {
+                // Failure row already written before agent-retry enqueue; nothing to update.
+                Ok(())
             } else {
                 db.mark_background_shell_finished(&jid, exit_code, &out, success)
             }
@@ -774,6 +887,105 @@ pub async fn reconcile_stale_shell_background_jobs(state: Arc<AppState>) -> Vec<
     reconciled
 }
 
+async fn caller_channel_for_chat(state: &AppState, chat_id: i64) -> &'static str {
+    match call_blocking(state.db.clone(), move |db| db.get_chat_type(chat_id)).await {
+        Ok(Some(t)) if t == "web" => "web",
+        Ok(Some(t)) if t == "discord" => "discord",
+        Ok(Some(t)) if t == "whatsapp" => "whatsapp",
+        _ => "telegram",
+    }
+}
+
+/// Enqueue an agent background job to diagnose a failed shell job and retry via tools.
+/// Returns true when a retry agent run was queued.
+async fn maybe_enqueue_shell_failure_agent_retry(
+    state: Arc<AppState>,
+    job: &BackgroundJob,
+    exit_code: i32,
+    output: &str,
+) -> bool {
+    if !state.config.background_shell_auto_retry_on_failure {
+        return false;
+    }
+    if job.last_stage.as_deref() == Some("agent_retry_enqueued") {
+        return false;
+    }
+    let max = state.config.background_shell_auto_retry_max.max(1);
+    let parent_id = job.id.clone();
+    let prior = match call_blocking(state.db.clone(), move |db| {
+        db.count_shell_failure_agent_retries(&parent_id)
+    })
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(job_id = %job.id, "shell failure retry count failed: {e}");
+            return false;
+        }
+    };
+    if prior >= i64::from(max) {
+        return false;
+    }
+    let attempt = prior + 1;
+    let label = job.label.as_deref().unwrap_or(job.prompt.as_str());
+    let shell_cmd = job.shell_command.as_deref().unwrap_or("(unknown)");
+    let workdir = job.workdir.as_deref().unwrap_or("(unknown)");
+    let prompt = format!(
+        "##INTERNAL_SHELL_FAILURE_RETRY##\n\
+         A background shell command failed. Diagnose the output, fix the command (flags, paths, placeholders, missing files), \
+         then retry with `spawn_background_command`. Do not use placeholder paths or invalid CLI flags.\n\n\
+         Failed shell job id: `{shell_job_id}`\n\
+         Task label: {label}\n\
+         Exit code: {exit_code}\n\
+         Workdir: {workdir}\n\
+         Command:\n```bash\n{shell_cmd}\n```\n\n\
+         Output:\n```\n{output}\n```\n",
+        shell_job_id = job.id,
+    );
+    let trigger = format!("shell_failure_retry:{}:{attempt}", job.id);
+    let jid = job.id.clone();
+    let _ = call_blocking(state.db.clone(), move |db| {
+        db.mark_background_shell_agent_retry_enqueued(&jid)
+    })
+    .await;
+    let channel = caller_channel_for_chat(&state, job.chat_id).await;
+    match try_enqueue_background_handoff(
+        state,
+        job.chat_id,
+        job.persona_id,
+        prompt,
+        &trigger,
+        channel,
+    )
+    .await
+    {
+        HandoffEnqueueOutcome::Queued { job_id, .. } => {
+            info!(
+                shell_job_id = %job.id,
+                agent_job_id = %job_id,
+                attempt,
+                "Enqueued agent retry after shell failure"
+            );
+            true
+        }
+        HandoffEnqueueOutcome::BlockedAlreadyRunning => {
+            warn!(
+                shell_job_id = %job.id,
+                "Shell failure agent retry blocked: another background job is active"
+            );
+            false
+        }
+        other => {
+            warn!(
+                shell_job_id = %job.id,
+                ?other,
+                "Shell failure agent retry could not be enqueued"
+            );
+            false
+        }
+    }
+}
+
 pub async fn notify_stale_shell_failures_on_startup(state: Arc<AppState>) {
     let jobs = match call_blocking(state.db.clone(), |db| {
         db.list_shell_jobs_needing_notification()
@@ -813,4 +1025,64 @@ pub fn spawn_background_shell_monitor(state: Arc<AppState>) {
             monitor_shell_background_jobs_tick(state.clone()).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn shell_job_dir_under_workspace_runtime() {
+        let mut config = Config::default();
+        config.workspace_dir = "/tmp/favb-workspace".into();
+        let dir = shell_job_dir(&config, "abc-123");
+        assert!(dir.is_absolute());
+        assert!(dir.ends_with(Path::new("runtime").join("background_jobs").join("abc-123")));
+    }
+
+    #[test]
+    fn resolve_shell_workdir_makes_relative_paths_absolute() {
+        let mut config = Config::default();
+        let root = std::env::temp_dir().join("favb-shell-workdir-test");
+        let _ = std::fs::create_dir_all(root.join("shared"));
+        config.workspace_dir = root.to_string_lossy().into();
+        let resolved = resolve_shell_workdir(&config, Path::new("shared"));
+        assert!(resolved.is_absolute());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_shell_workdir_drops_redundant_workspace_prefix() {
+        let mut config = Config::default();
+        let root = std::env::temp_dir()
+            .join("favb-shell-workspace-prefix-test")
+            .join("workspace");
+        let shared = root.join("shared");
+        let _ = std::fs::create_dir_all(&shared);
+        config.workspace_dir = root.to_string_lossy().into();
+
+        for rel in [
+            "./workspace/shared",
+            "workspace/shared",
+            "workspace/workspace/shared",
+        ] {
+            let resolved = resolve_shell_workdir(&config, Path::new(rel));
+            assert!(
+                resolved.ends_with(Path::new("shared")),
+                "unexpected path for {rel:?}: {}",
+                resolved.display()
+            );
+            assert!(
+                !resolved
+                    .components()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| w[0].as_os_str() == "workspace" && w[1].as_os_str() == "workspace"),
+                "doubled workspace segment in {}",
+                resolved.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
 }

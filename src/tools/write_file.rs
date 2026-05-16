@@ -57,6 +57,11 @@ impl Tool for WriteFileTool {
         if let Err(msg) = crate::tools::path_guard::check_path(&resolved_path_str) {
             return ToolResult::error(msg);
         }
+        if let Err(msg) =
+            super::check_shadow_workspace_write(self.working_dir.as_path(), &resolved_path)
+        {
+            return ToolResult::error(msg);
+        }
 
         let content = match input.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,

@@ -1885,6 +1885,7 @@ async fn send_and_store_response_with_events(
             persona_id,
             full_prompt_for_handoff,
             trig,
+            "web",
         )
         .await
         {

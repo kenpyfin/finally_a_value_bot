@@ -7,7 +7,10 @@ use crate::claude::ToolDefinition;
 use crate::safety_redaction::redact_secrets_internal;
 use crate::tools::command_runner::{build_command, shell_command};
 
-use super::bash_safety::{check_bash_safety, parse_confirmation_prefix};
+use super::bash_safety::{
+    check_bash_safety, check_expensive_shell_search, is_expensive_shell_search,
+    parse_confirmation_prefix, EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS,
+};
 use super::{schema_object, Tool, ToolResult};
 
 pub struct BashTool {
@@ -52,7 +55,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Execute a bash command and return the output. Use for running shell commands, scripts, or system operations.".into(),
+            description: "Execute a bash command and return the output. Use for running shell commands, scripts, or system operations. Do not use recursive `grep -r` or unbounded `find` over large trees — use the `glob` and `grep` tools instead (shell recursive search is blocked unless you prefix CONFIRM_EXECUTE).".into(),
             input_schema: schema_object(
                 json!({
                     "command": {
@@ -76,10 +79,13 @@ impl Tool for BashTool {
         };
         let (confirmed, command) = parse_confirmation_prefix(raw_command.trim());
 
-        let timeout_secs = input
+        let mut timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(1500);
+        if is_expensive_shell_search(&command) {
+            timeout_secs = timeout_secs.min(EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS);
+        }
         let working_dir = super::resolve_tool_working_dir(&self.working_dir);
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
             return ToolResult::error(format!(
@@ -94,6 +100,10 @@ impl Tool for BashTool {
             &self.safety_execution_mode,
             &self.safety_risky_categories,
         ) {
+            return blocked;
+        }
+
+        if let Some(blocked) = check_expensive_shell_search(&command, confirmed) {
             return blocked;
         }
 
@@ -288,6 +298,17 @@ mod tests {
         assert!(result
             .content
             .contains("Blocked by safety_execution_mode=strict"));
+        assert_eq!(result.error_type.as_deref(), Some("blocked_by_policy"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_blocks_recursive_grep_without_confirm() {
+        let tool = BashTool::new(".");
+        let result = tool
+            .execute(json!({"command": "grep -r foo ./shared/ | head -n 5"}))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Blocked expensive shell search"));
         assert_eq!(result.error_type.as_deref(), Some("blocked_by_policy"));
     }
 }

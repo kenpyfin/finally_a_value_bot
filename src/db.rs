@@ -3215,6 +3215,28 @@ impl Database {
         Ok(())
     }
 
+    /// External system id only (ComfyUI `prompt_id`, etc.): visible in queue, does not block handoff/shell slots.
+    pub fn create_background_tracked_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        prompt: &str,
+        label: Option<&str>,
+        trigger_reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO background_jobs (
+                id, chat_id, persona_id, prompt, status, trigger_reason,
+                created_at, started_at, last_progress_at, last_stage, job_kind, label
+             ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?6, ?6, 'external_queue', 'tracked', ?7)",
+            params![id, chat_id, persona_id, prompt, trigger_reason, now, label],
+        )?;
+        Ok(())
+    }
+
     pub fn set_background_shell_paths(
         &self,
         id: &str,
@@ -3249,6 +3271,37 @@ impl Database {
                  last_stage = 'user_notified'
              WHERE id = ?3",
             params![result_text, now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Agent background jobs enqueued after a shell failure (`shell_failure_retry:{parent_id}:N`).
+    pub fn count_shell_failure_agent_retries(
+        &self,
+        parent_shell_job_id: &str,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("shell_failure_retry:{parent_shell_job_id}:%");
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             WHERE job_kind = 'agent' AND trigger_reason LIKE ?1",
+            params![pattern],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn mark_background_shell_agent_retry_enqueued(
+        &self,
+        id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs
+             SET last_progress_at = ?1, last_stage = 'agent_retry_enqueued'
+             WHERE id = ?2 AND job_kind = 'shell'",
+            params![now, id],
         )?;
         Ok(())
     }
@@ -3389,11 +3442,15 @@ impl Database {
              FROM background_jobs
              WHERE chat_id = ?1
                AND (
-                    (status = 'pending' AND created_at >= ?2)
-                    OR (
-                        status IN ('running', 'completed_raw', 'main_agent_processing')
-                        AND COALESCE(lease_expires_at, '9999-12-31T23:59:59+00:00') >= ?3
+                    (job_kind IS NULL OR job_kind NOT IN ('tracked'))
+                    AND (
+                         (status = 'pending' AND created_at >= ?2)
+                         OR (
+                             status IN ('running', 'completed_raw', 'main_agent_processing')
+                             AND COALESCE(lease_expires_at, '9999-12-31T23:59:59+00:00') >= ?3
+                         )
                     )
+                    OR (job_kind = 'tracked' AND status = 'running')
                )
              ORDER BY created_at ASC"
         ))?;
@@ -3607,6 +3664,7 @@ impl Database {
         let count = conn.query_row(
             "SELECT COUNT(*) FROM background_jobs
              WHERE chat_id = ?1
+               AND (job_kind IS NULL OR job_kind NOT IN ('tracked'))
                AND (
                     (status = 'pending' AND created_at >= ?2)
                     OR (

@@ -28,7 +28,7 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "grep".into(),
-            description: "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers.".into(),
+            description: "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers. Prefer a narrow `path` and `glob` filter (e.g. path `shared/`, glob `*.md`) — avoid searching all of `shared/` without a glob.".into(),
             input_schema: schema_object(
                 json!({
                     "pattern": {
@@ -86,13 +86,66 @@ impl Tool for GrepTool {
         if results.is_empty() {
             ToolResult::success("No matches found.".into())
         } else {
-            if results.len() > 500 {
-                results.truncate(500);
-                results.push("... (results truncated)".into());
-            }
+            truncate_grep_results(&mut results);
             ToolResult::success(results.join("\n"))
         }
     }
+}
+
+const MAX_GREP_OUTPUT_CHARS: usize = 32_000;
+const MAX_GREP_MATCH_LINES: usize = 500;
+const MAX_GREP_FILES_SCANNED: usize = 3_000;
+
+fn truncate_grep_results(results: &mut Vec<String>) {
+    if results.len() > MAX_GREP_MATCH_LINES {
+        results.truncate(MAX_GREP_MATCH_LINES);
+        results.push("... (line matches truncated)".into());
+    }
+    let mut total = 0usize;
+    let mut keep = 0usize;
+    for line in results.iter() {
+        let next = total.saturating_add(line.len()).saturating_add(1);
+        if next > MAX_GREP_OUTPUT_CHARS {
+            break;
+        }
+        total = next;
+        keep += 1;
+    }
+    if keep < results.len() {
+        results.truncate(keep);
+        results.push("... (output size truncated)".into());
+    }
+}
+
+fn should_skip_grep_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules" | "target" | "vault_db" | "__pycache__" | ".git"
+        )
+}
+
+fn should_skip_grep_file(name: &str) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "safetensors"
+            | "bin"
+            | "pdf"
+            | "zip"
+            | "gz"
+            | "sqlite"
+            | "db"
+    )
 }
 
 fn grep_recursive(
@@ -105,7 +158,13 @@ fn grep_recursive(
     let metadata = std::fs::metadata(path)?;
 
     if metadata.is_file() {
-        grep_file(path, re, results)?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !should_skip_grep_file(&name) {
+            grep_file(path, re, results)?;
+        }
     } else if metadata.is_dir() {
         let glob_pattern = file_glob.and_then(|g| glob::Pattern::new(g).ok());
 
@@ -114,8 +173,7 @@ fn grep_recursive(
             let entry_path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
 
-            // Skip hidden directories and common non-code dirs
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
+            if should_skip_grep_dir(&name) {
                 continue;
             }
 
@@ -125,13 +183,17 @@ fn grep_recursive(
                 if crate::tools::path_guard::is_blocked(&entry_path) {
                     continue;
                 }
+                if should_skip_grep_file(&name) {
+                    continue;
+                }
                 if let Some(ref pat) = glob_pattern {
                     if !pat.matches(&name) {
                         continue;
                     }
                 }
                 *file_count += 1;
-                if *file_count > 10000 {
+                if *file_count > MAX_GREP_FILES_SCANNED {
+                    results.push("... (file scan limit reached)".into());
                     return Ok(());
                 }
                 grep_file(&entry_path, re, results)?;
@@ -150,7 +212,7 @@ fn grep_file(path: &Path, re: &regex::Regex, results: &mut Vec<String>) -> std::
     for (line_num, line) in content.lines().enumerate() {
         if re.is_match(line) {
             results.push(format!("{}:{}: {}", path.display(), line_num + 1, line));
-            if results.len() >= 500 {
+            if results.len() >= MAX_GREP_MATCH_LINES {
                 return Ok(());
             }
         }

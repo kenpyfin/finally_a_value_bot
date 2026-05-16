@@ -14,8 +14,7 @@ import {
 } from '../types'
 
 function historyDepthSelectValue(hs: PersonaBulletinHistorySuffix | null): string {
-  if (hs == null) return 'server'
-  if (hs.min_user.uses_default && hs.min_assistant.uses_default) return 'server'
+  if (hs == null) return '6'
   const u = hs.min_user.effective
   const a = hs.min_assistant.effective
   if (u === a && (u === 2 || u === 6 || u === 10)) return String(u)
@@ -118,10 +117,10 @@ export function CockpitBar({
       setDepthBusy(true)
       setDepthError('')
       try {
-        const body: Record<string, unknown> =
-          v === 'server'
-            ? { recent_history_min_user: null, recent_history_min_assistant: null }
-            : { recent_history_min_user: Number(v), recent_history_min_assistant: Number(v) }
+        const body: Record<string, unknown> = {
+          recent_history_min_user: Number(v),
+          recent_history_min_assistant: Number(v),
+        }
         await api(`/api/personas/${activePersonaId}/bulletin`, {
           method: 'PATCH',
           body: JSON.stringify(body),
@@ -444,9 +443,6 @@ export function CockpitBar({
                 >
                   <Select.Trigger className="w-full max-w-xs" />
                   <Select.Content position="popper">
-                    <Select.Item value="server">
-                      Server defaults ({historySuffix.defaults.min_user} / {historySuffix.defaults.min_assistant})
-                    </Select.Item>
                     <Select.Item value="2">Compact (2 / 2)</Select.Item>
                     <Select.Item value="6">Standard (6 / 6)</Select.Item>
                     <Select.Item value="10">Deep (10 / 10)</Select.Item>

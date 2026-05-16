@@ -127,6 +127,7 @@ pub async fn try_enqueue_background_handoff(
     persona_id: i64,
     full_prompt: String,
     trigger_reason_db: &str,
+    caller_channel: &str,
 ) -> HandoffEnqueueOutcome {
     let now = chrono::Utc::now().to_rfc3339();
     let pending_timeout_secs = state.config.background_job_pending_start_timeout_secs as i64;
@@ -155,8 +156,14 @@ pub async fn try_enqueue_background_handoff(
     .await
     {
         Ok(()) => {
-            let start_ack =
-                spawn_background_job(state, job_id.clone(), chat_id, persona_id, full_prompt);
+            let start_ack = spawn_background_job(
+                state,
+                job_id.clone(),
+                chat_id,
+                persona_id,
+                full_prompt,
+                caller_channel,
+            );
             HandoffEnqueueOutcome::Queued { job_id, start_ack }
         }
         Err(e) => HandoffEnqueueOutcome::DbCreateFailed(e.to_string()),
@@ -190,7 +197,9 @@ pub fn spawn_background_job(
     chat_id: i64,
     persona_id: i64,
     prompt: String,
+    caller_channel: &str,
 ) -> oneshot::Receiver<BackgroundStartAck> {
+    let caller_channel = caller_channel.to_string();
     let (start_tx, start_rx) = oneshot::channel::<BackgroundStartAck>();
     tokio::spawn(async move {
         let cancel = state
@@ -288,7 +297,7 @@ pub fn spawn_background_job(
         let bg_result = process_with_agent_with_events(
             &state,
             AgentRequestContext {
-                caller_channel: "web",
+                caller_channel: caller_channel.as_str(),
                 chat_id,
                 chat_type: "private",
                 persona_id,

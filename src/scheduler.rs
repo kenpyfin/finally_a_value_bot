@@ -508,6 +508,7 @@ async fn run_scheduled_agent_and_finalize(
                     persona_id,
                     prompt.clone(),
                     "scheduler",
+                    channel,
                 )
                 .await
                 {

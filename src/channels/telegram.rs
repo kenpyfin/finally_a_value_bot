@@ -1821,6 +1821,10 @@ pub async fn process_with_agent_with_events(
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
     const LOOP_SIGNATURE_REPEAT_THRESHOLD: usize = 3;
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
+    const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 3;
+    const DISCOVERY_STREAK_STALL_THRESHOLD: usize = 5;
+    const DEFERRED_COMMITMENT_MAX_NUDGES: usize = 2;
+    const DEFERRED_COMMITMENT_ROUTING_HINT: &str = "You ended your turn while promising further work. Either call a tool now (read_agent_history, read_file, glob, list_cursor_agent_runs, etc.) or give a final answer with what you already know—do not say you are checking something without a tool call.";
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
     let initial_llm_snapshot_json =
@@ -1864,6 +1868,8 @@ pub async fn process_with_agent_with_events(
     let mut last_swap_signature: Option<String> = None;
     let mut swap_no_evidence_repeat_count: usize = 0;
     let mut legacy_edit_without_block_count: usize = 0;
+    let mut discovery_streak_count: usize = 0;
+    let mut deferred_commitment_nudges: usize = 0;
 
     macro_rules! save_run_history {
         ($stop_reason:expr) => {{
@@ -2130,6 +2136,30 @@ pub async fn process_with_agent_with_events(
                 tool_calls: Vec::new(),
             });
 
+            if !assistant_text.trim().is_empty()
+                && should_reject_premature_end_turn(&assistant_text, &messages)
+                && deferred_commitment_nudges < DEFERRED_COMMITMENT_MAX_NUDGES
+                && iteration + 1 < state.config.max_tool_iterations
+            {
+                deferred_commitment_nudges += 1;
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(assistant_text.clone()),
+                });
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(DEFERRED_COMMITMENT_ROUTING_HINT.to_string()),
+                });
+                info!(
+                    "Main agent iteration {}/{}: deferred_commitment_rejected (nudge {}/{})",
+                    iteration + 1,
+                    state.config.max_tool_iterations,
+                    deferred_commitment_nudges,
+                    DEFERRED_COMMITMENT_MAX_NUDGES
+                );
+                continue;
+            }
+
             messages.push(Message {
                 role: "assistant".into(),
                 content: MessageContent::Text(assistant_text.clone()),
@@ -2231,6 +2261,7 @@ pub async fn process_with_agent_with_events(
             let mut history_tool_calls: Vec<ToolCallRecord> = Vec::new();
             let mut force_stall_response: Option<String> = None;
             let mut executed_tool_names: Vec<String> = Vec::new();
+            let mut executed_tool_inputs: Vec<(String, serde_json::Value)> = Vec::new();
 
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse {
@@ -2238,6 +2269,7 @@ pub async fn process_with_agent_with_events(
                 } = block
                 {
                     executed_tool_names.push(name.clone());
+                    executed_tool_inputs.push((name.clone(), input.clone()));
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolStart {
                             tool_use_id: id.clone(),
@@ -2596,6 +2628,42 @@ pub async fn process_with_agent_with_events(
                     iteration + 1,
                     state.config.max_tool_iterations,
                     legacy_edit_without_block_count
+                );
+            }
+
+            let iteration_had_progress = executed_tool_names
+                .iter()
+                .any(|name| is_progress_tool_use(name));
+            let iteration_had_discovery = executed_tool_inputs
+                .iter()
+                .any(|(name, input)| is_discovery_tool_use(name, input));
+            if iteration_had_progress {
+                discovery_streak_count = 0;
+            } else if iteration_had_discovery {
+                discovery_streak_count = discovery_streak_count.saturating_add(1);
+            }
+            if discovery_streak_count >= DISCOVERY_STREAK_HINT_THRESHOLD
+                && force_stall_response.is_none()
+            {
+                let routing_hint = "Routing hint: you are in a discovery/search loop (list tasks, list cursor runs, broad grep/find). For job status use `read_tiered_memory` and `list_cursor_agent_runs`; for files use `glob` with a pattern (e.g. PZ-*.png) or `read_file` on a known path — not recursive shell grep over `shared/`.";
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(routing_hint.to_string()),
+                });
+                info!(
+                    "Main agent iteration {}/{}: injected discovery routing hint (streak={})",
+                    iteration + 1,
+                    state.config.max_tool_iterations,
+                    discovery_streak_count
+                );
+            }
+            if discovery_streak_count >= DISCOVERY_STREAK_STALL_THRESHOLD
+                && force_stall_response.is_none()
+            {
+                force_stall_response = Some(
+                    "I stopped because this run kept searching without making progress (repeated status/list/grep steps). \
+Tell me what you need in one line — e.g. show the latest PZ image, check a specific background job id, or retry generation — and I will use a direct path (tiered memory, glob, or a single read) instead of scanning the tree."
+                        .to_string(),
                 );
             }
 
@@ -3332,6 +3400,122 @@ fn should_apply_generic_loop_guard(tool_name: &str) -> bool {
     )
 }
 
+fn is_progress_tool_use(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "send_message"
+            | "spawn_background_command"
+            | "write_file"
+            | "edit_file"
+            | "apply_search_replace"
+            | "symbol_edit"
+            | "read_tiered_memory"
+            | "read_memory"
+            | "write_tiered_memory"
+            | "write_memory_state"
+            | "schedule_task"
+            | "register_tracked_job"
+    )
+}
+
+/// True when assistant prose promises imminent work without having issued a tool call.
+fn assistant_text_defers_work(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const PHRASES: &[&str] = &[
+        "checking the log",
+        "checking run log",
+        "check the log",
+        "check run log",
+        "i will ",
+        "i'll ",
+        "i am going to ",
+        "i'm going to ",
+        "im going to ",
+        "let me ",
+        "one moment",
+        "(checking",
+        "right now",
+        "immediately",
+        "in a moment",
+        "give me a moment",
+        "hold on",
+    ];
+    PHRASES.iter().any(|p| lower.contains(p))
+}
+
+fn most_recent_tool_result_is_error(messages: &[Message]) -> bool {
+    for msg in messages.iter().rev() {
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks.iter().rev() {
+                if let ContentBlock::ToolResult { is_error, .. } = block {
+                    return *is_error == Some(true);
+                }
+            }
+        }
+    }
+    false
+}
+
+fn assistant_text_references_incomplete_work(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("background task")
+        || lower.contains("agent run")
+        || lower.contains("cursor-agent")
+        || lower.contains("cursor agent")
+        || lower.contains("run #")
+        || lower.contains("run logs")
+        || lower.contains("not successfully")
+        || lower.contains("no such file")
+        || lower.contains("was not created")
+        || lower.contains("was not found")
+    {
+        return true;
+    }
+    static RUN_ID_RE: OnceLock<Regex> = OnceLock::new();
+    let re = RUN_ID_RE.get_or_init(|| Regex::new(r"#\d{1,6}\b").expect("run id regex"));
+    re.is_match(text)
+}
+
+fn should_reject_premature_end_turn(assistant_text: &str, messages: &[Message]) -> bool {
+    if !assistant_text_defers_work(assistant_text) {
+        return false;
+    }
+    most_recent_tool_result_is_error(messages)
+        || assistant_text_references_incomplete_work(assistant_text)
+}
+
+fn is_discovery_tool_use(tool_name: &str, input: &serde_json::Value) -> bool {
+    match tool_name {
+        "list_scheduled_tasks" | "list_cursor_agent_runs" => true,
+        "grep" => {
+            let path = input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".")
+                .trim();
+            let has_glob = input
+                .get("glob")
+                .and_then(|v| v.as_str())
+                .is_some_and(|g| !g.trim().is_empty());
+            !has_glob || path == "." || path.ends_with("shared") || path.ends_with("shared/")
+        }
+        "glob" => {
+            let path = input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".")
+                .trim();
+            path == "." || path.ends_with("shared") || path.ends_with("shared/")
+        }
+        "bash" => {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            crate::tools::bash_safety::is_expensive_shell_search(cmd)
+                || cmd.to_ascii_lowercase().contains("find ")
+        }
+        _ => false,
+    }
+}
+
 fn is_memory_write_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -3725,7 +3909,7 @@ fn build_system_prompt(
 - **Media:** user images arrive as image blocks
 - **Cursor CLI:** cursor_agent, cursor_agent_send, list_cursor_agent_runs (use detach: true for long work)
 - **Skills:** `activate_skill` loads full `SKILL.md`; creating or updating skills uses **build_skill** only — see **Repository layout** (do not use file tools under `skills/**`)
-- **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
+- **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). **`register_tracked_job`** records an external id (e.g. ComfyUI `prompt_id`) so it appears in the same queue as shell jobs without blocking another background slot. Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
 - **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, read_agent_history
 
 ## Conversation Memory
@@ -3762,9 +3946,12 @@ For scheduling:
 
 For long-running jobs:
 - For shell/scripts/builds/GPU waits that may exceed bash timeout, use `spawn_background_command` (not inline bash)
+- When an external API returns an id you quote to the user as the job id (e.g. ComfyUI `prompt_id`), call `register_tracked_job` with that id so the cockpit queue matches your message
 - For full agent re-runs after interactive timeout (web), follow `background-handoff` skill and the handoff sentinel path
 - For `cursor_agent`, if the task is likely to take a while (multi-file refactors, large code generation, broad research), default to `detach: true`
 - After starting a background shell job or cursor_agent detach run, tell the user it was started in background; shell jobs get an automatic completion message when done
+- When a shell background job fails, the server may enqueue an automatic agent retry with the failure output; fix the command and use `spawn_background_command` again (no placeholders)
+- Do not tell the user you are about to check logs, run a command, or fix something unless you also call the matching tool in the same turn. If you cannot proceed, say what is missing and stop—no "(Checking …)" placeholders.
 
 ## Browser
 Browser automation uses the **browser** tool, which runs the command `agent-browser` from the user's PATH (the npm agent-browser CLI). The tool does not use finally_a_value_bot-browser or any hardcoded path. Use only the **browser** tool; do not run agent-browser or other browser executables via the bash tool.
@@ -3791,7 +3978,8 @@ User messages from chat history are wrapped in XML tags like <user_message sende
 ## Repository layout and environment variables
 - **Configuration root:** {config_env_summary}. `FINALLY_A_VALUE_BOT_CONFIG` overrides the path to the `.env` file when set. This directory is usually the git repository root if you start the bot from there.
 - **Workspace data root (`WORKSPACE_DIR`):** `{workspace_data_root_display}`. It contains `shared/`, `skills/`, and `runtime/`. If `WORKSPACE_DIR` is a relative path in `.env`, it is resolved against the process current working directory (same rule the binary uses when resolving paths).
-- **Tool working directory (file/bash/glob/grep):** `{workspace_path}`. Relative paths for those tools are resolved from this `shared/` directory—not from the configuration root.
+- **Tool working directory (file/bash/glob/grep):** `{workspace_path}`. Relative paths for those tools are resolved from this `shared/` directory—not from the configuration root. Do **not** prefix tool paths with `workspace/` or `workspace/shared/` (that creates a mistaken nested tree at `shared/workspace/`). Use `ORIGIN/...` or `foo.txt` under shared; use `runtime/...` or `skills/...` for data-root siblings (not `workspace/runtime/...`).
+- **Shadow workspace:** `shared/workspace/` is **not** `WORKSPACE_DIR`—it is a nested mistake. Do not create or write files there; migrate to the canonical paths above.
 - **User skills directory:** `{skills_dir_display}` under the workspace data root. **Built-in skills** load from the checkout’s `builtin_skills/` directory on disk (override with `FINALLY_A_VALUE_BOT_BUILTIN_SKILLS`, or place `builtin_skills/` beside the parent of `WORKSPACE_DIR`); they are not copied into `skills/`.
 - **Where to put secrets:** Prefer skill-specific credentials in `skills/<skill-name>/.env`. Put bot-wide keys (e.g. `TELEGRAM_BOT_TOKEN`, `LLM_*`, `WORKSPACE_DIR`, `VAULT_ORIGIN_VAULT_REPO`, other `VAULT_*` consumed by the Rust binary) in the configuration `.env` at the configuration root.
 - **Skill scripts and `.env`:** Many bundled skill scripts call `load_dotenv` on the skill folder’s `.env` to fill in variables that are **not** already set in the process environment. Values already exported by the bot (for example after loading the configuration `.env`) **take precedence**—the skill file does not override them by default. If a required variable is still missing, use the skill’s documented default or fix the env and tell the user clearly what is missing.
@@ -6106,6 +6294,83 @@ mod tests {
         assert!(!should_apply_generic_loop_guard("read_file"));
         assert!(!should_apply_generic_loop_guard("read_repo_map"));
         assert!(should_apply_generic_loop_guard("bash"));
+    }
+
+    #[test]
+    fn test_assistant_text_defers_work_detects_placeholder_promises() {
+        let sample = "I am checking the logs for that agent run now to see why it stopped. \
+            I will get the pipeline back on track immediately. One moment.\n\n(Checking run logs...)";
+        assert!(assistant_text_defers_work(sample));
+    }
+
+    #[test]
+    fn test_assistant_text_defers_work_false_for_normal_completion() {
+        assert!(!assistant_text_defers_work("Done."));
+        assert!(!assistant_text_defers_work(
+            "Here is the file path: shared/PZ-20260512.png"
+        ));
+    }
+
+    #[test]
+    fn test_should_reject_premature_end_turn_after_tool_error() {
+        let assistant = "Checking run logs for #148 now. One moment.";
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("status?".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "ls missing.py"}),
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "Exit code 2\nno such file".into(),
+                    is_error: Some(true),
+                }]),
+            },
+        ];
+        assert!(should_reject_premature_end_turn(assistant, &messages));
+    }
+
+    #[test]
+    fn test_should_reject_premature_end_turn_false_without_deferral_language() {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "error".into(),
+                is_error: Some(true),
+            }]),
+        }];
+        assert!(!should_reject_premature_end_turn(
+            "The file is missing. Re-run generation when ready.",
+            &messages
+        ));
+    }
+
+    #[test]
+    fn test_is_discovery_tool_use_detects_status_archaeology() {
+        assert!(is_discovery_tool_use(
+            "list_cursor_agent_runs",
+            &serde_json::json!({})
+        ));
+        let grep = serde_json::json!({"pattern":"LoRA","path":"./workspace/shared/."});
+        assert!(is_discovery_tool_use("grep", &grep));
+        let bash = serde_json::json!({"command":"grep -r PZ ./shared/ | head"});
+        assert!(is_discovery_tool_use("bash", &bash));
+    }
+
+    #[test]
+    fn test_is_progress_tool_use_includes_tiered_memory() {
+        assert!(is_progress_tool_use("read_tiered_memory"));
+        assert!(!is_progress_tool_use("list_scheduled_tasks"));
     }
 
     #[test]

@@ -16,6 +16,59 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-16 — Deferred-commitment guard: reject end_turn with “checking logs” placeholders
+
+- **Area:** agent loop / tools
+- **Summary:** When the main agent ends with `end_turn` but prose promises imminent work (“checking logs”, “one moment”, run #148, etc.) after a recent tool error or incomplete-work context, the loop injects a routing hint and continues (max 2 nudges) instead of returning to the user. System prompt and `list_cursor_agent_runs` now point at `read_agent_history` / capture-pane for post-mortems.
+- **Rationale:** Models often narrate follow-up steps without tool calls; PTE only runs after `tool_use`, so `end_turn` exited immediately (e.g. “Checking run logs…” with no action).
+- **Key files / symbols:** `src/channels/telegram.rs` (`assistant_text_defers_work`, `should_reject_premature_end_turn`, `DEFERRED_COMMITMENT_*`), `src/tools/cursor_agent.rs` (`ListCursorAgentRunsTool`).
+- **Follow-ups:** Optional cursor-agent completion watcher to persist tmux scrollback into `output_path`.
+
+### 2026-05-16 — Anti-stall: block expensive shell search + discovery loop guard
+
+- **Area:** tools / agent loop
+- **Summary:** Blocked interactive `bash` recursive `grep -r` and unbounded `find` (redirect to `glob`/`grep` tools); capped confirmed expensive searches at 120s. Tightened `grep` tool (skip binaries/`vault_db`, output caps). Added discovery-streak routing hint + stall after repeated list/grep archaeology.
+- **Rationale:** Status-check runs were hanging ~15+ minutes on `grep -r workspace/shared` (1500s tool timeout) before users cancelled; learned workflows reinforced `list_scheduled_tasks → list_cursor_agent_runs → bash` loops.
+- **Key files / symbols:** `src/tools/bash_safety.rs` (`is_expensive_shell_search`, `check_expensive_shell_search`), `src/tools/bash.rs`, `src/tools/grep.rs`, `src/channels/telegram.rs` (`is_discovery_tool_use`, `discovery_streak_count`).
+- **Follow-ups:** Truncate `list_scheduled_tasks` output for web UI; tune learned workflow promotion so it does not reinforce broad bash grep.
+
+### 2026-05-15 — Background shell: normalize relative `workdir` vs workspace root
+
+- **Area:** background_shell / spawn_background_command
+- **Summary:** Relative `workdir` values like `./workspace/shared` were joined onto `WORKSPACE_DIR` already ending in `workspace`, producing a bogus `workspace/workspace/shared` path and immediate `cd` failure in generated `command.sh`.
+- **Rationale:** Same redundancy rule as `workspace_data_path_display`: strip leading segments that duplicate the workspace root’s final path component (repeat until stable).
+- **Key files / symbols:** `background_shell::{join_workspace_relative_dir, resolve_shell_workdir}`, unit test `resolve_shell_workdir_drops_redundant_workspace_prefix`.
+- **Follow-ups:** Agents should still prefer tool cwd (`shared/` or absolute paths); this hardens mistaken relative paths.
+
+### 2026-05-15 — Tracked external job ids in background queue
+
+- **Area:** tools / db / cockpit
+- **Summary:** New tool `register_tracked_job` inserts `job_kind=tracked` rows (e.g. ComfyUI `prompt_id`) so user-visible ids match `background_jobs` in the UI. `count_active_background_jobs_for_chat` excludes `tracked` so handoff/shell slots unchanged.
+- **Key files / symbols:** `tools/register_tracked_job.rs`, `db::create_background_tracked_job`, `list_active_background_jobs_for_chat` / `count_active_background_jobs_for_chat` filters.
+- **Follow-ups:** Optional `complete_tracked_job` tool or auto-expiry.
+
+### 2026-05-15 — Shell failure auto-retry: unblock handoff + tmux wait-session fallback
+
+- **Area:** background_shell
+- **Summary:** Agent retry after shell failure called `try_enqueue_background_handoff` while the shell row was still `running`, so `count_active_background_jobs_for_chat` blocked every time (`Shell failure agent retry blocked`). `finalize_shell_job` now calls `mark_background_shell_finished` for failures before enqueueing retry. Older tmux without `wait-session` no longer triggers immediate finalize from the watcher (poll monitor only); detect via combined stdout/stderr `unknown command`.
+- **Key files / symbols:** `background_shell::{finalize_shell_job, spawn_tmux_completion_watcher}`.
+- **Follow-ups:** Upgrade tmux on hosts where possible for faster shell completion.
+
+### 2026-05-15 — Shell background: absolute log paths + auto agent retry on failure
+
+- **Area:** background_shell / background_jobs / config
+- **Summary:** Shell jobs now write `stdout.log`/`exit_code` using absolute paths and tmux cwd = workspace root (fixes empty logs when default workdir was `shared/`). On non-zero exit, the server delivers the failure output to the user and enqueues one agent background job (`shell_failure_retry:{parent_id}:N`) to diagnose and re-run via `spawn_background_command`. Config: `BACKGROUND_SHELL_AUTO_RETRY_ON_FAILURE` (default true), `BACKGROUND_SHELL_AUTO_RETRY_MAX` (default 1). Handoff agent runs use the chat’s real channel (not hardcoded `web`).
+- **Key files / symbols:** `background_shell::{resolve_shell_workdir, maybe_enqueue_shell_failure_agent_retry}`, `db::{count_shell_failure_agent_retries, mark_background_shell_agent_retry_enqueued}`, `background_jobs::try_enqueue_background_handoff` (+ `caller_channel` param).
+- **Follow-ups:** Optional `--reference-image` on `run_generation.py` for user uploads; rebuild/restart bot to pick up changes.
+
+### 2026-05-15 — Shadow workspace: path normalization, write guard, migration
+
+- **Area:** tools / agent prompt / doctor / workspace data
+- **Summary:** Agents doubling path prefixes (`workspace/shared/...` from cwd `shared/`) created a nested mistaken tree at `shared/workspace/`. `resolve_tool_path` now strips redundant prefixes and resolves `runtime/` and `skills/` against `WORKSPACE_DIR`. Write tools reject paths under `shared/workspace/`; startup and `doctor` warn if the shadow dir exists. Migrated 4 ORIGIN notes and the newer browser profile from the shadow tree, then removed `workspace/shared/workspace` (backup at `workspace/shared/workspace.bak-20260515`).
+- **Rationale:** Display-only dedup (`workspace_data_path_display`) did not fix tool resolution; shadow tree split vault/runtime data from canonical layout.
+- **Key files / symbols:** `src/tools/mod.rs` (`normalize_tool_relative_path`, `resolve_tool_path`, `check_shadow_workspace_write`, `shadow_workspace_path`), write tools, `src/main.rs` (`warn_shadow_workspace_if_present`), `src/doctor.rs` (`check_shadow_workspace`), `src/channels/telegram.rs` (Repository layout bullets), `workspace/AGENTS.md`.
+- **Follow-ups:** Re-index vault if merged ORIGIN files need search coverage; delete `workspace/shared/workspace.bak-*` when satisfied.
+
 ### 2026-05-15 — Shell background: fix tmux→bot feedback loop
 
 - **Area:** background_shell

@@ -228,6 +228,21 @@ fn ensure_workspace_shared_dir(data_root: &Path) {
             shared.display()
         );
     }
+    warn_shadow_workspace_if_present(data_root);
+}
+
+/// Log when a mistaken nested workspace exists under `shared/workspace/`.
+fn warn_shadow_workspace_if_present(data_root: &Path) {
+    let shadow = finally_a_value_bot::tools::shadow_workspace_path(data_root);
+    if shadow.is_dir() {
+        tracing::warn!(
+            shadow = %shadow.display(),
+            data_root = %data_root.display(),
+            "Shadow workspace detected at shared/workspace/ (not WORKSPACE_DIR). \
+             Migrate unique data to the canonical layout and remove this directory; \
+             file writes into it are blocked."
+        );
+    }
 }
 
 /// If repo-root shared/ exists, copy its contents into workspace shared dir so the canonical workspace has all shared content. Does not overwrite existing files.

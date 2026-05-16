@@ -2,6 +2,13 @@
 
 use super::ToolResult;
 
+/// Max runtime for expensive shell searches when explicitly confirmed via `CONFIRM_EXECUTE`.
+pub const EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS: u64 = 120;
+
+const EXPENSIVE_SEARCH_BLOCK_MESSAGE: &str = "Blocked expensive shell search. Recursive `grep -r` / unbounded `find` over large trees can run for many minutes and block the chat. \
+Prefer: `glob` (file names), the `grep` tool (contents; skips binaries and huge dirs), `read_tiered_memory` / `list_cursor_agent_runs` (job status), or `read_file` on a known path. \
+To run this exact shell command anyway, prefix: CONFIRM_EXECUTE <command>";
+
 pub fn parse_confirmation_prefix(command: &str) -> (bool, String) {
     const PREFIX: &str = "CONFIRM_EXECUTE ";
     if let Some(rest) = command.strip_prefix(PREFIX) {
@@ -120,4 +127,110 @@ Add explicit confirmation by re-running with prefix: CONFIRM_EXECUTE <your comma
         );
     }
     None
+}
+
+/// True when a shell command is likely to scan huge directory trees (e.g. `grep -r` on `shared/`).
+pub fn is_expensive_shell_search(command: &str) -> bool {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+    is_recursive_grep_command(cmd)
+        || is_unbounded_find_command(cmd)
+        || is_unbounded_ripgrep_command(cmd)
+}
+
+/// Returns `None` when execution may proceed, or a blocked `ToolResult`.
+/// `spawn_background_command` does not call this — long scans may be intentional in background.
+pub fn check_expensive_shell_search(command: &str, confirmed: bool) -> Option<ToolResult> {
+    if confirmed || !is_expensive_shell_search(command) {
+        return None;
+    }
+    Some(
+        ToolResult::error(EXPENSIVE_SEARCH_BLOCK_MESSAGE.to_string())
+            .with_error_type("blocked_by_policy"),
+    )
+}
+
+fn is_recursive_grep_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !lower.contains("grep") {
+        return false;
+    }
+    lower.contains(" -r")
+        || lower.contains(" -rn")
+        || lower.contains(" -r ")
+        || lower.contains(" -rn ")
+        || lower.contains(" --recursive")
+        || lower.starts_with("grep -r")
+        || lower.starts_with("grep -rn")
+        || lower.starts_with("grep -R")
+}
+
+fn is_unbounded_find_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !lower.contains("find ") {
+        return false;
+    }
+    if lower.contains("-maxdepth") {
+        return false;
+    }
+    // Name-filtered finds (e.g. PZ-*.png) are usually fast.
+    if lower.contains("-name") {
+        return false;
+    }
+    true
+}
+
+fn is_unbounded_ripgrep_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let uses_rg = lower.starts_with("rg ") || lower.contains(" rg ");
+    if !uses_rg {
+        return false;
+    }
+    let bounded = lower.contains("--max-count")
+        || lower.contains(" -m ")
+        || lower.contains("| head ")
+        || lower.contains("|head ");
+    !bounded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expensive_shell_search_blocks_recursive_grep() {
+        assert!(is_expensive_shell_search(
+            "grep -r \"PZ\" /home/ken/proj/workspace/shared/ | head -n 10"
+        ));
+    }
+
+    #[test]
+    fn expensive_shell_search_allows_find_with_name_filter() {
+        assert!(!is_expensive_shell_search(
+            "find /tmp/shared -name 'PZ-*.png' -mtime -1"
+        ));
+    }
+
+    #[test]
+    fn expensive_shell_search_blocks_unbounded_find() {
+        assert!(is_expensive_shell_search(
+            "find ./workspace/shared -mtime -1"
+        ));
+    }
+
+    #[test]
+    fn expensive_shell_search_allows_simple_ls() {
+        assert!(!is_expensive_shell_search(
+            "ls -lh /tmp/shared/PZ-20260515-CAFE-LoRA-Fixed.png"
+        ));
+    }
+
+    #[test]
+    fn check_expensive_shell_search_requires_confirm_prefix() {
+        let cmd = "grep -r foo ./shared/";
+        assert!(check_expensive_shell_search(cmd, false).is_some());
+        assert!(check_expensive_shell_search(cmd, true).is_none());
+    }
 }

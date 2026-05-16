@@ -165,6 +165,14 @@ fn default_background_shell_monitor_poll_secs() -> u64 {
     8
 }
 
+fn default_background_shell_auto_retry_on_failure() -> bool {
+    true
+}
+
+fn default_background_shell_auto_retry_max() -> u32 {
+    1
+}
+
 fn default_runtime_reliability_profile() -> String {
     "balanced".into()
 }
@@ -530,6 +538,12 @@ pub struct Config {
     /// Poll interval for tmux shell background job monitor. Default 8.
     #[serde(default = "default_background_shell_monitor_poll_secs")]
     pub background_shell_monitor_poll_secs: u64,
+    /// After a failed shell job, enqueue an agent run to diagnose and retry via `spawn_background_command`.
+    #[serde(default = "default_background_shell_auto_retry_on_failure")]
+    pub background_shell_auto_retry_on_failure: bool,
+    /// Max automatic agent retries per failed shell job. Default 1.
+    #[serde(default = "default_background_shell_auto_retry_max")]
+    pub background_shell_auto_retry_max: u32,
     /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
     #[serde(default = "default_runtime_reliability_profile")]
     pub runtime_reliability_profile: String,
@@ -959,6 +973,14 @@ impl Config {
                 "BACKGROUND_SHELL_MONITOR_POLL_SECS",
                 default_background_shell_monitor_poll_secs(),
             ),
+            background_shell_auto_retry_on_failure: Self::env_bool(
+                "BACKGROUND_SHELL_AUTO_RETRY_ON_FAILURE",
+                default_background_shell_auto_retry_on_failure(),
+            ),
+            background_shell_auto_retry_max: Self::env_u64(
+                "BACKGROUND_SHELL_AUTO_RETRY_MAX",
+                default_background_shell_auto_retry_max() as u64,
+            ) as u32,
             runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
                 .unwrap_or_else(default_runtime_reliability_profile),
             workflow_auto_learn: Self::env_bool(
@@ -1479,6 +1501,8 @@ pub fn test_config() -> Config {
         background_shell_tmux_enabled: default_background_shell_tmux_enabled(),
         background_shell_tmux_session_prefix: default_background_shell_tmux_session_prefix(),
         background_shell_monitor_poll_secs: default_background_shell_monitor_poll_secs(),
+        background_shell_auto_retry_on_failure: default_background_shell_auto_retry_on_failure(),
+        background_shell_auto_retry_max: default_background_shell_auto_retry_max(),
         runtime_reliability_profile: default_runtime_reliability_profile(),
         workflow_auto_learn: default_workflow_auto_learn(),
         workflow_min_success_repetitions: default_workflow_min_success_repetitions(),

@@ -131,6 +131,7 @@ fn build_report() -> DoctorReport {
     );
 
     check_config(&mut report);
+    check_shadow_workspace(&mut report);
     check_path(&mut report);
     check_shell(&mut report);
     check_node_and_browser(&mut report);
@@ -162,6 +163,38 @@ fn check_config(report: &mut DoctorReport) {
             err.to_string(),
             Some("Fix FINALLY_A_VALUE_BOT_CONFIG or create a valid config file.".to_string()),
         ),
+    }
+}
+
+fn check_shadow_workspace(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let root = config.workspace_root_absolute();
+    let shadow = crate::tools::shadow_workspace_path(&root);
+    if shadow.is_dir() {
+        report.push(
+            "workspace.shadow",
+            "Shadow workspace",
+            CheckStatus::Warn,
+            format!(
+                "nested workspace at {} — not WORKSPACE_DIR; agents may have doubled path prefixes",
+                shadow.display()
+            ),
+            Some(
+                "Migrate data from shared/workspace/ to the canonical tree, remove the shadow dir, \
+                 and use tool paths relative to shared/ without a workspace/ prefix."
+                    .to_string(),
+            ),
+        );
+    } else {
+        report.push(
+            "workspace.shadow",
+            "Shadow workspace",
+            CheckStatus::Pass,
+            "no shared/workspace/ nested copy detected".to_string(),
+            None,
+        );
     }
 }
 

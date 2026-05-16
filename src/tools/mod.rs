@@ -17,6 +17,7 @@ pub mod memory_state;
 pub mod path_guard;
 pub mod read_file;
 pub mod read_repo_map;
+pub mod register_tracked_job;
 pub mod schedule;
 pub mod search_history;
 pub mod search_vault;
@@ -108,6 +109,7 @@ impl ToolRisk {
 
 pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
+        "register_tracked_job" => ToolRisk::Low,
         "bash" | "spawn_background_command" => ToolRisk::High,
         "cursor_agent"
         | "write_file"
@@ -259,13 +261,111 @@ pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
 }
 
+/// Path to the mistaken nested copy agents sometimes create under tool cwd (`shared/workspace/`).
+pub fn shadow_workspace_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("shared").join("workspace")
+}
+
+/// Returns true if `path` lies under `{workspace_root}/shared/workspace/`.
+pub fn is_under_shadow_workspace(workspace_root: &Path, path: &Path) -> bool {
+    let shadow = shadow_workspace_path(workspace_root);
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shadow_resolved = std::fs::canonicalize(&shadow).unwrap_or(shadow);
+    resolved.starts_with(&shadow_resolved)
+}
+
+/// Reject writes into the shadow workspace tree (see `shadow_workspace_path`).
+pub fn check_shadow_workspace_write(workspace_root: &Path, resolved: &Path) -> Result<(), String> {
+    if is_under_shadow_workspace(workspace_root, resolved) {
+        Err(
+            "Path is under shadow workspace `shared/workspace/`; use paths relative to tool cwd \
+             (`shared/`) without a `workspace/` prefix."
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+/// Strip redundant `workspace/`, `workspace/shared/`, and `shared/` prefixes when tool cwd is already `.../shared`.
+pub fn normalize_tool_relative_path(working_dir: &Path, path: &str) -> String {
+    let mut s = path.trim().to_string();
+    if s.is_empty() {
+        return s;
+    }
+    while s.starts_with("./") {
+        s = s[2..].to_string();
+    }
+
+    let cwd_is_shared = working_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("shared"));
+
+    if !cwd_is_shared {
+        return s;
+    }
+
+    for prefix in ["workspace/shared/", "workspace/"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_prefix("shared/") {
+        s = rest.to_string();
+    }
+
+    if let Some(parent_name) = working_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    {
+        use std::path::Component;
+        let rel = Path::new(&s);
+        if let Some(Component::Normal(first)) = rel.components().next() {
+            if first == parent_name {
+                s = rel
+                    .components()
+                    .skip(1)
+                    .collect::<PathBuf>()
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+    }
+
+    s
+}
+
+fn resolves_under_workspace_data_root(_tool_shared_dir: &Path, normalized: &str) -> bool {
+    let rel = Path::new(normalized);
+    rel.components().next().is_some_and(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(name)
+                if name == "runtime" || name == "skills"
+        )
+    })
+}
+
 pub fn resolve_tool_path(working_dir: &Path, path: &str) -> PathBuf {
     let candidate = PathBuf::from(path);
     if candidate.is_absolute() {
-        candidate
-    } else {
-        working_dir.join(candidate)
+        return candidate;
     }
+
+    let normalized = normalize_tool_relative_path(working_dir, path);
+    if normalized.is_empty() {
+        return working_dir.join(path);
+    }
+
+    if resolves_under_workspace_data_root(working_dir, &normalized) {
+        let data_root = working_dir.parent().unwrap_or(working_dir);
+        return data_root.join(&normalized);
+    }
+
+    working_dir.join(&normalized)
 }
 
 /// Resolve the tool working directory. Always uses the shared workspace (base/shared).
@@ -376,6 +476,9 @@ impl ToolRegistry {
                 db.clone(),
                 config.bot_username.clone(),
                 config.clone(),
+            )),
+            Box::new(register_tracked_job::RegisterTrackedJobTool::new(
+                db.clone(),
             )),
             Box::new(schedule::ScheduleTaskTool::new(
                 db.clone(),
@@ -662,6 +765,66 @@ mod tests {
         });
         let err = authorize_chat_access(&input, 200).unwrap_err();
         assert!(err.contains("Permission denied"));
+    }
+
+    #[test]
+    fn test_normalize_tool_relative_path_strips_redundant_prefixes() {
+        let shared = std::path::PathBuf::from("/proj/workspace/shared");
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "workspace/shared/foo.txt"),
+            "foo.txt"
+        );
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "workspace/runtime/groups/1/x"),
+            "runtime/groups/1/x"
+        );
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "shared/ORIGIN/x.md"),
+            "ORIGIN/x.md"
+        );
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "./foo.txt"),
+            "foo.txt"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tool_path_from_shared_cwd() {
+        let shared = std::path::PathBuf::from("/proj/workspace/shared");
+        assert_eq!(
+            resolve_tool_path(&shared, "foo.txt"),
+            std::path::PathBuf::from("/proj/workspace/shared/foo.txt")
+        );
+        assert_eq!(
+            resolve_tool_path(&shared, "workspace/shared/foo.txt"),
+            std::path::PathBuf::from("/proj/workspace/shared/foo.txt")
+        );
+        assert_eq!(
+            resolve_tool_path(&shared, "workspace/runtime/groups/1/x"),
+            std::path::PathBuf::from("/proj/workspace/runtime/groups/1/x")
+        );
+        assert_eq!(
+            resolve_tool_path(&shared, "shared/ORIGIN/x.md"),
+            std::path::PathBuf::from("/proj/workspace/shared/ORIGIN/x.md")
+        );
+    }
+
+    #[test]
+    fn test_check_shadow_workspace_write_blocks_nested_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_shadow_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shadow_file = root.join("shared").join("workspace").join("nested.txt");
+        std::fs::create_dir_all(shadow_file.parent().unwrap()).unwrap();
+        std::fs::write(&shadow_file, "x").unwrap();
+        assert!(is_under_shadow_workspace(&root, &shadow_file));
+        let err = check_shadow_workspace_write(&root, &shadow_file).unwrap_err();
+        assert!(err.contains("shadow workspace"));
+        let ok_path = root.join("shared").join("ok.txt");
+        assert!(!is_under_shadow_workspace(&root, &ok_path));
+        assert!(check_shadow_workspace_write(&root, &ok_path).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

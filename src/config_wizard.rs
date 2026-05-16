@@ -504,6 +504,8 @@ fn default_config() -> Config {
         background_shell_tmux_enabled: true,
         background_shell_tmux_session_prefix: "finally_a_value_bot-bg".into(),
         background_shell_monitor_poll_secs: 8,
+        background_shell_auto_retry_on_failure: true,
+        background_shell_auto_retry_max: 1,
         runtime_reliability_profile: "balanced".into(),
         workflow_auto_learn: true,
         workflow_min_success_repetitions: 2,

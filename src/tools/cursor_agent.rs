@@ -518,7 +518,7 @@ impl Tool for ListCursorAgentRunsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_cursor_agent_runs".into(),
-            description: "List recent cursor-agent runs to monitor project status. By default returns runs for the current chat; use this to see last run outcome, success/failure, and output preview.".into(),
+            description: "List recent cursor-agent runs to monitor project status. By default returns runs for the current chat; use this to see last run outcome, success/failure, and output preview. For post-mortems on a finished run, use read_agent_history (iterations and tool traces) or read_file on output_path when present; if the tmux session is still alive, tmux capture-pane via bash can show scrollback.".into(),
             input_schema: schema_object(
                 json!({
                     "limit": {
@@ -621,6 +621,9 @@ impl Tool for ListCursorAgentRunsTool {
                         err
                     ));
                 }
+                out.push_str(
+                    "\nPost-mortem: use read_agent_history for full run traces; if a run has output_path, read_file that path; for a still-running tmux session, bash: tmux capture-pane -t <session> -p\n",
+                );
                 ToolResult::success(out)
             }
             Err(e) => ToolResult::error(format!("Failed to list cursor-agent runs: {e}")),
