@@ -20,6 +20,8 @@ describe('formatMessagesTranscript', () => {
     ])
     expect(transcript).toContain('Message 1 · user · runtime context')
     expect(transcript).toContain('Message 3 · user · persona context')
+    expect(transcript).toContain('Tier 2/3')
+    expect(transcript).not.toContain('### Identity')
     expect(transcript).toContain('## Memory')
     expect(transcript).toContain('## Operator focus')
     expect(transcript).toContain('Message 5 · user · chat (user)')

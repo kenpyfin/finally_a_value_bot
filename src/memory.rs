@@ -916,15 +916,7 @@ fn legacy_markdown_to_state(markdown: &str) -> PersonaMemoryState {
 
 const WORKFLOW_MEMORY_INTENTS_PROMPT_MAX: usize = 10;
 
-/// Compile persona memory into LLM-friendly prose for the main agent `[persona_context]` block.
-/// Omits empty fields and section headings with no content. Never emits raw JSON.
-pub fn render_memory_for_llm(state: &PersonaMemoryState, workflow_principles_max: usize) -> String {
-    let (prompt_state, trunc_note) =
-        cap_workflow_principles_for_prompt(state, workflow_principles_max);
-    let state = &prompt_state;
-
-    let mut sections: Vec<String> = Vec::new();
-
+fn append_identity_sections(sections: &mut Vec<String>, state: &PersonaMemoryState) {
     let mut identity = Vec::new();
     if !state.identity.display_name.trim().is_empty() {
         identity.push(format!("**Name:** {}", state.identity.display_name.trim()));
@@ -941,15 +933,18 @@ pub fn render_memory_for_llm(state: &PersonaMemoryState, workflow_principles_max
             identity.push(format!("- {t}"));
         }
     }
-    if !identity.is_empty() {
-        let mut block = String::from("### Identity\n\n");
-        for line in identity {
-            block.push_str(&line);
-            block.push('\n');
-        }
-        sections.push(block);
+    if identity.is_empty() {
+        return;
     }
+    let mut block = String::from("### Identity\n\n");
+    for line in identity {
+        block.push_str(&line);
+        block.push('\n');
+    }
+    sections.push(block);
+}
 
+fn append_tier1_sections(sections: &mut Vec<String>, state: &PersonaMemoryState) {
     let mut tier1 = Vec::new();
     for item in &state.tier1.stable_facts {
         let t = item.trim();
@@ -966,14 +961,77 @@ pub fn render_memory_for_llm(state: &PersonaMemoryState, workflow_principles_max
             }
         }
     }
-    if !tier1.is_empty() {
-        let mut block = String::from("### Long-term context\n\n");
-        for line in tier1 {
-            block.push_str(&line);
-            block.push('\n');
-        }
-        sections.push(block);
+    if tier1.is_empty() {
+        return;
     }
+    let mut block = String::from("### Long-term context (Tier 1)\n\n");
+    for line in tier1 {
+        block.push_str(&line);
+        block.push('\n');
+    }
+    sections.push(block);
+}
+
+/// Fill empty identity/tier1 fields for prompt rendering only (does not write disk).
+pub fn enrich_persona_memory_for_prompt(
+    mut state: PersonaMemoryState,
+    persona_display_name: Option<&str>,
+    legacy_memory_markdown: Option<&str>,
+) -> PersonaMemoryState {
+    if state.identity.display_name.trim().is_empty() {
+        if let Some(name) = persona_display_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            state.identity.display_name = name.to_string();
+        }
+    }
+    let tier1_empty = state.tier1.stable_facts.iter().all(|s| s.trim().is_empty())
+        && state
+            .tier1
+            .workflow_principles
+            .iter()
+            .all(|s| s.trim().is_empty());
+    if tier1_empty {
+        if let Some(md) = legacy_memory_markdown
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let legacy = legacy_markdown_to_state(md);
+            if !legacy.tier1.stable_facts.is_empty() {
+                state.tier1.stable_facts = legacy.tier1.stable_facts;
+            }
+        }
+    }
+    state.normalize();
+    state
+}
+
+/// Identity + Tier 1 prose for the main agent **system prompt** (stable persona context).
+pub fn render_identity_and_tier1_for_system(
+    state: &PersonaMemoryState,
+    workflow_principles_max: usize,
+) -> String {
+    let (prompt_state, trunc_note) =
+        cap_workflow_principles_for_prompt(state, workflow_principles_max);
+    let mut sections = Vec::new();
+    append_identity_sections(&mut sections, &prompt_state);
+    append_tier1_sections(&mut sections, &prompt_state);
+    if sections.is_empty() {
+        return String::new();
+    }
+    let mut out = sections.join("\n");
+    if let Some(note) = trunc_note {
+        out.push_str("\n_Note: ");
+        out.push_str(&note);
+        out.push_str("_\n");
+    }
+    out
+}
+
+/// Tier 2/3, learned workflows, and links for the `[persona_context]` message block.
+pub fn render_persona_context_memory(state: &PersonaMemoryState) -> String {
+    let mut sections: Vec<String> = Vec::new();
 
     let mut tier2: Vec<String> = state
         .tier2
@@ -1068,14 +1126,21 @@ pub fn render_memory_for_llm(state: &PersonaMemoryState, workflow_principles_max
         return String::new();
     }
 
-    let mut out = String::from("## Memory\n\n");
+    let mut out = String::from("## Memory (active context)\n\n");
     out.push_str(&sections.join("\n"));
-    if let Some(note) = trunc_note {
-        out.push_str("\n_Note: ");
-        out.push_str(&note);
-        out.push_str("_\n");
-    }
     out
+}
+
+/// Full compiled memory (all tiers) — used by PTE and tests.
+pub fn render_memory_for_llm(state: &PersonaMemoryState, workflow_principles_max: usize) -> String {
+    let system = render_identity_and_tier1_for_system(state, workflow_principles_max);
+    let ctx = render_persona_context_memory(state);
+    match (system.trim().is_empty(), ctx.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => ctx,
+        (false, true) => format!("## Memory\n\n{system}"),
+        (false, false) => format!("## Memory\n\n{system}\n\n{ctx}"),
+    }
 }
 
 pub fn render_memory_markdown(state: &PersonaMemoryState) -> String {
@@ -1512,16 +1577,45 @@ mod tests {
     }
 
     #[test]
-    fn test_render_memory_for_llm_omits_empty_sections() {
+    fn test_render_persona_context_memory_omits_tier1() {
         let mut state = PersonaMemoryState::default();
         state.tier3.recent_focus = vec!["finish report".to_string()];
-        let out = render_memory_for_llm(&state, 25);
-        assert!(out.contains("## Memory"));
+        let out = render_persona_context_memory(&state);
         assert!(out.contains("Recent focus"));
         assert!(out.contains("finish report"));
         assert!(!out.contains("### Identity"));
-        assert!(!out.contains("### Active projects"));
-        assert!(!out.contains("<memory_state_json>"));
+        assert!(!out.contains("Tier 1"));
+    }
+
+    #[test]
+    fn test_enrich_persona_memory_for_prompt_uses_persona_name() {
+        let state = PersonaMemoryState::default();
+        let enriched = enrich_persona_memory_for_prompt(state, Some("PZ"), None);
+        let out = render_identity_and_tier1_for_system(&enriched, 25);
+        assert!(out.contains("PZ"));
+    }
+
+    #[test]
+    fn test_render_identity_and_tier1_for_system() {
+        let mut state = PersonaMemoryState::default();
+        state.identity.display_name = "Milla".into();
+        state.tier1.stable_facts = vec!["likes Rust".into()];
+        let out = render_identity_and_tier1_for_system(&state, 25);
+        assert!(out.contains("### Identity"));
+        assert!(out.contains("Milla"));
+        assert!(out.contains("Tier 1"));
+        assert!(out.contains("likes Rust"));
+        assert!(!out.contains("Recent focus"));
+    }
+
+    #[test]
+    fn test_render_memory_for_llm_combines_system_and_context() {
+        let mut state = PersonaMemoryState::default();
+        state.identity.display_name = "Milla".into();
+        state.tier3.recent_focus = vec!["finish report".to_string()];
+        let out = render_memory_for_llm(&state, 25);
+        assert!(out.contains("Milla"));
+        assert!(out.contains("finish report"));
     }
 
     #[test]

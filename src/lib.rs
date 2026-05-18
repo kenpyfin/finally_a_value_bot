@@ -15,6 +15,7 @@ pub mod final_delivery_dedupe;
 pub mod gateway;
 pub mod job_heartbeat;
 pub mod llm;
+pub mod llm_catalog;
 pub mod logging;
 pub mod mcp;
 pub mod memory;

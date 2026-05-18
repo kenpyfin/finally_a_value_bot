@@ -16,6 +16,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-16 — Identity + Tier 1 memory in system prompt
+
+- **Area:** agent / memory / channels / web
+- **Summary:** Split persona memory rendering: **`render_identity_and_tier1_for_system`** (identity, stable facts, capped workflow principles) is appended in **`build_system_prompt`** under `# Identity and long-term memory (Tier 1)`. Tier 2/3, learned workflows, and Mem-Palace links stay in **`[persona_context]`** via **`render_persona_context_memory`** (with operator memo and bookmarks). Token trim uses **`protected_prefix_count`** so runtime/persona prepends are not dropped. System prompt carve-out treats `[persona_context]` / `[system_runtime_context]` / `[scheduler_policy]` as trusted operator context.
+- **Rationale:** Stable persona identity should sit in the system role (higher authority, better cache behavior); volatile Tier 2/3 and bookmarks remain in the message prefix.
+- **Key files / symbols:** `src/memory.rs` (`render_identity_and_tier1_for_system`, `render_persona_context_memory`), `src/channels/telegram.rs` (`build_system_prompt` `identity_tier1_memory`, `trim_to_token_budget`), `web/src/components/initial-run-prompt-view.tsx`.
+- **Follow-ups:** Redeploy + rebuild `web/dist` to pick up First-turn prompt labels.
+
 ### 2026-05-16 — Deferred-commitment guard: reject end_turn with “checking logs” placeholders
 
 - **Area:** agent loop / tools

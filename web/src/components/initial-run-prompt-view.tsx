@@ -51,7 +51,7 @@ function formatMessageContent(content: unknown): string {
 export function messageSectionLabel(body: string, role: string): string | null {
   if (role !== 'user') return null
   if (body.includes('[persona_context]')) {
-    return 'persona context — memory, operator focus, bookmarks'
+    return 'persona context — Tier 2/3, operator focus, bookmarks'
   }
   if (body.includes('[system_runtime_context]')) {
     return 'runtime context (date/time)'
@@ -199,9 +199,9 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
             </Text>
             <Text size="1" color="gray">
               {messageCount} message{messageCount === 1 ? '' : 's'} sent to the model on the first
-              call (full text below). Memory, operator memo, and bookmarks appear inside the
-              message labeled{' '}
-              <code className="text-xs">persona context</code> when they were included.
+              call (full text below). Identity and Tier 1 are in the system prompt above.
+              Tier 2/3 memory, operator memo, and bookmarks appear in the message labeled{' '}
+              <code className="text-xs">persona context</code> when included.
             </Text>
             {!hasPersonaContext && messageCount > 0 ? (
               <Text size="1" color="amber">
