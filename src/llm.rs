@@ -6,6 +6,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::claude::{
@@ -181,6 +182,96 @@ pub fn create_provider(config: &Config) -> Box<dyn LlmProvider> {
         "anthropic" => Box::new(AnthropicProvider::new(config)),
         "google" | "gemini" => Box::new(GeminiProvider::new(config)),
         _ => Box::new(OpenAiProvider::new(config)),
+    }
+}
+
+/// Hot-swappable main agent LLM (model changes from Web UI without full process restart).
+pub struct LlmHandle {
+    model: std::sync::RwLock<String>,
+    provider: std::sync::RwLock<Arc<dyn LlmProvider>>,
+    base_config: std::sync::RwLock<Config>,
+}
+
+impl LlmHandle {
+    pub fn new(config: &Config) -> Arc<Self> {
+        Self::from_provider(config, Arc::from(create_provider(config)))
+    }
+
+    pub fn from_provider(config: &Config, provider: Arc<dyn LlmProvider>) -> Arc<Self> {
+        Arc::new(Self {
+            model: std::sync::RwLock::new(config.model.clone()),
+            base_config: std::sync::RwLock::new(config.clone()),
+            provider: std::sync::RwLock::new(provider),
+        })
+    }
+
+    pub fn current_model(&self) -> String {
+        self.model
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_else(|_| String::new())
+    }
+
+    /// Update active model, rebuild provider, and return the new model id.
+    pub fn set_model(&self, model: String) -> Result<String, String> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err("model cannot be empty".into());
+        }
+        let mut cfg = self
+            .base_config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .clone();
+        cfg.model = model.clone();
+        let new_provider = Arc::from(create_provider(&cfg));
+        *self
+            .model
+            .write()
+            .map_err(|_| "model lock poisoned".to_string())? = model.clone();
+        *self
+            .base_config
+            .write()
+            .map_err(|_| "config lock poisoned".to_string())? = cfg;
+        *self
+            .provider
+            .write()
+            .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
+        Ok(model)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for LlmHandle {
+    async fn send_message(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let provider = self
+            .provider
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
+            .clone();
+        provider.send_message(system, messages, tools).await
+    }
+
+    async fn send_message_stream(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        text_tx: Option<&UnboundedSender<String>>,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let provider = self
+            .provider
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
+            .clone();
+        provider
+            .send_message_stream(system, messages, tools, text_tx)
+            .await
     }
 }
 

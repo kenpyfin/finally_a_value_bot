@@ -24,6 +24,7 @@ import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { api, AUTH_REQUIRED_EVENT, makeHeaders, sanitizeHttpHeaderValue, WEB_AUTH_STORAGE_KEY } from './api/client'
 import { CockpitBar } from './components/cockpit-bar'
+import { SettingsLlmPanel } from './components/settings-llm'
 import { InitialRunPromptView } from './components/initial-run-prompt-view'
 import { SessionSidebar } from './components/session-sidebar'
 import { ThreadPane } from './components/thread-pane'
@@ -1882,7 +1883,9 @@ function App() {
                     <Dialog.Content style={{ maxWidth: 920 }}>
                       <Dialog.Title>Web UI configuration</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
-                        LLM provider, API keys, and models are configured in repo-root <code className="text-xs">.env</code> only (for example <code className="text-xs">LLM_PROVIDER</code>, <code className="text-xs">LLM_API_KEY</code>, <code className="text-xs">LLM_MODEL</code>). Changing <code className="text-xs">.env</code> requires a process restart. Generic key-value writes to <code className="text-xs">app_settings</code> are disabled; the list below is read-only.
+                        Set <code className="text-xs">LLM_PROVIDER</code> and <code className="text-xs">LLM_API_KEY</code> in repo-root{' '}
+                        <code className="text-xs">.env</code>, then pick a model under the LLM tab (saved in the app; applies without editing{' '}
+                        <code className="text-xs">.env</code>). Changing provider or API key in <code className="text-xs">.env</code> requires a process restart.
                       </Dialog.Description>
                       {settingsError ? (
                         <Callout.Root color="red" size="1" variant="soft" className="mb-2">
@@ -1897,6 +1900,7 @@ function App() {
                       <Tabs.Root defaultValue="overview">
                         <Tabs.List size="1" className="mb-3 flex-wrap">
                           <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
+                          <Tabs.Trigger value="llm">LLM</Tabs.Trigger>
                           <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
                           <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
                         </Tabs.List>
@@ -1937,6 +1941,12 @@ function App() {
                               Loading installation status…
                             </Text>
                           )}
+                        </Tabs.Content>
+                        <Tabs.Content value="llm">
+                          <SettingsLlmPanel
+                            api={api}
+                            onError={setSettingsError}
+                          />
                         </Tabs.Content>
                         <Tabs.Content value="integrations">
                       <div

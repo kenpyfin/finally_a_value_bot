@@ -3712,6 +3712,106 @@ async fn api_contacts_bindings(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct LlmModelPatchRequest {
+    model: String,
+    #[serde(default)]
+    custom: bool,
+}
+
+async fn api_llm_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let cfg = &state.app_state.config;
+    let provider_id = crate::llm_catalog::resolve_catalog_provider_id(&cfg.llm_provider);
+    let preset = crate::llm_catalog::find_provider(&provider_id);
+    let current_model = state.app_state.llm.current_model();
+    let model_source = call_blocking(state.app_state.db.clone(), |db| {
+        let settings = db.list_app_settings()?;
+        Ok(settings.iter().any(|s| {
+            s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
+                && !s.value.trim().is_empty()
+        }))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let catalog_models = crate::llm_catalog::catalog_models_json(&provider_id, &current_model);
+    let catalog: Vec<serde_json::Value> = catalog_models
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+
+    let in_catalog = catalog_models
+        .iter()
+        .any(|m| m.id == current_model && !m.from_active_config);
+
+    Ok(Json(json!({
+        "ok": true,
+        "provider": {
+            "id": provider_id,
+            "env_provider": cfg.llm_provider.trim(),
+            "label": preset.map(|p| p.label).unwrap_or("Unknown provider"),
+        },
+        "api_key_configured": is_llm_ready(cfg),
+        "model": current_model,
+        "model_in_catalog": in_catalog,
+        "model_source": if model_source { "app_settings" } else { "env" },
+        "catalog": catalog,
+        "catalog_source": "static_curated",
+        "cost_reference_note": "Curated catalog (not live from Google/Anthropic). Approximate USD per 1M tokens — verify on your provider billing page.",
+        "custom_model_allowed": true,
+    })))
+}
+
+async fn api_llm_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<LlmModelPatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let model = body.model.trim().to_string();
+    if model.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "model is required".into()));
+    }
+    let provider_id =
+        crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.config.llm_provider);
+    if !body.custom && !crate::llm_catalog::model_allowed_for_provider(&provider_id, &model, false)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Model {:?} is not in the catalog for provider {:?}. Pick a listed model or set custom=true.",
+                model, provider_id
+            ),
+        ));
+    }
+
+    state
+        .app_state
+        .llm
+        .set_model(model.clone())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let model_saved = model.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_saved)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "model": model,
+        "model_source": "app_settings",
+        "message": "Model updated. New chats use this model immediately.",
+    })))
+}
+
 async fn api_settings_get(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -3767,7 +3867,8 @@ async fn api_settings_get(
             "web_enabled": cfg.web_enabled,
             // PATCH /api/settings is disabled; no in-app "pending restart" until we track real diffs.
             "requires_restart_for_env_changes": false,
-            "runtime_env_merge_from_app_settings": false,
+            "runtime_env_merge_from_app_settings": true,
+            "llm_model_from_app_settings": true,
         }
     })))
 }
@@ -4335,6 +4436,7 @@ fn build_router(web_state: WebState) -> Router {
             "/api/settings",
             get(api_settings_get).patch(api_settings_patch),
         )
+        .route("/api/llm", get(api_llm_get).patch(api_llm_patch))
         .route("/api/restart", post(api_restart_post))
         .route(
             "/api/channel_bot_instances",
@@ -4462,7 +4564,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_materialize_response_file_links_rewrites_local_markdown_target() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let chat_id = 997894126_i64;
         let workspace_root = web_state.app_state.config.workspace_root_absolute();
         let shared_dir = workspace_root.join("shared");
@@ -4484,7 +4590,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_materialize_response_file_links_repairs_missing_upload_url() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let chat_id = 997894126_i64;
         let workspace_root = web_state.app_state.config.workspace_root_absolute();
         let shared_dir = workspace_root.join("shared");
@@ -4505,7 +4615,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_materialize_response_file_links_rewrites_parenthesized_local_path() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let chat_id = 997894126_i64;
         let workspace_root = web_state.app_state.config.workspace_root_absolute();
         let shared_dir = workspace_root.join("shared");
@@ -4617,7 +4731,12 @@ mod tests {
         }
     }
 
-    fn test_state(llm: Arc<dyn LlmProvider>) -> Arc<AppState> {
+    fn test_llm_from_provider(provider: Arc<dyn LlmProvider>) -> Arc<crate::llm::LlmHandle> {
+        let cfg = crate::config::test_config();
+        crate::llm::LlmHandle::from_provider(&cfg, provider)
+    }
+
+    fn test_state(llm: Arc<crate::llm::LlmHandle>) -> Arc<AppState> {
         let mut cfg = crate::config::test_config();
         cfg.web_port = 3900;
         cfg.universal_chat_id = Some(997894126);
@@ -4649,7 +4768,7 @@ mod tests {
     }
 
     fn test_web_state(
-        llm: Arc<dyn LlmProvider>,
+        llm: Arc<crate::llm::LlmHandle>,
         auth_token: Option<String>,
         limits: WebLimits,
     ) -> WebState {
@@ -4665,7 +4784,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_then_stream_done() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -4705,7 +4828,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_slash_command_via_send_stream_returns_done_with_response() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -4777,7 +4904,7 @@ mod tests {
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Arc::new(DummyLlm), None, limits);
+        let web_state = test_web_state(test_llm_from_provider(Arc::new(DummyLlm)), None, limits);
         let app = build_router(web_state);
 
         let req1 = Request::builder()
@@ -4802,9 +4929,9 @@ mod tests {
     #[tokio::test]
     async fn test_stream_includes_tool_events_and_replay() {
         let web_state = test_web_state(
-            Arc::new(ToolFlowLlm {
+            test_llm_from_provider(Arc::new(ToolFlowLlm {
                 calls: AtomicUsize::new(0),
-            }),
+            })),
             None,
             WebLimits::default(),
         );
@@ -4877,7 +5004,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconnect_from_last_event_id_gets_non_empty_replay() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -4942,7 +5073,7 @@ mod tests {
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Arc::new(DummyLlm), None, limits);
+        let web_state = test_web_state(test_llm_from_provider(Arc::new(DummyLlm)), None, limits);
         let app = build_router(web_state);
 
         let mk_req = |msg: &str| {

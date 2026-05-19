@@ -173,6 +173,10 @@ fn default_background_shell_auto_retry_max() -> u32 {
     1
 }
 
+fn default_background_shell_auto_agent_on_success() -> bool {
+    true
+}
+
 fn default_runtime_reliability_profile() -> String {
     "balanced".into()
 }
@@ -244,8 +248,14 @@ fn is_local_web_host(host: &str) -> bool {
 
 /// Keys that configure LLM providers, models, and related limits. These must come from repo-root
 /// `.env` / process environment only — not from `app_settings` (Web UI persistence).
+///
+/// Exception: [`crate::llm_catalog::APP_SETTING_LLM_MODEL`] may be stored in `app_settings` so the
+/// Web UI can pick a model while provider and API key stay in `.env`.
 pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
     let u = key.trim().to_ascii_uppercase();
+    if u == crate::llm_catalog::APP_SETTING_LLM_MODEL {
+        return false;
+    }
     if u.starts_with("LLM_") {
         return true;
     }
@@ -544,6 +554,9 @@ pub struct Config {
     /// Max automatic agent retries per failed shell job. Default 1.
     #[serde(default = "default_background_shell_auto_retry_max")]
     pub background_shell_auto_retry_max: u32,
+    /// After a successful shell job, enqueue an agent run to summarize outputs for the user.
+    #[serde(default = "default_background_shell_auto_agent_on_success")]
+    pub background_shell_auto_agent_on_success: bool,
     /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
     #[serde(default = "default_runtime_reliability_profile")]
     pub runtime_reliability_profile: String,
@@ -981,6 +994,10 @@ impl Config {
                 "BACKGROUND_SHELL_AUTO_RETRY_MAX",
                 default_background_shell_auto_retry_max() as u64,
             ) as u32,
+            background_shell_auto_agent_on_success: Self::env_bool(
+                "BACKGROUND_SHELL_AUTO_AGENT_ON_SUCCESS",
+                default_background_shell_auto_agent_on_success(),
+            ),
             runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
                 .unwrap_or_else(default_runtime_reliability_profile),
             workflow_auto_learn: Self::env_bool(
@@ -996,6 +1013,26 @@ impl Config {
             project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
                 .unwrap_or_else(default_project_auto_association_strictness),
         }
+    }
+
+    /// If Web UI persisted `LLM_MODEL` in `app_settings`, apply it over `.env` / defaults.
+    pub fn merge_llm_model_from_app_settings(
+        &mut self,
+        db: &crate::db::Database,
+    ) -> Result<(), FinallyAValueBotError> {
+        let settings = db.list_app_settings()?;
+        for s in settings {
+            if s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
+            {
+                let v = s.value.trim();
+                if !v.is_empty() {
+                    self.model = v.to_string();
+                }
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Apply post-deserialization normalization and validation.
@@ -1024,7 +1061,7 @@ impl Config {
                 "anthropic" => "claude-sonnet-4-5-20250929".into(),
                 "ollama" => "llama3.2".into(),
                 "llama" | "llamacpp" => "local".into(),
-                "google" => "gemini-2.5-flash".into(),
+                "google" | "gemini" => "gemini-3-flash-preview".into(),
                 _ => "gpt-5.2".into(),
             };
         }
@@ -1503,6 +1540,7 @@ pub fn test_config() -> Config {
         background_shell_monitor_poll_secs: default_background_shell_monitor_poll_secs(),
         background_shell_auto_retry_on_failure: default_background_shell_auto_retry_on_failure(),
         background_shell_auto_retry_max: default_background_shell_auto_retry_max(),
+        background_shell_auto_agent_on_success: default_background_shell_auto_agent_on_success(),
         runtime_reliability_profile: default_runtime_reliability_profile(),
         workflow_auto_learn: default_workflow_auto_learn(),
         workflow_min_success_repetitions: default_workflow_min_success_repetitions(),

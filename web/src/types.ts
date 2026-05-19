@@ -43,6 +43,28 @@ export type InstallationStatus = {
   requires_restart_to_apply_runtime_settings?: boolean
   requires_restart_for_env_changes?: boolean
   runtime_env_merge_from_app_settings?: boolean
+  llm_model_from_app_settings?: boolean
+}
+
+export type LlmCatalogModel = {
+  id: string
+  input_usd_per_mtok?: number | null
+  output_usd_per_mtok?: number | null
+  cost_tier: string
+  cost_summary: string
+  from_active_config?: boolean
+}
+
+export type LlmConfigResponse = {
+  ok?: boolean
+  provider?: { id: string; label: string }
+  api_key_configured?: boolean
+  model?: string
+  model_in_catalog?: boolean
+  model_source?: 'env' | 'app_settings'
+  catalog?: LlmCatalogModel[]
+  cost_reference_note?: string
+  custom_model_allowed?: boolean
 }
 
 /** Redacted row from `GET /api/channel_bot_instances`. */

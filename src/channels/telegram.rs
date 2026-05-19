@@ -69,7 +69,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub memory: MemoryManager,
     pub skills: SkillManager,
-    pub llm: Arc<dyn LlmProvider>,
+    pub llm: Arc<crate::llm::LlmHandle>,
     pub tools: ToolRegistry,
     /// Discord HTTP clients keyed by `channel_bot_instances.id`.
     pub discord_http: Arc<HashMap<i64, Arc<SerenityHttp>>>,
@@ -207,7 +207,9 @@ pub async fn run_bot(
         info!("Telegram channel disabled (no TELEGRAM_BOT_TOKEN configured)");
     }
 
-    let llm: Arc<dyn LlmProvider> = Arc::from(crate::llm::create_provider(&config));
+    let mut config = config;
+    config.merge_llm_model_from_app_settings(&db)?;
+    let llm = crate::llm::LlmHandle::new(&config);
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
         Arc::new(std::sync::OnceLock::new());
     let mut tools = ToolRegistry::new(&config, tool_bot, db.clone());
@@ -1842,8 +1844,8 @@ pub async fn process_with_agent_with_events(
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
     const LOOP_SIGNATURE_REPEAT_THRESHOLD: usize = 3;
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
-    const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 3;
-    const DISCOVERY_STREAK_STALL_THRESHOLD: usize = 5;
+    const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 15;
+    const DISCOVERY_STREAK_STALL_THRESHOLD: usize = 20;
     const DEFERRED_COMMITMENT_MAX_NUDGES: usize = 2;
     const DEFERRED_COMMITMENT_ROUTING_HINT: &str = "You ended your turn while promising further work. Either call a tool now (read_agent_history, read_file, glob, list_cursor_agent_runs, etc.) or give a final answer with what you already know—do not say you are checking something without a tool call.";
 
@@ -3977,7 +3979,8 @@ For long-running jobs:
 - When an external API returns an id you quote to the user as the job id (e.g. ComfyUI `prompt_id`), call `register_tracked_job` with that id so the cockpit queue matches your message
 - For full agent re-runs after interactive timeout (web), follow `background-handoff` skill and the handoff sentinel path
 - For `cursor_agent`, if the task is likely to take a while (multi-file refactors, large code generation, broad research), default to `detach: true`
-- After starting a background shell job or cursor_agent detach run, tell the user it was started in background; shell jobs get an automatic completion message when done
+- After starting a background shell job or cursor_agent detach run, tell the user it was started in background; shell jobs get an automatic completion message when done, then (by default) an agent summary reply
+- When a shell background job succeeds, the server may enqueue an automatic agent follow-up with the output to summarize artifacts and next steps
 - When a shell background job fails, the server may enqueue an automatic agent retry with the failure output; fix the command and use `spawn_background_command` again (no placeholders)
 - Do not tell the user you are about to check logs, run a command, or fix something unless you also call the matching tool in the same turn. If you cannot proceed, say what is missing and stop—no "(Checking …)" placeholders.
 

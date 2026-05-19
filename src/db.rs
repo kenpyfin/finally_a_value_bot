@@ -3275,6 +3275,37 @@ impl Database {
         Ok(())
     }
 
+    /// Agent background jobs enqueued after a successful shell job (`shell_success_followup:{parent_id}:N`).
+    pub fn count_shell_success_agent_followups(
+        &self,
+        parent_shell_job_id: &str,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("shell_success_followup:{parent_shell_job_id}:%");
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             WHERE job_kind = 'agent' AND trigger_reason LIKE ?1",
+            params![pattern],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn mark_background_shell_agent_success_followup_enqueued(
+        &self,
+        id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs
+             SET last_progress_at = ?1, last_stage = 'agent_success_followup_enqueued'
+             WHERE id = ?2 AND job_kind = 'shell'",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
     /// Agent background jobs enqueued after a shell failure (`shell_failure_retry:{parent_id}:N`).
     pub fn count_shell_failure_agent_retries(
         &self,

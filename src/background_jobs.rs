@@ -15,6 +15,7 @@ use crate::db::call_blocking;
 use crate::job_heartbeat::{
     signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
 };
+use crate::llm::LlmProvider;
 use crate::telegram::{
     process_with_agent_with_events, AgentRequestContext, AppState, BACKGROUND_JOB_HANDOFF_PREFIX,
 };

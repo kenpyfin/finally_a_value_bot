@@ -506,6 +506,7 @@ fn default_config() -> Config {
         background_shell_monitor_poll_secs: 8,
         background_shell_auto_retry_on_failure: true,
         background_shell_auto_retry_max: 1,
+        background_shell_auto_agent_on_success: true,
         runtime_reliability_profile: "balanced".into(),
         workflow_auto_learn: true,
         workflow_min_success_repetitions: 2,

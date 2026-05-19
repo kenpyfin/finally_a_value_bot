@@ -16,6 +16,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-19 — Shell success: auto agent follow-up reply
+
+- **Area:** background_shell / background_jobs / config
+- **Summary:** Successful `spawn_background_command` jobs now enqueue an agent background handoff (like failure auto-retry) so the bot sends a summary reply after the raw completion message. Config: `BACKGROUND_SHELL_AUTO_AGENT_ON_SUCCESS` (default true).
+- **Rationale:** Users saw the `[PZ] Your background command finished.` log dump but no agent turn to summarize images, inventory warnings, or next steps.
+- **Key files / symbols:** `background_shell::{finalize_shell_job, maybe_enqueue_shell_success_agent_followup}`, `db::{count_shell_success_agent_followups, mark_background_shell_agent_success_followup_enqueued}`, `config::background_shell_auto_agent_on_success`.
+- **Follow-ups:** Rebuild/restart bot; set env to `false` to restore log-only completion.
+
+### 2026-05-18 — Web UI LLM model picker with cost reference
+
+- **Area:** web / config / llm
+- **Summary:** Provider and API key stay in `.env` (`LLM_PROVIDER`, `LLM_API_KEY`). Model selection moves to Web UI **Settings → LLM**: catalog from `llm_catalog` with approximate USD/1M-token cost hints, persisted as `LLM_MODEL` in `app_settings`, merged at startup and hot-swapped via `LlmHandle` without restart.
+- **Rationale:** Operators configure secrets in env but need a safe, guided model switch with pricing context.
+- **Key files / symbols:** `src/llm_catalog.rs`, `src/llm.rs` (`LlmHandle`), `src/web.rs` (`GET`/`PATCH /api/llm`), `web/src/components/settings-llm.tsx`, `config::merge_llm_model_from_app_settings`, `is_llm_related_runtime_setting_key` (excludes `LLM_MODEL`).
+- **Follow-ups:** Rebuild `web/dist` and restart bot after deploy.
+
 ### 2026-05-16 — Identity + Tier 1 memory in system prompt
 
 - **Area:** agent / memory / channels / web

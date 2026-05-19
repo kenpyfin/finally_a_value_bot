@@ -556,15 +556,22 @@ fn format_delivery_message(
     job: &BackgroundJob,
     exit_code: i32,
     output: &str,
-    agent_retry_scheduled: bool,
+    agent_followup_scheduled: bool,
 ) -> String {
     let label = job.label.as_deref().unwrap_or(job.prompt.as_str());
     let (headline, hint) = if exit_code == 0 {
-        (
-            format!("completed successfully (exit {exit_code})"),
-            "Your background command finished.",
-        )
-    } else if agent_retry_scheduled {
+        if agent_followup_scheduled {
+            (
+                format!("completed successfully (exit {exit_code})"),
+                "Your background command finished. I'm preparing a summary reply with the key outputs.",
+            )
+        } else {
+            (
+                format!("completed successfully (exit {exit_code})"),
+                "Your background command finished.",
+            )
+        }
+    } else if agent_followup_scheduled {
         (
             format!("FAILED (exit {exit_code})"),
             "The background command failed. I'm starting an agent run now to read this output, fix the issue, and retry the command.",
@@ -699,26 +706,26 @@ pub async fn finalize_shell_job(
     let output = redact_secrets_user_visible(&output);
     let success = exit_code == 0;
 
-    // Persist terminal failure before agent-retry enqueue: `try_enqueue_background_handoff`
+    // Persist terminal state before agent handoff enqueue: `try_enqueue_background_handoff`
     // counts active jobs and would block while this shell row is still `running`.
-    let mut failure_marked_for_retry_slot = false;
-    if !success && !already_terminal {
+    let mut marked_early = false;
+    if !already_terminal {
         let jid = job_id.clone();
         let out = output.clone();
         let ec = exit_code;
         let _ = call_blocking(state.db.clone(), move |db| {
-            db.mark_background_shell_finished(&jid, ec, &out, false)
+            db.mark_background_shell_finished(&jid, ec, &out, success)
         })
         .await;
-        failure_marked_for_retry_slot = true;
+        marked_early = true;
     }
 
-    let agent_retry_scheduled = if success {
-        false
+    let agent_followup_scheduled = if success {
+        maybe_enqueue_shell_success_agent_followup(state.clone(), &job, exit_code, &output).await
     } else {
         maybe_enqueue_shell_failure_agent_retry(state.clone(), &job, exit_code, &output).await
     };
-    let delivery_text = format_delivery_message(&job, exit_code, &output, agent_retry_scheduled);
+    let delivery_text = format_delivery_message(&job, exit_code, &output, agent_followup_scheduled);
 
     if let Err(e) = deliver_agent_final_to_contact(
         state.db.clone(),
@@ -747,12 +754,11 @@ pub async fn finalize_shell_job(
         let jid = job_id.clone();
         let out = output.clone();
         let terminal = already_terminal;
-        let marked_early = failure_marked_for_retry_slot;
         let _ = call_blocking(state.db.clone(), move |db| {
             if terminal {
                 db.record_background_shell_user_notification(&jid, &out)
-            } else if marked_early && !success {
-                // Failure row already written before agent-retry enqueue; nothing to update.
+            } else if marked_early {
+                // Row already written before agent handoff enqueue; nothing to update.
                 Ok(())
             } else {
                 db.mark_background_shell_finished(&jid, exit_code, &out, success)
@@ -893,6 +899,96 @@ async fn caller_channel_for_chat(state: &AppState, chat_id: i64) -> &'static str
         Ok(Some(t)) if t == "discord" => "discord",
         Ok(Some(t)) if t == "whatsapp" => "whatsapp",
         _ => "telegram",
+    }
+}
+
+/// Enqueue an agent background job to summarize a successful shell job for the user.
+/// Returns true when a follow-up agent run was queued.
+async fn maybe_enqueue_shell_success_agent_followup(
+    state: Arc<AppState>,
+    job: &BackgroundJob,
+    exit_code: i32,
+    output: &str,
+) -> bool {
+    if !state.config.background_shell_auto_agent_on_success {
+        return false;
+    }
+    if job.last_stage.as_deref() == Some("agent_success_followup_enqueued") {
+        return false;
+    }
+    let parent_id = job.id.clone();
+    let prior = match call_blocking(state.db.clone(), move |db| {
+        db.count_shell_success_agent_followups(&parent_id)
+    })
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(job_id = %job.id, "shell success follow-up count failed: {e}");
+            return false;
+        }
+    };
+    if prior >= 1 {
+        return false;
+    }
+    let attempt = prior + 1;
+    let label = job.label.as_deref().unwrap_or(job.prompt.as_str());
+    let shell_cmd = job.shell_command.as_deref().unwrap_or("(unknown)");
+    let workdir = job.workdir.as_deref().unwrap_or("(unknown)");
+    let prompt = format!(
+        "##INTERNAL_SHELL_SUCCESS_FOLLOWUP##\n\
+         A background shell command completed successfully. Read the output (paths, warnings, inventory), \
+         verify key artifacts exist when paths are given, and send the user a concise summary with next steps. \
+         Use `send_message` with attachments when images were produced. Do not re-run the same command unless an artifact is missing.\n\n\
+         Completed shell job id: `{shell_job_id}`\n\
+         Task label: {label}\n\
+         Exit code: {exit_code}\n\
+         Workdir: {workdir}\n\
+         Command:\n```bash\n{shell_cmd}\n```\n\n\
+         Output:\n```\n{output}\n```\n",
+        shell_job_id = job.id,
+    );
+    let trigger = format!("shell_success_followup:{}:{attempt}", job.id);
+    let jid = job.id.clone();
+    let _ = call_blocking(state.db.clone(), move |db| {
+        db.mark_background_shell_agent_success_followup_enqueued(&jid)
+    })
+    .await;
+    let channel = caller_channel_for_chat(&state, job.chat_id).await;
+    match try_enqueue_background_handoff(
+        state,
+        job.chat_id,
+        job.persona_id,
+        prompt,
+        &trigger,
+        channel,
+    )
+    .await
+    {
+        HandoffEnqueueOutcome::Queued { job_id, .. } => {
+            info!(
+                shell_job_id = %job.id,
+                agent_job_id = %job_id,
+                attempt,
+                "Enqueued agent follow-up after shell success"
+            );
+            true
+        }
+        HandoffEnqueueOutcome::BlockedAlreadyRunning => {
+            warn!(
+                shell_job_id = %job.id,
+                "Shell success agent follow-up blocked: another background job is active"
+            );
+            false
+        }
+        other => {
+            warn!(
+                shell_job_id = %job.id,
+                ?other,
+                "Shell success agent follow-up could not be enqueued"
+            );
+            false
+        }
     }
 }
 
