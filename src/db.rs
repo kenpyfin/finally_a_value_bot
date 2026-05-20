@@ -2222,6 +2222,38 @@ impl Database {
         Ok(tasks)
     }
 
+    /// All scheduled tasks for display filtered by chat:
+    /// active, running, paused, and completed.
+    pub fn get_scheduled_tasks_for_chat_for_display(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE chat_id = ?1 AND status IN ('active', 'running', 'paused', 'completed')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
     pub fn get_tasks_for_chat(
         &self,
         chat_id: i64,

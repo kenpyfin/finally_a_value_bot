@@ -777,7 +777,10 @@ async fn handle_message(
                 }
             }
             SlashCommand::Schedule => {
-                let tasks = call_blocking(state.db.clone(), |db| db.get_all_active_tasks()).await;
+                let tasks = call_blocking(state.db.clone(), move |db| {
+                    db.get_tasks_for_chat(canonical_chat_id)
+                })
+                .await;
                 let text = match &tasks {
                     Ok(t) => crate::tools::schedule::format_tasks_list_persona(t),
                     Err(e) => format!("Error listing tasks: {e}"),

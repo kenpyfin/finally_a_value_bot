@@ -16,6 +16,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-20 — Chat-scoped scheduled task listing
+
+- **Area:** channels / tools / db
+- **Summary:** Scheduled task listing (via slash commands and the `list_scheduled_tasks` tool) is now filtered to the current chat ID context. Global listing is restricted, and formatted outputs no longer display the `chat_id` unless explicitly requested.
+- **Rationale:** Previously, users and agents listing scheduled tasks saw active/completed tasks across all chats, leading to information leakage and cluttered layouts.
+- **Key files / symbols:** `src/db.rs` (`Database::get_scheduled_tasks_for_chat_for_display`), `src/tools/schedule.rs` (`ListTasksTool`, `format_tasks_list_impl`), `src/channels/telegram.rs` (`SlashCommand::Schedule`), `src/channels/discord.rs` (`SlashCommand::Schedule`), `src/channels/whatsapp.rs` (`SlashCommand::Schedule`), `src/web.rs` (`SlashCommand::Schedule`).
+
 ### 2026-05-20 — Bulletin update required every agent turn
 
 - **Area:** agent / prompt / tools

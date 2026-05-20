@@ -258,12 +258,12 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             .await;
                         }
                         SlashCommand::Schedule => {
-                            let tasks = call_blocking(state.app_state.db.clone(), |db| {
-                                db.get_all_scheduled_tasks_for_display()
+                            let tasks = call_blocking(state.app_state.db.clone(), move |db| {
+                                db.get_scheduled_tasks_for_chat_for_display(chat_id)
                             })
                             .await;
                             let text = match &tasks {
-                                Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
+                                Ok(t) => crate::tools::schedule::format_tasks_list(t),
                                 Err(e) => format!("Error listing tasks: {e}"),
                             };
                             send_whatsapp_message(

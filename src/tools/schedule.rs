@@ -42,7 +42,11 @@ fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> Str
     if tasks.is_empty() {
         return "No scheduled tasks. Ask me to schedule one (recurring or one-time).".to_string();
     }
-    let mut output = String::from("Scheduled tasks (all chats/personas):\n");
+    let mut output = if include_chat_id {
+        String::from("Scheduled tasks (all chats/personas):\n")
+    } else {
+        String::from("Scheduled tasks:\n")
+    };
     for t in tasks {
         if include_chat_id {
             output.push_str(&format!(
@@ -291,12 +295,12 @@ impl Tool for ListTasksTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_scheduled_tasks".into(),
-            description: "List all scheduled tasks (active, running, paused, completed) across all chats and personas. Learned workflows (queue `workflow_id`) are unrelated to these cron/once schedules.".into(),
+            description: "List all scheduled tasks (active, running, paused, completed) for the current chat. Learned workflows (queue `workflow_id`) are unrelated to these cron/once schedules.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
-                        "description": "Caller's chat ID (for auth); tasks shown are global."
+                        "description": "Caller's chat ID (for auth/filtering)."
                     }
                 }),
                 &["chat_id"],
@@ -316,12 +320,12 @@ impl Tool for ListTasksTool {
             return ToolResult::error(e);
         }
 
-        match call_blocking(self.db.clone(), |db| {
-            db.get_all_scheduled_tasks_for_display()
+        match call_blocking(self.db.clone(), move |db| {
+            db.get_scheduled_tasks_for_chat_for_display(chat_id)
         })
         .await
         {
-            Ok(tasks) => ToolResult::success(format_tasks_list_all(&tasks)),
+            Ok(tasks) => ToolResult::success(format_tasks_list(&tasks)),
             Err(e) => ToolResult::error(format!("Failed to list tasks: {e}")),
         }
     }
