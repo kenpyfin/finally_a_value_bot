@@ -27,7 +27,7 @@ impl Tool for UpdateBulletinFocusTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "update_bulletin_focus".into(),
-            description: "Set the per-persona Bulletin focus card for long-term/high-signal user-facing highlights. Replaces the current Bulletin content for this persona.".into(),
+            description: "Set the per-persona Bulletin focus card (required every agent turn). Operator-facing cockpit summary: active goals, in-flight work, blockers, recent outcomes. Replaces the current Bulletin content for this persona.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {

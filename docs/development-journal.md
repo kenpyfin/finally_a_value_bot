@@ -16,6 +16,13 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-20 — Bulletin update required every agent turn
+
+- **Area:** agent / prompt / tools
+- **Summary:** System prompt now states `update_bulletin_focus` is mandatory on every run (not optional), including short replies and when `send_message` already delivered the narrative. Tool schema description reinforced.
+- **Rationale:** Operators rely on the web cockpit Bulletin card; the bot was skipping updates without explicit must-do guidance.
+- **Key files / symbols:** `src/channels/telegram.rs` (`build_system_prompt`); `src/tools/bulletin.rs` (`UpdateBulletinFocusTool::definition`); `test_build_system_prompt_requires_bulletin_every_turn`.
+
 ### 2026-05-19 — Shell success: auto agent follow-up reply
 
 - **Area:** background_shell / background_jobs / config

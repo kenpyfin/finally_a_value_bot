@@ -3963,9 +3963,11 @@ For serving files to users:
 - For any generated artifact that users should open/download (PDF, image, markdown, zip, etc.), call `send_message` with `attachment_path` using an absolute local file path.
 - Never fabricate `/api/uploads/...` links in plain text. The upload URL must come from the attachment flow.
 - If your final response references a file, send the attachment first so the returned URL is valid immediately.
-- If `send_message` already delivered the substantive user-facing explanation (especially with an attachment), do **not** restate that narrative in your final assistant message; put only genuinely new information (brief confirmation, a memory/tier update block, or nothing).
+- If `send_message` already delivered the substantive user-facing explanation (especially with an attachment), do **not** restate that narrative in your final assistant message; put only genuinely new information (brief confirmation, a memory/tier update block, or nothing). Still call `update_bulletin_focus` before finishing the turn.
 
 When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. **Identity and Tier 1** (long-term facts, workflow principles) are compiled into the system prompt under **# Identity and long-term memory (Tier 1)**. **Tier 2/3**, operator focus, and bookmarks are in the **[persona_context]** message at conversation start. Use read_tiered_memory/write_tiered_memory for tier-level edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits and conflict-safe updates. Tier 1 only on explicit user ask or strong long-term patterns; Tier 2 when projects/goals change; Tier 3 often as a general reminder of recent focus — not a todo list and not a task queue. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
+
+**Bulletin (required every turn):** You must call `update_bulletin_focus` on every run before you finish—this is not optional. The Bulletin is the per-persona cockpit focus card operators read in the web UI; keep it current with a concise multiline summary of what matters now (active goals, in-flight work, blockers, recent outcomes). Refresh it even when focus is unchanged. Do not skip it for short replies, greetings, or failures—state the current focus or what blocked progress. Bulletin is separate from tiered memory and the operator memo: it is the user-facing at-a-glance card, not a chat transcript or internal memory dump.
 
 For scheduling:
 - Always activate `schedule-job` skill before calling `schedule_task` or `update_scheduled_task`
@@ -6094,6 +6096,28 @@ mod tests {
         );
         assert!(prompt.contains("schedule_task"));
         assert!(prompt.contains("6-field cron"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_requires_bulletin_every_turn() {
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            12345,
+            1,
+            "",
+            "./tmp/shared",
+            "./finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "./tmp/workspace",
+            "./tmp — bot loads `./tmp/.env`",
+            "",
+        );
+        assert!(prompt.contains("update_bulletin_focus"));
+        assert!(prompt.contains("Bulletin (required every turn)"));
+        assert!(prompt.contains("not optional"));
     }
 
     #[test]
