@@ -27,7 +27,7 @@ unnecessary_cast = "allow"
 teloxide = { version = "0.17", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
-rusqlite = { version = "0.32", features = ["bundled-full"] }
+rusqlite = { version = "0.39", features = ["bundled-full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
