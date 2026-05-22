@@ -16,6 +16,42 @@ use crate::claude::ToolDefinition;
 use crate::config::Config;
 use crate::db::{call_blocking, Database, StoredMessage};
 
+fn resolve_send_message_persona_id(
+    input: &serde_json::Value,
+    chat_id: i64,
+    override_id: Option<i64>,
+) -> Result<i64, String> {
+    if let Some(pid) = override_id {
+        if pid <= 0 {
+            return Err("persona_id must be a positive integer".into());
+        }
+        if let Some(auth) = auth_context_from_input(input) {
+            if !auth.is_control_chat() {
+                let allowed = default_persona_id_for_chat(input, chat_id)
+                    .filter(|id| *id > 0)
+                    .unwrap_or_else(|| {
+                        if auth.caller_chat_id == chat_id {
+                            auth.caller_persona_id
+                        } else {
+                            0
+                        }
+                    });
+                if allowed <= 0 || pid != allowed {
+                    return Err(
+                        "persona_id override must match the caller's run persona for this chat"
+                            .into(),
+                    );
+                }
+            }
+        }
+        return Ok(pid);
+    }
+    if let Some(pid) = default_persona_id_for_chat(input, chat_id) {
+        return Ok(pid);
+    }
+    Err("Missing auth context to resolve persona for send_message".into())
+}
+
 enum ActiveAttachmentTarget {
     Telegram(i64),
     Discord(i64),
@@ -550,19 +586,19 @@ impl Tool for SendMessageTool {
             match send_result {
                 Ok(content) => {
                     let db = self.db.clone();
-                    let pid_result = match persona_id_override {
-                        Some(id) => Ok(id),
-                        None => {
-                            if let Some(pid) = default_persona_id_for_chat(&input, chat_id) {
-                                Ok(pid)
-                            } else {
+                    let pid_result: Result<i64, String> =
+                        match resolve_send_message_persona_id(&input, chat_id, persona_id_override)
+                        {
+                            Ok(pid) => Ok(pid),
+                            Err(_) if persona_id_override.is_none() => {
                                 call_blocking(db.clone(), move |db| {
                                     db.get_or_create_default_persona(chat_id)
                                 })
                                 .await
+                                .map_err(|e| e.to_string())
                             }
-                        }
-                    };
+                            Err(e) => Err(e),
+                        };
                     let pid = match pid_result {
                         Ok(pid) => pid,
                         Err(e) => {
@@ -588,19 +624,18 @@ impl Tool for SendMessageTool {
             }
         } else {
             let cid = chat_id;
-            let persona_id_result = match persona_id_override {
-                Some(id) => Ok(id),
-                None => {
-                    if let Some(pid) = default_persona_id_for_chat(&input, chat_id) {
-                        Ok(pid)
-                    } else {
+            let persona_id_result: Result<i64, String> =
+                match resolve_send_message_persona_id(&input, chat_id, persona_id_override) {
+                    Ok(pid) => Ok(pid),
+                    Err(_) if persona_id_override.is_none() => {
                         call_blocking(self.db.clone(), move |db| {
                             db.get_or_create_default_persona(cid)
                         })
                         .await
+                        .map_err(|e| e.to_string())
                     }
-                }
-            };
+                    Err(e) => Err(e),
+                };
             let persona_id = match persona_id_result {
                 Ok(pid) => pid,
                 Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),

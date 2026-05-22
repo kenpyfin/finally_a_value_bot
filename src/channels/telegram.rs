@@ -64,6 +64,7 @@ enum UserIntent {
 
 pub struct AppState {
     pub config: Config,
+    pub runtime_toggles: Arc<crate::runtime_toggles::RuntimeToggles>,
     /// Telegram bots keyed by `channel_bot_instances.id` (see `Database::sync_channel_bot_instances_from_config`).
     pub telegram_bots: Arc<HashMap<i64, Bot>>,
     pub db: Arc<Database>,
@@ -209,10 +210,17 @@ pub async fn run_bot(
 
     let mut config = config;
     config.merge_llm_model_from_app_settings(&db)?;
+    let tool_output_debug = crate::runtime_toggles::RuntimeToggles::merge_tool_output_debug_from_app_settings(
+        config.tool_output_debug,
+        &db,
+    )?;
+    config.tool_output_debug = tool_output_debug;
+    let runtime_toggles =
+        crate::runtime_toggles::RuntimeToggles::new(tool_output_debug);
     let llm = crate::llm::LlmHandle::new(&config);
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
         Arc::new(std::sync::OnceLock::new());
-    let mut tools = ToolRegistry::new(&config, tool_bot, db.clone());
+    let mut tools = ToolRegistry::new(&config, tool_bot, db.clone(), runtime_toggles.clone());
     tools.add_tool(Box::new(
         crate::tools::spawn_background_command::SpawnBackgroundCommandTool::new(
             &config,
@@ -292,6 +300,7 @@ pub async fn run_bot(
 
     let state = Arc::new(AppState {
         config,
+        runtime_toggles,
         telegram_bots: Arc::new(telegram_bots_map),
         db,
         memory,
@@ -777,10 +786,22 @@ async fn handle_message(
                 }
             }
             SlashCommand::Schedule => {
-                let tasks = call_blocking(state.db.clone(), move |db| {
-                    db.get_tasks_for_chat(canonical_chat_id)
+                let pid = call_blocking(state.db.clone(), move |db| {
+                    db.get_current_persona_id(canonical_chat_id)
                 })
-                .await;
+                .await
+                .unwrap_or(0);
+                let tasks = if pid > 0 {
+                    call_blocking(state.db.clone(), move |db| {
+                        db.get_tasks_for_chat_and_persona(canonical_chat_id, pid)
+                    })
+                    .await
+                } else {
+                    call_blocking(state.db.clone(), move |db| {
+                        db.get_tasks_for_chat(canonical_chat_id)
+                    })
+                    .await
+                };
                 let text = match &tasks {
                     Ok(t) => crate::tools::schedule::format_tasks_list_persona(t),
                     Err(e) => format!("Error listing tasks: {e}"),
@@ -1843,7 +1864,7 @@ pub async fn process_with_agent_with_events(
     // - Tool execution timeout: prevents hanging on slow/unresponsive tools (e.g., browser, bash)
     // Both timeouts are critical to ensure the bot always sends a response.
     const LLM_ROUND_TIMEOUT_SECS: u64 = 180;
-    const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 1500;
+    const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 3600;
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
     const LOOP_SIGNATURE_REPEAT_THRESHOLD: usize = 3;
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
@@ -6431,6 +6452,7 @@ mod tests {
                     id: "t1".into(),
                     name: "bash".into(),
                     input: json!({"command": "ls missing.py"}),
+                    thought_signature: None,
                 }]),
             },
             Message {

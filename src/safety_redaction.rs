@@ -46,17 +46,19 @@ fn long_token_like_regex() -> &'static Regex {
     REGEX.get_or_init(|| Regex::new(r"\b[A-Za-z0-9_-]{40,}\b").expect("valid long token regex"))
 }
 
-/// True when `rest` begins (after optional ASCII whitespace) with a known model-weight extension.
-/// Used so long-token redaction does not strip LoRA / checkpoint basenames in tool echoes.
-fn is_followed_by_model_weight_extension(rest: &str) -> bool {
+fn extension_after_dot(rest: &str) -> Option<&str> {
     let s = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let Some(after_dot) = s.strip_prefix('.') else {
-        return false;
-    };
+    let after_dot = s.strip_prefix('.')?;
     let end = after_dot
         .find(|c: char| !c.is_ascii_alphanumeric())
         .unwrap_or(after_dot.len());
-    let ext = &after_dot[..end];
+    if end == 0 {
+        return None;
+    }
+    Some(&after_dot[..end])
+}
+
+fn is_model_weight_extension(ext: &str) -> bool {
     ext.eq_ignore_ascii_case("safetensors")
         || ext.eq_ignore_ascii_case("ckpt")
         || ext.eq_ignore_ascii_case("pth")
@@ -65,6 +67,36 @@ fn is_followed_by_model_weight_extension(rest: &str) -> bool {
         || ext.eq_ignore_ascii_case("gguf")
         || ext.eq_ignore_ascii_case("ggml")
         || ext.eq_ignore_ascii_case("pt")
+}
+
+fn is_common_media_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "tif"
+            | "tiff"
+            | "heic"
+            | "heif"
+            | "mp4"
+            | "mov"
+            | "avi"
+            | "webm"
+            | "mkv"
+    )
+}
+
+/// True when `rest` begins (after optional ASCII whitespace) with a dotted filename extension
+/// that should keep the preceding long token intact in tool echoes (paths, attachments, LoRA names).
+fn is_followed_by_preservable_file_extension(rest: &str) -> bool {
+    let Some(ext) = extension_after_dot(rest) else {
+        return false;
+    };
+    is_model_weight_extension(ext) || is_common_media_extension(ext)
 }
 
 fn likely_secret_token(token: &str) -> bool {
@@ -122,7 +154,7 @@ fn apply_long_token_fallback(redacted: &str) -> String {
         out.push_str(&redacted[last_end..m.start()]);
         let token = m.as_str();
         let after = &redacted[m.end()..];
-        if is_followed_by_model_weight_extension(after) || !likely_secret_token(token) {
+        if is_followed_by_preservable_file_extension(after) || !likely_secret_token(token) {
             out.push_str(token);
         } else {
             out.push_str(REDACTED);
@@ -171,6 +203,20 @@ mod tests {
         assert!(out.contains(".pdf")); // punctuation splits word boundary typically before .
         assert!(!out.contains(name));
         assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn internal_preserves_long_instagram_style_jpeg_basename() {
+        let basename = "s_official_1778931955_3898285836361751814_4607385765";
+        assert!(basename.len() >= 40);
+        let input = format!("parking/ayana.{basename}.jpg");
+        let out = redact_secrets_internal(&input);
+        assert!(
+            out.contains(basename),
+            "expected Instagram-style basename preserved, got: {out}"
+        );
+        assert!(out.contains(".jpg"));
+        assert!(!out.contains(REDACTED));
     }
 
     #[test]

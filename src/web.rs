@@ -554,6 +554,34 @@ async fn api_chat(
     })))
 }
 
+async fn resolve_history_persona_id(
+    state: &WebState,
+    chat_id: i64,
+    persona_id: Option<i64>,
+) -> Result<i64, (StatusCode, String)> {
+    let pid = match persona_id {
+        Some(id) if id > 0 => id,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "persona_id query parameter is required".into(),
+            ))
+        }
+    };
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Persona {pid} does not exist for this chat"),
+        ));
+    }
+    Ok(pid)
+}
+
 async fn api_history(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -564,16 +592,7 @@ async fn api_history(
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
-    let cid = chat_id;
-    let persona_id = if let Some(pid) = query.persona_id {
-        pid
-    } else {
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(cid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let persona_id = resolve_history_persona_id(&state, chat_id, query.persona_id).await?;
     let cid2 = chat_id;
     let pid = persona_id;
 
@@ -649,16 +668,7 @@ async fn api_history_days(
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
-    let cid = chat_id;
-    let persona_id = if let Some(pid) = query.persona_id {
-        pid
-    } else {
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(cid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let persona_id = resolve_history_persona_id(&state, chat_id, query.persona_id).await?;
     let cid2 = chat_id;
     let pid = persona_id;
     let days = call_blocking(state.app_state.db.clone(), move |db| {
@@ -1756,10 +1766,19 @@ async fn send_and_store_response_with_events(
                 .await
             }
             SlashCommand::Schedule => {
-                let tasks = call_blocking(state.app_state.db.clone(), move |db| {
-                    db.get_scheduled_tasks_for_chat_for_display(chat_id)
-                })
-                .await;
+                let cid_sched = chat_id;
+                let pid_sched = persona_id;
+                let tasks = if pid_sched > 0 {
+                    call_blocking(state.app_state.db.clone(), move |db| {
+                        db.get_scheduled_tasks_for_chat_and_persona(cid_sched, pid_sched)
+                    })
+                    .await
+                } else {
+                    call_blocking(state.app_state.db.clone(), move |db| {
+                        db.get_scheduled_tasks_for_chat_for_display(cid_sched)
+                    })
+                    .await
+                };
                 match &tasks {
                     Ok(t) => crate::tools::schedule::format_tasks_list(t),
                     Err(e) => format!("Error listing tasks: {e}"),
@@ -3719,6 +3738,59 @@ struct LlmModelPatchRequest {
     custom: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct RuntimePatchRequest {
+    tool_output_debug: bool,
+}
+
+async fn api_runtime_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let from_app = call_blocking(state.app_state.db.clone(), |db| {
+        crate::runtime_toggles::RuntimeToggles::tool_output_debug_from_app_settings(db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
+        "source": if from_app { "app_settings" } else { "env" },
+        "description": "When enabled, PZ/ComfyUI scripts emit WebSocket timeout and history-polling lines.",
+    })))
+}
+
+async fn api_runtime_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<RuntimePatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let enabled = body.tool_output_debug;
+    state
+        .app_state
+        .runtime_toggles
+        .set_tool_output_debug(enabled);
+    call_blocking(state.app_state.db.clone(), move |db| {
+        crate::runtime_toggles::RuntimeToggles::persist_tool_output_debug(db, enabled)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "tool_output_debug": enabled,
+        "source": "app_settings",
+        "message": if enabled {
+            "Verbose PZ/ComfyUI logging enabled for new shell commands."
+        } else {
+            "Verbose PZ/ComfyUI logging disabled for new shell commands."
+        },
+    })))
+}
+
 async fn api_llm_get(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -3824,6 +3896,10 @@ async fn api_settings_get(
     let mut items: Vec<serde_json::Value> = settings
         .into_iter()
         .filter(|s| !crate::config::is_llm_related_runtime_setting_key(&s.key))
+        .filter(|s| {
+            !s.key
+                .eq_ignore_ascii_case(crate::runtime_toggles::APP_SETTING_TOOL_OUTPUT_DEBUG)
+        })
         .map(|s| {
             let secret = setting_is_secret(&s.key);
             json!({
@@ -3869,6 +3945,7 @@ async fn api_settings_get(
             "requires_restart_for_env_changes": false,
             "runtime_env_merge_from_app_settings": true,
             "llm_model_from_app_settings": true,
+            "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
         }
     })))
 }
@@ -4437,6 +4514,10 @@ fn build_router(web_state: WebState) -> Router {
             get(api_settings_get).patch(api_settings_patch),
         )
         .route("/api/llm", get(api_llm_get).patch(api_llm_patch))
+        .route(
+            "/api/runtime",
+            get(api_runtime_get).patch(api_runtime_patch),
+        )
         .route("/api/restart", post(api_restart_post))
         .route(
             "/api/channel_bot_instances",
@@ -4752,14 +4833,16 @@ mod tests {
         let bot = Bot::new("123456:TEST_TOKEN");
         let mut telegram_bots = std::collections::HashMap::new();
         telegram_bots.insert(crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY, bot.clone());
+        let runtime_toggles = crate::runtime_toggles::RuntimeToggles::new(cfg.tool_output_debug);
         let state = AppState {
             config: cfg.clone(),
+            runtime_toggles: runtime_toggles.clone(),
             telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),
             skills: SkillManager::from_skills_dirs(cfg.skill_discovery_dirs()),
             llm,
-            tools: ToolRegistry::new(&cfg, bot, db),
+            tools: ToolRegistry::new(&cfg, bot, db, runtime_toggles),
             discord_http: Arc::new(std::collections::HashMap::new()),
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
             background_job_control: crate::background_jobs::BackgroundJobControl::default(),
@@ -4878,7 +4961,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_failure_requires_header() {
         let web_state = test_web_state(
-            Arc::new(DummyLlm),
+            test_llm_from_provider(Arc::new(DummyLlm)),
             Some("secret-token".into()),
             WebLimits::default(),
         );
@@ -5101,7 +5184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_db_paths_use_call_blocking_in_web_flow() {
-        let state = test_state(Arc::new(DummyLlm));
+        let state = test_state(test_llm_from_provider(Arc::new(DummyLlm)));
         let chat_id = 12345_i64;
         let cid = chat_id;
         let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(cid))

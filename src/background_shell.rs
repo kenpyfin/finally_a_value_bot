@@ -184,8 +184,13 @@ Run the bot on a host with tmux, or use inline bash for short commands."
     let wrapper_script = job_dir_abs.join(WRAPPER_SCRIPT);
     let tmux_cwd = state.config.workspace_root_absolute();
 
+    let debug_export = if state.runtime_toggles.tool_output_debug() {
+        "export TOOL_OUTPUT_DEBUG=1\n"
+    } else {
+        ""
+    };
     let command_body = format!(
-        "#!/usr/bin/env bash\nset -uo pipefail\ncd {}\n{}\n",
+        "#!/usr/bin/env bash\nset -uo pipefail\n{debug_export}cd {}\n{}\n",
         shell_escape_single(&workdir_abs.to_string_lossy()),
         command.trim()
     );
@@ -1130,7 +1135,7 @@ mod tests {
 
     #[test]
     fn shell_job_dir_under_workspace_runtime() {
-        let mut config = Config::default();
+        let mut config = Config::load_from_env();
         config.workspace_dir = "/tmp/favb-workspace".into();
         let dir = shell_job_dir(&config, "abc-123");
         assert!(dir.is_absolute());
@@ -1139,7 +1144,7 @@ mod tests {
 
     #[test]
     fn resolve_shell_workdir_makes_relative_paths_absolute() {
-        let mut config = Config::default();
+        let mut config = Config::load_from_env();
         let root = std::env::temp_dir().join("favb-shell-workdir-test");
         let _ = std::fs::create_dir_all(root.join("shared"));
         config.workspace_dir = root.to_string_lossy().into();
@@ -1150,7 +1155,7 @@ mod tests {
 
     #[test]
     fn resolve_shell_workdir_drops_redundant_workspace_prefix() {
-        let mut config = Config::default();
+        let mut config = Config::load_from_env();
         let root = std::env::temp_dir()
             .join("favb-shell-workspace-prefix-test")
             .join("workspace");

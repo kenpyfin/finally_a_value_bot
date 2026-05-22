@@ -1,11 +1,14 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
+
+use crate::runtime_toggles::RuntimeToggles;
 
 use crate::claude::ToolDefinition;
 use crate::safety_redaction::redact_secrets_internal;
-use crate::tools::command_runner::{build_command, shell_command};
+use crate::tools::command_runner::{build_command_with_env, shell_command};
 
 use super::bash_safety::{
     check_bash_safety, check_expensive_shell_search, is_expensive_shell_search,
@@ -17,6 +20,7 @@ pub struct BashTool {
     working_dir: PathBuf,
     safety_execution_mode: String,
     safety_risky_categories: Vec<String>,
+    runtime_toggles: Arc<RuntimeToggles>,
 }
 
 impl BashTool {
@@ -30,6 +34,7 @@ impl BashTool {
                 "network".into(),
                 "package".into(),
             ],
+            RuntimeToggles::new(false),
         )
     }
 
@@ -37,11 +42,13 @@ impl BashTool {
         working_dir: &str,
         safety_execution_mode: String,
         safety_risky_categories: Vec<String>,
+        runtime_toggles: Arc<RuntimeToggles>,
     ) -> Self {
         Self {
             working_dir: PathBuf::from(working_dir),
             safety_execution_mode,
             safety_risky_categories,
+            runtime_toggles,
         }
     }
 }
@@ -64,7 +71,7 @@ impl Tool for BashTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 1500)"
+                        "description": "Timeout in seconds (default: 3600)"
                     }
                 }),
                 &["command"],
@@ -82,7 +89,7 @@ impl Tool for BashTool {
         let mut timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1500);
+            .unwrap_or(3600);
         if is_expensive_shell_search(&command) {
             timeout_secs = timeout_secs.min(EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS);
         }
@@ -112,7 +119,12 @@ impl Tool for BashTool {
         let spec = shell_command(&command);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            build_command(&spec, Some(&working_dir)).output(),
+            build_command_with_env(
+                &spec,
+                Some(&working_dir),
+                self.runtime_toggles.tool_output_debug(),
+            )
+            .output(),
         )
         .await;
 
@@ -269,7 +281,12 @@ mod tests {
     #[tokio::test]
     async fn test_bash_warn_confirm_requires_prefix_for_risky_command() {
         let tool =
-            BashTool::new_with_safety(".", "warn_confirm".into(), vec!["destructive".into()]);
+            BashTool::new_with_safety(
+                ".",
+                "warn_confirm".into(),
+                vec!["destructive".into()],
+                RuntimeToggles::new(false),
+            );
         let result = tool.execute(json!({"command": "rm -rf /tmp/foo"})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Execution paused by safety policy"));
@@ -279,7 +296,12 @@ mod tests {
     #[tokio::test]
     async fn test_bash_warn_confirm_allows_risky_command_with_prefix() {
         let tool =
-            BashTool::new_with_safety(".", "warn_confirm".into(), vec!["destructive".into()]);
+            BashTool::new_with_safety(
+                ".",
+                "warn_confirm".into(),
+                vec!["destructive".into()],
+                RuntimeToggles::new(false),
+            );
         // Unix: real rm; Windows (PowerShell): keep `rm -rf` substring for destructive match but run a no-op.
         let cmd = if cfg!(windows) {
             "CONFIRM_EXECUTE Write-Output 'rm -rf noop'"
@@ -292,7 +314,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_strict_blocks_risky_command() {
-        let tool = BashTool::new_with_safety(".", "strict".into(), vec!["package".into()]);
+        let tool = BashTool::new_with_safety(
+            ".",
+            "strict".into(),
+            vec!["package".into()],
+            RuntimeToggles::new(false),
+        );
         let result = tool.execute(json!({"command": "npm install lodash"})).await;
         assert!(result.is_error);
         assert!(result

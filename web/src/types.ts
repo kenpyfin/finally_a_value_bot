@@ -55,6 +55,14 @@ export type LlmCatalogModel = {
   from_active_config?: boolean
 }
 
+export type RuntimeConfigResponse = {
+  ok?: boolean
+  tool_output_debug?: boolean
+  source?: 'env' | 'app_settings'
+  description?: string
+  message?: string
+}
+
 export type LlmConfigResponse = {
   ok?: boolean
   provider?: { id: string; label: string }

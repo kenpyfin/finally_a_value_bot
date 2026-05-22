@@ -118,7 +118,7 @@ fn default_cursor_agent_model() -> String {
 }
 
 fn default_cursor_agent_timeout_secs() -> u64 {
-    1500
+    3600
 }
 
 fn default_scheduler_task_timeout_secs() -> u64 {
@@ -138,19 +138,33 @@ fn default_scheduler_poll_interval_secs() -> u64 {
 }
 
 fn default_background_job_lease_ttl_secs() -> u64 {
-    120
+    // Must exceed longest expected gap between lease renewals (e.g. one bash/ComfyUI tool call).
+    1800
 }
 
 fn default_background_job_lease_fallback_renew_secs() -> u64 {
-    180
+    // Renew periodically during long tool calls; must be well below lease TTL.
+    60
 }
 
 fn default_background_job_pending_start_timeout_secs() -> u64 {
-    120
+    300
 }
 
 fn default_background_job_notify_chat_progress() -> bool {
     false
+}
+
+fn default_tool_output_debug() -> bool {
+    false
+}
+
+/// Parses truthy strings for bool settings (`1`, `true`, `yes`, `on`; case-insensitive).
+pub fn parse_bool_setting(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn default_background_shell_tmux_session_prefix() -> String {
@@ -469,7 +483,7 @@ pub struct Config {
     /// Model for cursor-agent (e.g. "gpt-5"). Leave empty to omit --model (cursor-agent uses its default / "auto").
     #[serde(default = "default_cursor_agent_model")]
     pub cursor_agent_model: String,
-    /// Timeout in seconds for cursor-agent runs. Default: 1500.
+    /// Timeout in seconds for cursor-agent runs. Default: 3600.
     #[serde(default = "default_cursor_agent_timeout_secs")]
     pub cursor_agent_timeout_secs: u64,
     #[serde(default)]
@@ -528,18 +542,21 @@ pub struct Config {
     /// Seconds between scheduler ticks (reclaim + due-task scan). Default 60.
     #[serde(default = "default_scheduler_poll_interval_secs")]
     pub scheduler_poll_interval_secs: u64,
-    /// Lease TTL for active manual background jobs. Worker heartbeat/event flow renews this lease. Default 120.
+    /// Lease TTL for active manual background jobs. Worker heartbeat/event flow renews this lease. Default 1800.
     #[serde(default = "default_background_job_lease_ttl_secs")]
     pub background_job_lease_ttl_secs: u64,
-    /// Fallback heartbeat lease renewal cadence when no events are emitted. Default 180.
+    /// Fallback heartbeat lease renewal cadence when no events are emitted. Default 60 (must be < lease TTL).
     #[serde(default = "default_background_job_lease_fallback_renew_secs")]
     pub background_job_lease_fallback_renew_secs: u64,
-    /// Maximum age for a pending background job before stale reconciliation fails it. Default 120.
+    /// Maximum age for a pending background job before stale reconciliation fails it. Default 300.
     #[serde(default = "default_background_job_pending_start_timeout_secs")]
     pub background_job_pending_start_timeout_secs: u64,
     /// Post "Background update: …" chat messages during manual background jobs (very noisy). Default false.
     #[serde(default = "default_background_job_notify_chat_progress")]
     pub background_job_notify_chat_progress: bool,
+    /// When true, bash/background shell sets `TOOL_OUTPUT_DEBUG=1` so PZ/ComfyUI scripts emit WebSocket poll noise. Default false.
+    #[serde(default = "default_tool_output_debug")]
+    pub tool_output_debug: bool,
     /// Allow spawning shell commands in tmux for `spawn_background_command`. Default true (false in Docker).
     #[serde(default = "default_background_shell_tmux_enabled")]
     pub background_shell_tmux_enabled: bool,
@@ -976,6 +993,7 @@ impl Config {
                 "BACKGROUND_JOB_NOTIFY_CHAT_PROGRESS",
                 default_background_job_notify_chat_progress(),
             ),
+            tool_output_debug: Self::env_bool("TOOL_OUTPUT_DEBUG", default_tool_output_debug()),
             background_shell_tmux_enabled: Self::env_bool(
                 "BACKGROUND_SHELL_TMUX_ENABLED",
                 default_background_shell_tmux_enabled(),
@@ -1509,7 +1527,7 @@ pub fn test_config() -> Config {
         web_search_searxng_url: None,
         cursor_agent_cli_path: default_cursor_agent_cli_path(),
         cursor_agent_model: String::new(),
-        cursor_agent_timeout_secs: 1500,
+        cursor_agent_timeout_secs: default_cursor_agent_timeout_secs(),
         social: None,
         vault: None,
         orchestrator_enabled: true,
@@ -1535,6 +1553,7 @@ pub fn test_config() -> Config {
         background_job_pending_start_timeout_secs:
             default_background_job_pending_start_timeout_secs(),
         background_job_notify_chat_progress: default_background_job_notify_chat_progress(),
+        tool_output_debug: default_tool_output_debug(),
         background_shell_tmux_enabled: default_background_shell_tmux_enabled(),
         background_shell_tmux_session_prefix: default_background_shell_tmux_session_prefix(),
         background_shell_monitor_poll_secs: default_background_shell_monitor_poll_secs(),

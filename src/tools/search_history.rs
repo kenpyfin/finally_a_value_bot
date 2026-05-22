@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-use super::{auth_context_from_input, schema_object, Tool, ToolResult};
+use super::{
+    authorize_chat_access, authorize_chat_persona_access, default_persona_id_for_chat,
+    schema_object, Tool, ToolResult,
+};
 use crate::claude::ToolDefinition;
 use crate::db::Database;
 
@@ -65,13 +68,22 @@ impl Tool for SearchHistoryTool {
             None => return ToolResult::error("Missing 'chat_id' parameter".into()),
         };
 
-        // Permission check via auth context
-        if let Some(auth) = auth_context_from_input(&input) {
-            if !auth.can_access_chat(chat_id) {
-                return ToolResult::error(format!(
-                    "Permission denied: cannot search history for chat {chat_id}"
-                ));
+        if let Err(e) = authorize_chat_access(&input, chat_id) {
+            return ToolResult::error(e);
+        }
+
+        let persona_id = match default_persona_id_for_chat(&input, chat_id) {
+            Some(pid) => pid,
+            None => {
+                return ToolResult::error(
+                    "Missing auth context (__finally_a_value_bot_auth) with caller_persona_id for this chat"
+                        .into(),
+                )
+                .with_error_type("auth_required");
             }
+        };
+        if let Err(e) = authorize_chat_persona_access(&input, chat_id, persona_id) {
+            return ToolResult::error(e).with_error_type("auth_required");
         }
 
         let limit = input
@@ -88,10 +100,6 @@ impl Tool for SearchHistoryTool {
             .get("to_date")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-
-        let persona_id = auth_context_from_input(&input)
-            .map(|a| a.caller_persona_id)
-            .unwrap_or(0);
 
         let db = self.db.clone();
         let query_owned = query.clone();
@@ -139,5 +147,84 @@ impl Tool for SearchHistoryTool {
             )),
             Err(e) => ToolResult::error(format!("Search task error: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, StoredMessage};
+    use serde_json::json;
+
+    fn test_db() -> (Arc<Database>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_search_hist_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(Database::new(dir.to_str().unwrap()).unwrap());
+        (db, dir)
+    }
+
+    fn cleanup(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_search_chat_history_persona_scoped() {
+        let (db, dir) = test_db();
+        let pid_a = db.get_or_create_default_persona(100).unwrap();
+        let pid_b = db.create_persona(100, "B", None).unwrap();
+        db.store_message(&StoredMessage {
+            id: "a1".into(),
+            chat_id: 100,
+            persona_id: pid_a,
+            sender_name: "user".into(),
+            content: "alpha secret keyword".into(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.store_message(&StoredMessage {
+            id: "b1".into(),
+            chat_id: 100,
+            persona_id: pid_b,
+            sender_name: "user".into(),
+            content: "beta secret keyword".into(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:01Z".into(),
+        })
+        .unwrap();
+
+        let tool = SearchHistoryTool::new(db);
+        let result = tool
+            .execute(json!({
+                "query": "secret",
+                "chat_id": 100,
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 100,
+                    "caller_persona_id": pid_a,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("alpha"));
+        assert!(!result.content.contains("beta"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_search_chat_history_requires_auth_persona() {
+        let (db, dir) = test_db();
+        let tool = SearchHistoryTool::new(db);
+        let result = tool
+            .execute(json!({
+                "query": "anything",
+                "chat_id": 100
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("auth"));
+        cleanup(&dir);
     }
 }

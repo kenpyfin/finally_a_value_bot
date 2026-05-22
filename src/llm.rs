@@ -325,19 +325,60 @@ impl AnthropicProvider {
         let mut streamed_request = request.clone();
         streamed_request.stream = Some(true);
 
-        let response = self
-            .http
-            .post(&self.base_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&streamed_request)
-            .send()
-            .await?;
+        let mut retries = 0u32;
+        let max_retries = 3;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+        let response = loop {
+            let response_res = self
+                .http
+                .post(&self.base_url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&streamed_request)
+                .send()
+                .await;
+
+            let resp = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Anthropic stream request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                warn!(
+                    "Transient stream error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let body = resp.text().await.unwrap_or_default();
             if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
                 return Err(FinallyAValueBotError::LlmApi(format!(
                     "{}: {}",
@@ -347,7 +388,7 @@ impl AnthropicProvider {
             return Err(FinallyAValueBotError::LlmApi(format!(
                 "HTTP {status}: {body}"
             )));
-        }
+        };
 
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();
@@ -731,7 +772,7 @@ impl LlmProvider for AnthropicProvider {
         let max_retries = 3;
 
         loop {
-            let response = self
+            let response_res = self
                 .http
                 .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
@@ -739,7 +780,24 @@ impl LlmProvider for AnthropicProvider {
                 .header("content-type", "application/json")
                 .json(&request)
                 .send()
-                .await?;
+                .await;
+
+            let response = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Anthropic request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
 
             let status = response.status();
 
@@ -753,11 +811,17 @@ impl LlmProvider for AnthropicProvider {
                 return Ok(parsed);
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
                 retries += 1;
                 let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
+                    "Transient error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
                     delay
                 );
                 tokio::time::sleep(delay).await;
@@ -944,7 +1008,24 @@ impl LlmProvider for OpenAiProvider {
             if !self.api_key.trim().is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", self.api_key));
             }
-            let response = req.send().await?;
+            let response_res = req.send().await;
+
+            let response = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending OpenAI request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
 
             let status = response.status();
 
@@ -958,11 +1039,17 @@ impl LlmProvider for OpenAiProvider {
                 return Ok(translate_oai_response(oai));
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
                 retries += 1;
                 let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
+                    "Transient error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
                     delay
                 );
                 tokio::time::sleep(delay).await;
@@ -1002,18 +1089,60 @@ impl LlmProvider for OpenAiProvider {
             }
         }
 
-        let mut req = self
-            .http
-            .post(&self.chat_url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if !self.api_key.trim().is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
-        }
-        let response = req.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+        let mut retries = 0u32;
+        let max_retries = 3;
+
+        let response = loop {
+            let mut req = self
+                .http
+                .post(&self.chat_url)
+                .header("Content-Type", "application/json")
+                .json(&body);
+            if !self.api_key.trim().is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+            let response_res = req.send().await;
+
+            let resp = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending OpenAI stream request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                warn!(
+                    "Transient stream error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let text = resp.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
                 let msg = format_oai_error(status, &err.error, &text);
                 return Err(FinallyAValueBotError::LlmApi(msg));
@@ -1021,7 +1150,7 @@ impl LlmProvider for OpenAiProvider {
             return Err(FinallyAValueBotError::LlmApi(format!(
                 "HTTP {status}: {text}"
             )));
-        }
+        };
 
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();
@@ -1155,13 +1284,30 @@ impl LlmProvider for GeminiProvider {
         let max_retries = 3;
 
         loop {
-            let response = self
+            let response_res = self
                 .http
                 .post(&self.generate_url())
                 .header("Content-Type", "application/json")
                 .json(&request_body)
                 .send()
-                .await?;
+                .await;
+
+            let response = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Gemini request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
 
             let status = response.status();
 
@@ -1170,11 +1316,17 @@ impl LlmProvider for GeminiProvider {
                 return parse_gemini_response(&body);
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
                 retries += 1;
                 let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
+                    "Transient error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
                     delay
                 );
                 tokio::time::sleep(delay).await;
@@ -1204,17 +1356,58 @@ impl LlmProvider for GeminiProvider {
         let messages = sanitize_messages(messages);
         let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
 
-        let response = self
-            .http
-            .post(&self.stream_url())
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
+        let mut retries = 0u32;
+        let max_retries = 3;
 
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+        let response = loop {
+            let response_res = self
+                .http
+                .post(&self.stream_url())
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send()
+                .await;
+
+            let resp = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Gemini stream request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                warn!(
+                    "Transient stream error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let text = resp.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<GeminiError>(&text) {
                 return Err(FinallyAValueBotError::LlmApi(format!(
                     "Gemini API error {}: {}",
@@ -1224,7 +1417,7 @@ impl LlmProvider for GeminiProvider {
             return Err(FinallyAValueBotError::LlmApi(format!(
                 "HTTP {status}: {text}"
             )));
-        }
+        };
 
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();

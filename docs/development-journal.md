@@ -16,6 +16,54 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-21 — Increase long-running tool timeouts to 1 hour
+
+- **Area:** agent loop / tools / config
+- **Summary:** Raised the main in-loop tool execution timeout and default `bash`/`cursor_agent` timeout defaults from 1500s to 3600s; updated `.env.example` and config-wizard defaults to match.
+- **Rationale:** ComfyUI/PZ recovery and generation flows can exceed 25 minutes under load; default 1500s cut off legitimate long-running jobs before they completed.
+- **Key files / symbols:** `src/channels/telegram.rs` (`TOOL_EXECUTION_TIMEOUT_SECS`), `src/tools/bash.rs` (`timeout_secs` schema + default), `src/config.rs` (`default_cursor_agent_timeout_secs`, `cursor_agent_timeout_secs`), `src/config_wizard.rs`, `.env.example`.
+- **Follow-ups:** Restart running bot processes so the new defaults are loaded from code/env.
+
+### 2026-05-20 — Web UI toggle for PZ/ComfyUI debug logging
+
+- **Area:** web / runtime_toggles / tools
+- **Summary:** Settings → Overview includes **PZ / ComfyUI debug logging** switch (`GET`/`PATCH /api/runtime`). Value persists in `app_settings` (`TOOL_OUTPUT_DEBUG`) and hot-updates `RuntimeToggles` for bash and background shell without restart.
+- **Rationale:** Operators should not edit `.env` for a UI-facing verbosity flag.
+- **Key files / symbols:** `runtime_toggles::{RuntimeToggles, APP_SETTING_TOOL_OUTPUT_DEBUG}`; `web::{api_runtime_get, api_runtime_patch}`; `web/src/components/settings-runtime.tsx`.
+- **Follow-ups:** Rebuild `web/dist` and restart gateway.
+
+### 2026-05-20 — PZ/ComfyUI verbose logging behind `TOOL_OUTPUT_DEBUG`
+
+- **Area:** config / tools / workspace scripts
+- **Summary:** WebSocket timeout / history-poll lines from `run_pz_*` and `comfy_swap_cli.py` are suppressed unless debug is on. Bot sets `TOOL_OUTPUT_DEBUG=1` when `tool_output_debug` is true (env `TOOL_OUTPUT_DEBUG=true`). Shared `workspace/shared/pz_log.py`; scripts accept `--debug` for manual runs.
+- **Rationale:** Long ComfyUI waits spam bash output; milestones (queued, saved) stay visible.
+- **Key files / symbols:** `config::tool_output_debug`; `command_runner::apply_tool_output_debug_env`; `bash` / `background_shell` env injection; `pz_log::{is_debug, pipeline_log}`.
+- **Follow-ups:** Restart bot after enabling in `.env`.
+
+### 2026-05-20 — Longer background job lease defaults
+
+- **Area:** config / background_jobs / scheduler
+- **Summary:** Raised `background_job_lease_ttl_secs` default 120→1800, fallback renew 180→60, pending-start stale threshold 120→300. Documented env vars in `.env.example`.
+- **Rationale:** Long ComfyUI/bash tool calls emit no agent events for many minutes; lease expired at 120s while fallback renewal ticked every 180s, so `reconcile_expired_background_job_leases` could mark GPU jobs failed mid-run.
+- **Key files / symbols:** `config::{default_background_job_lease_ttl_secs, default_background_job_lease_fallback_renew_secs}`; `job_heartbeat::spawn_shared_heartbeat`; `scheduler::run_due_tasks` → `reconcile_expired_background_job_leases`.
+- **Follow-ups:** Restart bot after deploy; override via `BACKGROUND_JOB_LEASE_TTL_SECS` / `BACKGROUND_JOB_LEASE_FALLBACK_RENEW_SECS` if jobs routinely exceed 30m.
+
+### 2026-05-20 — Persona-scoped schedules and chat history
+
+- **Area:** tools / web / db / channels
+- **Summary:** Scheduled-task list/mutate tools and chat-history surfaces now enforce caller persona (control chats list all personas in a chat for schedules). `GET /api/history` and `/api/history/days` require `persona_id`; web `loadHistory` always sends it. `search_chat_history` uses `authorize_chat_persona_access`. `send_message` cannot override `persona_id` to another persona unless control chat. Slash `/schedule` filters to active persona per channel.
+- **Rationale:** Multi-persona chats should not leak another persona's cron jobs or message history to agents or the wrong sidebar thread.
+- **Key files / symbols:** `src/db.rs` (`get_scheduled_tasks_for_chat_and_persona`, `get_tasks_for_chat_and_persona`); `src/tools/schedule.rs` (`list_schedules_for_caller`, `authorize_scheduled_task_access`); `src/tools/search_history.rs`; `src/tools/send_message.rs` (`resolve_send_message_persona_id`); `src/web.rs` (`resolve_history_persona_id`); `web/src/main.tsx` (`loadHistory`); `src/channels/{telegram,discord,whatsapp}.rs` (`SlashCommand::Schedule`).
+- **Follow-ups:** Optional `cursor_agent_runs.persona_id` if run listing should match persona isolation.
+
+### 2026-05-20 — Internal redaction: preserve long basenames before image/media extensions
+
+- **Area:** safety redaction / tools / agent loop
+- **Summary:** Extended the long-token fallback in `redact_secrets_internal` so segments immediately before common image/video extensions (e.g. `.jpg`, `.png`, `.webp`) are not masked — same idea as the existing `.safetensors` carve-out.
+- **Rationale:** Instagram-style parking filenames (`ayana.s_official_<long_id>.jpg`) were redacted to `ayana.[REDACTED_SECRET].jpg` in tool results; the agent then reused the redacted path in bash and hit file-not-found. User-visible redaction was already safe; the bug was internal masking on tool echoes fed back into the loop.
+- **Key files / symbols:** `src/safety_redaction.rs` (`extension_after_dot`, `is_followed_by_preservable_file_extension`, `is_common_media_extension`), test `internal_preserves_long_instagram_style_jpeg_basename`.
+- **Follow-ups:** None unless other dotted artifacts (e.g. `.json` config basenames) need the same treatment.
+
 ### 2026-05-20 — Chat-scoped scheduled task listing
 
 - **Area:** channels / tools / db

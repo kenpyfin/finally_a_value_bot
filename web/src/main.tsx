@@ -25,6 +25,7 @@ import './styles.css'
 import { api, AUTH_REQUIRED_EVENT, makeHeaders, sanitizeHttpHeaderValue, WEB_AUTH_STORAGE_KEY } from './api/client'
 import { CockpitBar } from './components/cockpit-bar'
 import { SettingsLlmPanel } from './components/settings-llm'
+import { SettingsRuntimePanel } from './components/settings-runtime'
 import { InitialRunPromptView } from './components/initial-run-prompt-view'
 import { SessionSidebar } from './components/session-sidebar'
 import { ThreadPane } from './components/thread-pane'
@@ -729,8 +730,19 @@ function App() {
     opts?: { force?: boolean; limitOverride?: number },
   ): Promise<void> {
     if (cid == null) return
-    const query = new URLSearchParams({ chat_id: String(cid) })
-    if (personaId != null && personaId > 0) query.set('persona_id', String(personaId))
+    const pid =
+      personaId != null && personaId > 0
+        ? personaId
+        : activePersonaId != null && activePersonaId > 0
+          ? activePersonaId
+          : null
+    if (pid == null) {
+      setHistorySeed([])
+      setHistoryByDay({})
+      setHistoryHasMore(false)
+      return
+    }
+    const query = new URLSearchParams({ chat_id: String(cid), persona_id: String(pid) })
     if (day) query.set('day', day)
     else {
       const visibleLimit = opts?.limitOverride ?? historyVisibleLimitRef.current
@@ -1022,7 +1034,17 @@ function App() {
       await loadPersonas(chatId)
       if (activePersonaId === personaId) {
         resetHistoryPagination()
-        await loadHistory(chatId, undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
+        const reloadPid =
+          activePersonaId != null && activePersonaId > 0 ? activePersonaId : undefined
+        if (reloadPid != null) {
+          await loadHistory(chatId, reloadPid, null, {
+            force: true,
+            limitOverride: HISTORY_PAGE_SIZE,
+          })
+        } else {
+          resetHistoryPagination()
+          setHistorySeed([])
+        }
       }
       setStatusText('Persona deleted')
     } catch (e) {
@@ -1298,7 +1320,12 @@ function App() {
     })
     await loadBindings(chatId)
     resetHistoryPagination()
-    await loadHistory(chatId, undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
+    if (activePersonaId != null && activePersonaId > 0) {
+      await loadHistory(chatId, activePersonaId, null, {
+        force: true,
+        limitOverride: HISTORY_PAGE_SIZE,
+      })
+    }
   }
 
   async function unlinkContact(): Promise<void> {
@@ -1941,6 +1968,17 @@ function App() {
                               Loading installation status…
                             </Text>
                           )}
+                          <div
+                            className="rounded-md border p-3 mt-3"
+                            style={appearance === 'dark'
+                              ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
+                              : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
+                          >
+                            <Text size="2" weight="bold" className="mb-2 block">
+                              Pipeline logging
+                            </Text>
+                            <SettingsRuntimePanel api={api} onError={setSettingsError} />
+                          </div>
                         </Tabs.Content>
                         <Tabs.Content value="llm">
                           <SettingsLlmPanel

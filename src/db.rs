@@ -2254,6 +2254,38 @@ impl Database {
         Ok(tasks)
     }
 
+    /// Scheduled tasks for display filtered by chat and persona (active, running, paused, completed).
+    pub fn get_scheduled_tasks_for_chat_and_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND status IN ('active', 'running', 'paused', 'completed')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map(params![chat_id, persona_id], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
     pub fn get_tasks_for_chat(
         &self,
         chat_id: i64,
@@ -2267,6 +2299,38 @@ impl Database {
         )?;
         let tasks = stmt
             .query_map(params![chat_id], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    /// Active/running/paused scheduled tasks for one persona in a chat.
+    pub fn get_tasks_for_chat_and_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND status IN ('active', 'running', 'paused')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map(params![chat_id, persona_id], |row| {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,

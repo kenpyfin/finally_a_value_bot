@@ -258,10 +258,22 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             .await;
                         }
                         SlashCommand::Schedule => {
-                            let tasks = call_blocking(state.app_state.db.clone(), move |db| {
-                                db.get_scheduled_tasks_for_chat_for_display(chat_id)
+                            let pid = call_blocking(state.app_state.db.clone(), move |db| {
+                                db.get_current_persona_id(chat_id)
                             })
-                            .await;
+                            .await
+                            .unwrap_or(0);
+                            let tasks = if pid > 0 {
+                                call_blocking(state.app_state.db.clone(), move |db| {
+                                    db.get_scheduled_tasks_for_chat_and_persona(chat_id, pid)
+                                })
+                                .await
+                            } else {
+                                call_blocking(state.app_state.db.clone(), move |db| {
+                                    db.get_scheduled_tasks_for_chat_for_display(chat_id)
+                                })
+                                .await
+                            };
                             let text = match &tasks {
                                 Ok(t) => crate::tools::schedule::format_tasks_list(t),
                                 Err(e) => format!("Error listing tasks: {e}"),

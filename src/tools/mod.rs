@@ -407,7 +407,12 @@ fn detect_vault_search_command(config: &Config) -> Option<String> {
 }
 
 impl ToolRegistry {
-    pub fn new(config: &Config, bot: Bot, db: Arc<Database>) -> Self {
+    pub fn new(
+        config: &Config,
+        bot: Bot,
+        db: Arc<Database>,
+        runtime_toggles: std::sync::Arc<crate::runtime_toggles::RuntimeToggles>,
+    ) -> Self {
         let working_dir = PathBuf::from(config.working_dir());
         if let Err(e) = std::fs::create_dir_all(&working_dir) {
             tracing::warn!(
@@ -422,6 +427,7 @@ impl ToolRegistry {
                 config.working_dir(),
                 config.safety_execution_mode.clone(),
                 config.safety_risky_categories.clone(),
+                runtime_toggles,
             )),
             Box::new(browser::BrowserTool::new(
                 &config.runtime_data_dir(),

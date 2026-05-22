@@ -203,10 +203,22 @@ impl EventHandler for Handler {
                     let _ = msg.channel_id.say(&ctx.http, resp).await;
                 }
                 SlashCommand::Schedule => {
-                    let tasks = call_blocking(self.app_state.db.clone(), move |db| {
-                        db.get_scheduled_tasks_for_chat_for_display(canonical_chat_id)
+                    let pid = call_blocking(self.app_state.db.clone(), move |db| {
+                        db.get_current_persona_id(canonical_chat_id)
                     })
-                    .await;
+                    .await
+                    .unwrap_or(0);
+                    let tasks = if pid > 0 {
+                        call_blocking(self.app_state.db.clone(), move |db| {
+                            db.get_scheduled_tasks_for_chat_and_persona(canonical_chat_id, pid)
+                        })
+                        .await
+                    } else {
+                        call_blocking(self.app_state.db.clone(), move |db| {
+                            db.get_scheduled_tasks_for_chat_for_display(canonical_chat_id)
+                        })
+                        .await
+                    };
                     let text = match &tasks {
                         Ok(t) => crate::tools::schedule::format_tasks_list(t),
                         Err(e) => format!("Error listing tasks: {e}"),
