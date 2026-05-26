@@ -61,6 +61,12 @@ function messageForFailedResponse(status: number, data: Record<string, unknown>,
   if (status === 401) {
     return 'Unauthorized. Enter the API token (WEB_AUTH_TOKEN from .env).'
   }
+  if (status === 413) {
+    const serverMsg = String(data.error || data.message || bodyText || '').trim()
+    return serverMsg
+      ? `Upload too large: ${serverMsg}`
+      : 'Upload too large. Choose a smaller file or increase MAX_DOCUMENT_SIZE_MB in .env.'
+  }
   if (status === 429) {
     const serverMsg = String(data.error || data.message || bodyText || '').trim()
     return serverMsg
@@ -72,6 +78,28 @@ function messageForFailedResponse(status: number, data: Record<string, unknown>,
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(path, { ...options, headers: makeHeaders(options) })
+  const bodyText = await res.text()
+  let data: Record<string, unknown> = {}
+  try {
+    data = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {}
+  } catch {
+    data = { message: bodyText || undefined }
+  }
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT))
+    throw new Error(messageForFailedResponse(401, data, bodyText))
+  }
+  if (!res.ok) {
+    throw new Error(messageForFailedResponse(res.status, data, bodyText))
+  }
+  return data as T
+}
+
+/** Multipart/form-data requests (do not set Content-Type; browser adds boundary). */
+export async function apiForm<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = makeHeaders(options) as Record<string, string>
+  delete headers['Content-Type']
+  const res = await fetch(path, { ...options, headers })
   const bodyText = await res.text()
   let data: Record<string, unknown> = {}
   try {

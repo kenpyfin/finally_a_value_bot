@@ -32,6 +32,12 @@ import { ThreadPane } from './components/thread-pane'
 import { useDocumentVisible } from './hooks/use-document-visible'
 import { useOpsPoll } from './hooks/use-ops-poll'
 import { queryClient } from './query-client'
+import {
+  dataUrlToFile,
+  splitDataUrl,
+  uploadAttachmentFile,
+  type SendAttachmentRef,
+} from './lib/attachments'
 import { historiesEqual, mapBackendHistory } from './lib/history-sync'
 import { parseAgentHistoryMarkdown, splitAgentHistoryRaw, type ParsedAgentHistory } from './parse-agent-history'
 import {
@@ -261,45 +267,25 @@ if (typeof document !== 'undefined') {
   document.documentElement.setAttribute('data-ui-theme', readUiTheme())
 }
 
-type SendAttachmentPayload = {
-  filename?: string
-  media_type?: string
-  data_base64: string
+type ExtractAttachmentOptions = {
+  chatId: number | null
+  signal?: AbortSignal
+  onUploadProgress?: (message: string) => void
 }
 
-function splitDataUrl(value: string): { mimeType?: string; base64: string } | null {
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  if (!trimmed.startsWith('data:')) return { base64: trimmed }
-  const comma = trimmed.indexOf(',')
-  if (comma < 0) return null
-  const header = trimmed.slice(5, comma)
-  const base64 = trimmed.slice(comma + 1)
-  const mimeType = header.split(';')[0] || undefined
-  return { mimeType, base64 }
-}
-
-async function fileToBase64(file: File): Promise<string> {
-  const buf = await file.arrayBuffer()
-  let binary = ''
-  const bytes = new Uint8Array(buf)
-  for (let i = 0; i < bytes.length; i += 1) {
-    binary += String.fromCharCode(bytes[i])
-  }
-  return btoa(binary)
-}
-
-async function extractAttachmentFromUnknown(part: unknown): Promise<SendAttachmentPayload | null> {
+async function extractAttachmentFromUnknown(
+  part: unknown,
+  opts: ExtractAttachmentOptions,
+): Promise<SendAttachmentRef | null> {
   if (!part || typeof part !== 'object') return null
   const obj = part as Record<string, unknown>
 
   const fileVal = obj.file
   if (fileVal instanceof File) {
-    return {
-      filename: fileVal.name || undefined,
-      media_type: fileVal.type || undefined,
-      data_base64: await fileToBase64(fileVal),
-    }
+    return uploadAttachmentFile(fileVal, opts.chatId, {
+      signal: opts.signal,
+      onProgress: opts.onUploadProgress,
+    })
   }
 
   const candidateData =
@@ -309,26 +295,32 @@ async function extractAttachmentFromUnknown(part: unknown): Promise<SendAttachme
     (typeof obj.source === 'string' && String(obj.source).startsWith('data:') ? String(obj.source) : null)
 
   if (!candidateData) return null
-  const parsed = splitDataUrl(candidateData)
-  if (!parsed || !parsed.base64) return null
 
   const filename = typeof obj.filename === 'string' ? obj.filename : undefined
   const mediaType =
     (typeof obj.mediaType === 'string' ? obj.mediaType : undefined) ||
     (typeof obj.mimeType === 'string' ? obj.mimeType : undefined) ||
     (typeof obj.contentType === 'string' ? obj.contentType : undefined) ||
-    parsed.mimeType
+    splitDataUrl(candidateData)?.mimeType
 
-  return {
-    filename,
-    media_type: mediaType,
-    data_base64: parsed.base64,
+  const file = dataUrlToFile(candidateData, filename)
+  if (mediaType && !file.type) {
+    return uploadAttachmentFile(
+      new File([file], file.name, { type: mediaType }),
+      opts.chatId,
+      { signal: opts.signal, onProgress: opts.onUploadProgress },
+    )
   }
+  return uploadAttachmentFile(file, opts.chatId, {
+    signal: opts.signal,
+    onProgress: opts.onUploadProgress,
+  })
 }
 
 async function extractLatestUserInput(
   messages: readonly ChatModelRunOptions['messages'][number][],
-): Promise<{ text: string; attachments: SendAttachmentPayload[] }> {
+  opts: ExtractAttachmentOptions,
+): Promise<{ text: string; attachments: SendAttachmentRef[] }> {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i]
     if (message.role !== 'user') continue
@@ -336,7 +328,7 @@ async function extractLatestUserInput(
     // Runtime may supply string or non-array shapes; library types are array-only for user messages.
     const content = message.content as unknown
     let text = ''
-    const attachments: SendAttachmentPayload[] = []
+    const attachments: SendAttachmentRef[] = []
 
     if (typeof content === 'string') {
       text = content.trim()
@@ -350,7 +342,7 @@ async function extractLatestUserInput(
         })
       text = textParts.join('\n').trim()
       for (const part of content) {
-        const att = await extractAttachmentFromUnknown(part)
+        const att = await extractAttachmentFromUnknown(part, opts)
         if (att) attachments.push(att)
       }
     } else if (content && typeof content === 'object' && !Array.isArray(content)) {
@@ -359,7 +351,7 @@ async function extractLatestUserInput(
       if (part.type === 'text' && typeof part.text === 'string') {
         text = part.text.trim()
       } else {
-        const att = await extractAttachmentFromUnknown(content)
+        const att = await extractAttachmentFromUnknown(content, opts)
         if (att) attachments.push(att)
       }
     }
@@ -367,7 +359,7 @@ async function extractLatestUserInput(
     const extraAttachments = (message as { attachments?: unknown }).attachments
     if (Array.isArray(extraAttachments)) {
       for (const part of extraAttachments) {
-        const att = await extractAttachmentFromUnknown(part)
+        const att = await extractAttachmentFromUnknown(part, opts)
         if (att) attachments.push(att)
       }
     }
@@ -942,10 +934,14 @@ function App() {
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
       run: async function* (options): AsyncGenerator<ChatModelRunResult, void> {
-        const { text: userText, attachments } = await extractLatestUserInput(options.messages)
+        const { text: userText, attachments } = await extractLatestUserInput(options.messages, {
+          chatId,
+          signal: options.abortSignal,
+          onUploadProgress: (msg) => setStatusText(msg),
+        })
         if (!userText && attachments.length === 0) return
 
-        setStatusText('Sending...')
+        setStatusText(attachments.length > 0 ? 'Sending message…' : 'Sending...')
         setReplayNotice('')
         setError('')
 
@@ -960,7 +956,7 @@ function App() {
             persona_id?: number
             sender_name: string
             message: string
-            attachments?: SendAttachmentPayload[]
+            attachments?: SendAttachmentRef[]
           } = {
             sender_name: 'web-user',
             message: userText,
@@ -3203,6 +3199,11 @@ function App() {
                     bookmarkedMessageIds={bookmarkedMessageIds}
                     onToggleBookmark={toggleMessageBookmark}
                     onMobileThreadScroll={handleMobileThreadScroll}
+                    uploadHint={
+                      statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
+                        ? statusText
+                        : undefined
+                    }
                   />
                 </div>
               </div>

@@ -16,6 +16,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-26 — Faster web image uploads + drag-and-drop
+
+- **Area:** web / channels
+- **Summary:** Web attachments now upload via `POST /api/uploads` (multipart, streamed to disk) before a small JSON `POST /api/send_stream` with `tool_path`/`url` refs. Composer supports drag-and-drop (`ComposerPrimitive.AttachmentDropzone`), upload status hints, and clearer 413 errors. Axum body limits scale with `MAX_DOCUMENT_SIZE_MB`. Reference attachments skip re-decode/re-write; first image is read from disk once for vision.
+- **Rationale:** 10 MB images were slow because base64-in-JSON inflated payload size and caused multiple encode/decode passes; drag-and-drop was not wired in the UI.
+- **Key files / symbols:** `src/web.rs` (`api_upload`, `process_web_attachments`, `web_json_body_limit_bytes`); `web/src/lib/attachments.ts`; `web/src/components/thread-pane.tsx` (`DraftAwareComposer` dropzone); `web/src/main.tsx` (multipart-first send path); `web/src/api/client.ts` (`apiForm`).
+- **Follow-ups:** Rebuild `web/dist` after UI changes; optional removal of legacy inline `data_base64` path once all clients migrate.
+
 ### 2026-05-22 — Gate background-shell chat output on pipeline logging
 
 - **Area:** background_shell / runtime_toggles / web

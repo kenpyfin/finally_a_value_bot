@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -15,6 +15,7 @@ use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
@@ -325,7 +326,29 @@ struct SendRequest {
 struct SendAttachmentRequest {
     filename: Option<String>,
     media_type: Option<String>,
-    data_base64: String,
+    /// Inline base64 payload (legacy). Prefer `tool_path` + `url` from `POST /api/uploads`.
+    #[serde(default)]
+    data_base64: Option<String>,
+    /// Relative path under `shared/upload/` (e.g. `upload/web/{chat_id}/{file}`).
+    #[serde(default)]
+    tool_path: Option<String>,
+    /// Public URL path (e.g. `/api/uploads/web/{chat_id}/{file}`).
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadQueryParams {
+    chat_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadResponse {
+    filename: String,
+    media_type: String,
+    bytes: u64,
+    tool_path: String,
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2121,6 +2144,109 @@ async fn materialize_response_file_links(
     Ok(updated)
 }
 
+fn web_max_document_bytes(config: &Config) -> u64 {
+    config
+        .max_document_size_mb
+        .saturating_mul(1024)
+        .saturating_mul(1024)
+}
+
+/// Axum default is 2 MB; allow inline JSON base64 payloads up to ~1.4× file limit + headroom.
+fn web_json_body_limit_bytes(config: &Config) -> usize {
+    let doc = web_max_document_bytes(config) as f64;
+    (doc * 1.45).ceil() as usize + 65_536
+}
+
+fn web_multipart_body_limit_bytes(config: &Config) -> usize {
+    web_max_document_bytes(config) as usize + 2 * 1024 * 1024
+}
+
+fn web_upload_dir(state: &WebState, chat_id: i64) -> PathBuf {
+    state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
+        .join("web")
+        .join(chat_id.to_string())
+}
+
+fn resolve_upload_tool_path_on_disk(state: &WebState, tool_path: &str) -> Option<PathBuf> {
+    let clean = tool_path.trim().trim_start_matches('/');
+    if clean.is_empty() || clean.contains("..") {
+        return None;
+    }
+    let full = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join(clean);
+    if full.is_file() {
+        Some(full)
+    } else {
+        None
+    }
+}
+
+fn fast_upload_filename(safe_name: &str) -> String {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    format!("{ts}-{safe_name}")
+}
+
+fn attachment_notes_for_saved(
+    filename: &str,
+    bytes_len: u64,
+    mime: &str,
+    tool_path: &str,
+    saved_path: &FsPath,
+    rel_url: &str,
+) -> Vec<String> {
+    let mut notes = vec![format!(
+        "[document] filename={} bytes={} mime={} tool_path={} saved_path={} url={}",
+        filename,
+        bytes_len,
+        mime,
+        tool_path,
+        saved_path.display(),
+        rel_url
+    )];
+    if mime.starts_with("image/") {
+        let alt = filename.replace(']', "_");
+        notes.push(format!("![{alt}]({rel_url})"));
+    } else {
+        notes.push(format!("[{filename}]({rel_url})"));
+    }
+    notes
+}
+
+async fn set_image_data_from_bytes(
+    image_data: &mut Option<(String, String)>,
+    bytes: &[u8],
+    mime: &str,
+) {
+    if image_data.is_none() && mime.starts_with("image/") {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        *image_data = Some((b64, mime.to_string()));
+    }
+}
+
+async fn set_image_data_from_path(
+    image_data: &mut Option<(String, String)>,
+    path: &FsPath,
+    mime: &str,
+) -> Result<(), (StatusCode, String)> {
+    if image_data.is_some() || !mime.starts_with("image/") {
+        return Ok(());
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    set_image_data_from_bytes(image_data, &bytes, mime).await;
+    Ok(())
+}
+
 async fn process_web_attachments(
     state: &WebState,
     chat_id: i64,
@@ -2131,32 +2257,14 @@ async fn process_web_attachments(
         return Ok(Vec::new());
     }
 
-    let max_bytes = state
-        .app_state
-        .config
-        .max_document_size_mb
-        .saturating_mul(1024)
-        .saturating_mul(1024);
-    let dir = state
-        .app_state
-        .config
-        .workspace_root_absolute()
-        .join("shared")
-        .join("upload")
-        .join("web")
-        .join(chat_id.to_string());
+    let max_bytes = web_max_document_bytes(&state.app_state.config);
+    let dir = web_upload_dir(state, chat_id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut notes = Vec::new();
     for (idx, att) in attachments.iter().enumerate() {
-        let bytes = decode_base64_payload(&att.data_base64).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid attachment base64: {e}"),
-            )
-        })?;
         let mime = att
             .media_type
             .clone()
@@ -2165,6 +2273,61 @@ async fn process_web_attachments(
             .filename
             .clone()
             .unwrap_or_else(|| format!("web-attachment-{}.bin", idx + 1));
+
+        if let Some(tool_path) = att.tool_path.as_deref().filter(|s| !s.trim().is_empty()) {
+            let expected_prefix = format!("upload/web/{chat_id}/");
+            if !tool_path.starts_with(&expected_prefix) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("attachment path must start with {expected_prefix}"),
+                ));
+            }
+            let disk_path =
+                resolve_upload_tool_path_on_disk(state, tool_path).ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("attachment not found: {tool_path}"),
+                    )
+                })?;
+            let meta = tokio::fs::metadata(&disk_path)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let bytes_len = meta.len();
+            if bytes_len > max_bytes {
+                notes.push(format!(
+                    "[document] filename={} bytes={} mime={} skipped=too_large",
+                    filename, bytes_len, mime
+                ));
+                continue;
+            }
+            let rel_url = att.url.clone().unwrap_or_else(|| {
+                let saved_file = disk_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                format!("/api/uploads/web/{chat_id}/{saved_file}")
+            });
+            set_image_data_from_path(image_data, &disk_path, &mime).await?;
+            notes.extend(attachment_notes_for_saved(
+                &filename, bytes_len, &mime, tool_path, &disk_path, &rel_url,
+            ));
+            continue;
+        }
+
+        let b64 = att.data_base64.as_deref().filter(|s| !s.trim().is_empty());
+        let Some(b64) = b64 else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "attachment must include tool_path or data_base64".into(),
+            ));
+        };
+
+        let bytes = decode_base64_payload(b64).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid attachment base64: {e}"),
+            )
+        })?;
 
         if (bytes.len() as u64) > max_bytes {
             notes.push(format!(
@@ -2187,30 +2350,106 @@ async fn process_web_attachments(
         let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
         let rel_url = format!("/api/uploads/web/{chat_id}/{saved_file}");
 
-        if image_data.is_none() && mime.starts_with("image/") {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
-            *image_data = Some((b64, mime.clone()));
-        }
+        set_image_data_from_bytes(image_data, &bytes, &mime).await;
 
-        notes.push(format!(
-            "[document] filename={} bytes={} mime={} tool_path={} saved_path={} url={}",
-            filename,
-            bytes.len(),
-            mime,
-            tool_path,
-            path.display(),
-            rel_url
+        notes.extend(attachment_notes_for_saved(
+            &filename,
+            bytes.len() as u64,
+            &mime,
+            &tool_path,
+            &path,
+            &rel_url,
         ));
-
-        if mime.starts_with("image/") {
-            let alt = filename.replace(']', "_");
-            notes.push(format!("![{alt}]({rel_url})"));
-        } else {
-            notes.push(format!("[{filename}]({rel_url})"));
-        }
     }
 
     Ok(notes)
+}
+
+async fn api_upload(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<UploadQueryParams>,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    let max_bytes = web_max_document_bytes(&state.app_state.config);
+    let dir = web_upload_dir(&state, chat_id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut uploaded: Option<UploadResponse> = None;
+
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid multipart upload: {e}"),
+        )
+    })? {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let original_name = field
+            .file_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "web-upload.bin".to_string());
+        let mime = field
+            .content_type()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let safe_name = sanitize_upload_filename(&original_name);
+        let disk_name = fast_upload_filename(&safe_name);
+        let path = dir.join(&disk_name);
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut total: u64 = 0;
+        while let Some(chunk) = field.chunk().await.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read upload chunk: {e}"),
+            )
+        })? {
+            total = total.saturating_add(chunk.len() as u64);
+            if total > max_bytes {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "file exceeds maximum size of {} MB (MAX_DOCUMENT_SIZE_MB)",
+                        state.app_state.config.max_document_size_mb
+                    ),
+                ));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let saved_file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
+        let rel_url = format!("/api/uploads/web/{chat_id}/{saved_file}");
+        uploaded = Some(UploadResponse {
+            filename: original_name,
+            media_type: mime,
+            bytes: total,
+            tool_path,
+            url: rel_url,
+        });
+        break;
+    }
+
+    uploaded.map(Json).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing file field in upload".into(),
+        )
+    })
 }
 
 fn decode_base64_payload(payload: &str) -> anyhow::Result<Vec<u8>> {
@@ -4498,6 +4737,8 @@ async fn api_oauth_callback(
 }
 
 fn build_router(web_state: WebState) -> Router {
+    let json_limit = web_json_body_limit_bytes(&web_state.app_state.config);
+    let multipart_limit = web_multipart_body_limit_bytes(&web_state.app_state.config);
     Router::new()
         .route("/", get(index))
         .route("/assets/*file", get(asset_file))
@@ -4545,8 +4786,15 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/history", get(api_history))
         .route("/api/history/days", get(api_history_days))
         .route("/api/artifacts", get(api_artifacts))
+        .route(
+            "/api/uploads",
+            post(api_upload).layer(DefaultBodyLimit::max(multipart_limit)),
+        )
         .route("/api/send", post(api_send))
-        .route("/api/send_stream", post(api_send_stream))
+        .route(
+            "/api/send_stream",
+            post(api_send_stream).layer(DefaultBodyLimit::max(json_limit)),
+        )
         .route("/api/stream", get(api_stream))
         .route("/api/run_status", get(api_run_status))
         .route("/api/queue_diagnostics", get(api_queue_diagnostics))
@@ -4588,6 +4836,7 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route("/api/oauth/authorize/:platform", get(api_oauth_authorize))
         .route("/api/oauth/callback/:platform", get(api_oauth_callback))
+        .layer(DefaultBodyLimit::max(json_limit))
         .with_state(web_state)
 }
 
@@ -4863,6 +5112,79 @@ mod tests {
             request_hub: RequestHub::default(),
             limits,
         }
+    }
+
+    #[tokio::test]
+    async fn test_multipart_upload_then_send_with_ref() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = web_state
+            .app_state
+            .config
+            .universal_chat_id
+            .unwrap_or(997894126);
+        let app = build_router(web_state);
+
+        let boundary = "----testboundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--{boundary}--\r\n"
+        );
+        let upload_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/uploads?chat_id={chat_id}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let upload_resp = app.clone().oneshot(upload_req).await.unwrap();
+        assert_eq!(upload_resp.status(), StatusCode::OK);
+        let upload_bytes = axum::body::to_bytes(upload_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let upload_json: serde_json::Value = serde_json::from_slice(&upload_bytes).unwrap();
+        let tool_path = upload_json
+            .get("tool_path")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let url = upload_json
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let send_body = json!({
+            "chat_id": chat_id,
+            "sender_name": "u",
+            "message": "see image",
+            "attachments": [{
+                "filename": "photo.png",
+                "media_type": "image/png",
+                "tool_path": tool_path,
+                "url": url,
+            }]
+        });
+        let send_req = Request::builder()
+            .method("POST")
+            .uri("/api/send_stream")
+            .header("content-type", "application/json")
+            .body(Body::from(send_body.to_string()))
+            .unwrap();
+        let send_resp = app.oneshot(send_req).await.unwrap();
+        assert_eq!(send_resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_web_body_limit_helpers() {
+        let mut cfg = crate::config::test_config();
+        cfg.max_document_size_mb = 10;
+        assert!(web_json_body_limit_bytes(&cfg) > 10 * 1024 * 1024);
+        assert!(web_multipart_body_limit_bytes(&cfg) >= 10 * 1024 * 1024);
     }
 
     #[tokio::test]

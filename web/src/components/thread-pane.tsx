@@ -2,6 +2,7 @@ import React from 'react'
 import {
   AssistantRuntimeProvider,
   CompositeAttachmentAdapter,
+  ComposerPrimitive,
   MessagePrimitive,
   SimpleImageAttachmentAdapter,
   SimpleTextAttachmentAdapter,
@@ -93,6 +94,7 @@ type ThreadPaneUiContextValue = {
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
   draftText: string
   onDraftTextChange?: (text: string) => void
+  uploadHint?: string
 }
 
 const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
@@ -100,6 +102,7 @@ const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
   onToggleBookmark: undefined,
   draftText: '',
   onDraftTextChange: undefined,
+  uploadHint: undefined,
 })
 
 function MessageBookmarkButton({
@@ -228,10 +231,12 @@ export type ThreadPaneProps = {
     source: 'scroll' | 'reset' | 'focus' | 'media-change'
     scrollTop?: number
   }) => void
+  /** Shown under the composer during multipart uploads (e.g. "Uploading photo.png (10.2 MB)…"). */
+  uploadHint?: string
 }
 
 function DraftAwareComposer() {
-  const { draftText, onDraftTextChange } = React.useContext(ThreadPaneUiContext)
+  const { draftText, onDraftTextChange, uploadHint } = React.useContext(ThreadPaneUiContext)
   const aui = useAui()
   const composerText = useAuiState(({ composer }) => composer.text)
   const lastAppliedDraftRef = React.useRef<string | null>(null)
@@ -246,7 +251,20 @@ function DraftAwareComposer() {
     onDraftTextChange?.(composerText)
   }, [composerText, onDraftTextChange])
 
-  return <Composer />
+  return (
+    <ComposerPrimitive.AttachmentDropzone className="mc-composer-dropzone">
+      <Composer />
+      {uploadHint ? (
+        <div className="mc-upload-hint" aria-live="polite">
+          {uploadHint}
+        </div>
+      ) : (
+        <div className="mc-upload-hint mc-upload-hint-idle">
+          Drop files here or use the attach button
+        </div>
+      )}
+    </ComposerPrimitive.AttachmentDropzone>
+  )
 }
 
 /** Isolated from App re-renders (persona poll, queue lane, schedules, etc.). `useLocalRuntime` runs an effect after every render that touches options/load; re-rendering on unrelated parent state was resetting the composer and scroll. */
@@ -259,6 +277,7 @@ export const ThreadPane = React.memo(function ThreadPane({
   bookmarkedMessageIds,
   onToggleBookmark,
   onMobileThreadScroll,
+  uploadHint,
 }: ThreadPaneProps) {
   const MarkdownText = makeMarkdownText({
     remarkPlugins: [remarkGfm],
@@ -293,8 +312,9 @@ export const ThreadPane = React.memo(function ThreadPane({
       onToggleBookmark,
       draftText,
       onDraftTextChange,
+      uploadHint,
     }),
-    [bookmarkedMessageIds, draftText, onDraftTextChange, onToggleBookmark],
+    [bookmarkedMessageIds, draftText, onDraftTextChange, onToggleBookmark, uploadHint],
   )
 
   const viewportScrollCleanupRef = React.useRef<(() => void) | null>(null)
