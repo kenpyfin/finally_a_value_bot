@@ -16,6 +16,30 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-22 — Gate background-shell chat output on pipeline logging
+
+- **Area:** background_shell / runtime_toggles / web
+- **Summary:** When `tool_output_debug` is off, `finalize_shell_job` no longer appends stdout/stderr to user-facing completion messages; full output remains in DB and agent success/retry handoff prompts. Settings help text updated.
+- **Rationale:** Pipeline logging is a gateway UX control, not per-script `pz_log` discipline; users should not see raw shell dumps when debug is off.
+- **Key files / symbols:** `background_shell::{format_delivery_message, finalize_shell_job}`; `web/src/components/settings-runtime.tsx`.
+- **Follow-ups:** Rebuild `web/dist`; optional: gate in-loop `bash` tool echoes similarly if needed.
+
+### 2026-05-22 — Suppress run_pz_i2i_pure queue poll spam when debug off
+
+- **Area:** workspace scripts
+- **Summary:** `run_pz_i2i_pure` ComfyUI queue/WebSocket wait lines (e.g. repeated “Waiting for ComfyUI job … RUNNING”) now use `debug_only=True` via `pz_log`, matching other PZ scripts. Default-off pipeline logging no longer floods background-job completion messages.
+- **Rationale:** UI toggle only affects scripts that honor `TOOL_OUTPUT_DEBUG`; this script left poll status at default visibility.
+- **Key files / symbols:** `workspace/shared/run_pz_i2i_pure.py` (`_maybe_log_queue_wait`, `wait_for_prompt_result`, `_recv_ws_message`).
+- **Follow-ups:** Wrapper scripts (`pz_v8_i2i_pipeline.py`, etc.) still print Gemini/scene lines unconditionally if those should be gated too.
+
+### 2026-05-22 — Pipeline logging toggle copy (global scope)
+
+- **Area:** web
+- **Summary:** Settings → Overview “Pipeline logging” switch label/help text now describes a gateway-wide verbose shell setting, not PZ/face-swap-only. Behavior unchanged (`TOOL_OUTPUT_DEBUG` / `tool_output_debug`).
+- **Rationale:** The toggle was always global; PZ-specific wording implied a single-persona feature.
+- **Key files / symbols:** `web/src/components/settings-runtime.tsx`; rebuild `web/dist`.
+- **Follow-ups:** None.
+
 ### 2026-05-21 — Increase long-running tool timeouts to 1 hour
 
 - **Area:** agent loop / tools / config

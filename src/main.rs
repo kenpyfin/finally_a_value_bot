@@ -146,8 +146,12 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
         let bot = teloxide::Bot::new(token);
         let runtime_toggles =
             finally_a_value_bot::runtime_toggles::RuntimeToggles::new(config.tool_output_debug);
-        let tools =
-            finally_a_value_bot::tools::ToolRegistry::new(&config, bot, db.clone(), runtime_toggles);
+        let tools = finally_a_value_bot::tools::ToolRegistry::new(
+            &config,
+            bot,
+            db.clone(),
+            runtime_toggles,
+        );
         let defs = tools.definitions();
         println!("Testing with {} tools (same as Telegram).", defs.len());
         Some(defs)

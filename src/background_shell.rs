@@ -562,6 +562,7 @@ fn format_delivery_message(
     exit_code: i32,
     output: &str,
     agent_followup_scheduled: bool,
+    show_shell_output_to_user: bool,
 ) -> String {
     let label = job.label.as_deref().unwrap_or(job.prompt.as_str());
     let (headline, hint) = if exit_code == 0 {
@@ -581,20 +582,35 @@ fn format_delivery_message(
             format!("FAILED (exit {exit_code})"),
             "The background command failed. I'm starting an agent run now to read this output, fix the issue, and retry the command.",
         )
-    } else {
+    } else if show_shell_output_to_user {
         (
             format!("FAILED (exit {exit_code})"),
             "The background command failed. Review the output below; reply if you want me to retry or debug.",
         )
+    } else {
+        (
+            format!("FAILED (exit {exit_code})"),
+            "The background command failed. Reply if you want me to investigate or retry.",
+        )
     };
-    format!(
-        "{hint}\n\nBackground job `{job_id}` — {headline}\nTask: {label}\n\n{output}",
-        hint = hint,
-        job_id = job.id,
-        headline = headline,
-        label = label,
-        output = output
-    )
+    if show_shell_output_to_user {
+        format!(
+            "{hint}\n\nBackground job `{job_id}` — {headline}\nTask: {label}\n\n{output}",
+            hint = hint,
+            job_id = job.id,
+            headline = headline,
+            label = label,
+            output = output
+        )
+    } else {
+        format!(
+            "{hint}\n\nBackground job `{job_id}` — {headline}\nTask: {label}",
+            hint = hint,
+            job_id = job.id,
+            headline = headline,
+            label = label,
+        )
+    }
 }
 
 async fn notify_shell_job_enqueue_failure(
@@ -730,7 +746,14 @@ pub async fn finalize_shell_job(
     } else {
         maybe_enqueue_shell_failure_agent_retry(state.clone(), &job, exit_code, &output).await
     };
-    let delivery_text = format_delivery_message(&job, exit_code, &output, agent_followup_scheduled);
+    let show_shell_output_to_user = state.runtime_toggles.tool_output_debug();
+    let delivery_text = format_delivery_message(
+        &job,
+        exit_code,
+        &output,
+        agent_followup_scheduled,
+        show_shell_output_to_user,
+    );
 
     if let Err(e) = deliver_agent_final_to_contact(
         state.db.clone(),
@@ -1185,5 +1208,48 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    fn sample_job() -> BackgroundJob {
+        BackgroundJob {
+            id: "job-1".into(),
+            chat_id: 1,
+            persona_id: 1,
+            prompt: "prompt".into(),
+            status: "running".into(),
+            trigger_reason: "manual".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            result_text: None,
+            error_text: None,
+            lease_owner: None,
+            lease_expires_at: None,
+            last_progress_at: None,
+            last_stage: None,
+            job_kind: "shell".into(),
+            shell_command: None,
+            workdir: None,
+            tmux_session: None,
+            output_path: None,
+            exit_code: None,
+            label: Some("my-task".into()),
+        }
+    }
+
+    #[test]
+    fn format_delivery_message_omits_output_when_debug_off() {
+        let job = sample_job();
+        let msg = format_delivery_message(&job, 0, "line1\nline2", true, false);
+        assert!(msg.contains("preparing a summary"));
+        assert!(msg.contains("my-task"));
+        assert!(!msg.contains("line1"));
+    }
+
+    #[test]
+    fn format_delivery_message_includes_output_when_debug_on() {
+        let job = sample_job();
+        let msg = format_delivery_message(&job, 0, "line1\nline2", true, true);
+        assert!(msg.contains("line1"));
     }
 }

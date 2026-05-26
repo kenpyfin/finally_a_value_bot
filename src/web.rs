@@ -3758,7 +3758,7 @@ async fn api_runtime_get(
         "ok": true,
         "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
         "source": if from_app { "app_settings" } else { "env" },
-        "description": "When enabled, PZ/ComfyUI scripts emit WebSocket timeout and history-polling lines.",
+        "description": "When enabled, verbose shell output is shown in chat (including background-job completion). When off, full logs are agent-only.",
     })))
 }
 
@@ -3784,9 +3784,9 @@ async fn api_runtime_patch(
         "tool_output_debug": enabled,
         "source": "app_settings",
         "message": if enabled {
-            "Verbose PZ/ComfyUI logging enabled for new shell commands."
+            "Verbose pipeline logging enabled: shell output visible in chat."
         } else {
-            "Verbose PZ/ComfyUI logging disabled for new shell commands."
+            "Verbose pipeline logging disabled: shell output agent-only in chat."
         },
     })))
 }

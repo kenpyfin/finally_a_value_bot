@@ -210,13 +210,13 @@ pub async fn run_bot(
 
     let mut config = config;
     config.merge_llm_model_from_app_settings(&db)?;
-    let tool_output_debug = crate::runtime_toggles::RuntimeToggles::merge_tool_output_debug_from_app_settings(
-        config.tool_output_debug,
-        &db,
-    )?;
+    let tool_output_debug =
+        crate::runtime_toggles::RuntimeToggles::merge_tool_output_debug_from_app_settings(
+            config.tool_output_debug,
+            &db,
+        )?;
     config.tool_output_debug = tool_output_debug;
-    let runtime_toggles =
-        crate::runtime_toggles::RuntimeToggles::new(tool_output_debug);
+    let runtime_toggles = crate::runtime_toggles::RuntimeToggles::new(tool_output_debug);
     let llm = crate::llm::LlmHandle::new(&config);
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
         Arc::new(std::sync::OnceLock::new());

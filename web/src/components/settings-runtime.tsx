@@ -62,11 +62,13 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
       <Flex align="center" justify="between" gap="3" wrap="wrap">
         <Flex direction="column" gap="1" style={{ flex: 1, minWidth: 200 }}>
           <Text size="2" weight="medium">
-            PZ / ComfyUI debug logging
+            Verbose pipeline logging
           </Text>
           <Text size="1" color="gray">
-            Show WebSocket timeout and history-polling lines from face-swap scripts. Applies to new
-            bash and background shell commands immediately ({source}).
+            When on: verbose shell logs appear in chat (including background-job completion
+            messages). When off: full logs are kept for the agent only; users see short completion
+            notices. Applies to new bash and background shell commands for the whole gateway
+            immediately ({source}).
           </Text>
         </Flex>
         <Switch

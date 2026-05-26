@@ -280,13 +280,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_warn_confirm_requires_prefix_for_risky_command() {
-        let tool =
-            BashTool::new_with_safety(
-                ".",
-                "warn_confirm".into(),
-                vec!["destructive".into()],
-                RuntimeToggles::new(false),
-            );
+        let tool = BashTool::new_with_safety(
+            ".",
+            "warn_confirm".into(),
+            vec!["destructive".into()],
+            RuntimeToggles::new(false),
+        );
         let result = tool.execute(json!({"command": "rm -rf /tmp/foo"})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Execution paused by safety policy"));
@@ -295,13 +294,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_warn_confirm_allows_risky_command_with_prefix() {
-        let tool =
-            BashTool::new_with_safety(
-                ".",
-                "warn_confirm".into(),
-                vec!["destructive".into()],
-                RuntimeToggles::new(false),
-            );
+        let tool = BashTool::new_with_safety(
+            ".",
+            "warn_confirm".into(),
+            vec!["destructive".into()],
+            RuntimeToggles::new(false),
+        );
         // Unix: real rm; Windows (PowerShell): keep `rm -rf` substring for destructive match but run a no-op.
         let cmd = if cfg!(windows) {
             "CONFIRM_EXECUTE Write-Output 'rm -rf noop'"
