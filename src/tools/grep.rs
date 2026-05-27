@@ -56,7 +56,16 @@ impl Tool for GrepTool {
         };
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let working_dir = super::resolve_tool_working_dir(&self.working_dir);
+        let workspace_root = working_dir.parent().unwrap_or(&working_dir);
         let resolved_path = super::resolve_tool_path(&working_dir, path);
+        if !is_path_within_workspace_root(&resolved_path, workspace_root) {
+            return ToolResult::error(format!(
+                "Path '{}' is outside the workspace root '{}'. \
+grep is limited to workspace files.",
+                resolved_path.display(),
+                workspace_root.display()
+            ));
+        }
         let resolved_path_str = resolved_path.to_string_lossy().to_string();
         if let Err(msg) = crate::tools::path_guard::check_path(&resolved_path_str) {
             return ToolResult::error(msg);
@@ -95,6 +104,13 @@ impl Tool for GrepTool {
 const MAX_GREP_OUTPUT_CHARS: usize = 32_000;
 const MAX_GREP_MATCH_LINES: usize = 500;
 const MAX_GREP_FILES_SCANNED: usize = 3_000;
+
+fn is_path_within_workspace_root(path: &Path, workspace_root: &Path) -> bool {
+    let resolved_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let resolved_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    resolved_path.starts_with(resolved_root)
+}
 
 fn truncate_grep_results(results: &mut Vec<String>) {
     if results.len() > MAX_GREP_MATCH_LINES {
@@ -240,39 +256,60 @@ mod tests {
 
     #[tokio::test]
     async fn test_grep_finds_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_grep_ws_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
         let dir = setup_grep_dir();
-        let tool = GrepTool::new(".");
+        std::fs::rename(&dir, shared.join("sample")).unwrap();
+        let tool = GrepTool::new(root.to_str().unwrap());
         let result = tool
-            .execute(json!({"pattern": "hello", "path": dir.to_str().unwrap()}))
+            .execute(json!({"pattern": "hello", "path": "sample"}))
             .await;
         assert!(!result.is_error);
         assert!(result.content.contains("hello"));
         // Should have file:line format
         assert!(result.content.contains(":"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn test_grep_no_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_grep_ws_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
         let dir = setup_grep_dir();
-        let tool = GrepTool::new(".");
+        std::fs::rename(&dir, shared.join("sample")).unwrap();
+        let tool = GrepTool::new(root.to_str().unwrap());
         let result = tool
-            .execute(json!({"pattern": "zzzzzzz", "path": dir.to_str().unwrap()}))
+            .execute(json!({"pattern": "zzzzzzz", "path": "sample"}))
             .await;
         assert!(!result.is_error);
         assert!(result.content.contains("No matches"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn test_grep_with_file_glob() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_grep_ws_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
         let dir = setup_grep_dir();
-        let tool = GrepTool::new(".");
+        std::fs::rename(&dir, shared.join("sample")).unwrap();
+        let tool = GrepTool::new(root.to_str().unwrap());
         // Only search .txt files
         let result = tool
             .execute(json!({
                 "pattern": "hello",
-                "path": dir.to_str().unwrap(),
+                "path": "sample",
                 "glob": "*.txt"
             }))
             .await;
@@ -280,7 +317,7 @@ mod tests {
         assert!(result.content.contains("world.txt"));
         // Should NOT match the .rs file
         assert!(!result.content.contains("hello.rs"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -356,5 +393,34 @@ mod tests {
         assert!(result.content.contains("a.txt"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_grep_rejects_path_outside_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_grep_outside_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let outside_dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_grep_external_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("a.txt"), "needle").unwrap();
+
+        let tool = GrepTool::new(root.to_str().unwrap());
+        let result = tool
+            .execute(json!({
+                "pattern":"needle",
+                "path": outside_dir.to_string_lossy().to_string()
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("outside the workspace root"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside_dir);
     }
 }

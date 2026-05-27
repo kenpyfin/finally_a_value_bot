@@ -16,6 +16,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-27 — Restrict grep tool to workspace root
+
+- **Area:** tools / security
+- **Summary:** Added a hard workspace-root boundary in the `grep` tool so absolute/external paths are rejected before traversal. The tool now resolves the candidate path and blocks searches outside the configured workspace data root (`workspace/`), preventing accidental whole-disk scans.
+- **Rationale:** Agents could pass absolute paths to `grep` and recursively scan outside project scope, causing slow runs and unnecessary exposure beyond intended workspace files.
+- **Key files / symbols:** `src/tools/grep.rs` (`GrepTool::execute`, `is_path_within_workspace_root`, workspace-boundary tests).
+- **Follow-ups:** If needed, apply the same workspace-root guard pattern to other read/search tools that currently accept absolute paths.
+
 ### 2026-05-26 — Faster web image uploads + drag-and-drop
 
 - **Area:** web / channels
