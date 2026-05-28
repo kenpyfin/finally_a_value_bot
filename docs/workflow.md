@@ -107,3 +107,17 @@ Workflows are **not** installed from the repo. A fresh DB has an empty `workflow
 
 - [`runtime-gap-analysis.md`](runtime-gap-analysis.md) — deferred items (e.g. strict replay, management tools).
 - [`development-journal.md`](development-journal.md) — 2026-04-01 entry (projects/workflows/timeline).
+
+## Hook runtime and persona policy
+
+Learned workflows and deterministic hooks are separate systems:
+
+- **Learned workflows** store intent-to-approach patterns after runs and may promote concise principles into tiered memory.
+- **Hooks** run at fixed lifecycle boundaries (`BeforeTurn`, `PreToolUse`, `PostToolUse`, `PostToolBatch`, `PreStop`, `PostDelivery`) and can add deterministic context or block operations.
+
+Per-persona policy applies to both:
+
+- `persona_hook_skill_policy.allowed_hook_ids_json`: `NULL` means default allow-all hooks; JSON array means explicit allowlist.
+- `persona_hook_skill_policy.allowed_skill_names_json`: `NULL` means default allow-all skills; JSON array means explicit allowlist.
+
+The policy is enforcement-time only and does not rewrite historical workflow rows.

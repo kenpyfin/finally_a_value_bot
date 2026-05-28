@@ -2664,6 +2664,42 @@ struct PersonaMessagePathParams {
 }
 
 #[derive(Deserialize)]
+struct PersonaPolicyPathParams {
+    persona_id: i64,
+}
+
+#[derive(Deserialize)]
+struct HookDefinitionUpsertBody {
+    id: Option<i64>,
+    name: String,
+    event_name: String,
+    matcher: Option<String>,
+    action_type: String,
+    action_payload_json: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct HookDefinitionDeletePathParams {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct SkillsQuery {
+    persona_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PersonaPolicyPatchBody {
+    /// `null` => default allow-all. `[]` => explicit allow-none.
+    #[serde(default)]
+    allowed_hook_ids: Option<Option<Vec<i64>>>,
+    /// `null` => default allow-all. `[]` => explicit allow-none.
+    #[serde(default)]
+    allowed_skill_names: Option<Option<Vec<String>>>,
+}
+
+#[derive(Deserialize)]
 struct PersonaBookmarkUpsertBody {
     message_id: String,
     note: Option<String>,
@@ -2687,6 +2723,256 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     } else {
         input.to_string()
     }
+}
+
+async fn api_skills_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<SkillsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let persona_skill_policy = if let Some(pid) = query.persona_id {
+        let exists = call_blocking(state.app_state.db.clone(), move |db| {
+            db.persona_exists(chat_id, pid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !exists {
+            return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+        }
+        Some(
+            call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_persona_hook_skill_policy(chat_id, pid)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let skill_manager = &state.app_state.skills;
+    let all_skills = skill_manager.discover_all_skills();
+    let mut remote_count = 0usize;
+    let rows: Vec<serde_json::Value> = all_skills
+        .into_iter()
+        .map(|s| {
+            let remote = skill_manager.skill_is_remote(&s);
+            if remote {
+                remote_count += 1;
+            }
+            let allowed_for_persona = persona_skill_policy.as_ref().map(|policy| {
+                let Some(row) = policy else {
+                    return true;
+                };
+                let Some(allowed) = row.allowed_skill_names.as_ref() else {
+                    return true;
+                };
+                allowed.iter().any(|a| a.eq_ignore_ascii_case(&s.name))
+            });
+            json!({
+                "name": s.name,
+                "description": s.description,
+                "when_to_use": s.when_to_use,
+                "platforms": s.platforms,
+                "deps": s.deps,
+                "source": s.source,
+                "version": s.version,
+                "updated_at": s.updated_at,
+                "remote": remote,
+                "allowed_for_persona": allowed_for_persona,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "skills": rows,
+        "total": rows.len(),
+        "remote_count": remote_count,
+    })))
+}
+
+async fn api_hooks_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let hooks = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_hook_definitions()
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let hooks_json: Vec<serde_json::Value> = hooks
+        .into_iter()
+        .map(|h| {
+            let payload = serde_json::from_str::<serde_json::Value>(&h.action_payload_json)
+                .unwrap_or_else(|_| json!({}));
+            json!({
+                "id": h.id,
+                "name": h.name,
+                "event_name": h.event_name,
+                "matcher": h.matcher,
+                "action_type": h.action_type,
+                "action_payload_json": h.action_payload_json,
+                "action_payload": payload,
+                "enabled": h.enabled,
+                "updated_at": h.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "ok": true, "hooks": hooks_json })))
+}
+
+async fn api_hooks_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<HookDefinitionUpsertBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let payload_json = body
+        .action_payload_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("{}")
+        .to_string();
+    let enabled = body.enabled.unwrap_or(true);
+    let id = call_blocking(state.app_state.db.clone(), move |db| {
+        db.upsert_hook_definition(
+            body.id,
+            &body.name,
+            &body.event_name,
+            body.matcher.as_deref(),
+            &body.action_type,
+            &payload_json,
+            enabled,
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn api_hooks_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<HookDefinitionDeletePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_hook_definition(path.id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "ok": true, "deleted": deleted })))
+}
+
+async fn api_persona_policy_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaPolicyPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let policy = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_persona_hook_skill_policy(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "persona_id": path.persona_id,
+        "allowed_hook_ids": policy.as_ref().and_then(|p| p.allowed_hook_ids.clone()),
+        "allowed_skill_names": policy.as_ref().and_then(|p| p.allowed_skill_names.clone()),
+        "uses_default_hooks": policy.as_ref().and_then(|p| p.allowed_hook_ids.as_ref()).is_none(),
+        "uses_default_skills": policy.as_ref().and_then(|p| p.allowed_skill_names.as_ref()).is_none(),
+        "updated_at": policy.as_ref().map(|p| p.updated_at.clone()),
+    })))
+}
+
+async fn api_persona_policy_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaPolicyPathParams>,
+    Json(body): Json<PersonaPolicyPatchBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let current = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_persona_hook_skill_policy(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut next_hooks = current.as_ref().and_then(|p| p.allowed_hook_ids.clone());
+    let mut next_skills = current.as_ref().and_then(|p| p.allowed_skill_names.clone());
+    if let Some(v) = body.allowed_hook_ids {
+        next_hooks = v;
+    }
+    if let Some(v) = body.allowed_skill_names {
+        next_skills = v;
+    }
+    if let Some(list) = next_hooks.as_mut() {
+        list.retain(|id| *id > 0);
+        list.sort_unstable();
+        list.dedup();
+    }
+    if let Some(list) = next_skills.as_mut() {
+        let mut norm = Vec::new();
+        for item in list.iter() {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() {
+                norm.push(trimmed.to_string());
+            }
+        }
+        norm.sort_by_key(|s| s.to_ascii_lowercase());
+        norm.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        *list = norm;
+    }
+
+    let next_hooks_for_db = next_hooks.clone();
+    let next_skills_for_db = next_skills.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_persona_hook_skill_policy(
+            chat_id,
+            pid,
+            next_hooks_for_db.as_deref(),
+            next_skills_for_db.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "persona_id": path.persona_id,
+        "allowed_hook_ids": next_hooks,
+        "allowed_skill_names": next_skills,
+    })))
 }
 
 async fn api_persona_bulletin_get(
@@ -4806,9 +5092,16 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/personas/switch", post(api_personas_switch))
         .route("/api/personas/create", post(api_personas_create))
         .route("/api/personas/delete", post(api_personas_delete))
+        .route("/api/skills", get(api_skills_get))
+        .route("/api/hooks", get(api_hooks_get).post(api_hooks_post))
+        .route("/api/hooks/:id", delete(api_hooks_delete))
         .route(
             "/api/personas/:persona_id/bulletin",
             get(api_persona_bulletin_get).patch(api_persona_bulletin_patch),
+        )
+        .route(
+            "/api/personas/:persona_id/policy",
+            get(api_persona_policy_get).patch(api_persona_policy_patch),
         )
         .route(
             "/api/personas/:persona_id/bookmarks",

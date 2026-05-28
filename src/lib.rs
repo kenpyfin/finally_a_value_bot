@@ -1,4 +1,5 @@
 pub mod agent_history;
+pub mod agent_path_discipline;
 pub mod background_jobs;
 pub mod background_shell;
 pub mod builtin_skills;
@@ -13,6 +14,7 @@ pub mod doctor;
 pub mod error;
 pub mod final_delivery_dedupe;
 pub mod gateway;
+pub mod hook_runtime;
 pub mod job_heartbeat;
 pub mod llm;
 pub mod llm_catalog;

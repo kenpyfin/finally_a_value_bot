@@ -63,6 +63,25 @@ export type RuntimeConfigResponse = {
   message?: string
 }
 
+export type HookDefinition = {
+  id: number
+  name: string
+  event_name: string
+  matcher?: string | null
+  action_type: string
+  action_payload_json: string
+  enabled: boolean
+  updated_at: string
+}
+
+export type PersonaHookSkillPolicy = {
+  allowed_hook_ids: number[] | null
+  allowed_skill_names: string[] | null
+  uses_default_hooks: boolean
+  uses_default_skills: boolean
+  updated_at?: string | null
+}
+
 export type LlmConfigResponse = {
   ok?: boolean
   provider?: { id: string; label: string }

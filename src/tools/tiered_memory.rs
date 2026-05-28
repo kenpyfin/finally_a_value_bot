@@ -2,11 +2,11 @@
 
 use async_trait::async_trait;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
-use crate::memory::{ActiveProjectMemory, MemoryManager, PersonaMemoryState};
+use crate::memory::{MemoryManager, PersonaMemoryState};
 
 use super::{
     auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult,
@@ -51,71 +51,89 @@ fn parse_tier_content(state: &PersonaMemoryState, tier: u8) -> String {
             );
             lines.join("\n").trim().to_string()
         }
-        2 => state
-            .tier2
-            .active_projects
-            .iter()
-            .map(|p| {
-                format!(
-                    "- ProjectState|id={}|status={}|updated={}|summary={}",
-                    p.id, p.status, p.updated_at, p.summary
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string(),
+        2 => {
+            let mut lines = Vec::new();
+            lines.extend(
+                state
+                    .tier2
+                    .user_terminology
+                    .iter()
+                    .map(|v| format!("- Terminology|{}", v.trim())),
+            );
+            lines.extend(
+                state
+                    .tier2
+                    .known_steps
+                    .iter()
+                    .map(|v| format!("- KnownStep|{}", v.trim())),
+            );
+            lines.extend(
+                state
+                    .tier2
+                    .preferences
+                    .iter()
+                    .map(|v| format!("- Preference|{}", v.trim())),
+            );
+            lines.join("\n").trim().to_string()
+        }
         3 => state.tier3.recent_focus.join("\n").trim().to_string(),
         _ => String::new(),
     }
 }
 
-fn normalize_tier2_task_states(content: &str) -> String {
-    let mut out = Vec::new();
-    let mut seen_exact = HashSet::new();
-    let mut last_next_goal: Option<String> = None;
-    let mut task_state_latest: HashMap<String, String> = HashMap::new();
-    let mut task_state_order: Vec<String> = Vec::new();
-
+fn parse_tier2_knowledge_lines(content: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut terminology = Vec::new();
+    let mut known_steps = Vec::new();
+    let mut preferences = Vec::new();
     for raw_line in content.lines() {
-        let line = raw_line.trim_end();
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let line = raw_line.trim();
+        if line.is_empty() {
             continue;
         }
-        if trimmed.to_ascii_lowercase().starts_with("- next goal:") {
-            last_next_goal = Some(trimmed.to_string());
+        if let Some(v) = line.strip_prefix("- Terminology|") {
+            terminology.push(v.trim().to_string());
             continue;
         }
-        // Canonical state line format:
-        // - TaskState|key=<task_key>|status=<queued|running|stalled|completed|cancelled>|updated=<iso>|evidence=<summary>
-        if let Some(rest) = trimmed.strip_prefix("- TaskState|key=") {
-            let key = rest.split('|').next().unwrap_or("").trim().to_string();
-            if !key.is_empty() {
-                if !task_state_latest.contains_key(&key) {
-                    task_state_order.push(key.clone());
-                }
-                task_state_latest.insert(key, trimmed.to_string());
-                continue;
-            }
+        if let Some(v) = line.strip_prefix("- KnownStep|") {
+            known_steps.push(v.trim().to_string());
+            continue;
         }
-        if seen_exact.insert(trimmed.to_string()) {
-            out.push(trimmed.to_string());
+        if let Some(v) = line.strip_prefix("- Preference|") {
+            preferences.push(v.trim().to_string());
+            continue;
         }
+        // Backward compatibility: legacy project/task lines become known_steps.
+        if let Some(v) = line.strip_prefix("- ProjectState|") {
+            known_steps.push(v.trim().to_string());
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("- TaskState|") {
+            known_steps.push(v.trim().to_string());
+            continue;
+        }
+        known_steps.push(line.to_string());
     }
+    (
+        dedupe_lines(&terminology, 40),
+        dedupe_lines(&known_steps, 40),
+        dedupe_lines(&preferences, 40),
+    )
+}
 
-    if !task_state_latest.is_empty() {
-        for key in task_state_order {
-            if let Some(line) = task_state_latest.get(&key) {
-                out.push(line.clone());
-            }
+fn dedupe_lines(lines: &[String], max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let key = t.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(t.to_string());
         }
     }
-    if let Some(goal) = last_next_goal {
-        out.push(goal);
-    }
-
-    out.join("\n")
+    out.into_iter().take(max).collect()
 }
 
 fn normalize_tier3_recent_focus(content: &str) -> Vec<String> {
@@ -132,35 +150,6 @@ fn normalize_tier3_recent_focus(content: &str) -> Vec<String> {
         }
     }
     out.into_iter().take(15).collect()
-}
-
-fn parse_project_state_line(line: &str) -> Option<ActiveProjectMemory> {
-    let rest = line.strip_prefix("- ProjectState|")?;
-    let mut id = String::new();
-    let mut status = String::new();
-    let mut updated_at = String::new();
-    let mut summary = String::new();
-    for part in rest.split('|') {
-        let mut kv = part.splitn(2, '=');
-        let key = kv.next()?.trim();
-        let value = kv.next().unwrap_or("").trim();
-        match key {
-            "id" => id = value.to_string(),
-            "status" => status = value.to_string(),
-            "updated" => updated_at = value.to_string(),
-            "summary" => summary = value.to_string(),
-            _ => {}
-        }
-    }
-    if summary.is_empty() {
-        return None;
-    }
-    Some(ActiveProjectMemory {
-        id,
-        status,
-        summary,
-        updated_at,
-    })
 }
 
 fn apply_tier_write(state: &mut PersonaMemoryState, tier: u8, content: &str) {
@@ -201,25 +190,10 @@ fn apply_tier_write(state: &mut PersonaMemoryState, tier: u8, content: &str) {
             state.tier1.workflow_principles = workflow_principles;
         }
         2 => {
-            let normalized = normalize_tier2_task_states(content);
-            let mut projects = Vec::new();
-            for raw_line in normalized.lines() {
-                let line = raw_line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(project) = parse_project_state_line(line) {
-                    projects.push(project);
-                } else {
-                    projects.push(ActiveProjectMemory {
-                        id: String::new(),
-                        status: "active".to_string(),
-                        summary: line.to_string(),
-                        updated_at: String::new(),
-                    });
-                }
-            }
-            state.tier2.active_projects = projects;
+            let (terminology, known_steps, preferences) = parse_tier2_knowledge_lines(content);
+            state.tier2.user_terminology = terminology;
+            state.tier2.known_steps = known_steps;
+            state.tier2.preferences = preferences;
         }
         3 => {
             state.tier3.recent_focus = normalize_tier3_recent_focus(content);
@@ -249,7 +223,7 @@ impl Tool for ReadTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_tiered_memory".into(),
-            description: "Read this persona's tiered memory from canonical memory_state.json (legacy MEMORY.md auto-migrates). Optional tier (1, 2, or 3) returns only that section.".into(),
+            description: "Read this persona's tiered memory from canonical memory_state.json (legacy MEMORY.md auto-migrates). Optional tier (1, 2, or 3) returns only that section. Tier 2 contains user terminology, known steps, and durable preferences.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -341,7 +315,7 @@ impl Tool for WriteTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_tiered_memory".into(),
-            description: "Write one tier of canonical memory_state.json. Tier 1 = long-term (only on explicit user ask); Tier 2 = active projects; Tier 3 = recent focus/mood. Replaces only that tier's section.".into(),
+            description: "Write one tier of canonical memory_state.json. Tier 1 = long-term (only on explicit user ask); Tier 2 = user terminology + known steps + preferences; Tier 3 = short-lived scratch focus. Replaces only that tier's section.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -438,15 +412,15 @@ mod tests {
         let mut state = PersonaMemoryState::default();
         state.identity.display_name = "Nova".into();
         state.tier1.stable_facts = vec!["- stable fact".into()];
-        state.tier2.active_projects = vec![ActiveProjectMemory {
-            id: "project-1".into(),
-            status: "active".into(),
-            summary: "Build memory model".into(),
-            updated_at: "2026-04-27T00:00:00Z".into(),
-        }];
+        state.tier2.user_terminology = vec!["PZ = persona zero".into()];
+        state.tier2.known_steps = vec!["Approve base image, then hotify".into()];
+        state.tier2.preferences = vec!["Prefer Bay Area weather context".into()];
         state.tier3.recent_focus = vec!["- recent".into()];
         assert!(parse_tier_content(&state, 1).contains("Identity|display_name=Nova"));
-        assert!(parse_tier_content(&state, 2).contains("Build memory model"));
+        let t2 = parse_tier_content(&state, 2);
+        assert!(t2.contains("Terminology|PZ = persona zero"));
+        assert!(t2.contains("KnownStep|Approve base image, then hotify"));
+        assert!(t2.contains("Preference|Prefer Bay Area weather context"));
         assert_eq!(parse_tier_content(&state, 3), "- recent");
     }
 
@@ -468,20 +442,21 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_tier2_task_states_dedupes_next_goal_and_taskstate() {
+    fn test_parse_tier2_knowledge_lines_supports_new_and_legacy_formats() {
         let input = r#"
-- Keep this.
-- Next Goal: old one
-- TaskState|key=swap:pz-20260330|status=running|updated=2026-04-01T01:00:00Z|evidence=queued
-- TaskState|key=swap:pz-20260330|status=stalled|updated=2026-04-01T02:00:00Z|evidence=timeout
-- Next Goal: latest one
-- Keep this.
+- Terminology|PZ = Persona Zero
+- KnownStep|Approve base image before hotify
+- Preference|Use V4 ref by default
+- ProjectState|id=legacy|status=active|updated=2026-04-01T02:00:00Z|summary=Old active project
+- freeform step note
 "#;
-        let out = normalize_tier2_task_states(input);
-        assert_eq!(out.matches("TaskState|key=swap:pz-20260330").count(), 1);
-        assert!(out.contains("status=stalled"));
-        assert_eq!(out.matches("Next Goal:").count(), 1);
-        assert!(out.contains("latest one"));
+        let (terminology, known_steps, preferences) = parse_tier2_knowledge_lines(input);
+        assert_eq!(terminology.len(), 1);
+        assert_eq!(preferences.len(), 1);
+        assert!(known_steps.iter().any(|s| s.contains("freeform step note")));
+        assert!(known_steps
+            .iter()
+            .any(|s| s.contains("ProjectState|id=legacy")));
     }
 
     #[test]
@@ -505,11 +480,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_project_state_line() {
-        let line = "- ProjectState|id=proj-a|status=running|updated=2026-04-27T00:00:00Z|summary=Ship migration";
-        let project = parse_project_state_line(line).unwrap();
-        assert_eq!(project.id, "proj-a");
-        assert_eq!(project.status, "running");
-        assert_eq!(project.summary, "Ship migration");
+    fn test_apply_tier_write_tier2_knowledge() {
+        let mut state = PersonaMemoryState::default();
+        let content = "\
+- Terminology|IG = Instagram
+- KnownStep|Collect user approval before publishing
+- Preference|Avoid strap-slip prompts
+- freeform fallback line";
+        apply_tier_write(&mut state, 2, content);
+        assert_eq!(state.tier2.user_terminology.len(), 1);
+        assert_eq!(state.tier2.preferences.len(), 1);
+        assert!(state
+            .tier2
+            .known_steps
+            .iter()
+            .any(|s| s.contains("freeform fallback line")));
     }
 }

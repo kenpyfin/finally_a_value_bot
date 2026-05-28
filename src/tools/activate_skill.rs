@@ -1,15 +1,18 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
+use crate::db::Database;
 use crate::skills::SkillManager;
 
-use super::{schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, schema_object, Tool, ToolResult};
 
 pub struct ActivateSkillTool {
     skill_manager: SkillManager,
+    db: Option<Arc<Database>>,
 }
 
 impl ActivateSkillTool {
@@ -17,6 +20,7 @@ impl ActivateSkillTool {
     pub fn new(skills_dir: &str) -> Self {
         ActivateSkillTool {
             skill_manager: SkillManager::from_skills_dir(skills_dir),
+            db: None,
         }
     }
 
@@ -25,6 +29,17 @@ impl ActivateSkillTool {
     pub fn new_with_dirs(dirs: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
         ActivateSkillTool {
             skill_manager: SkillManager::from_skills_dirs(dirs),
+            db: None,
+        }
+    }
+
+    pub fn new_with_dirs_and_db(
+        dirs: impl IntoIterator<Item = impl AsRef<Path>>,
+        db: Arc<Database>,
+    ) -> Self {
+        ActivateSkillTool {
+            skill_manager: SkillManager::from_skills_dirs(dirs),
+            db: Some(db),
         }
     }
 }
@@ -38,7 +53,7 @@ impl Tool for ActivateSkillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "activate_skill".into(),
-            description: "Activate an agent skill to load its full instructions. Use this when you see a relevant skill in the available skills list and need its detailed instructions to complete a task. Skills are filtered by platform/dependencies before they are listed.".into(),
+            description: "Activate an agent skill to load its full instructions. Use this when you see a relevant skill in the available skills list and need its detailed instructions to complete a task. The catalog excludes skills for other platforms only; declared deps are not required locally (API/remote skills).".into(),
             input_schema: schema_object(
                 json!({
                     "skill_name": {
@@ -58,6 +73,27 @@ impl Tool for ActivateSkillTool {
         };
 
         info!("Activating skill: {}", skill_name);
+
+        if let (Some(db), Some(auth)) = (&self.db, auth_context_from_input(&input)) {
+            match db.is_skill_allowed_for_persona(
+                auth.caller_chat_id,
+                auth.caller_persona_id,
+                skill_name,
+            ) {
+                Ok(false) => {
+                    return ToolResult::error(format!(
+                        "Skill '{skill_name}' is not allowed for persona {}.",
+                        auth.caller_persona_id
+                    ))
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    return ToolResult::error(format!(
+                        "Failed to evaluate skill policy for '{skill_name}': {e}"
+                    ))
+                }
+            }
+        }
 
         match self.skill_manager.load_skill_checked(skill_name) {
             Ok((meta, body)) => {

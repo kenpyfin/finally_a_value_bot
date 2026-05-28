@@ -340,6 +340,8 @@ sqlite> SELECT * FROM chats;
 | Increase context window    | Raise `max_history_messages` / `MAX_HISTORY_MESSAGES` (more DB rows eligible for the prompt; uses more tokens). Ensure it is ≥ user + assistant suffix minimums when turns alternate. |
 | More dialogue at the tail  | Set `recent_history_min_user_messages` / `recent_history_min_assistant_messages` (env `RECENT_HISTORY_MIN_USER_MESSAGES` / `RECENT_HISTORY_MIN_ASSISTANT_MESSAGES`, default 2) or per-persona overrides via web cockpit → `GET`/`PATCH /api/personas/:id/bulletin` (`history_suffix`). |
 | Operator steering note     | Per-persona `operator_memo` (web cockpit bulletin PATCH, injected in the system prompt). Distinct from the header Memory JSON editor (`memory_state`). |
+| Bulletin focus card        | `update_bulletin_focus` writes the cockpit focus card (`persona_bulletin_focus`). Bulletin is injected into `[persona_context]` on the next run; lifecycle focus-sync hooks persist routine updates after delivery. |
+| Tier 2 knowledge layer     | Tier 2 stores durable knowledge only (terminology, known steps, preferences). Active/recent execution focus belongs to Bulletin; Tier 3 remains scratch-only and should not duplicate bulletin status lines. |
 | Increase tool iterations   | Set `max_tool_iterations: 200` in `finally-a-value-bot.config.yaml`                                                                         |
 | Reset memory               | Delete files under `finally-a-value-bot.data/runtime/groups/`                                                                               |
 | Reset all data             | Delete the `finally-a-value-bot.data/` directory                                                                                            |

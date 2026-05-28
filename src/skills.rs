@@ -99,9 +99,33 @@ impl SkillManager {
         }
     }
 
-    /// Discover all skills that are available on the current platform and satisfy dependency checks.
+    /// Discover skills for the agent catalog: valid frontmatter and supported on this platform.
+    /// Does not require local `deps` binaries (API/remote skills may list optional tools in frontmatter).
     pub fn discover_skills(&self) -> Vec<SkillMetadata> {
         self.discover_skills_internal(false)
+    }
+
+    /// Discover every skill with valid `SKILL.md` frontmatter (including other platforms).
+    pub fn discover_all_skills(&self) -> Vec<SkillMetadata> {
+        self.discover_skills_internal(true)
+    }
+
+    /// API or cross-platform skill (declared deps and/or not targeted at this OS).
+    pub fn skill_is_remote(&self, skill: &SkillMetadata) -> bool {
+        !skill.deps.is_empty() || !platform_allowed(&skill.platforms)
+    }
+
+    /// Discover available skills filtered by an optional allowlist.
+    /// `None` => allow all. `Some(set)` => only skills in the set (case-insensitive).
+    pub fn discover_skills_for_allowed(
+        &self,
+        allowed_skill_names: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<SkillMetadata> {
+        let mut skills = self.discover_skills();
+        if let Some(allowed) = allowed_skill_names {
+            skills.retain(|s| allowed.iter().any(|a| a.eq_ignore_ascii_case(&s.name)));
+        }
+        skills
     }
 
     fn discover_skills_internal(&self, include_unavailable: bool) -> Vec<SkillMetadata> {
@@ -196,22 +220,12 @@ impl SkillManager {
     fn skill_is_available(&self, skill: &SkillMetadata) -> Result<(), String> {
         if !platform_allowed(&skill.platforms) {
             return Err(format!(
-                "Skill '{}' is not available on this platform (current: {}, supported: {}).",
+                "Skill '{}' is a remote skill for this platform (current: {}, supported: {}).",
                 skill.name,
                 current_platform(),
                 skill.platforms.join(", ")
             ));
         }
-
-        let missing = missing_deps(&skill.deps);
-        if !missing.is_empty() {
-            return Err(format!(
-                "Skill '{}' is missing required dependencies: {}",
-                skill.name,
-                missing.join(", ")
-            ));
-        }
-
         Ok(())
     }
 
@@ -222,12 +236,31 @@ impl SkillManager {
         self.build_skills_catalog_with_mode(SkillsCatalogMode::from_env())
     }
 
+    /// Same as [`Self::build_skills_catalog`] but filtered by an optional allowlist.
+    pub fn build_skills_catalog_for_allowed(
+        &self,
+        allowed_skill_names: Option<&std::collections::HashSet<String>>,
+    ) -> String {
+        self.build_skills_catalog_with_mode_for_allowed(
+            SkillsCatalogMode::from_env(),
+            allowed_skill_names,
+        )
+    }
+
     /// Same as [`Self::build_skills_catalog`] with an explicit mode (tests; overrides env).
     pub fn build_skills_catalog_with_mode(&self, mode: SkillsCatalogMode) -> String {
+        self.build_skills_catalog_with_mode_for_allowed(mode, None)
+    }
+
+    fn build_skills_catalog_with_mode_for_allowed(
+        &self,
+        mode: SkillsCatalogMode,
+        allowed_skill_names: Option<&std::collections::HashSet<String>>,
+    ) -> String {
         const WHEN_TO_USE_MAX_CHARS: usize = 800;
         const COMPACT_DESCRIPTION_MAX_CHARS: usize = 280;
 
-        let skills = self.discover_skills();
+        let skills = self.discover_skills_for_allowed(allowed_skill_names);
         if skills.is_empty() {
             return String::new();
         }
@@ -299,7 +332,7 @@ impl SkillManager {
     }
 
     /// Build a user-facing formatted list of available skills.
-    /// Shows the skills directory path(s) and, if any skills in the folder are unavailable (platform/deps), lists them too.
+    /// Shows the skills directory path(s) and, if any skills are remote (other platform / API), lists them too.
     pub fn list_skills_formatted(&self) -> String {
         let skills_dir_display = self
             .skills_dirs
@@ -336,15 +369,20 @@ impl SkillManager {
             .collect();
         if !unavailable.is_empty() {
             output.push_str(&format!(
-                "\nPresent in folder but not available on this platform/runtime ({}):\n",
+                "\nRemote skills (API or other platform) ({}):\n",
                 unavailable.len()
             ));
             for skill in &unavailable {
-                let reason = self
-                    .skill_is_available(skill)
-                    .err()
-                    .unwrap_or_else(|| "unknown".into());
-                output.push_str(&format!("  • {} — {}\n", skill.name, reason));
+                let note = if !platform_allowed(&skill.platforms) {
+                    self.skill_is_available(skill)
+                        .err()
+                        .unwrap_or_else(|| "other platform".into())
+                } else if !skill.deps.is_empty() {
+                    format!("API skill (declared deps: {})", skill.deps.join(", "))
+                } else {
+                    "remote skill".to_string()
+                };
+                output.push_str(&format!("  • {} — {}\n", skill.name, note));
             }
         }
 
@@ -389,56 +427,6 @@ fn platform_allowed(platforms: &[String]) -> bool {
         let p = normalize_platform(p);
         p == "all" || p == "*" || p == current
     })
-}
-
-fn command_exists(command: &str) -> bool {
-    if command.trim().is_empty() {
-        return true;
-    }
-
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    let paths = std::env::split_paths(&path_var);
-
-    #[cfg(target_os = "windows")]
-    let candidates: Vec<String> = {
-        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-        let ext_list: Vec<String> = exts
-            .split(';')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let lower = command.to_ascii_lowercase();
-        if ext_list.iter().any(|ext| lower.ends_with(ext)) {
-            vec![command.to_string()]
-        } else {
-            let mut c = vec![command.to_string()];
-            for ext in ext_list {
-                c.push(format!("{command}{ext}"));
-            }
-            c
-        }
-    };
-
-    #[cfg(not(target_os = "windows"))]
-    let candidates: Vec<String> = vec![command.to_string()];
-
-    for base in paths {
-        for candidate in &candidates {
-            let full = base.join(candidate);
-            if full.is_file() {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn missing_deps(deps: &[String]) -> Vec<String> {
-    deps.iter()
-        .filter(|dep| !command_exists(dep))
-        .cloned()
-        .collect()
 }
 
 /// Parse a SKILL.md file, extracting frontmatter via YAML and body.

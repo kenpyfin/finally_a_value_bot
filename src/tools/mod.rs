@@ -507,8 +507,9 @@ impl ToolRegistry {
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
             Box::new(cursor_agent::CursorAgentSendTool::new(config)),
             Box::new(cursor_agent::BuildSkillTool::new(config, db.clone())),
-            Box::new(activate_skill::ActivateSkillTool::new_with_dirs(
+            Box::new(activate_skill::ActivateSkillTool::new_with_dirs_and_db(
                 config.skill_discovery_dirs(),
+                db.clone(),
             )),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(tiered_memory::ReadTieredMemoryTool::new(

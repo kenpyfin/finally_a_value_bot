@@ -126,6 +126,29 @@ pub struct AppSetting {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct HookDefinitionRecord {
+    pub id: i64,
+    pub name: String,
+    pub event_name: String,
+    pub matcher: Option<String>,
+    pub action_type: String,
+    pub action_payload_json: String,
+    pub enabled: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonaHookSkillPolicy {
+    pub chat_id: i64,
+    pub persona_id: i64,
+    /// `None` means default allow-all. `Some(vec![])` means explicit allow-none.
+    pub allowed_hook_ids: Option<Vec<i64>>,
+    /// `None` means default allow-all. `Some(vec![])` means explicit allow-none.
+    pub allowed_skill_names: Option<Vec<String>>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelPersonaMode {
     All,
@@ -565,6 +588,30 @@ impl Database {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS hook_definitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                event_name TEXT NOT NULL,
+                matcher TEXT,
+                action_type TEXT NOT NULL,
+                action_payload_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hook_definitions_event_enabled
+                ON hook_definitions(event_name, enabled, id);
+
+            CREATE TABLE IF NOT EXISTS persona_hook_skill_policy (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                allowed_hook_ids_json TEXT,
+                allowed_skill_names_json TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_hook_skill_policy_chat
+                ON persona_hook_skill_policy(chat_id);
+
             CREATE TABLE IF NOT EXISTS channel_persona_policy (
                 canonical_chat_id INTEGER NOT NULL,
                 channel_type TEXT NOT NULL,
@@ -589,6 +636,7 @@ impl Database {
         Self::migrate_background_jobs_lease_schema(&conn)?;
         Self::migrate_background_jobs_shell_schema(&conn)?;
         Self::migrate_personas_prompt_context(&conn)?;
+        Self::migrate_hook_policy_schema(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -1029,6 +1077,34 @@ impl Database {
         if !Self::column_exists(conn, "personas", "operator_memo")? {
             conn.execute("ALTER TABLE personas ADD COLUMN operator_memo TEXT", [])?;
         }
+        Ok(())
+    }
+
+    fn migrate_hook_policy_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hook_definitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                event_name TEXT NOT NULL,
+                matcher TEXT,
+                action_type TEXT NOT NULL,
+                action_payload_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hook_definitions_event_enabled
+                ON hook_definitions(event_name, enabled, id);
+            CREATE TABLE IF NOT EXISTS persona_hook_skill_policy (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                allowed_hook_ids_json TEXT,
+                allowed_skill_names_json TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_hook_skill_policy_chat
+                ON persona_hook_skill_policy(chat_id);",
+        )?;
         Ok(())
     }
 
@@ -1784,6 +1860,270 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
         Ok(rows > 0)
+    }
+
+    fn parse_i64_array_json(
+        raw: Option<String>,
+    ) -> Result<Option<Vec<i64>>, FinallyAValueBotError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+            FinallyAValueBotError::ToolExecution(format!("Invalid allowed_hook_ids_json: {e}"))
+        })?;
+        let arr = parsed.as_array().ok_or_else(|| {
+            FinallyAValueBotError::ToolExecution(
+                "Invalid allowed_hook_ids_json: expected JSON array".to_string(),
+            )
+        })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let Some(id) = v.as_i64() else {
+                return Err(FinallyAValueBotError::ToolExecution(
+                    "Invalid allowed_hook_ids_json: array must contain integers".to_string(),
+                ));
+            };
+            out.push(id);
+        }
+        Ok(Some(out))
+    }
+
+    fn parse_string_array_json(
+        raw: Option<String>,
+    ) -> Result<Option<Vec<String>>, FinallyAValueBotError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+            FinallyAValueBotError::ToolExecution(format!("Invalid allowed_skill_names_json: {e}"))
+        })?;
+        let arr = parsed.as_array().ok_or_else(|| {
+            FinallyAValueBotError::ToolExecution(
+                "Invalid allowed_skill_names_json: expected JSON array".to_string(),
+            )
+        })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let Some(name) = v.as_str() else {
+                return Err(FinallyAValueBotError::ToolExecution(
+                    "Invalid allowed_skill_names_json: array must contain strings".to_string(),
+                ));
+            };
+            out.push(name.trim().to_string());
+        }
+        Ok(Some(out))
+    }
+
+    pub fn list_hook_definitions(
+        &self,
+    ) -> Result<Vec<HookDefinitionRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, event_name, matcher, action_type, action_payload_json, enabled, updated_at
+             FROM hook_definitions
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(HookDefinitionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                event_name: row.get(2)?,
+                matcher: row.get(3)?,
+                action_type: row.get(4)?,
+                action_payload_json: row.get(5)?,
+                enabled: row.get::<_, i64>(6)? != 0,
+                updated_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn upsert_hook_definition(
+        &self,
+        id: Option<i64>,
+        name: &str,
+        event_name: &str,
+        matcher: Option<&str>,
+        action_type: &str,
+        action_payload_json: &str,
+        enabled: bool,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let name = name.trim();
+        let event_name = event_name.trim();
+        let action_type = action_type.trim();
+        if name.is_empty() || event_name.is_empty() || action_type.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "name, event_name, and action_type are required".to_string(),
+            ));
+        }
+        // Validate payload JSON eagerly.
+        let _: serde_json::Value = serde_json::from_str(action_payload_json).map_err(|e| {
+            FinallyAValueBotError::ToolExecution(format!("Invalid action_payload_json: {e}"))
+        })?;
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let enabled_i = if enabled { 1 } else { 0 };
+        let matcher_norm = matcher.map(|m| m.trim()).filter(|m| !m.is_empty());
+        if let Some(id) = id {
+            let rows = conn.execute(
+                "UPDATE hook_definitions
+                 SET name = ?1,
+                     event_name = ?2,
+                     matcher = ?3,
+                     action_type = ?4,
+                     action_payload_json = ?5,
+                     enabled = ?6,
+                     updated_at = ?7
+                 WHERE id = ?8",
+                params![
+                    name,
+                    event_name,
+                    matcher_norm,
+                    action_type,
+                    action_payload_json,
+                    enabled_i,
+                    now,
+                    id
+                ],
+            )?;
+            if rows == 0 {
+                return Err(FinallyAValueBotError::ToolExecution(format!(
+                    "Hook definition {id} not found"
+                )));
+            }
+            Ok(id)
+        } else {
+            conn.execute(
+                "INSERT INTO hook_definitions
+                 (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    name,
+                    event_name,
+                    matcher_norm,
+                    action_type,
+                    action_payload_json,
+                    enabled_i,
+                    now
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+
+    pub fn delete_hook_definition(&self, id: i64) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute("DELETE FROM hook_definitions WHERE id = ?1", params![id])?;
+        Ok(rows > 0)
+    }
+
+    pub fn get_persona_hook_skill_policy(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Option<PersonaHookSkillPolicy>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chat_id, persona_id, allowed_hook_ids_json, allowed_skill_names_json, updated_at
+             FROM persona_hook_skill_policy
+             WHERE chat_id = ?1 AND persona_id = ?2",
+        )?;
+        let row = stmt.query_row(params![chat_id, persona_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        });
+        let (chat_id, persona_id, hooks_raw, skills_raw, updated_at) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let allowed_hook_ids = Self::parse_i64_array_json(hooks_raw)?;
+        let allowed_skill_names = Self::parse_string_array_json(skills_raw)?;
+        Ok(Some(PersonaHookSkillPolicy {
+            chat_id,
+            persona_id,
+            allowed_hook_ids,
+            allowed_skill_names,
+            updated_at,
+        }))
+    }
+
+    pub fn set_persona_hook_skill_policy(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        allowed_hook_ids: Option<&[i64]>,
+        allowed_skill_names: Option<&[String]>,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !self.persona_exists(chat_id, persona_id)? {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "persona_id {persona_id} does not exist for chat {chat_id}"
+            )));
+        }
+        let hooks_json = allowed_hook_ids
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "Failed to serialize allowed_hook_ids: {e}"
+                ))
+            })?;
+        let skills_json = allowed_skill_names
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "Failed to serialize allowed_skill_names: {e}"
+                ))
+            })?;
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_hook_skill_policy
+             (chat_id, persona_id, allowed_hook_ids_json, allowed_skill_names_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, persona_id) DO UPDATE SET
+               allowed_hook_ids_json = excluded.allowed_hook_ids_json,
+               allowed_skill_names_json = excluded.allowed_skill_names_json,
+               updated_at = excluded.updated_at",
+            params![chat_id, persona_id, hooks_json, skills_json, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_skill_allowed_for_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        skill_name: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let Some(policy) = self.get_persona_hook_skill_policy(chat_id, persona_id)? else {
+            return Ok(true);
+        };
+        let Some(allowed) = policy.allowed_skill_names else {
+            return Ok(true);
+        };
+        Ok(allowed.iter().any(|s| s.eq_ignore_ascii_case(skill_name)))
+    }
+
+    pub fn is_hook_allowed_for_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        hook_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let Some(policy) = self.get_persona_hook_skill_policy(chat_id, persona_id)? else {
+            return Ok(true);
+        };
+        let Some(allowed) = policy.allowed_hook_ids else {
+            return Ok(true);
+        };
+        Ok(allowed.contains(&hook_id))
     }
 
     pub fn list_channel_persona_policies(

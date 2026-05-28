@@ -794,7 +794,7 @@ Requirements:
 Description for this skill: {}
 Instructions (markdown body): {}
 
-Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{} so they are available to all personas. Follow the existing skill format (see other skills in the same directory for examples)."#,
+Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{} so they are available to all personas. Follow the existing skill format (see other skills in the same directory for examples).{}"#,
             skills_dir_display,
             skills_dir_display,
             name,
@@ -804,6 +804,10 @@ Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{
             instructions,
             skills_dir_display,
             name,
+            crate::agent_path_discipline::build_skill_path_discipline_footer(
+                &skills_dir_display,
+                name,
+            ),
         );
         let cursor_tool = CursorAgentTool::new(&self.config, self.db.clone());
         let mut cursor_input = serde_json::json!({ "prompt": prompt });

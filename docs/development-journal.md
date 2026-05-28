@@ -16,6 +16,61 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-28 — Tier 2 knowledge schema + bulletin-only active focus
+
+- **Area:** memory / tools / agent prompt / docs
+- **Summary:** Refactored Tier 2 from `active_projects` to a durable knowledge layer (`user_terminology`, `known_steps`, `preferences`) and aligned runtime prompts so bulletin remains the canonical active/recent focus source. Added legacy `active_projects` migration with event logging and updated tiered-memory read/write grammar.
+- **Rationale:** Active execution status in Tier 2 duplicated bulletin and caused drift. Splitting responsibilities hardens memory semantics: bulletin for active focus, Tier 2 for durable reusable knowledge.
+- **Key files / symbols:** `src/memory.rs` (`Tier2Memory`, `Tier2LegacyMigrationStats`, `PersonaMemoryState::normalize`, `read_persona_memory_state`, `render_persona_context_memory_with_options`, `render_memory_markdown`), `src/tools/tiered_memory.rs` (`parse_tier_content`, `parse_tier2_knowledge_lines`, `apply_tier_write`), `src/channels/telegram.rs` (`build_system_prompt`, `run_persona_focus_sync_after_delivery`, `apply_deterministic_persona_memory_hygiene`), `docs/memory-framework.md`, `DEVELOP.md`, `workspace/AGENTS.md`.
+- **Follow-ups:** Consider stricter validation for malformed Tier 2 lines and a dedicated migration report endpoint for large persona fleets.
+
+### 2026-05-28 — Hooks/skills settings: checkbox allowlists (no typing)
+
+- **Area:** web / settings
+- **Summary:** Replaced comma-separated text fields for persona hook/skill policy with restriction toggles, checkboxes on hook rows and the skills catalog, select-all/clear, and skill search filter. Hook creation uses payload presets via dropdown (JSON still editable).
+- **Rationale:** Operators had to remember numeric hook IDs and exact skill slugs; error-prone and unnecessary when the catalog is already loaded from the API.
+- **Key files / symbols:** `web/src/components/settings-hooks-skills.tsx` (`restrictHooks`, `restrictSkills`, `selectedHookIds`, `selectedSkillNames`, `HOOK_PAYLOAD_PRESETS`); `web/dist/` (rebuilt).
+- **Follow-ups:** None.
+
+### 2026-05-28 — Bulletin-first persona context + lifecycle focus sync
+
+- **Area:** agent / memory / bulletin / skills
+- **Summary:** Persona context now reads bulletin focus into `[persona_context]`, filters Tier 2 prompt rendering to in-flight projects, and can suppress Tier 3 when bulletin exists. Replaced post-response memory maintenance with a post-delivery lifecycle focus-sync hook (hybrid: deterministic hygiene always, bounded LLM sync only on non-trivial turns) and added deterministic PostToolUse cleanup for terminal PZ post IDs.
+- **Rationale:** Persona 24 showed triple redundancy (Tier 2 + Tier 3 + bulletin), stale terminal items marked `active`, and write-only bulletin continuity gaps. The new flow makes bulletin the canonical episodic focus while reducing token bloat and persistence drift.
+- **Key files / symbols:** `src/channels/telegram.rs` (`format_bulletin_focus_section`, `build_persona_context_message`, `build_system_prompt`, `run_persona_focus_sync_after_delivery`, `apply_deterministic_persona_memory_hygiene`, `extract_terminal_pz_post_ids`); `src/memory.rs` (`render_persona_context_memory_with_options`, terminal project filtering); `workspace/AGENTS.md`; `workspace/skills/pz-publisher/SKILL.md`; `workspace/skills/pz-inventory-manager/SKILL.md`; `docs/memory-framework.md`; `DEVELOP.md`; `workspace/runtime/groups/997894126/24/memory_state.json`.
+- **Follow-ups:** Consider a strict status vocabulary validator in `write_tiered_memory` and optional `PostToolUse` hook criteria tuning beyond PZ-style post IDs.
+
+### 2026-05-28 — Frontend design Cursor rule (from agent-skills)
+
+- **Area:** web / cursor rules
+- **Summary:** Added `.cursor/rules/frontend-design.mdc` — file-scoped guidance for `web/**/*.{tsx,css,html}` adapted from [frontend-design-principles](https://github.com/joshuadavidthomas/agent-skills/blob/main/frontend-design-principles/SKILL.md). Covers intent/domain/signature checks, craft principles, app vs marketing routing, anti-patterns, and alignment with existing `--mc-*` tokens.
+- **Rationale:** Reduce generic AI dashboard defaults when building or reviewing the operator cockpit UI.
+- **Key files / symbols:** `.cursor/rules/frontend-design.mdc`; `web/src/styles.css` (`--mc-*`).
+
+### 2026-05-28 — Settings skills catalog lists all discovered skills
+
+- **Area:** web / skills API
+- **Summary:** `GET /api/skills` returns every skill with valid `SKILL.md` plus `remote` (API/cross-platform) and `allowed_for_persona`. Removed local `deps` binary checks from discovery/activation; settings label is **remote skill**, not unavailable on host.
+- **Rationale:** Many skills are API-backed; missing local CLIs should not hide or block them. Operators need the full catalog for allowlists.
+- **Key files / symbols:** `src/skills.rs` (`discover_all_skills`, `skill_availability`); `src/web.rs` (`api_skills_get`); `web/src/components/settings-hooks-skills.tsx`.
+- **Follow-ups:** Shadow-tree skills still require migration to `workspace/skills/` to appear.
+
+### 2026-05-28 — Strict path discipline in agent system prompts
+
+- **Area:** agent / prompts / skills
+- **Summary:** Added a dedicated **Path discipline (strict)** section to `build_system_prompt` (allowed/forbidden path table, shadow-workspace warning, skills checklist). Shared text lives in `src/agent_path_discipline.rs` and is also appended to `build_skill` cursor-agent prompts. Updated `workspace/AGENTS.md` and `builtin_skills/create-skill/SKILL.md`.
+- **Rationale:** Personas were still writing skills under `shared/workspace/skills/` via `workspace/skills/...` prefixes in bash and file tools; file-tool guards alone do not cover bash or detached cursor-agent runs.
+- **Key files / symbols:** `src/agent_path_discipline.rs` (`strict_path_discipline_section`, `build_skill_path_discipline_footer`); `src/channels/telegram.rs` (`build_system_prompt`); `src/tools/cursor_agent.rs` (`BuildSkillTool`); `workspace/AGENTS.md`; `builtin_skills/create-skill/SKILL.md`.
+- **Follow-ups:** Optional code enforcement: bash shadow-path rejection; cursor-agent cwd at workspace root.
+
+### 2026-05-28 — Remove learned-workflow memory influence from agent runs
+
+- **Area:** agent loop / memory
+- **Summary:** Removed post-run learned-workflow persistence/promotion from the shared agent path and stopped rendering `tier1.workflow_principles` into the active memory prompt block.
+- **Rationale:** Learned workflow hints were adding stale/overfit execution guidance that could steer the bot away from current user intent.
+- **Key files / symbols:** `src/channels/telegram.rs` (`save_run_history!`), `src/memory.rs` (`append_tier1_sections`).
+- **Follow-ups:** Existing `tier1.workflow_principles` and SQL `workflows` rows remain on disk for audit/backward compatibility but no longer affect run-time prompting.
+
 ### 2026-05-27 — Restrict grep tool to workspace root
 
 - **Area:** tools / security
@@ -23,6 +78,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Rationale:** Agents could pass absolute paths to `grep` and recursively scan outside project scope, causing slow runs and unnecessary exposure beyond intended workspace files.
 - **Key files / symbols:** `src/tools/grep.rs` (`GrepTool::execute`, `is_path_within_workspace_root`, workspace-boundary tests).
 - **Follow-ups:** If needed, apply the same workspace-root guard pattern to other read/search tools that currently accept absolute paths.
+
+### 2026-05-27 — Deterministic hook runtime + persona hook/skill policy in Web UI
+
+- **Area:** agent loop / hooks / db / web / skills
+- **Summary:** Added a deterministic hook runtime across turn/tool/stop/delivery boundaries with DB-backed hook definitions, plus Web API/UI to manage hooks and per-persona hook/skill allowlists. Default policy remains allow-all for backward compatibility.
+- **Rationale:** Operators need non-LLM automation controls and persona-scoped capability governance without consuming agent turn context, while preventing bulletin updates from being mistaken as user delivery.
+- **Key files / symbols:** `src/hook_runtime.rs` (`HookEventName`, `run_hooks_for_event`); `src/channels/telegram.rs` (hook dispatch at `BeforeTurn`/`PreToolUse`/`PostToolUse`/`PostToolBatch`/`PreStop`/`PostDelivery`, delivery recovery helpers); `src/db.rs` (`hook_definitions`, `persona_hook_skill_policy`, policy/query helpers); `src/tools/activate_skill.rs` (persona policy enforcement); `src/tools/mod.rs` (activate-skill tool wiring with DB); `src/web.rs` (`/api/hooks`, `/api/skills`, `/api/personas/:id/policy`); `web/src/components/settings-hooks-skills.tsx`; `web/src/main.tsx`; `web/src/types.ts`; `docs/hooks-architecture.md`; `docs/persona-hook-skill-policy.md`; `docs/workflow.md`.
+- **Follow-ups:** Re-run `cargo fmt --all --check` and `cargo clippy -- -D warnings` after shell environment recovery; add richer hook action types/UI validation as needed.
 
 ### 2026-05-26 — Faster web image uploads + drag-and-drop
 

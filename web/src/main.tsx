@@ -25,6 +25,7 @@ import './styles.css'
 import { api, AUTH_REQUIRED_EVENT, makeHeaders, sanitizeHttpHeaderValue, WEB_AUTH_STORAGE_KEY } from './api/client'
 import { CockpitBar } from './components/cockpit-bar'
 import { SettingsLlmPanel } from './components/settings-llm'
+import { SettingsHooksSkillsPanel } from './components/settings-hooks-skills'
 import { SettingsRuntimePanel } from './components/settings-runtime'
 import { InitialRunPromptView } from './components/initial-run-prompt-view'
 import { SessionSidebar } from './components/session-sidebar'
@@ -1924,6 +1925,7 @@ function App() {
                         <Tabs.List size="1" className="mb-3 flex-wrap">
                           <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
                           <Tabs.Trigger value="llm">LLM</Tabs.Trigger>
+                          <Tabs.Trigger value="hooks-skills">Hooks & Skills</Tabs.Trigger>
                           <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
                           <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
                         </Tabs.List>
@@ -1980,6 +1982,13 @@ function App() {
                           <SettingsLlmPanel
                             api={api}
                             onError={setSettingsError}
+                          />
+                        </Tabs.Content>
+                        <Tabs.Content value="hooks-skills">
+                          <SettingsHooksSkillsPanel
+                            api={api}
+                            onError={setSettingsError}
+                            activePersonaId={activePersonaId}
                           />
                         </Tabs.Content>
                         <Tabs.Content value="integrations">

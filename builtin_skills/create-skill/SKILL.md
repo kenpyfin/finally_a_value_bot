@@ -27,7 +27,16 @@ skills/
     helper_script.py  # Optional — any supporting files
 ```
 
-The only required file is `SKILL.md`. The skill manager discovers skills by scanning for `SKILL.md` (or `skill.md`) in subdirectories.
+The only required file is `SKILL.md`. The skill manager discovers skills by scanning for `SKILL.md` (or `skill.md`) in subdirectories under `WORKSPACE_DIR/skills/` (not under `shared/workspace/skills/`).
+
+## Path discipline (strict)
+
+When creating or editing skills:
+
+- Prefer **`build_skill`** — it writes to the absolute skills directory on disk.
+- If using `write_file`, path must be **`skills/<name>/SKILL.md`** (tool-relative from `shared/` cwd), never `workspace/skills/...`.
+- In SKILL.md body examples, invoke scripts as `python3 skills/<name>/script.py`, not `workspace/skills/...`.
+- Never use bash `mkdir workspace/skills/...` from tool cwd; that creates an undiscoverable shadow tree.
 
 ## SKILL.md format
 
@@ -102,13 +111,15 @@ Use the `build_skill` tool, which handles creating the directory and writing `SK
 build_skill(name="my-skill", description="...", instructions="...")
 ```
 
-Or create the files directly with `write_file`:
+Or create the files directly with `write_file` (tool-relative path only):
 
 ```
 write_file(path="skills/my-skill/SKILL.md", content="---\nname: my-skill\n...")
 ```
 
-After creating the skill, it becomes available immediately for activation via `activate_skill`.
+Do **not** use `workspace/skills/my-skill/SKILL.md` — that path lands under `shared/workspace/` and will not appear in `/skills` or `activate_skill`.
+
+After creating the skill at the canonical `skills/<name>/` location, it becomes available immediately for activation via `activate_skill`.
 
 ## Example: minimal skill
 

@@ -55,21 +55,26 @@ Legacy `MEMORY.md` is read for migration compatibility and converted into canoni
   - Promotion source: patterns in `workflow_memory.intents` with enough support.
   - Behavior: trimmed, empties removed, deduped case-insensitively.
 
-#### `tier2` (mid-term project memory)
+#### `tier2` (mid-term knowledge memory)
 
-- `active_projects` (`object[]`)
-  - Meaning: list of currently in-flight efforts.
-  - Each item fields:
-    - `id` (`string`): stable project key; auto-generated from `summary` if missing.
-    - `status` (`string`): lifecycle flag (defaults to `"active"` if missing).
-    - `summary` (`string`): human-readable project statement; required in practice (empty summaries are dropped).
-    - `updated_at` (`string`, RFC3339): last modification timestamp for that project; auto-filled if missing.
-  - Behavior: duplicate project IDs are collapsed to unique IDs.
+- `user_terminology` (`string[]`)
+  - Meaning: durable terms/aliases and user-specific language conventions.
+  - Behavior: trimmed, empties removed, deduped case-insensitively, truncated to 40.
+- `known_steps` (`string[]`)
+  - Meaning: reusable procedural steps that solve recurring user goals.
+  - Behavior: trimmed, empties removed, deduped case-insensitively, truncated to 40.
+- `preferences` (`string[]`)
+  - Meaning: durable operating preferences and defaults.
+  - Behavior: trimmed, empties removed, deduped case-insensitively, truncated to 40.
+- Migration note:
+  - Legacy `active_projects` is read for backward compatibility and migrated into Tier 2 knowledge buckets where possible.
+  - Terminal execution status lines are dropped during migration and kept in bulletin/history.
 
 #### `tier3` (short-term focus memory)
 
 - `recent_focus` (`string[]`)
   - Meaning: most recent and quickly-changing focus items.
+  - Prompt behavior: when bulletin focus is available, Tier 3 can be suppressed in `[persona_context]` to avoid duplicated status narration.
   - Constraint: capped to 15 entries.
   - Behavior: trimmed, empties removed, deduped case-insensitively, truncated to 15.
 
@@ -221,13 +226,14 @@ Per-event fields:
 
 ## Runtime Prompt Injection
 
-At runtime, persona memory context injected into the system prompt includes:
+At runtime, memory is injected as structured prose:
 
-- `<memory_field_legend>`: compact deterministic field-meaning map for canonical memory keys
-- `<memory_this_persona>`: rendered memory projection for quick model consumption
-- `<memory_state_json>`: raw canonical JSON state for precise structured reference
+- Identity + Tier 1 render in the **system prompt**.
+- Tier 2/3 render in `[persona_context]` (Tier 2 knowledge render + optional Tier 3 suppression).
+- Bulletin focus (from `persona_bulletin_focus`) is also injected in `[persona_context]` as the canonical episodic focus card.
+- Operator memo and bookmarks are appended in the same `[persona_context]` block.
 
-This keeps field semantics always available to the model while keeping token overhead low compared to injecting full prose documentation.
+Post-delivery lifecycle focus-sync hooks perform routine bulletin + Tier 3 hygiene writes, so end-of-turn persistence is not dependent on main-loop tool calls.
 
 ## Safety and Manual Edits
 

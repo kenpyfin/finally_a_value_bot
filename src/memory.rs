@@ -124,7 +124,7 @@ pub struct Tier1Memory {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ActiveProjectMemory {
+pub struct LegacyActiveProjectMemory {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -138,7 +138,23 @@ pub struct ActiveProjectMemory {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Tier2Memory {
     #[serde(default)]
-    pub active_projects: Vec<ActiveProjectMemory>,
+    pub user_terminology: Vec<String>,
+    #[serde(default)]
+    pub known_steps: Vec<String>,
+    #[serde(default)]
+    pub preferences: Vec<String>,
+    #[serde(default, rename = "active_projects", skip_serializing)]
+    pub legacy_active_projects: Vec<LegacyActiveProjectMemory>,
+    #[serde(skip)]
+    pub legacy_migration: Option<Tier2LegacyMigrationStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Tier2LegacyMigrationStats {
+    pub moved_terminology: usize,
+    pub moved_known_steps: usize,
+    pub moved_preferences: usize,
+    pub dropped_active_projects: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -216,32 +232,91 @@ impl PersonaMemoryState {
             self.meta.updated_at = now.clone();
         }
 
-        let mut seen_projects = HashSet::new();
-        self.tier2.active_projects = self
-            .tier2
-            .active_projects
-            .drain(..)
-            .filter_map(|mut p| {
-                p.summary = p.summary.trim().to_string();
-                if p.summary.is_empty() {
-                    return None;
-                }
-                if p.id.trim().is_empty() {
-                    p.id = deterministic_key_from_text(&p.summary);
-                }
-                if p.status.trim().is_empty() {
-                    p.status = "active".to_string();
-                }
-                if p.updated_at.trim().is_empty() {
-                    p.updated_at = now.clone();
-                }
-                if seen_projects.insert(p.id.clone()) {
-                    Some(p)
-                } else {
-                    None
-                }
-            })
+        self.tier2.user_terminology = dedupe_trimmed_lines(&self.tier2.user_terminology)
+            .into_iter()
+            .take(40)
             .collect();
+        self.tier2.known_steps = dedupe_trimmed_lines(&self.tier2.known_steps)
+            .into_iter()
+            .take(40)
+            .collect();
+        self.tier2.preferences = dedupe_trimmed_lines(&self.tier2.preferences)
+            .into_iter()
+            .take(40)
+            .collect();
+        self.tier2.legacy_migration = None;
+
+        if !self.tier2.legacy_active_projects.is_empty() {
+            let mut terminology = self.tier2.user_terminology.clone();
+            let mut known_steps = self.tier2.known_steps.clone();
+            let mut preferences = self.tier2.preferences.clone();
+            let mut moved_terminology = 0usize;
+            let mut moved_known_steps = 0usize;
+            let mut moved_preferences = 0usize;
+            let mut dropped = 0usize;
+            for p in self.tier2.legacy_active_projects.drain(..) {
+                let summary = p.summary.trim();
+                if summary.is_empty() {
+                    dropped += 1;
+                    continue;
+                }
+                let lower = summary.to_ascii_lowercase();
+                if lower.contains("published")
+                    || lower.contains("scrapped")
+                    || lower.contains("completed")
+                    || lower.contains("cancelled")
+                    || lower.contains("canceled")
+                {
+                    dropped += 1;
+                    continue;
+                }
+                if lower.starts_with("term:")
+                    || lower.starts_with("terminology:")
+                    || lower.starts_with("[term]")
+                {
+                    terminology.push(summary.to_string());
+                    moved_terminology += 1;
+                    continue;
+                }
+                if lower.starts_with("step:")
+                    || lower.starts_with("known step:")
+                    || lower.starts_with("[step]")
+                {
+                    known_steps.push(summary.to_string());
+                    moved_known_steps += 1;
+                    continue;
+                }
+                if lower.starts_with("pref:")
+                    || lower.starts_with("preference:")
+                    || lower.starts_with("[preference]")
+                {
+                    preferences.push(summary.to_string());
+                    moved_preferences += 1;
+                    continue;
+                }
+                // Default migration bucket for durable-ish legacy lines.
+                known_steps.push(summary.to_string());
+                moved_known_steps += 1;
+            }
+            self.tier2.user_terminology = dedupe_trimmed_lines(&terminology)
+                .into_iter()
+                .take(40)
+                .collect();
+            self.tier2.known_steps = dedupe_trimmed_lines(&known_steps)
+                .into_iter()
+                .take(40)
+                .collect();
+            self.tier2.preferences = dedupe_trimmed_lines(&preferences)
+                .into_iter()
+                .take(40)
+                .collect();
+            self.tier2.legacy_migration = Some(Tier2LegacyMigrationStats {
+                moved_terminology,
+                moved_known_steps,
+                moved_preferences,
+                dropped_active_projects: dropped,
+            });
+        }
 
         let mut by_intent: HashMap<String, WorkflowMemoryEntry> = HashMap::new();
         for mut item in self.workflow_memory.intents.drain(..) {
@@ -567,10 +642,30 @@ impl MemoryManager {
         chat_id: i64,
         persona_id: i64,
     ) -> Option<PersonaMemoryState> {
+        let persist_migration_if_needed =
+            |this: &MemoryManager, mut state: PersonaMemoryState| -> PersonaMemoryState {
+                if let Some(stats) = state.tier2.legacy_migration.clone() {
+                    let _ = this.append_persona_memory_event(
+                        chat_id,
+                        persona_id,
+                        "memory_state_migrated_tier2_knowledge",
+                        "system",
+                        json!({
+                            "moved_terminology": stats.moved_terminology,
+                            "moved_known_steps": stats.moved_known_steps,
+                            "moved_preferences": stats.moved_preferences,
+                            "dropped_active_projects": stats.dropped_active_projects,
+                        }),
+                    );
+                    let _ = this.write_persona_memory_state(chat_id, persona_id, state.clone());
+                    state.tier2.legacy_migration = None;
+                }
+                state
+            };
         let path = self.persona_memory_state_path(chat_id, persona_id);
         let content = std::fs::read_to_string(&path).ok()?;
         match self.parse_and_validate_state(&content) {
-            Ok(state) => Some(state),
+            Ok(state) => Some(persist_migration_if_needed(self, state)),
             Err(primary_err) => {
                 let backup_path = path.with_extension("json.bak");
                 let recovered = std::fs::read_to_string(&backup_path)
@@ -589,7 +684,7 @@ impl MemoryManager {
                             "error": primary_err,
                         }),
                     );
-                    Some(state)
+                    Some(persist_migration_if_needed(self, state))
                 } else {
                     let _ = self.append_persona_memory_event(
                         chat_id,
@@ -803,25 +898,6 @@ fn dedupe_trimmed_lines(lines: &[String]) -> Vec<String> {
     out
 }
 
-fn deterministic_key_from_text(input: &str) -> String {
-    let key: String = input
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let key = key
-        .split('-')
-        .filter(|s| !s.trim().is_empty())
-        .take(8)
-        .collect::<Vec<_>>()
-        .join("-");
-    if key.is_empty() {
-        "item".to_string()
-    } else {
-        key
-    }
-}
-
 fn extract_tier_sections(full: &str) -> [String; 3] {
     const TIER_HEADERS: [&str; 3] = [
         "## Tier 1 — Long term",
@@ -872,16 +948,11 @@ fn legacy_markdown_to_state(markdown: &str) -> PersonaMemoryState {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
-    let tier2_projects: Vec<ActiveProjectMemory> = tiers[1]
+    let tier2_known_steps: Vec<String> = tiers[1]
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|summary| ActiveProjectMemory {
-            id: deterministic_key_from_text(summary),
-            status: "active".to_string(),
-            summary: summary.to_string(),
-            updated_at: Utc::now().to_rfc3339(),
-        })
+        .map(|s| s.to_string())
         .collect();
     let tier3_lines: Vec<String> = tiers[2]
         .lines()
@@ -902,7 +973,11 @@ fn legacy_markdown_to_state(markdown: &str) -> PersonaMemoryState {
             workflow_principles: Vec::new(),
         },
         tier2: Tier2Memory {
-            active_projects: tier2_projects,
+            user_terminology: Vec::new(),
+            known_steps: tier2_known_steps,
+            preferences: Vec::new(),
+            legacy_active_projects: Vec::new(),
+            legacy_migration: None,
         },
         tier3: Tier3Memory {
             recent_focus: tier3_lines,
@@ -950,15 +1025,6 @@ fn append_tier1_sections(sections: &mut Vec<String>, state: &PersonaMemoryState)
         let t = item.trim();
         if !t.is_empty() {
             tier1.push(format!("- {t}"));
-        }
-    }
-    if !state.tier1.workflow_principles.is_empty() {
-        tier1.push("\n**Workflow principles:**".to_string());
-        for item in &state.tier1.workflow_principles {
-            let t = item.trim();
-            if !t.is_empty() {
-                tier1.push(format!("- {t}"));
-            }
         }
     }
     if tier1.is_empty() {
@@ -1030,26 +1096,34 @@ pub fn render_identity_and_tier1_for_system(
 }
 
 /// Tier 2/3, learned workflows, and links for the `[persona_context]` message block.
-pub fn render_persona_context_memory(state: &PersonaMemoryState) -> String {
+pub fn render_persona_context_memory_with_options(
+    state: &PersonaMemoryState,
+    suppress_recent_focus: bool,
+) -> String {
     let mut sections: Vec<String> = Vec::new();
 
-    let mut tier2: Vec<String> = state
-        .tier2
-        .active_projects
-        .iter()
-        .filter(|p| !p.summary.trim().is_empty())
-        .map(|p| {
-            format!(
-                "- [{}] {} — {}",
-                p.status.trim(),
-                p.summary.trim(),
-                p.id.trim()
-            )
-        })
-        .collect();
-    if !tier2.is_empty() {
-        let mut block = String::from("### Active projects\n\n");
-        for line in tier2.drain(..) {
+    let mut tier2_lines: Vec<String> = Vec::new();
+    for t in &state.tier2.user_terminology {
+        let s = t.trim();
+        if !s.is_empty() {
+            tier2_lines.push(format!("- Terminology: {s}"));
+        }
+    }
+    for s in &state.tier2.known_steps {
+        let s = s.trim();
+        if !s.is_empty() {
+            tier2_lines.push(format!("- Known step: {s}"));
+        }
+    }
+    for p in &state.tier2.preferences {
+        let p = p.trim();
+        if !p.is_empty() {
+            tier2_lines.push(format!("- Preference: {p}"));
+        }
+    }
+    if !tier2_lines.is_empty() {
+        let mut block = String::from("### Tier 2 knowledge\n\n");
+        for line in tier2_lines {
             block.push_str(&line);
             block.push('\n');
         }
@@ -1069,7 +1143,7 @@ pub fn render_persona_context_memory(state: &PersonaMemoryState) -> String {
             }
         })
         .collect();
-    if !tier3.is_empty() {
+    if !suppress_recent_focus && !tier3.is_empty() {
         let mut block = String::from("### Recent focus\n\n");
         for line in tier3.drain(..) {
             block.push_str(&line);
@@ -1131,6 +1205,11 @@ pub fn render_persona_context_memory(state: &PersonaMemoryState) -> String {
     out
 }
 
+/// Tier 2/3, learned workflows, and links for the `[persona_context]` message block.
+pub fn render_persona_context_memory(state: &PersonaMemoryState) -> String {
+    render_persona_context_memory_with_options(state, false)
+}
+
 /// Full compiled memory (all tiers) — used by PTE and tests.
 pub fn render_memory_for_llm(state: &PersonaMemoryState, workflow_principles_max: usize) -> String {
     let system = render_identity_and_tier1_for_system(state, workflow_principles_max);
@@ -1178,11 +1257,14 @@ pub fn render_memory_markdown(state: &PersonaMemoryState) -> String {
     out.push('\n');
 
     out.push_str("## Tier 2 — Mid term\n\n");
-    for project in &state.tier2.active_projects {
-        out.push_str(&format!(
-            "- ProjectState|id={}|status={}|updated={}|summary={}\n",
-            project.id, project.status, project.updated_at, project.summary
-        ));
+    for term in &state.tier2.user_terminology {
+        out.push_str(&format!("- Terminology|{}\n", term.trim()));
+    }
+    for step in &state.tier2.known_steps {
+        out.push_str(&format!("- KnownStep|{}\n", step.trim()));
+    }
+    for pref in &state.tier2.preferences {
+        out.push_str(&format!("- Preference|{}\n", pref.trim()));
     }
     out.push('\n');
 
@@ -1204,11 +1286,9 @@ fn render_memory_field_legend_compact() -> String {
         "identity.non_negotiables[]: hard constraints the persona should not violate.",
         "tier1.stable_facts[]: long-lived durable facts.",
         "tier1.workflow_principles[]: reusable workflow rules from repeated success.",
-        "tier2.active_projects[]: current in-flight project list.",
-        "tier2.active_projects[].id: stable project key; derived from summary if missing.",
-        "tier2.active_projects[].status: project lifecycle label; defaults to active.",
-        "tier2.active_projects[].summary: required human-readable project statement.",
-        "tier2.active_projects[].updated_at: RFC3339 timestamp of project update.",
+        "tier2.user_terminology[]: user-specific terms, aliases, and phrasing.",
+        "tier2.known_steps[]: reusable procedures that reliably solve user tasks.",
+        "tier2.preferences[]: durable operating preferences and defaults.",
         "tier3.recent_focus[]: short-term focus items; passive context only; capped to 15.",
         "workflow_memory.intents[]: learned intent-pattern retention entries.",
         "workflow_memory.intents[].intent_signature: canonical lowercased intent key.",
@@ -1393,7 +1473,9 @@ mod tests {
         let (mm, dir) = test_memory_manager();
         let mut state = PersonaMemoryState::default();
         state.tier1.stable_facts = vec![];
-        state.tier2.active_projects = vec![];
+        state.tier2.user_terminology = vec![];
+        state.tier2.known_steps = vec![];
+        state.tier2.preferences = vec![];
         state.tier3.recent_focus = vec![];
         mm.write_persona_memory_state(100, 1, state).unwrap();
         let ctx = mm.build_memory_context_with_options(
@@ -1616,6 +1698,73 @@ mod tests {
         let out = render_memory_for_llm(&state, 25);
         assert!(out.contains("Milla"));
         assert!(out.contains("finish report"));
+    }
+
+    #[test]
+    fn test_render_persona_context_memory_renders_tier2_knowledge() {
+        let mut state = PersonaMemoryState::default();
+        state.tier2.user_terminology = vec!["PZ means Persona Zero".into()];
+        state.tier2.known_steps = vec!["Collect approval before publishing".into()];
+        state.tier2.preferences = vec!["Use V4 face reference by default".into()];
+        let out = render_persona_context_memory(&state);
+        assert!(out.contains("### Tier 2 knowledge"));
+        assert!(out.contains("Terminology: PZ means Persona Zero"));
+        assert!(out.contains("Known step: Collect approval before publishing"));
+        assert!(out.contains("Preference: Use V4 face reference by default"));
+    }
+
+    #[test]
+    fn test_read_persona_memory_state_migrates_legacy_active_projects() {
+        let (mm, dir) = test_memory_manager();
+        let path = mm.persona_memory_state_path(300, 2);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+  "meta":{"version":1,"revision":1,"updated_at":"2026-05-28T00:00:00Z"},
+  "identity":{},
+  "tier1":{},
+  "tier2":{
+    "active_projects":[
+      {"id":"a","status":"active","summary":"Term: PZ means Persona Zero","updated_at":"2026-05-28T00:00:00Z"},
+      {"id":"b","status":"active","summary":"Preference: Use V4 default","updated_at":"2026-05-28T00:00:00Z"},
+      {"id":"c","status":"active","summary":"Rainy Cafe: Published","updated_at":"2026-05-28T00:00:00Z"}
+    ]
+  },
+  "tier3":{},
+  "workflow_memory":{},
+  "links":{}
+}"#,
+        )
+        .unwrap();
+        let state = mm.read_persona_memory_state(300, 2).unwrap();
+        assert!(state
+            .tier2
+            .user_terminology
+            .iter()
+            .any(|s| s.contains("PZ means Persona Zero")));
+        assert!(state
+            .tier2
+            .preferences
+            .iter()
+            .any(|s| s.contains("Use V4 default")));
+        assert!(!state
+            .tier2
+            .known_steps
+            .iter()
+            .any(|s| s.contains("Published")));
+        let events = std::fs::read_to_string(mm.persona_memory_events_path(300, 2)).unwrap();
+        assert!(events.contains("memory_state_migrated_tier2_knowledge"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_render_persona_context_memory_with_options_can_hide_recent_focus() {
+        let mut state = PersonaMemoryState::default();
+        state.tier3.recent_focus = vec!["finish report".to_string()];
+        let out = render_persona_context_memory_with_options(&state, true);
+        assert!(!out.contains("### Recent focus"));
+        assert!(!out.contains("finish report"));
     }
 
     #[test]
