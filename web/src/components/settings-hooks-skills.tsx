@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Checkbox, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
+import { Button, Checkbox, Flex, Switch, Text, TextField } from '@radix-ui/themes'
 import type { HookDefinition, PersonaHookSkillPolicy } from '../types'
 
 type SkillRow = {
@@ -13,30 +13,6 @@ type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
   onError: (message: string) => void
   activePersonaId: number | null
-}
-
-const HOOK_EVENTS = [
-  'BeforeTurn',
-  'PreToolUse',
-  'PostToolUse',
-  'PostToolBatch',
-  'PreStop',
-  'PostDelivery',
-] as const
-
-const HOOK_ACTION_TYPES = ['block', 'add_context'] as const
-
-const HOOK_PAYLOAD_PRESETS: Record<(typeof HOOK_ACTION_TYPES)[number], { label: string; json: string }[]> = {
-  block: [
-    { label: 'Policy block', json: '{"reason":"Blocked by policy"}' },
-    { label: 'Tool denied', json: '{"reason":"This tool is not allowed for this persona"}' },
-  ],
-  add_context: [
-    {
-      label: 'Reminder context',
-      json: '{"additional_context":"Remember persona-specific constraints before acting."}',
-    },
-  ],
 }
 
 function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
@@ -55,16 +31,6 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   const [policy, setPolicy] = useState<PersonaHookSkillPolicy | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-
-  const [newName, setNewName] = useState('')
-  const [newEventName, setNewEventName] = useState<(typeof HOOK_EVENTS)[number]>('PreToolUse')
-  const [newMatcher, setNewMatcher] = useState('')
-  const [newActionType, setNewActionType] =
-    useState<(typeof HOOK_ACTION_TYPES)[number]>('block')
-  const [newPayloadJson, setNewPayloadJson] = useState(
-    HOOK_PAYLOAD_PRESETS.block[0]?.json ?? '{"reason":"Blocked by policy"}',
-  )
-  const [newPayloadPreset, setNewPayloadPreset] = useState('0')
 
   const [restrictHooks, setRestrictHooks] = useState(false)
   const [restrictSkills, setRestrictSkills] = useState(false)
@@ -138,15 +104,6 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
     void load()
   }, [load])
 
-  const payloadPresets = HOOK_PAYLOAD_PRESETS[newActionType]
-
-  useEffect(() => {
-    const preset = payloadPresets[Number(newPayloadPreset)] ?? payloadPresets[0]
-    if (preset) {
-      setNewPayloadJson(preset.json)
-    }
-  }, [newActionType, newPayloadPreset, payloadPresets])
-
   const filteredSkills = useMemo(() => {
     const q = skillFilter.trim().toLowerCase()
     if (!q) return skills
@@ -211,70 +168,6 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
     setSelectedSkillNames(checked ? new Set(skills.map((s) => s.name)) : new Set())
   }
 
-  async function createHook() {
-    if (!newName.trim()) {
-      onError('Hook name is required.')
-      return
-    }
-    setSaving(true)
-    try {
-      await api('/api/hooks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: newName.trim(),
-          event_name: newEventName,
-          matcher: newMatcher.trim() || null,
-          action_type: newActionType.trim() || 'block',
-          action_payload_json: newPayloadJson.trim() || '{}',
-          enabled: true,
-        }),
-      })
-      setNewName('')
-      await load()
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function toggleHookEnabled(hook: HookDefinition, enabled: boolean) {
-    setSaving(true)
-    try {
-      await api('/api/hooks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: hook.id,
-          name: hook.name,
-          event_name: hook.event_name,
-          matcher: hook.matcher,
-          action_type: hook.action_type,
-          action_payload_json: hook.action_payload_json,
-          enabled,
-        }),
-      })
-      await load()
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function deleteHook(id: number) {
-    setSaving(true)
-    try {
-      await api(`/api/hooks/${id}`, { method: 'DELETE' })
-      await load()
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
   async function savePersonaPolicy(useDefaults: boolean) {
     if (activePersonaId == null) return
     setSaving(true)
@@ -303,6 +196,10 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   return (
     <Flex direction="column" gap="3">
       <Text size="2" weight="bold">Hook definitions</Text>
+      <Text size="1" color="gray">
+        Hook creation/editing is handled by the agent via the <code>create-hook</code> skill.
+        Settings provides catalog visibility and per-persona assignment only.
+      </Text>
       <Flex direction="column" gap="2">
         {hooks.length === 0 ? (
           <Text size="1" color="gray">No hooks defined yet.</Text>
@@ -323,86 +220,14 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                 #{hook.id} {hook.name}
               </Text>
               <Text size="1" color="gray">{hook.event_name}</Text>
-              <Switch
-                size="1"
-                checked={hook.enabled}
-                disabled={saving}
-                onCheckedChange={(checked) => void toggleHookEnabled(hook, checked)}
-              />
-              <Button
-                size="1"
-                variant="soft"
-                color="red"
-                disabled={saving}
-                onClick={() => void deleteHook(hook.id)}
-              >
-                Delete
-              </Button>
+              <Text size="1" color={hook.enabled ? 'green' : 'gray'}>
+                {hook.enabled ? 'enabled' : 'disabled'}
+              </Text>
+              {hook.matcher ? <Text size="1" color="gray">matcher: {hook.matcher}</Text> : null}
+              <Text size="1" color="gray">action: {hook.action_type}</Text>
             </Flex>
           ))
         )}
-      </Flex>
-
-      <Text size="2" weight="bold">Create hook</Text>
-      <Flex gap="2" wrap="wrap" align="end">
-        <TextField.Root
-          value={newName}
-          placeholder="name"
-          onChange={(e) => setNewName(e.target.value)}
-        />
-        <Select.Root
-          value={newEventName}
-          onValueChange={(value) => setNewEventName(value as (typeof HOOK_EVENTS)[number])}
-        >
-          <Select.Trigger className="w-[180px]" placeholder="Lifecycle event" />
-          <Select.Content>
-            {HOOK_EVENTS.map((evt) => (
-              <Select.Item key={evt} value={evt}>
-                {evt}
-              </Select.Item>
-            ))}
-          </Select.Content>
-        </Select.Root>
-        <TextField.Root
-          value={newMatcher}
-          placeholder="matcher (regex, optional)"
-          onChange={(e) => setNewMatcher(e.target.value)}
-        />
-        <Select.Root
-          value={newActionType}
-          onValueChange={(value) => {
-            setNewActionType(value as (typeof HOOK_ACTION_TYPES)[number])
-            setNewPayloadPreset('0')
-          }}
-        >
-          <Select.Trigger className="w-[160px]" placeholder="Action type" />
-          <Select.Content>
-            {HOOK_ACTION_TYPES.map((actionType) => (
-              <Select.Item key={actionType} value={actionType}>
-                {actionType}
-              </Select.Item>
-            ))}
-          </Select.Content>
-        </Select.Root>
-        <Select.Root value={newPayloadPreset} onValueChange={setNewPayloadPreset}>
-          <Select.Trigger className="w-[200px]" placeholder="Payload preset" />
-          <Select.Content>
-            {payloadPresets.map((preset, index) => (
-              <Select.Item key={`${newActionType}-${index}`} value={String(index)}>
-                {preset.label}
-              </Select.Item>
-            ))}
-          </Select.Content>
-        </Select.Root>
-        <TextField.Root
-          className="min-w-[280px]"
-          value={newPayloadJson}
-          placeholder="payload JSON (edit if needed)"
-          onChange={(e) => setNewPayloadJson(e.target.value)}
-        />
-        <Button size="1" disabled={saving} onClick={() => void createHook()}>
-          Add
-        </Button>
       </Flex>
 
       <Text size="2" weight="bold">

@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod error;
 pub mod final_delivery_dedupe;
 pub mod gateway;
+pub mod hook_actions;
 pub mod hook_runtime;
 pub mod job_heartbeat;
 pub mod llm;

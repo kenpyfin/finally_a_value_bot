@@ -39,6 +39,8 @@ pub struct HookRunResult {
     pub blocked_reason: Option<String>,
     pub additional_contexts: Vec<String>,
     pub matched_hook_ids: Vec<i64>,
+    /// Matched a `pz_terminal_cleanup` PostToolUse hook; apply via `hook_actions`.
+    pub pz_terminal_cleanup: bool,
 }
 
 fn event_matches(record: &HookDefinitionRecord, event: HookEventName) -> bool {
@@ -116,6 +118,9 @@ pub fn run_hooks_for_event(
                 {
                     out.additional_contexts.push(text);
                 }
+            }
+            "pz_terminal_cleanup" => {
+                out.pz_terminal_cleanup = true;
             }
             _ => {}
         }
@@ -199,5 +204,36 @@ mod tests {
         .expect("run hooks");
         assert!(out.additional_contexts.is_empty());
         assert!(!out.matched_hook_ids.contains(&hook_id));
+    }
+
+    #[test]
+    fn pz_terminal_cleanup_action_sets_flag() {
+        let db = test_db();
+        let chat_id = 9003;
+        let persona_id = db
+            .create_persona(chat_id, "default", None)
+            .expect("create persona");
+        db.upsert_hook_definition(
+            None,
+            "posttool-pz-terminal-cleanup",
+            HookEventName::PostToolUse.as_str(),
+            None,
+            "pz_terminal_cleanup",
+            "{}",
+            true,
+        )
+        .expect("upsert hook");
+        let out = run_hooks_for_event(
+            &db,
+            chat_id,
+            persona_id,
+            HookEventName::PostToolUse,
+            &HookRunInput {
+                tool_name: Some("bash".to_string()),
+                ..HookRunInput::default()
+            },
+        )
+        .expect("run hooks");
+        assert!(out.pz_terminal_cleanup);
     }
 }

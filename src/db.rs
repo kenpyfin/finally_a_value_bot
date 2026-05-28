@@ -637,6 +637,8 @@ impl Database {
         Self::migrate_background_jobs_shell_schema(&conn)?;
         Self::migrate_personas_prompt_context(&conn)?;
         Self::migrate_hook_policy_schema(&conn)?;
+        Self::seed_default_hook_definitions(&conn)?;
+        Self::ensure_builtin_hook_definitions(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -1104,6 +1106,83 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_persona_hook_skill_policy_chat
                 ON persona_hook_skill_policy(chat_id);",
+        )?;
+        Ok(())
+    }
+
+    fn seed_default_hook_definitions(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        let existing_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM hook_definitions", [], |row| {
+                row.get(0)
+            })?;
+        if existing_count > 0 {
+            return Ok(());
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let defaults = [
+            (
+                "template-pretool-block-example",
+                "PreToolUse",
+                Some("(?i)^dangerous_tool$"),
+                "block",
+                r#"{"reason":"Blocked by default template hook."}"#,
+                0_i64,
+            ),
+            (
+                "template-posttool-context-example",
+                "PostToolUse",
+                None,
+                "add_context",
+                r#"{"additional_context":"Template hook example: inject reminder context after a tool runs."}"#,
+                0_i64,
+            ),
+            (
+                "template-prestop-context-example",
+                "PreStop",
+                Some("(?i)^end_turn$"),
+                "add_context",
+                r#"{"additional_context":"Template hook example: verify user-facing delivery before ending turn."}"#,
+                0_i64,
+            ),
+        ];
+
+        for (name, event_name, matcher, action_type, action_payload_json, enabled) in defaults {
+            conn.execute(
+                "INSERT OR IGNORE INTO hook_definitions
+                 (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    name,
+                    event_name,
+                    matcher,
+                    action_type,
+                    action_payload_json,
+                    enabled,
+                    now
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Inserts built-in hooks that should exist on every install (including upgrades).
+    fn ensure_builtin_hook_definitions(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_definitions
+             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "posttool-pz-terminal-cleanup",
+                "PostToolUse",
+                Option::<&str>::None,
+                "pz_terminal_cleanup",
+                "{}",
+                1_i64,
+                now,
+            ],
         )?;
         Ok(())
     }

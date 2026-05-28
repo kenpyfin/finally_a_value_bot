@@ -16,6 +16,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-28 — PostToolUse PZ cleanup registered as DB hook
+
+- **Area:** hooks / memory / db
+- **Summary:** Moved terminal PZ post Tier 3 hygiene from hardcoded PostToolUse logic into an enabled built-in hook (`posttool-pz-terminal-cleanup`, action `pz_terminal_cleanup`). Extraction and memory writes live in `hook_actions`; the agent path applies side effects when the hook matches.
+- **Rationale:** Keeps deterministic cleanup visible in the hook catalog and persona allowlists instead of hidden inline code.
+- **Key files / symbols:** `src/hook_actions.rs` (`extract_terminal_pz_post_ids`, `apply_post_tool_hook_side_effects`); `src/hook_runtime.rs` (`HookRunResult::pz_terminal_cleanup`); `src/db.rs` (`ensure_builtin_hook_definitions`); `src/channels/telegram.rs` (PostToolUse dispatch); `docs/hooks-architecture.md`.
+- **Follow-ups:** None.
+
+### 2026-05-28 — Hooks settings made read-only + default hook templates seeded
+
+- **Area:** web / hooks / db
+- **Summary:** Simplified Hooks & Skills settings by removing hook CRUD controls from the UI and keeping hook catalog visibility + persona assignment only. Added DB bootstrap seeding for three disabled template hook definitions so new installs immediately show existing hooks.
+- **Rationale:** Operators found in-UI hook authoring confusing; hook creation should be agent-driven via the `create-hook` skill while Settings mirrors the skills-style catalog/assignment workflow.
+- **Key files / symbols:** `web/src/components/settings-hooks-skills.tsx` (removed create/toggle/delete controls, added read-only hook metadata note), `src/db.rs` (`seed_default_hook_definitions`, startup call in `Database::new`).
+- **Follow-ups:** Optionally expose a dedicated “Run create-hook skill” action in Settings for guided hook authoring without direct form editing.
+
 ### 2026-05-28 — Tier 2 knowledge schema + bulletin-only active focus
 
 - **Area:** memory / tools / agent prompt / docs

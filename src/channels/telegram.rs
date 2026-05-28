@@ -25,6 +25,9 @@ use crate::config::Config;
 use crate::db::{
     call_blocking, Database, PersonaBulletinFocus, PersonaMessageBookmark, StoredMessage,
 };
+use crate::hook_actions::{
+    apply_deterministic_persona_memory_hygiene, apply_post_tool_hook_side_effects,
+};
 use crate::hook_runtime::{run_hooks_for_event, HookEventName, HookRunInput};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
@@ -2701,18 +2704,6 @@ pub async fn process_with_agent_with_events(
                         is_error: result.is_error,
                     });
 
-                    let terminal_post_ids =
-                        extract_terminal_pz_post_ids(name, input, &result.content, result.is_error);
-                    if !terminal_post_ids.is_empty() {
-                        apply_deterministic_persona_memory_hygiene(
-                            state,
-                            chat_id,
-                            persona_id,
-                            &terminal_post_ids,
-                            false,
-                        );
-                    }
-
                     if let Ok(post_tool_hook) = call_blocking(state.db.clone(), {
                         let tool_name = name.clone();
                         move |db| {
@@ -2731,6 +2722,16 @@ pub async fn process_with_agent_with_events(
                     })
                     .await
                     {
+                        apply_post_tool_hook_side_effects(
+                            &state.memory,
+                            chat_id,
+                            persona_id,
+                            &post_tool_hook,
+                            name,
+                            input,
+                            &result.content,
+                            result.is_error,
+                        );
                         hook_batch_contexts.extend(post_tool_hook.additional_contexts);
                     }
 
@@ -5100,76 +5101,6 @@ pub async fn send_response(
 
 const FOCUS_SYNC_MAX_ITERATIONS: usize = 1;
 
-fn is_terminal_focus_line(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("published")
-        || lower.contains("scrapped")
-        || lower.contains("completed")
-        || lower.contains("cancelled")
-        || lower.contains("canceled")
-}
-
-fn extract_pz_post_ids(text: &str) -> HashSet<String> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"PZ-\d{8}(?:-[A-Za-z0-9_]+)?").expect("valid PZ post id regex"))
-        .find_iter(text)
-        .map(|m| m.as_str().to_string())
-        .collect()
-}
-
-fn extract_terminal_pz_post_ids(
-    tool_name: &str,
-    input: &serde_json::Value,
-    result_content: &str,
-    is_error: bool,
-) -> HashSet<String> {
-    if is_error {
-        return HashSet::new();
-    }
-    let input_s = serde_json::to_string(input).unwrap_or_default();
-    let mut combined = String::new();
-    combined.push_str(tool_name);
-    combined.push('\n');
-    combined.push_str(&input_s);
-    combined.push('\n');
-    combined.push_str(result_content);
-    if !is_terminal_focus_line(&combined) {
-        return HashSet::new();
-    }
-    extract_pz_post_ids(&combined)
-}
-
-fn apply_deterministic_persona_memory_hygiene(
-    state: &AppState,
-    chat_id: i64,
-    persona_id: i64,
-    terminal_post_ids: &HashSet<String>,
-    bulletin_present: bool,
-) {
-    let Some(mut memory_state) = state.memory.read_persona_memory_state(chat_id, persona_id) else {
-        return;
-    };
-    let mut changed = false;
-
-    if bulletin_present || !terminal_post_ids.is_empty() {
-        let before_tier3_len = memory_state.tier3.recent_focus.len();
-        memory_state.tier3.recent_focus.retain(|line| {
-            let post_match = terminal_post_ids.iter().any(|id| line.contains(id));
-            !is_terminal_focus_line(line) && !post_match
-        });
-        changed |= memory_state.tier3.recent_focus.len() != before_tier3_len;
-    }
-
-    if changed {
-        if let Err(e) = state
-            .memory
-            .write_persona_memory_state(chat_id, persona_id, memory_state)
-        {
-            warn!("Deterministic focus hygiene write failed: {e}");
-        }
-    }
-}
-
 async fn run_persona_focus_sync_after_delivery(
     state: &AppState,
     chat_id: i64,
@@ -5185,7 +5116,13 @@ async fn run_persona_focus_sync_after_delivery(
         return;
     }
 
-    apply_deterministic_persona_memory_hygiene(state, chat_id, persona_id, &HashSet::new(), true);
+    apply_deterministic_persona_memory_hygiene(
+        &state.memory,
+        chat_id,
+        persona_id,
+        &HashSet::new(),
+        true,
+    );
 
     if !should_run_focus_sync_llm(false, messages, response_len, had_tool_calls) {
         return;

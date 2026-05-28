@@ -35,8 +35,11 @@ Hook definitions live in SQLite:
 
 - `block`: stops the current lifecycle action; payload key `reason`.
 - `add_context`: appends deterministic context; payload key `additional_context` (or `context`).
+- `pz_terminal_cleanup`: after a successful tool run, scans tool name/input/output for terminal PZ post outcomes (`published`, `completed`, etc.) and prunes matching Tier 3 focus lines. Applied in the agent path via `hook_actions::apply_post_tool_hook_side_effects` (requires tool output, so it is not evaluated inside `run_hooks_for_event` alone).
 
 Unknown action types are ignored.
+
+Built-in hook `posttool-pz-terminal-cleanup` is seeded enabled on every install/upgrade (`db::ensure_builtin_hook_definitions`).
 
 ## Matcher behavior
 
