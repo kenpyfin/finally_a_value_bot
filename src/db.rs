@@ -1195,6 +1195,20 @@ impl Database {
                 now,
             ],
         )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_definitions
+             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "postdelivery-persona-focus-sync",
+                "PostDelivery",
+                Option::<&str>::None,
+                "builtin_persona_focus_sync",
+                "{}",
+                1_i64,
+                now,
+            ],
+        )?;
         Ok(())
     }
 
@@ -2048,11 +2062,11 @@ impl Database {
         }
         let valid_action_type = matches!(
             action_type.as_str(),
-            "block" | "add_context" | "command" | "prompt"
+            "block" | "add_context" | "command" | "prompt" | "builtin_persona_focus_sync"
         );
         if !valid_action_type {
             return Err(FinallyAValueBotError::ToolExecution(format!(
-                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt",
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync",
                 action_type
             )));
         }
@@ -5928,6 +5942,20 @@ mod tests {
         assert!(!db
             .delete_persona_message_bookmark(100, pid, "m-bookmark-1")
             .unwrap());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_builtin_postdelivery_focus_sync_hook_seeded() {
+        let (db, dir) = test_db();
+        let hooks = db.list_hook_definitions().unwrap();
+        let focus_hook = hooks
+            .iter()
+            .find(|h| h.name == "postdelivery-persona-focus-sync")
+            .expect("focus sync hook must be seeded");
+        assert_eq!(focus_hook.event_name, "PostDelivery");
+        assert_eq!(focus_hook.action_type, "builtin_persona_focus_sync");
+        assert!(focus_hook.enabled);
         cleanup(&dir);
     }
 }

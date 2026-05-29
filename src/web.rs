@@ -1178,6 +1178,29 @@ async fn api_send_stream(
                                 )
                                 .await;
                         }
+                        AgentEvent::Hook {
+                            event_name,
+                            tool_name,
+                            matched_hook_ids,
+                            blocked_reason,
+                            additional_context_count,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "hook",
+                                    json!({
+                                        "event_name": event_name,
+                                        "tool_name": tool_name,
+                                        "matched_hook_ids": matched_hook_ids,
+                                        "blocked_reason": blocked_reason,
+                                        "additional_context_count": additional_context_count,
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
                         AgentEvent::FinalResponse { .. } => {}
                     }
                 }

@@ -233,7 +233,7 @@ At runtime, memory is injected as structured prose:
 - Bulletin focus (from `persona_bulletin_focus`) is also injected in `[persona_context]` as the canonical episodic focus card.
 - Operator memo and bookmarks are appended in the same `[persona_context]` block.
 
-Post-delivery lifecycle focus-sync hooks perform routine bulletin + Tier 3 hygiene writes, so end-of-turn persistence is not dependent on main-loop tool calls.
+Post-delivery lifecycle focus-sync hooks perform routine bulletin + Tier 3 hygiene writes (built-in hook: `postdelivery-persona-focus-sync`), so end-of-turn persistence is not dependent on main-loop tool calls.
 
 ## Safety and Manual Edits
 

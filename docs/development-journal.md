@@ -16,6 +16,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-28 — PostDelivery focus sync moved under hook runtime + prompt prefix trim
+
+- **Area:** agent / hooks / prompt context / memory
+- **Summary:** Converted post-delivery persona focus sync to a built-in hook action (`builtin_persona_focus_sync`) and wired delivery exits through a shared post-delivery pipeline that runs hook contexts and focus sync only when the hook triggers. Removed synthetic assistant acknowledgment prefix turns, filtered `send_message` out of scheduled-run tool definitions, and trimmed duplicated scheduler/skill/persistence prompt prose.
+- **Rationale:** Reduce recurring token overhead and move deterministic behavior ownership from prompt narration/inline orchestration to hook/runtime contracts.
+- **Key files / symbols:** `src/channels/telegram.rs` (`run_post_delivery_hooks_and_builtin_focus_sync`, scheduled tool filtering, prefix cleanup, `build_system_prompt`, `build_persona_context_message`); `src/hook_runtime.rs` (`HookRunResult::run_persona_focus_sync`, `builtin_persona_focus_sync` branch); `src/db.rs` (`ensure_builtin_hook_definitions`, `upsert_hook_definition` action validation); `src/tools/send_message.rs` (`test_send_message_blocks_scheduled_same_chat`); `docs/hooks-architecture.md`; `docs/memory-framework.md`; `DEVELOP.md`.
+- **Follow-ups:** Consider whether persona hook allowlists should be able to disable `postdelivery-persona-focus-sync` or whether it should remain always-on framework behavior.
+
+### 2026-05-28 — Hook observability in run history and latest run trace
+
+- **Area:** agent loop / web streaming / run history
+- **Summary:** Added explicit hook execution observability to the shared agent event stream, DB run timeline (`run_timeline_events`), and persisted agent-history markdown iteration traces. Hook entries now include lifecycle event, optional tool name, matched hook IDs, block reason (if any), and added-context count.
+- **Rationale:** Operators need to see why hooks influenced a run (or blocked actions) when reviewing “Last agent run” and historical run traces, not just infer hook effects from downstream behavior.
+- **Key files / symbols:** `src/channels/telegram.rs` (`AgentEvent::Hook`, `publish_hook_event_observability`, `hook_event_summary`, `run_post_delivery_hooks_and_builtin_focus_sync`), `src/agent_history.rs` (`IterationRecord.hook_events`, markdown rendering), `src/web.rs` (stream forwarding for `hook` events), `src/job_heartbeat.rs` (hook progress signal mapping).
+- **Follow-ups:** Optionally add a dedicated hook section/filter in the web run viewer so hook events can be toggled independently from tool lines.
+
 ### 2026-05-28 — `modify-skill` builtin + mandatory activation for skill updates
 
 - **Area:** skills / agent loop / builtin_skills

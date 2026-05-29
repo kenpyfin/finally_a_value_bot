@@ -57,6 +57,19 @@ pub fn signal_from_agent_event(evt: &AgentEvent) -> Option<HeartbeatSignal> {
             tool: name.clone(),
             is_error: *is_error,
         }),
+        AgentEvent::Hook {
+            event_name,
+            tool_name,
+            matched_hook_ids,
+            blocked_reason,
+            ..
+        } => Some(HeartbeatSignal::Progress(format!(
+            "hook {} tool={} matched={} blocked={}",
+            event_name,
+            tool_name.as_deref().unwrap_or("-"),
+            matched_hook_ids.len(),
+            blocked_reason.as_deref().unwrap_or("-"),
+        ))),
         AgentEvent::TextDelta { .. } => None,
         AgentEvent::FinalResponse { .. } => None,
     }

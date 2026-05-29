@@ -800,6 +800,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_message_blocks_scheduled_same_chat() {
+        let (db, dir) = test_db();
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db, "bot".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 999,
+                "text": "scheduled update",
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 999,
+                    "caller_channel": "scheduler",
+                    "is_scheduled_task": true,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result
+            .content
+            .contains("Scheduled runs deliver the final reply automatically"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
     async fn test_send_attachment_non_telegram_rejected_without_network() {
         let (db, dir) = test_db();
         db.upsert_chat(999, Some("web-main"), "web").unwrap();

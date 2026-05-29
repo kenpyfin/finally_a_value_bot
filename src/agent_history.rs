@@ -137,6 +137,7 @@ pub struct IterationRecord {
     pub stop_reason: String,
     pub assistant_text_preview: String,
     pub tool_calls: Vec<ToolCallRecord>,
+    pub hook_events: Vec<String>,
 }
 
 pub struct AgentRunRecord {
@@ -191,6 +192,11 @@ impl AgentRunRecord {
                         "- Tool: {} ({}ms) {} — input: {} → result: {}\n",
                         tc.name, tc.duration_ms, status, tc.input_preview, tc.result_preview
                     ));
+                }
+            }
+            if !iter.hook_events.is_empty() {
+                for hook in &iter.hook_events {
+                    md.push_str(&format!("- Hook: {}\n", hook));
                 }
             }
 

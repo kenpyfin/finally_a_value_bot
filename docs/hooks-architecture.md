@@ -38,6 +38,7 @@ Supported `action_type` values:
 - `add_context` (inline)
 - `command` (subprocess hook script)
 - `prompt` (LLM-based policy hook)
+- `builtin_persona_focus_sync` (built-in PostDelivery bulletin/memory sync trigger)
 
 `pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.
 
@@ -113,6 +114,16 @@ Built-in seed now creates `posttool-pz-terminal-cleanup` as:
 - `enabled: false` (persona-specific opt-in)
 
 The hook returns `effects.memory_tier3_prune`, and Rust applies memory writes via `hook_actions::apply_hook_memory_effects`.
+
+## Built-in PostDelivery focus-sync hook
+
+Built-in seed also creates `postdelivery-persona-focus-sync` as:
+
+- `event_name: PostDelivery`
+- `action_type: builtin_persona_focus_sync`
+- `enabled: true`
+
+When matched, runtime sets a built-in trigger that runs the post-delivery persona focus sync pipeline (`run_persona_focus_sync_after_delivery`) rather than requiring inline unconditional orchestration.
 
 ## Separation from delivery safeguards
 

@@ -61,6 +61,7 @@ pub struct HookRunResult {
     pub matched_hook_ids: Vec<i64>,
     pub updated_tool_input: Option<Value>,
     pub memory_effects: HookMemoryEffects,
+    pub run_persona_focus_sync: bool,
 }
 
 fn event_matches(record: &HookDefinitionRecord, event: HookEventName) -> bool {
@@ -260,6 +261,9 @@ pub async fn run_hooks_for_event_async(
                     break;
                 }
             }
+            "builtin_persona_focus_sync" => {
+                out.run_persona_focus_sync = true;
+            }
             _ => {}
         }
     }
@@ -398,5 +402,40 @@ mod tests {
             ))
             .expect("run hooks");
         assert!(out.blocked_reason.is_none());
+    }
+
+    #[test]
+    fn builtin_persona_focus_sync_sets_flag() {
+        let db = test_db();
+        let chat_id = 9004;
+        let persona_id = db
+            .create_persona(chat_id, "default", None)
+            .expect("create persona");
+        db.upsert_hook_definition(
+            None,
+            "postdelivery-focus-sync",
+            HookEventName::PostDelivery.as_str(),
+            None,
+            "builtin_persona_focus_sync",
+            "{}",
+            true,
+        )
+        .expect("upsert hook");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let out = rt
+            .block_on(run_hooks_for_event_async(
+                db.clone(),
+                &crate::config::test_config(),
+                HookEventName::PostDelivery,
+                &HookRunInput {
+                    chat_id,
+                    persona_id,
+                    stop_reason: Some("end_turn".to_string()),
+                    assistant_text: Some("done".to_string()),
+                    ..HookRunInput::default()
+                },
+            ))
+            .expect("run hooks");
+        assert!(out.run_persona_focus_sync);
     }
 }
