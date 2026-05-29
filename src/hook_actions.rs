@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::hook_runtime::HookRunResult;
+use crate::hook_runtime::HookMemoryEffects;
 use crate::memory::MemoryManager;
 
 fn is_terminal_focus_line(text: &str) -> bool {
@@ -75,25 +75,17 @@ pub fn apply_deterministic_persona_memory_hygiene(
     }
 }
 
-/// Runs side-effect hook actions that require tool output (e.g. PZ terminal cleanup).
-pub fn apply_post_tool_hook_side_effects(
+/// Applies validated hook memory effects.
+pub fn apply_hook_memory_effects(
     memory: &MemoryManager,
     chat_id: i64,
     persona_id: i64,
-    hook_result: &HookRunResult,
-    tool_name: &str,
-    tool_input: &Value,
-    tool_result_content: &str,
-    tool_is_error: bool,
+    effects: &HookMemoryEffects,
 ) {
-    if !hook_result.pz_terminal_cleanup {
+    if effects.terminal_pz_post_ids.is_empty() {
         return;
     }
-    let terminal_post_ids =
-        extract_terminal_pz_post_ids(tool_name, tool_input, tool_result_content, tool_is_error);
-    if terminal_post_ids.is_empty() {
-        return;
-    }
+    let terminal_post_ids: HashSet<String> = effects.terminal_pz_post_ids.iter().cloned().collect();
     apply_deterministic_persona_memory_hygiene(
         memory,
         chat_id,

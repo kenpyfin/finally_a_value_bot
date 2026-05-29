@@ -31,6 +31,7 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   const [policy, setPolicy] = useState<PersonaHookSkillPolicy | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [togglingHookId, setTogglingHookId] = useState<number | null>(null)
 
   const [restrictHooks, setRestrictHooks] = useState(false)
   const [restrictSkills, setRestrictSkills] = useState(false)
@@ -189,6 +190,30 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
     }
   }
 
+  async function toggleHookEnabled(hook: HookDefinition, enabled: boolean) {
+    setTogglingHookId(hook.id)
+    try {
+      await api('/api/hooks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: hook.id,
+          name: hook.name,
+          event_name: hook.event_name,
+          matcher: hook.matcher ?? null,
+          action_type: hook.action_type,
+          action_payload_json: hook.action_payload_json,
+          enabled,
+        }),
+      })
+      await load()
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setTogglingHookId(null)
+    }
+  }
+
   if (loading) {
     return <Text size="2" color="gray">Loading hook and skill policies…</Text>
   }
@@ -204,29 +229,51 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
         {hooks.length === 0 ? (
           <Text size="1" color="gray">No hooks defined yet.</Text>
         ) : (
-          hooks.map((hook) => (
-            <Flex key={hook.id} align="center" gap="2" wrap="wrap">
-              {activePersonaId != null && restrictHooks ? (
-                <Checkbox
-                  size="1"
-                  checked={selectedHookIds.has(hook.id)}
-                  disabled={saving}
-                  onCheckedChange={(checked) =>
-                    toggleHookId(hook.id, checked === true)
-                  }
-                />
-              ) : null}
-              <Text size="1" className="min-w-[180px] font-mono">
-                #{hook.id} {hook.name}
-              </Text>
-              <Text size="1" color="gray">{hook.event_name}</Text>
-              <Text size="1" color={hook.enabled ? 'green' : 'gray'}>
-                {hook.enabled ? 'enabled' : 'disabled'}
-              </Text>
-              {hook.matcher ? <Text size="1" color="gray">matcher: {hook.matcher}</Text> : null}
-              <Text size="1" color="gray">action: {hook.action_type}</Text>
-            </Flex>
-          ))
+          hooks.map((hook) => {
+            const payload = hook.action_payload ?? {}
+            const command =
+              hook.action_type.toLowerCase() === 'command' &&
+              typeof payload.command === 'string'
+                ? payload.command
+                : null
+            return (
+              <Flex key={hook.id} align="center" gap="2" wrap="wrap">
+                {activePersonaId != null && restrictHooks ? (
+                  <Checkbox
+                    size="1"
+                    checked={selectedHookIds.has(hook.id)}
+                    disabled={saving}
+                    onCheckedChange={(checked) =>
+                      toggleHookId(hook.id, checked === true)
+                    }
+                  />
+                ) : null}
+                <Text size="1" className="min-w-[180px] font-mono">
+                  #{hook.id} {hook.name}
+                </Text>
+                <Text size="1" color="gray">{hook.event_name}</Text>
+                <Text size="1" color={hook.enabled ? 'green' : 'gray'}>
+                  {hook.enabled ? 'enabled' : 'disabled'}
+                </Text>
+                <Text as="label" size="1">
+                  <Flex align="center" gap="2">
+                    <Switch
+                      size="1"
+                      checked={hook.enabled}
+                      disabled={saving || togglingHookId === hook.id}
+                      onCheckedChange={(checked) =>
+                        void toggleHookEnabled(hook, checked === true)
+                      }
+                    />
+                    {hook.enabled ? 'On' : 'Off'}
+                  </Flex>
+                </Text>
+                {hook.matcher ? <Text size="1" color="gray">matcher: {hook.matcher}</Text> : null}
+                <Text size="1" color="gray">action: {hook.action_type}</Text>
+                {command ? <Text size="1" color="gray">command: {command}</Text> : null}
+              </Flex>
+            )
+          })
         )}
       </Flex>
 

@@ -739,7 +739,7 @@ impl Tool for BuildSkillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "build_skill".into(),
-            description: "Create or update a FinallyAValueBot skill by running cursor-agent. Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.".into(),
+            description: "Create or update a FinallyAValueBot skill by running cursor-agent. For new skills activate `create-skill` first; for changes to an existing skill activate `modify-skill` first (enforced when the skill folder already exists). Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.".into(),
             input_schema: schema_object(
                 json!({
                     "name": {

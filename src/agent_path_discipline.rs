@@ -20,7 +20,8 @@ Follow these rules on **every** turn for `read_file`, `write_file`, `edit_file`,
 |------|---------------------------|-------|
 | Files in the shared workspace | `ORIGIN/...`, `notes/foo.md`, `./report.pdf` | No `workspace/` prefix |
 | Skills (read/write via tools) | `skills/<name>/SKILL.md`, `skills/<name>/script.py` | Resolves to `{skills_dir_display}/` |
-| Create or update a skill | **`build_skill`** tool | Writes under `{skills_dir_display}/` |
+| Create a new skill | **`build_skill`** after `activate_skill` `create-skill` | Writes under `{skills_dir_display}/` |
+| Update an existing skill | **`build_skill`** or `skills/<name>/...` after `activate_skill` `modify-skill` | Required before mutating existing skills |
 | Runtime / DB / groups | `runtime/...` | Not `workspace/runtime/...` |
 | Skill credentials | `skills/<name>/.env` | Not project-root `.env` via file tools |
 
@@ -37,10 +38,12 @@ Follow these rules on **every** turn for `read_file`, `write_file`, `edit_file`,
 
 ### Skills checklist
 
-1. Prefer **`build_skill(name=..., ...)`** over manual `write_file` under `skills/`.
-2. If using `write_file`, path must be `skills/<name>/SKILL.md` (tool-relative), never `workspace/skills/...`.
-3. Skill shell examples in SKILL.md bodies should use `skills/<name>/script.py` or absolute `{skills_dir_display}/<name>/...`, not `workspace/skills/...`.
-4. After creating a skill, it must exist at `{skills_dir_display}/<name>/SKILL.md` to be discoverable by `/skills` and `activate_skill`.
+1. **New skill:** activate `create-skill`, then prefer **`build_skill(name=..., ...)`** over manual `write_file`.
+2. **Existing skill:** activate `modify-skill`, read current `SKILL.md`, then `build_skill` or targeted edits under `skills/<name>/`.
+3. Prefer **`build_skill`** over manual `write_file` when rewriting most of a skill.
+4. If using `write_file`, path must be `skills/<name>/SKILL.md` (tool-relative), never `workspace/skills/...`.
+5. Skill shell examples in SKILL.md bodies should use `skills/<name>/script.py` or absolute `{skills_dir_display}/<name>/...`, not `workspace/skills/...`.
+6. After creating a skill, it must exist at `{skills_dir_display}/<name>/SKILL.md` to be discoverable by `/skills` and `activate_skill`.
 "##,
         tool_cwd = tool_cwd_display,
         workspace_data_root_display = workspace_data_root_display,

@@ -1170,6 +1170,17 @@ impl Database {
     /// Inserts built-in hooks that should exist on every install (including upgrades).
     fn ensure_builtin_hook_definitions(conn: &Connection) -> Result<(), FinallyAValueBotError> {
         let now = Utc::now().to_rfc3339();
+        let payload = r#"{"command":"pz-terminal-cleanup.py","timeout_secs":10,"fail_closed":false,"cwd":"shared"}"#;
+        conn.execute(
+            "UPDATE hook_definitions
+             SET action_type = 'command',
+                 action_payload_json = ?1,
+                 enabled = 0,
+                 updated_at = ?2
+             WHERE name = 'posttool-pz-terminal-cleanup'
+               AND action_type = 'pz_terminal_cleanup'",
+            params![payload, now],
+        )?;
         conn.execute(
             "INSERT OR IGNORE INTO hook_definitions
              (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
@@ -1178,9 +1189,9 @@ impl Database {
                 "posttool-pz-terminal-cleanup",
                 "PostToolUse",
                 Option::<&str>::None,
-                "pz_terminal_cleanup",
-                "{}",
-                1_i64,
+                "command",
+                payload,
+                0_i64,
                 now,
             ],
         )?;
@@ -2029,11 +2040,21 @@ impl Database {
     ) -> Result<i64, FinallyAValueBotError> {
         let name = name.trim();
         let event_name = event_name.trim();
-        let action_type = action_type.trim();
+        let action_type = action_type.trim().to_ascii_lowercase();
         if name.is_empty() || event_name.is_empty() || action_type.is_empty() {
             return Err(FinallyAValueBotError::ToolExecution(
                 "name, event_name, and action_type are required".to_string(),
             ));
+        }
+        let valid_action_type = matches!(
+            action_type.as_str(),
+            "block" | "add_context" | "command" | "prompt"
+        );
+        if !valid_action_type {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt",
+                action_type
+            )));
         }
         // Validate payload JSON eagerly.
         let _: serde_json::Value = serde_json::from_str(action_payload_json).map_err(|e| {
@@ -2058,7 +2079,7 @@ impl Database {
                     name,
                     event_name,
                     matcher_norm,
-                    action_type,
+                    action_type.as_str(),
                     action_payload_json,
                     enabled_i,
                     now,
@@ -2080,7 +2101,7 @@ impl Database {
                     name,
                     event_name,
                     matcher_norm,
-                    action_type,
+                    action_type.as_str(),
                     action_payload_json,
                     enabled_i,
                     now

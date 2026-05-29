@@ -31,6 +31,7 @@ use crate::db::{
     call_blocking, ChannelBotInstance, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage,
     BOT_INSTANCE_WEB,
 };
+use crate::hook_executor::validate_command_payload;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
@@ -2838,6 +2839,10 @@ async fn api_hooks_post(
         .filter(|s| !s.is_empty())
         .unwrap_or("{}")
         .to_string();
+    if body.action_type.trim().eq_ignore_ascii_case("command") {
+        validate_command_payload(&state.app_state.config, &payload_json)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
     let enabled = body.enabled.unwrap_or(true);
     let id = call_blocking(state.app_state.db.clone(), move |db| {
         db.upsert_hook_definition(

@@ -70,6 +70,7 @@ export type HookDefinition = {
   matcher?: string | null
   action_type: string
   action_payload_json: string
+  action_payload?: Record<string, unknown>
   enabled: boolean
   updated_at: string
 }

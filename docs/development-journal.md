@@ -16,6 +16,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-28 — `modify-skill` builtin + mandatory activation for skill updates
+
+- **Area:** skills / agent loop / builtin_skills
+- **Summary:** Added `builtin_skills/modify-skill/SKILL.md` and runtime gate (`skill_activation_gate`) so `build_skill` (when the skill already exists) and file edits under `skills/<name>/` require `activate_skill` `modify-skill` in the same turn—mirroring `schedule-job` enforcement. System prompt and `create-skill` now route updates to `modify-skill`.
+- **Rationale:** Skill edits were easy to do ad hoc without reading current SKILL.md or path discipline; a dedicated modify flow reduces shadow-tree mistakes and frontmatter drift.
+- **Key files / symbols:** `builtin_skills/modify-skill/SKILL.md`; `src/skill_activation_gate.rs` (`requires_modify_skill_activation`, `REQUIRED_MODIFY_SKILL`); `src/channels/telegram.rs` (turn-local `modify_skill_activated_this_turn`, `skill_required` deny); `builtin_skills/create-skill/SKILL.md`; `src/tools/cursor_agent.rs` (`BuildSkillTool` description).
+- **Follow-ups:** Optionally enforce `create-skill` activation for brand-new `build_skill` calls the same way.
+
+### 2026-05-28 — Hook runtime expanded to command/prompt executor model
+
+- **Area:** hooks / agent loop / db / web / config
+- **Summary:** Reworked hook evaluation to support Cursor-style `command` and `prompt` hooks with structured JSON I/O, richer hook input context, command path allowlists, and optional tool-input rewrite/memory effects. Replaced framework-level `pz_terminal_cleanup` action type with a disabled built-in command hook script (`builtin_hooks/pz-terminal-cleanup.py`) and Rust-side validated effect application.
+- **Rationale:** The previous deterministic runtime (`block`/`add_context` plus special `pz_terminal_cleanup`) was not extensible and encoded persona-specific behavior as a core action type. The new model keeps framework primitives generic and moves edge-case behavior into normal hooks.
+- **Key files / symbols:** `src/hook_executor.rs` (`execute_command_hook`, `execute_prompt_hook`, `resolve_hook_command_path`, `parse_hook_output`), `src/hook_runtime.rs` (`run_hooks_for_event_async`, `HookRunInput`, `HookMemoryEffects`), `src/hook_actions.rs` (`apply_hook_memory_effects`), `src/channels/telegram.rs` (async hook dispatch + pre/post tool integration), `src/db.rs` (`ensure_builtin_hook_definitions`, `upsert_hook_definition` validation), `src/web.rs` (`api_hooks_post` command payload validation), `src/config.rs` (`HOOK_*` config), `docs/hooks-architecture.md`, `builtin_skills/create-hook/SKILL.md`, `builtin_hooks/pz-terminal-cleanup.py`.
+- **Follow-ups:** Add richer operator-facing handling for hook `ask` semantics and optional Windows PowerShell companion for `builtin_hooks/pz-terminal-cleanup.py` if shell parity requirements expand.
+
 ### 2026-05-28 — PostToolUse PZ cleanup registered as DB hook
 
 - **Area:** hooks / memory / db

@@ -2,7 +2,7 @@
 name: create-skill
 description: Authoring guide for FinallyAValueBot skills (YAML catalog + full body after activate_skill).
 when_to_use: |
-  Use when the user asks to create or redesign a skill, define skill frontmatter, or integrate a new capability via SKILL.md and build_skill. Also use when you need the canonical checklist for rate limits, credentials layout, and discovery rules.
+  Use when the user asks to create a new skill, define skill frontmatter for a new capability, or integrate a new SKILL.md via build_skill. For updating an existing skill, activate `modify-skill` instead. Also use when you need the canonical checklist for rate limits, credentials layout, and discovery rules.
 license: MIT
 platforms:
   - linux
@@ -13,7 +13,7 @@ deps: []
 
 # Create skill
 
-Use this skill when the user asks you to create a new skill, build a skill, add a capability, or when you need to create a skill yourself. Follow this guide so skills integrate with discovery, the **frontmatter-only** system prompt catalog, and `activate_skill`.
+Use this skill when the user asks you to **create** a new skill, add a capability, or when you need to author a skill from scratch. For **updates** to an existing skill, activate **`modify-skill`** first. Follow this guide so skills integrate with discovery, the **frontmatter-only** system prompt catalog, and `activate_skill`.
 
 ## Skill structure
 

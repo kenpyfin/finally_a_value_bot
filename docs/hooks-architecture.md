@@ -1,62 +1,119 @@
 # Hook architecture
 
-This document describes the deterministic hook system added to the shared agent path.
+This document describes bot-native hooks in the shared agent path (`process_with_agent_with_events`).
 
 ## Lifecycle events
 
-Hooks are evaluated in `process_with_agent_with_events` at these boundaries:
+Hooks are evaluated at these boundaries:
 
-- `BeforeTurn` (once before iteration loop)
-- `PreToolUse` (before each tool execution)
-- `PostToolUse` (after each tool execution)
-- `PostToolBatch` (after the full tool batch in one iteration)
-- `PreStop` (before finalizing an `end_turn` response)
-- `PostDelivery` (after final response text is finalized)
+- `BeforeTurn`
+- `PreToolUse`
+- `PostToolUse`
+- `PostToolBatch`
+- `PreStop`
+- `PostDelivery`
 
-Event evaluation entry point:
+Runtime entry point:
 
-- `hook_runtime::run_hooks_for_event`
+- `hook_runtime::run_hooks_for_event_async`
 
 ## Storage
 
-Hook definitions live in SQLite:
+Hook definitions are persisted in SQLite `hook_definitions`:
 
-- `hook_definitions`
-  - `id`
-  - `name`
-  - `event_name`
-  - `matcher`
-  - `action_type`
-  - `action_payload_json`
-  - `enabled`
-  - `updated_at`
+- `id`
+- `name`
+- `event_name`
+- `matcher`
+- `action_type`
+- `action_payload_json`
+- `enabled`
+- `updated_at`
 
-## Supported action types
+## Action types
 
-- `block`: stops the current lifecycle action; payload key `reason`.
-- `add_context`: appends deterministic context; payload key `additional_context` (or `context`).
-- `pz_terminal_cleanup`: after a successful tool run, scans tool name/input/output for terminal PZ post outcomes (`published`, `completed`, etc.) and prunes matching Tier 3 focus lines. Applied in the agent path via `hook_actions::apply_post_tool_hook_side_effects` (requires tool output, so it is not evaluated inside `run_hooks_for_event` alone).
+Supported `action_type` values:
 
-Unknown action types are ignored.
+- `block` (inline)
+- `add_context` (inline)
+- `command` (subprocess hook script)
+- `prompt` (LLM-based policy hook)
 
-Built-in hook `posttool-pz-terminal-cleanup` is seeded enabled on every install/upgrade (`db::ensure_builtin_hook_definitions`).
+`pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.
 
 ## Matcher behavior
 
-- Empty matcher means match all for that event.
-- `*` means match all.
-- Otherwise matcher is a Rust regex.
-- For tool events, matcher is evaluated against `tool_name`.
-- For stop/delivery events, matcher is evaluated against `stop_reason`.
+- Empty matcher => match all for event.
+- `*` => match all.
+- Otherwise matcher is Rust regex.
+- For tool events, matcher target includes tool name plus serialized tool input/output.
+- For stop/delivery events, matcher target is stop reason (fallback to assistant text).
+
+## Hook input (stdin JSON / prompt `$ARGUMENTS`)
+
+Hooks receive serialized runtime context, including:
+
+- `event`
+- `chat_id`, `persona_id`, `caller_channel`, `is_scheduled_task`
+- `tool_name`, `tool_input`, `tool_output`, `tool_is_error`
+- `stop_reason`, `assistant_text`
+
+## Hook output (stdout JSON)
+
+Hooks may return:
+
+- `permission`: `allow` | `deny` | `ask`
+- `reason`, `user_message`
+- `agent_message`, `additional_context`
+- `updated_tool_input`
+- `effects.memory_tier3_prune.terminal_pz_post_ids`
+
+Notes:
+
+- Exit code `2` from command hook is treated as deny.
+- Other non-zero exits fail open unless `fail_closed: true`.
+- `ask` is treated as a deny-style block in current runtime.
+
+## Command hook path policy
+
+`action_payload_json.command` must be a relative path under:
+
+- `WORKSPACE_DIR/hooks/`
+- repository `builtin_hooks/` (or `FINALLY_A_VALUE_BOT_BUILTIN_HOOKS`)
+
+Rejected:
+
+- absolute paths
+- `..` traversal
+- non-executable files
+
+Default command-hook cwd is `WORKSPACE_DIR/shared/` unless payload sets `cwd` to `workspace`.
+
+## Prompt hooks
+
+Prompt hooks run a small LLM check with JSON-only contract.
+
+- Payload keys: `prompt`, optional `timeout_secs`, `fail_closed`, `model`
+- Model fallback order: payload model -> `HOOK_PROMPT_MODEL` -> `TOOL_SKILL_AGENT_MODEL` -> `ORCHESTRATOR_MODEL` -> main model
 
 ## Persona enforcement
 
-Before a matched hook executes, runtime checks persona policy:
+Before a matched hook executes, runtime checks:
 
 - `Database::is_hook_allowed_for_persona(chat_id, persona_id, hook_id)`
 
-Default behavior is allow-all when no policy row exists or when `allowed_hook_ids_json` is `NULL`.
+Default behavior remains allow-all when no persona policy row exists (or allowlist is `NULL`).
 
-## Delivery guard relation
+## Built-in PZ hook
 
-The hook system is separate from baseline delivery safeguards. Delivery correctness is still enforced in the shared agent path, and hooks are an additional deterministic control layer rather than the sole protection.
+Built-in seed now creates `posttool-pz-terminal-cleanup` as:
+
+- `action_type: command`
+- script: `builtin_hooks/pz-terminal-cleanup.py`
+- `enabled: false` (persona-specific opt-in)
+
+The hook returns `effects.memory_tier3_prune`, and Rust applies memory writes via `hook_actions::apply_hook_memory_effects`.
+
+## Separation from delivery safeguards
+
+Hooks are additive policy controls. Baseline delivery correctness and final-response guardrails remain in the shared agent path.

@@ -25,10 +25,8 @@ use crate::config::Config;
 use crate::db::{
     call_blocking, Database, PersonaBulletinFocus, PersonaMessageBookmark, StoredMessage,
 };
-use crate::hook_actions::{
-    apply_deterministic_persona_memory_hygiene, apply_post_tool_hook_side_effects,
-};
-use crate::hook_runtime::{run_hooks_for_event, HookEventName, HookRunInput};
+use crate::hook_actions::{apply_deterministic_persona_memory_hygiene, apply_hook_memory_effects};
+use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::memory::{
@@ -1889,6 +1887,7 @@ pub async fn process_with_agent_with_events(
     const LLM_ROUND_TIMEOUT_SECS: u64 = 180;
     const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 3600;
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
+    const REQUIRED_MODIFY_SKILL: &str = crate::skill_activation_gate::REQUIRED_MODIFY_SKILL;
     const LOOP_SIGNATURE_REPEAT_THRESHOLD: usize = 3;
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
     const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 15;
@@ -1933,6 +1932,10 @@ pub async fn process_with_agent_with_events(
         .unwrap_or_default();
     let mut history_iterations: Vec<IterationRecord> = Vec::new();
     let mut schedule_skill_activated_this_turn = false;
+    let mut modify_skill_activated_this_turn = false;
+    let skills_data_dir = state.config.skills_data_dir_absolute();
+    let tool_shared_dir =
+        crate::tools::resolve_tool_working_dir(Path::new(state.config.working_dir()));
     let mut last_tool_signature: Option<String> = None;
     let mut consecutive_same_signature_count: usize = 0;
     let mut last_swap_signature: Option<String> = None;
@@ -1980,15 +1983,18 @@ pub async fn process_with_agent_with_events(
         }};
     }
 
-    let before_turn_hooks = call_blocking(state.db.clone(), move |db| {
-        run_hooks_for_event(
-            db,
+    let before_turn_hooks = run_hooks_for_event_async(
+        state.db.clone(),
+        &state.config,
+        HookEventName::BeforeTurn,
+        &HookRunInput {
             chat_id,
             persona_id,
-            HookEventName::BeforeTurn,
-            &HookRunInput::default(),
-        )
-    })
+            caller_channel: context.caller_channel.to_string(),
+            is_scheduled_task: context.is_scheduled_task,
+            ..HookRunInput::default()
+        },
+    )
     .await?;
     if let Some(reason) = before_turn_hooks.blocked_reason {
         let blocked = format!("This run was blocked before execution: {reason}");
@@ -2174,23 +2180,20 @@ pub async fn process_with_agent_with_events(
                 }
             }
 
-            if let Ok(pre_stop_hook) = call_blocking(state.db.clone(), {
-                let sr = stop_reason.to_string();
-                let at = assistant_text_preview.clone();
-                move |db| {
-                    run_hooks_for_event(
-                        db,
-                        chat_id,
-                        persona_id,
-                        HookEventName::PreStop,
-                        &HookRunInput {
-                            tool_name: None,
-                            stop_reason: Some(sr),
-                            assistant_text: Some(at),
-                        },
-                    )
-                }
-            })
+            if let Ok(pre_stop_hook) = run_hooks_for_event_async(
+                state.db.clone(),
+                &state.config,
+                HookEventName::PreStop,
+                &HookRunInput {
+                    chat_id,
+                    persona_id,
+                    caller_channel: context.caller_channel.to_string(),
+                    is_scheduled_task: context.is_scheduled_task,
+                    stop_reason: Some(stop_reason.to_string()),
+                    assistant_text: Some(assistant_text_preview.clone()),
+                    ..HookRunInput::default()
+                },
+            )
             .await
             {
                 if let Some(reason) = pre_stop_hook.blocked_reason {
@@ -2227,23 +2230,20 @@ pub async fn process_with_agent_with_events(
                     continue;
                 }
             }
-            if let Ok(post_delivery_hook) = call_blocking(state.db.clone(), {
-                let sr = stop_reason.to_string();
-                let at = final_text.clone();
-                move |db| {
-                    run_hooks_for_event(
-                        db,
-                        chat_id,
-                        persona_id,
-                        HookEventName::PostDelivery,
-                        &HookRunInput {
-                            tool_name: None,
-                            stop_reason: Some(sr),
-                            assistant_text: Some(at),
-                        },
-                    )
-                }
-            })
+            if let Ok(post_delivery_hook) = run_hooks_for_event_async(
+                state.db.clone(),
+                &state.config,
+                HookEventName::PostDelivery,
+                &HookRunInput {
+                    chat_id,
+                    persona_id,
+                    caller_channel: context.caller_channel.to_string(),
+                    is_scheduled_task: context.is_scheduled_task,
+                    stop_reason: Some(stop_reason.to_string()),
+                    assistant_text: Some(final_text.clone()),
+                    ..HookRunInput::default()
+                },
+            )
             .await
             {
                 if !post_delivery_hook.additional_contexts.is_empty() {
@@ -2342,7 +2342,6 @@ pub async fn process_with_agent_with_events(
                 } = block
                 {
                     executed_tool_names.push(name.clone());
-                    executed_tool_inputs.push((name.clone(), input.clone()));
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolStart {
                             tool_use_id: id.clone(),
@@ -2381,34 +2380,22 @@ pub async fn process_with_agent_with_events(
                     );
 
                     let started = std::time::Instant::now();
-                    let requested_skill_name = input
-                        .get("skill_name")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim);
-                    let activates_required_schedule_skill = name == "activate_skill"
-                        && requested_skill_name
-                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_SCHEDULING_SKILL))
-                            .unwrap_or(false);
-                    let missing_schedule_skill = (name == "schedule_task"
-                        || name == "update_scheduled_task")
-                        && !schedule_skill_activated_this_turn;
+                    let mut hook_input_for_exec = input.clone();
 
-                    let pre_tool_hook = call_blocking(state.db.clone(), {
-                        let tool_name = name.clone();
-                        move |db| {
-                            run_hooks_for_event(
-                                db,
-                                chat_id,
-                                persona_id,
-                                HookEventName::PreToolUse,
-                                &HookRunInput {
-                                    tool_name: Some(tool_name),
-                                    stop_reason: None,
-                                    assistant_text: None,
-                                },
-                            )
-                        }
-                    })
+                    let pre_tool_hook = run_hooks_for_event_async(
+                        state.db.clone(),
+                        &state.config,
+                        HookEventName::PreToolUse,
+                        &HookRunInput {
+                            chat_id,
+                            persona_id,
+                            caller_channel: context.caller_channel.to_string(),
+                            is_scheduled_task: context.is_scheduled_task,
+                            tool_name: Some(name.clone()),
+                            tool_input: Some(hook_input_for_exec.clone()),
+                            ..HookRunInput::default()
+                        },
+                    )
                     .await
                     .ok();
                     if let Some(hook) = pre_tool_hook.as_ref() {
@@ -2426,7 +2413,8 @@ pub async fn process_with_agent_with_events(
                             history_tool_calls.push(ToolCallRecord {
                                 name: name.clone(),
                                 input_preview: redact_secrets_internal(&truncate_preview(
-                                    &serde_json::to_string(input).unwrap_or_default(),
+                                    &serde_json::to_string(&hook_input_for_exec)
+                                        .unwrap_or_default(),
                                     10000,
                                 )),
                                 result_preview: reason.to_string(),
@@ -2435,8 +2423,35 @@ pub async fn process_with_agent_with_events(
                             });
                             continue;
                         }
+                        if let Some(updated) = hook.updated_tool_input.clone() {
+                            hook_input_for_exec = updated;
+                        }
                         hook_batch_contexts.extend(hook.additional_contexts.iter().cloned());
                     }
+                    executed_tool_inputs.push((name.clone(), hook_input_for_exec.clone()));
+
+                    let requested_skill_name = hook_input_for_exec
+                        .get("skill_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim);
+                    let activates_required_schedule_skill = name == "activate_skill"
+                        && requested_skill_name
+                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_SCHEDULING_SKILL))
+                            .unwrap_or(false);
+                    let activates_required_modify_skill = name == "activate_skill"
+                        && requested_skill_name
+                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_MODIFY_SKILL))
+                            .unwrap_or(false);
+                    let missing_schedule_skill = (name == "schedule_task"
+                        || name == "update_scheduled_task")
+                        && !schedule_skill_activated_this_turn;
+                    let missing_modify_skill =
+                        crate::skill_activation_gate::requires_modify_skill_activation(
+                            name,
+                            &hook_input_for_exec,
+                            &skills_data_dir,
+                            &tool_shared_dir,
+                        ) && !modify_skill_activated_this_turn;
 
                     // TSA: allow or deny before execution
                     let tsa_deny = if state.config.tool_skill_agent_enabled {
@@ -2450,7 +2465,7 @@ pub async fn process_with_agent_with_events(
                         match evaluate_tool_use(
                             &state.config,
                             name,
-                            input,
+                            &hook_input_for_exec,
                             &messages,
                             Some(&tool_auth),
                         )
@@ -2508,13 +2523,20 @@ pub async fn process_with_agent_with_events(
                             "schedule_task and update_scheduled_task require activating the `schedule-job` skill first in this turn. Call `activate_skill` with skill_name `schedule-job`, follow its preflight (including timezone handling), then call the scheduling tool.".into(),
                         )
                         .with_error_type("skill_required")
+                    } else if missing_modify_skill {
+                        crate::tools::ToolResult::error(
+                            crate::skill_activation_gate::modify_skill_required_error_message(),
+                        )
+                        .with_error_type("skill_required")
                     } else {
                         match await_with_cancel(
                             tokio::time::timeout(
                                 std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
-                                state
-                                    .tools
-                                    .execute_with_auth(name, input.clone(), &tool_auth),
+                                state.tools.execute_with_auth(
+                                    name,
+                                    hook_input_for_exec.clone(),
+                                    &tool_auth,
+                                ),
                             ),
                             cancel.as_ref(),
                         )
@@ -2557,9 +2579,9 @@ pub async fn process_with_agent_with_events(
                     };
                     if state.config.post_edit_validation_enabled
                         && !result.is_error
-                        && should_validate_post_edit(name, input)
+                        && should_validate_post_edit(name, &hook_input_for_exec)
                     {
-                        let path = input
+                        let path = hook_input_for_exec
                             .get("path")
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
@@ -2586,6 +2608,15 @@ pub async fn process_with_agent_with_events(
                             REQUIRED_SCHEDULING_SKILL
                         );
                     }
+                    if activates_required_modify_skill && !result.is_error {
+                        modify_skill_activated_this_turn = true;
+                        info!(
+                            "Main agent iteration {}/{}: required modify skill activated ({})",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            REQUIRED_MODIFY_SKILL
+                        );
+                    }
 
                     let result_preview = if result.content.len() > 10000 {
                         format!(
@@ -2610,7 +2641,7 @@ pub async fn process_with_agent_with_events(
                     let signature = format!(
                         "{}::{}::{}::{}",
                         name,
-                        tool_input_signature(input),
+                        tool_input_signature(&hook_input_for_exec),
                         if result.is_error { "error" } else { "ok" },
                         result_progress_marker(&result.content)
                     );
@@ -2630,8 +2661,9 @@ pub async fn process_with_agent_with_events(
                         }
                     }
 
-                    if is_swap_related_tool_use(name, input) {
-                        let swap_sig = format!("{}::{}", name, tool_input_signature(input));
+                    if is_swap_related_tool_use(name, &hook_input_for_exec) {
+                        let swap_sig =
+                            format!("{}::{}", name, tool_input_signature(&hook_input_for_exec));
                         if has_new_swap_evidence(&result.content) {
                             swap_no_evidence_repeat_count = 0;
                             last_swap_signature = Some(swap_sig);
@@ -2691,7 +2723,7 @@ pub async fn process_with_agent_with_events(
                     history_tool_calls.push(ToolCallRecord {
                         name: name.clone(),
                         input_preview: redact_secrets_internal(&truncate_preview(
-                            &serde_json::to_string(input).unwrap_or_default(),
+                            &serde_json::to_string(&hook_input_for_exec).unwrap_or_default(),
                             10000,
                         )),
                         result_preview: redact_secrets_internal(&truncate_preview(
@@ -2704,33 +2736,35 @@ pub async fn process_with_agent_with_events(
                         is_error: result.is_error,
                     });
 
-                    if let Ok(post_tool_hook) = call_blocking(state.db.clone(), {
-                        let tool_name = name.clone();
-                        move |db| {
-                            run_hooks_for_event(
-                                db,
-                                chat_id,
-                                persona_id,
-                                HookEventName::PostToolUse,
-                                &HookRunInput {
-                                    tool_name: Some(tool_name),
-                                    stop_reason: None,
-                                    assistant_text: None,
-                                },
-                            )
-                        }
-                    })
+                    if let Ok(post_tool_hook) = run_hooks_for_event_async(
+                        state.db.clone(),
+                        &state.config,
+                        HookEventName::PostToolUse,
+                        &HookRunInput {
+                            chat_id,
+                            persona_id,
+                            caller_channel: context.caller_channel.to_string(),
+                            is_scheduled_task: context.is_scheduled_task,
+                            tool_name: Some(name.clone()),
+                            tool_input: Some(hook_input_for_exec.clone()),
+                            tool_output: Some(result.content.clone()),
+                            tool_is_error: Some(result.is_error),
+                            ..HookRunInput::default()
+                        },
+                    )
                     .await
                     {
-                        apply_post_tool_hook_side_effects(
+                        if let Some(reason) = post_tool_hook.blocked_reason.as_deref() {
+                            force_stall_response = Some(format!(
+                                "I paused due to post-tool hook policy after `{}`: {}",
+                                name, reason
+                            ));
+                        }
+                        apply_hook_memory_effects(
                             &state.memory,
                             chat_id,
                             persona_id,
-                            &post_tool_hook,
-                            name,
-                            input,
-                            &result.content,
-                            result.is_error,
+                            &post_tool_hook.memory_effects,
                         );
                         hook_batch_contexts.extend(post_tool_hook.additional_contexts);
                     }
@@ -2743,17 +2777,26 @@ pub async fn process_with_agent_with_events(
                 }
             }
 
-            if let Ok(post_batch_hook) = call_blocking(state.db.clone(), move |db| {
-                run_hooks_for_event(
-                    db,
+            if let Ok(post_batch_hook) = run_hooks_for_event_async(
+                state.db.clone(),
+                &state.config,
+                HookEventName::PostToolBatch,
+                &HookRunInput {
                     chat_id,
                     persona_id,
-                    HookEventName::PostToolBatch,
-                    &HookRunInput::default(),
-                )
-            })
+                    caller_channel: context.caller_channel.to_string(),
+                    is_scheduled_task: context.is_scheduled_task,
+                    ..HookRunInput::default()
+                },
+            )
             .await
             {
+                if let Some(reason) = post_batch_hook.blocked_reason.as_deref() {
+                    force_stall_response = Some(format!(
+                        "I paused due to post-tool-batch hook policy: {}",
+                        reason
+                    ));
+                }
                 hook_batch_contexts.extend(post_batch_hook.additional_contexts);
             }
 
@@ -2873,22 +2916,20 @@ Tell me what you need in one line — e.g. show the latest PZ image, check a spe
                 } else {
                     guarded_text
                 };
-                if let Ok(post_delivery_hook) = call_blocking(state.db.clone(), {
-                    let at = final_text.clone();
-                    move |db| {
-                        run_hooks_for_event(
-                            db,
-                            chat_id,
-                            persona_id,
-                            HookEventName::PostDelivery,
-                            &HookRunInput {
-                                tool_name: None,
-                                stop_reason: Some("memory_write_short_circuit".to_string()),
-                                assistant_text: Some(at),
-                            },
-                        )
-                    }
-                })
+                if let Ok(post_delivery_hook) = run_hooks_for_event_async(
+                    state.db.clone(),
+                    &state.config,
+                    HookEventName::PostDelivery,
+                    &HookRunInput {
+                        chat_id,
+                        persona_id,
+                        caller_channel: context.caller_channel.to_string(),
+                        is_scheduled_task: context.is_scheduled_task,
+                        stop_reason: Some("memory_write_short_circuit".to_string()),
+                        assistant_text: Some(final_text.clone()),
+                        ..HookRunInput::default()
+                    },
+                )
                 .await
                 {
                     if !post_delivery_hook.additional_contexts.is_empty() {
@@ -3035,22 +3076,20 @@ Tell me what you need in one line — e.g. show the latest PZ image, check a spe
                         } else {
                             guarded_text
                         };
-                        if let Ok(post_delivery_hook) = call_blocking(state.db.clone(), {
-                            let at = final_text.clone();
-                            move |db| {
-                                run_hooks_for_event(
-                                    db,
-                                    chat_id,
-                                    persona_id,
-                                    HookEventName::PostDelivery,
-                                    &HookRunInput {
-                                        tool_name: None,
-                                        stop_reason: Some("pte_complete".to_string()),
-                                        assistant_text: Some(at),
-                                    },
-                                )
-                            }
-                        })
+                        if let Ok(post_delivery_hook) = run_hooks_for_event_async(
+                            state.db.clone(),
+                            &state.config,
+                            HookEventName::PostDelivery,
+                            &HookRunInput {
+                                chat_id,
+                                persona_id,
+                                caller_channel: context.caller_channel.to_string(),
+                                is_scheduled_task: context.is_scheduled_task,
+                                stop_reason: Some("pte_complete".to_string()),
+                                assistant_text: Some(final_text.clone()),
+                                ..HookRunInput::default()
+                            },
+                        )
                         .await
                         {
                             if !post_delivery_hook.additional_contexts.is_empty() {
@@ -4141,7 +4180,7 @@ fn build_system_prompt(
 - **History / export:** export_chat, search_chat_history
 - **Media:** user images arrive as image blocks
 - **Cursor CLI:** cursor_agent, cursor_agent_send, list_cursor_agent_runs (use detach: true for long work)
-- **Skills:** `activate_skill` loads full `SKILL.md`; creating or updating skills uses **`build_skill`** or tool-relative `skills/<name>/...` only — see **Path discipline (strict)** (never `workspace/skills/...`)
+- **Skills:** `activate_skill` loads full `SKILL.md`; **new** skills → activate `create-skill` then **`build_skill`**; **existing** skill changes → activate **`modify-skill`** first, then `build_skill` or `skills/<name>/...` file tools — see **Path discipline (strict)** (never `workspace/skills/...`)
 - **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). **`register_tracked_job`** records an external id (e.g. ComfyUI `prompt_id`) so it appears in the same queue as shell jobs without blocking another background slot. Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
 - **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, read_agent_history
 
@@ -4171,6 +4210,10 @@ For serving files to users:
 When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. **Identity and Tier 1** (long-term facts, workflow principles) are compiled into the system prompt under **# Identity and long-term memory (Tier 1)**. **Tier 2/3**, bulletin focus, operator focus, and bookmarks are in the **[persona_context]** message at conversation start. Tier 2 is durable knowledge only (user terminology, known steps, preferences), not active project status. Bulletin is the canonical active-focus card. Tier 3 is short-lived scratch context and should not duplicate bulletin status lines. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use read_tiered_memory/write_tiered_memory for explicit tier edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
 
 **Bulletin + memory sync:** Routine bulletin and Tier 3 hygiene are persisted automatically by lifecycle hooks after delivery. Do not treat `update_bulletin_focus` or `write_tiered_memory` as mandatory end-of-turn tools; use them when the user explicitly asks for a direct memory/bulletin edit during the run.
+
+For skills:
+- **New skill:** activate `create-skill`, then use `build_skill` (or `write_file` at `skills/<name>/SKILL.md` only when creating a brand-new directory)
+- **Update / modify / change an existing skill:** activate `modify-skill` first in the same turn, read current `SKILL.md`, then `build_skill` or targeted file edits under `skills/<name>/`
 
 For scheduling:
 - Always activate `schedule-job` skill before calling `schedule_task` or `update_scheduled_task`
@@ -5755,6 +5798,7 @@ mod tests {
         assert!(prompt.contains("shared/workspace/"));
         assert!(prompt.contains("/home/user/finally_a_value_bot.data/skills"));
         assert!(prompt.contains("build_skill"));
+        assert!(prompt.contains("modify-skill"));
     }
 
     #[test]

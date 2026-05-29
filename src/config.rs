@@ -234,6 +234,15 @@ fn default_post_tool_evaluator_enabled() -> bool {
 fn default_post_tool_evaluator_model() -> String {
     String::new()
 }
+fn default_hook_command_timeout_secs() -> u64 {
+    10
+}
+fn default_hook_prompt_timeout_secs() -> u64 {
+    15
+}
+fn default_hook_prompt_model() -> String {
+    String::new()
+}
 
 fn default_allow_fuzzy_search_replace() -> bool {
     false
@@ -509,6 +518,15 @@ pub struct Config {
     /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_post_tool_evaluator_model")]
     pub post_tool_evaluator_model: String,
+    /// Default timeout in seconds for command hooks.
+    #[serde(default = "default_hook_command_timeout_secs")]
+    pub hook_command_timeout_secs: u64,
+    /// Default timeout in seconds for prompt hooks.
+    #[serde(default = "default_hook_prompt_timeout_secs")]
+    pub hook_prompt_timeout_secs: u64,
+    /// Optional model override for prompt hooks.
+    #[serde(default = "default_hook_prompt_model")]
+    pub hook_prompt_model: String,
     /// Allow fuzzy fallback in apply_search_replace when input requests allow_fuzzy.
     #[serde(default = "default_allow_fuzzy_search_replace")]
     pub allow_fuzzy_search_replace: bool,
@@ -940,6 +958,15 @@ impl Config {
                 default_post_tool_evaluator_enabled(),
             ),
             post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
+            hook_command_timeout_secs: Self::env_u64(
+                "HOOK_COMMAND_TIMEOUT_SECS",
+                default_hook_command_timeout_secs(),
+            ),
+            hook_prompt_timeout_secs: Self::env_u64(
+                "HOOK_PROMPT_TIMEOUT_SECS",
+                default_hook_prompt_timeout_secs(),
+            ),
+            hook_prompt_model: Self::env("HOOK_PROMPT_MODEL").unwrap_or_default(),
             allow_fuzzy_search_replace: Self::env_bool(
                 "ALLOW_FUZZY_SEARCH_REPLACE",
                 default_allow_fuzzy_search_replace(),
@@ -1385,6 +1412,20 @@ impl Config {
             "SHOW_THINKING={}",
             if self.show_thinking { "true" } else { "false" }
         ));
+        lines.push(format!(
+            "HOOK_COMMAND_TIMEOUT_SECS={}",
+            self.hook_command_timeout_secs
+        ));
+        lines.push(format!(
+            "HOOK_PROMPT_TIMEOUT_SECS={}",
+            self.hook_prompt_timeout_secs
+        ));
+        if !self.hook_prompt_model.trim().is_empty() {
+            lines.push(format!(
+                "HOOK_PROMPT_MODEL={}",
+                esc(&self.hook_prompt_model)
+            ));
+        }
         lines.push("".into());
         lines.push("# Workspace".into());
         lines.push(format!("WORKSPACE_DIR={}", esc(&self.workspace_dir)));
@@ -1536,6 +1577,9 @@ pub fn test_config() -> Config {
         tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
+        hook_command_timeout_secs: default_hook_command_timeout_secs(),
+        hook_prompt_timeout_secs: default_hook_prompt_timeout_secs(),
+        hook_prompt_model: String::new(),
         allow_fuzzy_search_replace: false,
         symbol_edit_enabled: false,
         post_edit_validation_enabled: true,
