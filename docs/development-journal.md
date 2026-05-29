@@ -16,6 +16,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-28 — Migrate remaining inline guards into built-in hooks
+
+- **Area:** hooks / agent loop / prompt context
+- **Summary:** Migrated remaining deterministic inline policies to hook-owned built-ins: scheduled-run policy context, turn skill gating, deferred-commitment pre-stop guard, and post-tool-batch loop guard. Removed scheduled policy prefix injection and switched guard routing to `runtime_signals` passed through `HookRunInput`.
+- **Rationale:** Complete prompt-to-hook migration so recurring policy behavior is centralized in lifecycle hooks, reducing prompt bloat and duplicated inline branches.
+- **Key files / symbols:** `src/hook_runtime.rs` (`HookRunInput::runtime_signals`, builtin action handlers), `src/db.rs` (`ensure_builtin_hook_definitions`, action-type validation), `src/channels/telegram.rs` (PreToolUse/PreStop/PostToolBatch hook signal wiring; removed scheduler policy prepend), `docs/hooks-architecture.md`.
+- **Follow-ups:** If operator configurability is needed, decide which built-in policy hooks should remain always-on vs persona-allowlist-gated.
+
 ### 2026-05-28 — PostDelivery focus sync moved under hook runtime + prompt prefix trim
 
 - **Area:** agent / hooks / prompt context / memory

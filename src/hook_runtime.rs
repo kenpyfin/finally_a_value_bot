@@ -47,6 +47,7 @@ pub struct HookRunInput {
     pub tool_is_error: Option<bool>,
     pub stop_reason: Option<String>,
     pub assistant_text: Option<String>,
+    pub runtime_signals: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,6 +128,24 @@ fn payload_string(payload: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn signal_bool(input: &HookRunInput, key: &str) -> bool {
+    input
+        .runtime_signals
+        .as_ref()
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn signal_u64(input: &HookRunInput, key: &str) -> u64 {
+    input
+        .runtime_signals
+        .as_ref()
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
 fn build_hook_input_json(
     event: HookEventName,
     hook: &HookDefinitionRecord,
@@ -145,6 +164,7 @@ fn build_hook_input_json(
         "tool_is_error": input.tool_is_error,
         "stop_reason": input.stop_reason,
         "assistant_text": input.assistant_text,
+        "runtime_signals": input.runtime_signals,
     })
     .to_string()
 }
@@ -263,6 +283,64 @@ pub async fn run_hooks_for_event_async(
             }
             "builtin_persona_focus_sync" => {
                 out.run_persona_focus_sync = true;
+            }
+            "builtin_scheduler_policy_context" => {
+                if input.is_scheduled_task {
+                    out.additional_contexts.push(
+                        "Scheduled run policy: send one final assistant reply only; do not call send_message for this chat."
+                            .to_string(),
+                    );
+                }
+            }
+            "builtin_turn_skill_gate" => {
+                if signal_bool(input, "requires_schedule_skill") {
+                    out.blocked_reason = Some(
+                        "skill_required: schedule_task and update_scheduled_task require activating the `schedule-job` skill first in this turn. Call `activate_skill` with skill_name `schedule-job`, follow its preflight (including timezone handling), then call the scheduling tool.".to_string()
+                    );
+                    break;
+                }
+                if signal_bool(input, "requires_modify_skill") {
+                    out.blocked_reason = Some(format!(
+                        "skill_required: {}",
+                        crate::skill_activation_gate::modify_skill_required_error_message()
+                    ));
+                    break;
+                }
+            }
+            "builtin_deferred_commitment_guard" => {
+                let should_reject = signal_bool(input, "deferred_commitment_should_reject");
+                let nudge_count = signal_u64(input, "deferred_commitment_nudges");
+                let nudge_max = signal_u64(input, "deferred_commitment_max_nudges");
+                let can_continue = signal_bool(input, "can_continue_iteration");
+                if should_reject && can_continue && nudge_count < nudge_max {
+                    out.blocked_reason = Some(
+                        "deferred_commitment: You ended your turn while promising further work. Either call a tool now (read_agent_history, read_file, glob, list_cursor_agent_runs, etc.) or give a final answer with what you already know—do not say you are checking something without a tool call."
+                            .to_string(),
+                    );
+                    break;
+                }
+            }
+            "builtin_loop_guard" => {
+                if signal_bool(input, "force_stall_present") {
+                    continue;
+                }
+                let legacy_count = signal_u64(input, "legacy_edit_without_block_count");
+                if legacy_count >= signal_u64(input, "legacy_edit_hint_threshold").max(2) {
+                    out.additional_contexts.push("Routing hint: you are repeatedly editing files via write_file/edit_file without using apply_search_replace. For non-trivial code edits, first call read_repo_map, then use apply_search_replace with explicit SEARCH/REPLACE blocks; keep edit_file as fallback only.".to_string());
+                }
+                let discovery_count = signal_u64(input, "discovery_streak_count");
+                let discovery_hint = signal_u64(input, "discovery_streak_hint_threshold").max(1);
+                let discovery_stall = signal_u64(input, "discovery_streak_stall_threshold").max(2);
+                if discovery_count >= discovery_hint {
+                    out.additional_contexts.push("Routing hint: you are in a discovery/search loop (list tasks, list cursor runs, broad grep/find). For job status use `read_tiered_memory` and `list_cursor_agent_runs`; for files use `glob` with a pattern (e.g. PZ-*.png) or `read_file` on a known path — not recursive shell grep over `shared/`.".to_string());
+                }
+                if discovery_count >= discovery_stall {
+                    out.blocked_reason = Some(
+                        "stall_response: I stopped because this run kept searching without making progress (repeated status/list/grep steps). Tell me what you need in one line — e.g. show the latest PZ image, check a specific background job id, or retry generation — and I will use a direct path (tiered memory, glob, or a single read) instead of scanning the tree."
+                            .to_string(),
+                    );
+                    break;
+                }
             }
             _ => {}
         }
@@ -437,5 +515,46 @@ mod tests {
             ))
             .expect("run hooks");
         assert!(out.run_persona_focus_sync);
+    }
+
+    #[test]
+    fn builtin_turn_skill_gate_blocks_missing_activation() {
+        let db = test_db();
+        let chat_id = 9005;
+        let persona_id = db
+            .create_persona(chat_id, "default", None)
+            .expect("create persona");
+        db.upsert_hook_definition(
+            None,
+            "pretool-turn-skill-gate-test",
+            HookEventName::PreToolUse.as_str(),
+            None,
+            "builtin_turn_skill_gate",
+            "{}",
+            true,
+        )
+        .expect("upsert hook");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let out = rt
+            .block_on(run_hooks_for_event_async(
+                db.clone(),
+                &crate::config::test_config(),
+                HookEventName::PreToolUse,
+                &HookRunInput {
+                    chat_id,
+                    persona_id,
+                    tool_name: Some("schedule_task".to_string()),
+                    runtime_signals: Some(serde_json::json!({
+                        "requires_schedule_skill": true
+                    })),
+                    ..HookRunInput::default()
+                },
+            ))
+            .expect("run hooks");
+        assert!(out
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("skill_required:"));
     }
 }

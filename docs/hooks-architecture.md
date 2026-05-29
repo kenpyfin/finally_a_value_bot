@@ -39,6 +39,10 @@ Supported `action_type` values:
 - `command` (subprocess hook script)
 - `prompt` (LLM-based policy hook)
 - `builtin_persona_focus_sync` (built-in PostDelivery bulletin/memory sync trigger)
+- `builtin_scheduler_policy_context` (BeforeTurn scheduled-run policy context)
+- `builtin_turn_skill_gate` (PreToolUse schedule/modify activation gate)
+- `builtin_deferred_commitment_guard` (PreStop deferred-work guard)
+- `builtin_loop_guard` (PostToolBatch discovery/edit loop guard)
 
 `pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.
 
@@ -124,6 +128,17 @@ Built-in seed also creates `postdelivery-persona-focus-sync` as:
 - `enabled: true`
 
 When matched, runtime sets a built-in trigger that runs the post-delivery persona focus sync pipeline (`run_persona_focus_sync_after_delivery`) rather than requiring inline unconditional orchestration.
+
+## Additional built-in policy hooks
+
+Built-in seeds also create:
+
+- `beforeturn-scheduler-policy-context` (`BeforeTurn`, `builtin_scheduler_policy_context`, enabled)
+- `pretool-turn-skill-gate` (`PreToolUse`, `builtin_turn_skill_gate`, enabled)
+- `prestop-deferred-commitment-guard` (`PreStop`, `builtin_deferred_commitment_guard`, enabled)
+- `postbatch-loop-guard` (`PostToolBatch`, `builtin_loop_guard`, enabled)
+
+These replace several former inline prompt/runtime branches with hook-evaluated deterministic policy.
 
 ## Separation from delivery safeguards
 

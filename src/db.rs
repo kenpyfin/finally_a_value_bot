@@ -1209,6 +1209,62 @@ impl Database {
                 now,
             ],
         )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_definitions
+             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "beforeturn-scheduler-policy-context",
+                "BeforeTurn",
+                Option::<&str>::None,
+                "builtin_scheduler_policy_context",
+                "{}",
+                1_i64,
+                now,
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_definitions
+             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "pretool-turn-skill-gate",
+                "PreToolUse",
+                Option::<&str>::None,
+                "builtin_turn_skill_gate",
+                "{}",
+                1_i64,
+                now,
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_definitions
+             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "prestop-deferred-commitment-guard",
+                "PreStop",
+                Option::<&str>::None,
+                "builtin_deferred_commitment_guard",
+                "{}",
+                1_i64,
+                now,
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_definitions
+             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "postbatch-loop-guard",
+                "PostToolBatch",
+                Option::<&str>::None,
+                "builtin_loop_guard",
+                "{}",
+                1_i64,
+                now,
+            ],
+        )?;
         Ok(())
     }
 
@@ -2062,11 +2118,19 @@ impl Database {
         }
         let valid_action_type = matches!(
             action_type.as_str(),
-            "block" | "add_context" | "command" | "prompt" | "builtin_persona_focus_sync"
+            "block"
+                | "add_context"
+                | "command"
+                | "prompt"
+                | "builtin_persona_focus_sync"
+                | "builtin_scheduler_policy_context"
+                | "builtin_turn_skill_gate"
+                | "builtin_deferred_commitment_guard"
+                | "builtin_loop_guard"
         );
         if !valid_action_type {
             return Err(FinallyAValueBotError::ToolExecution(format!(
-                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync",
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard",
                 action_type
             )));
         }
