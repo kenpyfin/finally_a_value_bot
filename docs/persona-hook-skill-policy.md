@@ -2,6 +2,13 @@
 
 Per-persona hook and skill access is controlled by `persona_hook_skill_policy`.
 
+Hook definitions also have an optional intrinsic scope (`hook_definitions.scoped_persona_ids_json`):
+
+- `NULL` => global hook
+- JSON array of persona ids => hook only evaluates for those personas
+
+`persona_hook_skill_policy` is an additional allowlist gate evaluated after hook scope.
+
 ## Table
 
 - `chat_id`

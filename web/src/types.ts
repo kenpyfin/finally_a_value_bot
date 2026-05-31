@@ -71,6 +71,8 @@ export type HookDefinition = {
   action_type: string
   action_payload_json: string
   action_payload?: Record<string, unknown>
+  scoped_persona_ids: number[] | null
+  is_global: boolean
   enabled: boolean
   updated_at: string
 }

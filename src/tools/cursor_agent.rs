@@ -331,8 +331,8 @@ impl Tool for CursorAgentTool {
 
         let auth = auth_context_from_input(&input);
         let started_at = chrono::Utc::now().to_rfc3339();
-        let working_dir =
-            super::resolve_tool_working_dir(PathBuf::from(self.config.working_dir()).as_path());
+        let workspace_root = PathBuf::from(self.config.working_dir());
+        let working_dir = super::resolve_tool_working_dir_for_auth(&workspace_root, auth.as_ref());
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
             return ToolResult::error(format!(
                 "Failed to create working directory {}: {e}",
@@ -790,6 +790,8 @@ Create (or update) the skill at: {}/{}/
 Requirements:
 1. Create the folder {}/{} if it does not exist.
 2. Create or overwrite SKILL.md with YAML frontmatter (name, description, platforms, deps, source) and a body.
+3. Put reusable helper scripts/files for this capability inside the same skill folder (or shared/skills/<skill-name>/ only when truly shared).
+4. Do NOT place skill scripts in persona folders or flat shared paths like shared/scripts/.
 
 Description for this skill: {}
 Instructions (markdown body): {}

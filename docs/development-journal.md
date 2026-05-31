@@ -16,6 +16,29 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-30 — Persona-scoped hook definitions with creator-default registration
+
+- **Area:** hooks / db / tools / web
+- **Summary:** Added hook-level scope (`scoped_persona_ids_json`) so custom hooks can be restricted to explicit persona ids while shipped `builtin_*` hooks remain global. Hook dispatch now enforces scope before persona allowlist/matcher checks. New `register_hook` tool defaults new hooks to the caller persona unless `global: true` is set.
+- **Rationale:** Global hook registration with default allow-all persona policy let one persona's hook unexpectedly affect other personas.
+- **Key files / symbols:** `src/db.rs` (`HookDefinitionRecord.scoped_persona_ids`, `migrate_hook_policy_schema`, `upsert_hook_definition`, `get_hook_definition`), `src/hook_runtime.rs` (`hook_scope_matches_persona`, `run_hooks_for_event_async`), `src/tools/register_hook.rs`, `src/tools/mod.rs`, `src/web.rs` (`HookDefinitionUpsertBody`, `api_hooks_get`, `api_hooks_post`), `src/builtin_hooks.rs` (force shipped hooks to global scope), `web/src/components/settings-hooks-skills.tsx`, `web/src/types.ts`, `builtin_skills/create-hook/SKILL.md`, `docs/hooks-architecture.md`.
+- **Follow-ups:** Expand UI scope editor to support multi-persona assignment by name (current quick actions are global or active persona).
+
+### 2026-05-29 — Shipped hooks catalog in `builtin_hooks/*.hook.json` (PZ not shipped)
+
+- **Area:** hooks / db / docs
+- **Summary:** Shipped policy hooks are five `*.hook.json` manifests under repository `builtin_hooks/` (present on fresh clone). `sync_shipped_hook_definitions` upserts them into SQLite on migrate. Removed hardcoded SQL seeds, template hooks, and PZ from the shipped catalog. PZ/optional command hooks belong under `{WORKSPACE_DIR}/hooks/` only.
+- **Rationale:** Fresh installs should ship hook definitions as files in `builtin_hooks/`, not only as Rust INSERTs; PZ is persona-specific and must not be treated as a built-in shipped hook.
+- **Key files / symbols:** `src/builtin_hooks.rs` (`sync_shipped_hook_definitions`, `load_shipped_manifests`); `builtin_hooks/*.hook.json`; `src/db.rs` (`ensure_builtin_hook_definitions`); `docs/hooks-architecture.md`.
+
+### 2026-05-29 — Persona-scoped shared cwd with global skill artifacts
+
+- **Area:** tools / web / startup migration / prompt-path discipline
+- **Summary:** Switched tool working directories from flat `shared/` to persona-scoped `shared/personas/{chat_id}/{persona_id}/` using auth context, while keeping shared access for `ORIGIN/`, `vault_db/`, `.venv-vault/`, `skills/`, and `shared/skills/`. Added path-jail enforcement to block persona cross-read/write and reject writes to deprecated flat `shared/scripts/` and `shared/parking/`.
+- **Rationale:** Personas were leaking into each other’s ad-hoc files via broad glob/grep from shared root. Shared skill code remains intentionally global and discoverable across personas.
+- **Key files / symbols:** `src/tools/mod.rs` (`persona_shared_dir`, `resolve_tool_working_dir_for_auth`, `resolve_tool_path`, `assert_persona_tool_path_allowed`); tool call sites in `src/tools/{read_file,write_file,edit_file,apply_search_replace,symbol_edit,glob,grep,bash,browser,spawn_background_command,read_repo_map,cursor_agent,search_vault}.rs`; `src/channels/telegram.rs` (`process_with_agent_with_events`, prompt workspace path bullets); `src/web.rs` (persona-scoped upload paths and URL/tool_path generation); `src/persona_shared_migrate.rs`; `src/main.rs`; `src/doctor.rs`; `src/skill_activation_gate.rs`.
+- **Follow-ups:** Legacy skill docs that still mention flat `shared/scripts/...` should be incrementally updated to `skills/<skill>/...` or `shared/skills/<skill>/...`.
+
 ### 2026-05-28 — Migrate remaining inline guards into built-in hooks
 
 - **Area:** hooks / agent loop / prompt context

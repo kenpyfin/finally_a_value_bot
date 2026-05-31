@@ -93,7 +93,9 @@ impl Tool for BashTool {
         if is_expensive_shell_search(&command) {
             timeout_secs = timeout_secs.min(EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS);
         }
-        let working_dir = super::resolve_tool_working_dir(&self.working_dir);
+        let auth = super::auth_context_from_input(&input);
+        let working_dir =
+            super::resolve_tool_working_dir_for_auth(&self.working_dir, auth.as_ref());
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
             return ToolResult::error(format!(
                 "Failed to create working directory {}: {e}",

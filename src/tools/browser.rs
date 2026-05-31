@@ -135,8 +135,8 @@ impl BrowserTool {
         format!("finally_a_value_bot-chat-{normalized}")
     }
 
-    fn command_working_dir(&self) -> PathBuf {
-        super::resolve_tool_working_dir(&self.base_working_dir)
+    fn command_working_dir(&self, auth: Option<&crate::tools::ToolAuthContext>) -> PathBuf {
+        super::resolve_tool_working_dir_for_auth(&self.base_working_dir, auth)
     }
 }
 
@@ -241,7 +241,7 @@ impl Tool for BrowserTool {
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&args);
-        let working_dir = self.command_working_dir();
+        let working_dir = self.command_working_dir(auth.as_ref());
         let _ = tokio::fs::create_dir_all(&working_dir).await;
         cmd.current_dir(&working_dir);
 
@@ -378,7 +378,7 @@ mod tests {
     fn test_browser_command_working_dir_uses_workspace_shared() {
         let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
         assert_eq!(
-            tool.command_working_dir(),
+            tool.command_working_dir(None),
             PathBuf::from("/tmp/workspace/shared")
         );
     }

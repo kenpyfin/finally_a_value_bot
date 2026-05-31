@@ -3,7 +3,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use super::command_runner::{build_command, shell_command};
-use super::{resolve_tool_working_dir, schema_object, Tool, ToolResult};
+use super::{schema_object, Tool, ToolResult};
 use crate::claude::ToolDefinition;
 
 /// Search mode: native (embedding + ChromaDB HTTP) or command (run vault_search_command).
@@ -63,7 +63,7 @@ impl SearchVaultTool {
         // Substitute {query} in the command (support both {query} and {query:shell} if needed)
         let command = vault_search_command.replace("{query}", query);
 
-        let working_dir_resolved = resolve_tool_working_dir(working_dir);
+        let working_dir_resolved = working_dir.clone();
         if let Err(e) = tokio::fs::create_dir_all(&working_dir_resolved).await {
             return ToolResult::error(format!(
                 "Failed to create working directory {}: {e}",
@@ -160,8 +160,11 @@ impl Tool for SearchVaultTool {
                 vault_search_command,
                 working_dir,
             } => {
+                let auth = super::auth_context_from_input(&input);
+                let working_dir_resolved =
+                    super::resolve_tool_working_dir_for_auth(working_dir, auth.as_ref());
                 return self
-                    .execute_command_mode(vault_search_command, working_dir, &query)
+                    .execute_command_mode(vault_search_command, &working_dir_resolved, &query)
                     .await;
             }
             SearchVaultMode::Native { .. } => {

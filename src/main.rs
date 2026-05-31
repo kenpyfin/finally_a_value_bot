@@ -510,6 +510,18 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
+    match finally_a_value_bot::persona_shared_migrate::maybe_run(&config, &db) {
+        Ok(stats) => {
+            if stats.moved_to_persona + stats.moved_to_skills + stats.moved_to_unmigrated > 0 {
+                info!(
+                    "Persona shared migration: moved_to_persona={}, moved_to_skills={}, moved_to_unmigrated={}",
+                    stats.moved_to_persona, stats.moved_to_skills, stats.moved_to_unmigrated
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Persona shared migration skipped: {}", e),
+    }
+
     db.sync_channel_bot_instances_from_config(&config)?;
 
     // Seed onboarding task for fresh installations

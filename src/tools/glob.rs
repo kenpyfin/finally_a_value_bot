@@ -51,11 +51,21 @@ impl Tool for GlobTool {
             None => return ToolResult::error("Missing 'pattern' parameter".into()),
         };
         let base = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let working_dir = super::resolve_tool_working_dir(&self.working_dir);
-        let resolved_base = super::resolve_tool_path(&working_dir, base);
+        let auth = super::auth_context_from_input(&input);
+        let working_dir =
+            super::resolve_tool_working_dir_for_auth(&self.working_dir, auth.as_ref());
+        let resolved_base = super::resolve_tool_path(&self.working_dir, &working_dir, base);
         let resolved_base_str = resolved_base.to_string_lossy().to_string();
 
         if let Err(msg) = crate::tools::path_guard::check_path(&resolved_base_str) {
+            return ToolResult::error(msg);
+        }
+        if let Err(msg) = super::assert_persona_tool_path_allowed(
+            &self.working_dir,
+            &resolved_base,
+            auth.as_ref(),
+            false,
+        ) {
             return ToolResult::error(msg);
         }
 

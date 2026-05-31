@@ -132,6 +132,7 @@ fn build_report() -> DoctorReport {
 
     check_config(&mut report);
     check_shadow_workspace(&mut report);
+    check_legacy_flat_shared(&mut report);
     check_path(&mut report);
     check_shell(&mut report);
     check_node_and_browser(&mut report);
@@ -194,6 +195,43 @@ fn check_shadow_workspace(report: &mut DoctorReport) {
             CheckStatus::Pass,
             "no shared/workspace/ nested copy detected".to_string(),
             None,
+        );
+    }
+}
+
+fn check_legacy_flat_shared(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let shared = config.workspace_root_absolute().join("shared");
+    let legacy_candidates = ["scripts", "parking"];
+    let found: Vec<String> = legacy_candidates
+        .iter()
+        .map(|n| shared.join(n))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    if found.is_empty() {
+        report.push(
+            "workspace.persona_shared",
+            "Persona shared layout",
+            CheckStatus::Pass,
+            "no legacy flat shared/scripts or shared/parking directories detected".to_string(),
+            None,
+        );
+    } else {
+        report.push(
+            "workspace.persona_shared",
+            "Persona shared layout",
+            CheckStatus::Warn,
+            format!(
+                "legacy flat shared directories still present: {}",
+                found.join(", ")
+            ),
+            Some(
+                "Move reusable scripts into skills/<name>/ or shared/skills/<name>/, and move scratch/output files under shared/personas/{chat_id}/{persona_id}/."
+                    .to_string(),
+            ),
         );
     }
 }

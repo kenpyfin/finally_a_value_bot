@@ -115,6 +115,13 @@ fn matcher_matches(matcher: Option<&str>, input: &HookRunInput, event: HookEvent
         .unwrap_or(false)
 }
 
+fn hook_scope_matches_persona(record: &HookDefinitionRecord, persona_id: i64) -> bool {
+    let Some(scoped_persona_ids) = record.scoped_persona_ids.as_ref() else {
+        return true;
+    };
+    scoped_persona_ids.contains(&persona_id)
+}
+
 fn parse_payload(payload_json: &str) -> Value {
     serde_json::from_str(payload_json).unwrap_or(Value::Null)
 }
@@ -193,6 +200,9 @@ pub async fn run_hooks_for_event_async(
         let mut matched = Vec::new();
         for hook in hooks {
             if !hook.enabled || !event_matches(&hook, event) {
+                continue;
+            }
+            if !hook_scope_matches_persona(&hook, persona_id) {
                 continue;
             }
             if !db.is_hook_allowed_for_persona(chat_id, persona_id, hook.id)? {
@@ -379,6 +389,7 @@ mod tests {
                 Some("^bash$"),
                 "block",
                 r#"{"reason":"blocked"}"#,
+                None,
                 true,
             )
             .expect("upsert hook");
@@ -415,6 +426,7 @@ mod tests {
                 None,
                 "add_context",
                 r#"{"additional_context":"ctx"}"#,
+                None,
                 true,
             )
             .expect("upsert hook");
@@ -438,6 +450,45 @@ mod tests {
     }
 
     #[test]
+    fn persona_scope_blocks_other_personas_even_with_default_policy() {
+        let db = test_db();
+        let chat_id = 9006;
+        let owner_persona_id = db
+            .create_persona(chat_id, "owner", None)
+            .expect("create owner persona");
+        let other_persona_id = db
+            .create_persona(chat_id, "other", None)
+            .expect("create other persona");
+        let hook_id = db
+            .upsert_hook_definition(
+                None,
+                "owner-only-hook",
+                HookEventName::PostToolBatch.as_str(),
+                None,
+                "add_context",
+                r#"{"additional_context":"owner-only"}"#,
+                Some(&[owner_persona_id]),
+                true,
+            )
+            .expect("upsert hook");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let out = rt
+            .block_on(run_hooks_for_event_async(
+                db.clone(),
+                &crate::config::test_config(),
+                HookEventName::PostToolBatch,
+                &HookRunInput {
+                    chat_id,
+                    persona_id: other_persona_id,
+                    ..HookRunInput::default()
+                },
+            ))
+            .expect("run hooks");
+        assert!(out.additional_contexts.is_empty());
+        assert!(!out.matched_hook_ids.contains(&hook_id));
+    }
+
+    #[test]
     fn command_and_prompt_action_types_supported() {
         let db = test_db();
         let chat_id = 9003;
@@ -451,6 +502,7 @@ mod tests {
             None,
             "command",
             r#"{"command":"missing.sh","fail_closed":false}"#,
+            None,
             false,
         )
         .expect("upsert hook");
@@ -461,6 +513,7 @@ mod tests {
             None,
             "prompt",
             r#"{"prompt":"Return {\"permission\":\"allow\"}","fail_closed":false}"#,
+            None,
             false,
         )
         .expect("upsert hook");
@@ -496,6 +549,7 @@ mod tests {
             None,
             "builtin_persona_focus_sync",
             "{}",
+            None,
             true,
         )
         .expect("upsert hook");
@@ -531,6 +585,7 @@ mod tests {
             None,
             "builtin_turn_skill_gate",
             "{}",
+            None,
             true,
         )
         .expect("upsert hook");

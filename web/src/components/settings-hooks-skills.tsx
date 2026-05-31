@@ -32,6 +32,7 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [togglingHookId, setTogglingHookId] = useState<number | null>(null)
+  const [updatingScopeHookId, setUpdatingScopeHookId] = useState<number | null>(null)
 
   const [restrictHooks, setRestrictHooks] = useState(false)
   const [restrictSkills, setRestrictSkills] = useState(false)
@@ -203,6 +204,7 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
           matcher: hook.matcher ?? null,
           action_type: hook.action_type,
           action_payload_json: hook.action_payload_json,
+          scoped_persona_ids: hook.scoped_persona_ids,
           enabled,
         }),
       })
@@ -211,6 +213,36 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
       onError(e instanceof Error ? e.message : String(e))
     } finally {
       setTogglingHookId(null)
+    }
+  }
+
+  async function setHookScope(hook: HookDefinition, makeGlobal: boolean) {
+    if (!makeGlobal && activePersonaId == null) {
+      onError('Select a persona first to scope this hook to a persona.')
+      return
+    }
+    setUpdatingScopeHookId(hook.id)
+    try {
+      await api('/api/hooks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: hook.id,
+          name: hook.name,
+          event_name: hook.event_name,
+          matcher: hook.matcher ?? null,
+          action_type: hook.action_type,
+          action_payload_json: hook.action_payload_json,
+          enabled: hook.enabled,
+          scope: makeGlobal ? 'global' : 'persona',
+          scoped_persona_ids: makeGlobal ? null : [activePersonaId],
+        }),
+      })
+      await load()
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setUpdatingScopeHookId(null)
     }
   }
 
@@ -255,6 +287,12 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                 <Text size="1" color={hook.enabled ? 'green' : 'gray'}>
                   {hook.enabled ? 'enabled' : 'disabled'}
                 </Text>
+                <Text size="1" color="gray">
+                  scope:{' '}
+                  {hook.is_global
+                    ? 'global'
+                    : `persona:${(hook.scoped_persona_ids ?? []).join(',') || 'none'}`}
+                </Text>
                 <Text as="label" size="1">
                   <Flex align="center" gap="2">
                     <Switch
@@ -271,6 +309,37 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                 {hook.matcher ? <Text size="1" color="gray">matcher: {hook.matcher}</Text> : null}
                 <Text size="1" color="gray">action: {hook.action_type}</Text>
                 {command ? <Text size="1" color="gray">command: {command}</Text> : null}
+                <Flex gap="1">
+                  <Button
+                    size="1"
+                    variant="soft"
+                    disabled={
+                      saving ||
+                      togglingHookId === hook.id ||
+                      updatingScopeHookId === hook.id ||
+                      hook.is_global
+                    }
+                    onClick={() => void setHookScope(hook, true)}
+                  >
+                    Global
+                  </Button>
+                  <Button
+                    size="1"
+                    variant="soft"
+                    disabled={
+                      saving ||
+                      togglingHookId === hook.id ||
+                      updatingScopeHookId === hook.id ||
+                      activePersonaId == null ||
+                      (!hook.is_global &&
+                        hook.scoped_persona_ids?.length === 1 &&
+                        hook.scoped_persona_ids[0] === activePersonaId)
+                    }
+                    onClick={() => void setHookScope(hook, false)}
+                  >
+                    Scope to active persona
+                  </Button>
+                </Flex>
               </Flex>
             )
           })

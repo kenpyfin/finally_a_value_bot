@@ -87,7 +87,8 @@ pub fn resolved_path_under_skills_data_dir(
     skills_data_dir: &Path,
     path: &str,
 ) -> Option<PathBuf> {
-    let resolved = crate::tools::resolve_tool_path(tool_shared_dir, path);
+    let workspace_root = tool_shared_dir.parent().unwrap_or(tool_shared_dir);
+    let resolved = crate::tools::resolve_tool_path(workspace_root, tool_shared_dir, path);
     if resolved.starts_with(skills_data_dir) {
         Some(resolved)
     } else {

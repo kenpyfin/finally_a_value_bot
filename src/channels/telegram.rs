@@ -1450,6 +1450,15 @@ pub async fn process_with_agent_with_events(
     let chat_id = context.chat_id;
     let persona_id = context.persona_id;
     ensure_persona_memory_file_exists(state, chat_id, persona_id);
+    if let Err(e) = crate::tools::ensure_persona_shared_dir(
+        Path::new(state.config.working_dir()),
+        chat_id,
+        persona_id,
+    ) {
+        tracing::warn!(
+            "Failed to ensure persona shared dir for chat {chat_id} persona {persona_id}: {e}"
+        );
+    }
 
     let persona_row = call_blocking(state.db.clone(), move |db| db.get_persona(persona_id))
         .await?
@@ -1501,8 +1510,12 @@ pub async fn process_with_agent_with_events(
     let skills_catalog = state
         .skills
         .build_skills_catalog_for_allowed(allowed_skill_names.as_ref());
-    // Workspace shared directory: only working_dir/shared (or workspace_dir/shared when unified). No fallback to repo-root shared/.
-    let workspace_dir = Path::new(state.config.working_dir()).join("shared");
+    // Persona-scoped tool cwd under workspace shared root.
+    let workspace_dir = crate::tools::persona_shared_dir(
+        Path::new(state.config.working_dir()),
+        chat_id,
+        persona_id,
+    );
     let workspace_path = workspace_dir.to_string_lossy();
     let agents_md_path = state.memory.groups_root_memory_path_display();
     // Use absolute skills path so the bot writes to the real skills dir; file tools resolve relative paths from workspace_dir/shared.
@@ -4383,7 +4396,9 @@ User messages from chat history are wrapped in XML tags like <user_message sende
 ## Repository layout and environment variables
 - **Configuration root:** {config_env_summary}. `FINALLY_A_VALUE_BOT_CONFIG` overrides the path to the `.env` file when set. This directory is usually the git repository root if you start the bot from there.
 - **Workspace data root (`WORKSPACE_DIR`):** `{workspace_data_root_display}`. It contains `shared/`, `skills/`, and `runtime/`. If `WORKSPACE_DIR` is a relative path in `.env`, it is resolved against the process current working directory (same rule the binary uses when resolving paths).
-- **Tool working directory (file/bash/glob/grep):** `{workspace_path}`. Relative paths resolve from this `shared/` directory. See **Path discipline (strict)** below for allowed and forbidden prefixes.
+- **Tool working directory (file/bash/glob/grep):** `{workspace_path}` (`shared/personas/{chat_id}/{persona_id}/`). Relative paths are persona-scoped by default.
+- **Global shared paths:** use explicit prefixes for shared content — `ORIGIN/...`, `vault_db/...`, `.venv-vault/...`, `skills/...`, or `shared/skills/...`.
+- **Deprecated flat shared scratch:** do not write to `shared/scripts/` or `shared/parking/`; keep persona scratch under the persona cwd above.
 - **User skills directory:** `{skills_dir_display}` under the workspace data root. **Built-in skills** load from the checkout’s `builtin_skills/` directory on disk (override with `FINALLY_A_VALUE_BOT_BUILTIN_SKILLS`, or place `builtin_skills/` beside the parent of `WORKSPACE_DIR`); they are not copied into `skills/`.
 - **Where to put secrets:** Prefer skill-specific credentials in `skills/<skill-name>/.env`. Put bot-wide keys (e.g. `TELEGRAM_BOT_TOKEN`, `LLM_*`, `WORKSPACE_DIR`, `VAULT_ORIGIN_VAULT_REPO`, other `VAULT_*` consumed by the Rust binary) in the configuration `.env` at the configuration root.
 - **Skill scripts and `.env`:** Many bundled skill scripts call `load_dotenv` on the skill folder’s `.env` to fill in variables that are **not** already set in the process environment. Values already exported by the bot (for example after loading the configuration `.env`) **take precedence**—the skill file does not override them by default. If a required variable is still missing, use the skill’s documented default or fix the env and tell the user clearly what is missing.

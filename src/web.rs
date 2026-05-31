@@ -330,10 +330,10 @@ struct SendAttachmentRequest {
     /// Inline base64 payload (legacy). Prefer `tool_path` + `url` from `POST /api/uploads`.
     #[serde(default)]
     data_base64: Option<String>,
-    /// Relative path under `shared/upload/` (e.g. `upload/web/{chat_id}/{file}`).
+    /// Relative path under `shared/upload/` (e.g. `upload/web/{chat_id}/{persona_id}/{file}`).
     #[serde(default)]
     tool_path: Option<String>,
-    /// Public URL path (e.g. `/api/uploads/web/{chat_id}/{file}`).
+    /// Public URL path (e.g. `/api/uploads/web/{chat_id}/{persona_id}/{file}`).
     #[serde(default)]
     url: Option<String>,
 }
@@ -341,6 +341,7 @@ struct SendAttachmentRequest {
 #[derive(Debug, Deserialize)]
 struct UploadQueryParams {
     chat_id: Option<i64>,
+    persona_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -723,7 +724,8 @@ async fn list_chat_artifacts(
         .join("shared")
         .join("upload")
         .join("web")
-        .join(chat_id.to_string());
+        .join(chat_id.to_string())
+        .join(persona_id.to_string());
     let legacy_dir = FsPath::new(state.app_state.config.working_dir())
         .join("uploads")
         .join("web")
@@ -756,7 +758,7 @@ async fn list_chat_artifacts(
                     continue;
                 }
             }
-            let url = format!("/api/uploads/web/{chat_id}/{name}");
+            let url = format!("/api/uploads/web/{chat_id}/{persona_id}/{name}");
             let preview_url = format!("{url}?preview=1");
             let meta = std::fs::metadata(&path).ok();
             let created_at = meta
@@ -1759,8 +1761,24 @@ async fn send_and_store_response_with_events(
     let mut image_data: Option<(String, String)> = None;
 
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
-    let attachment_notes =
-        process_web_attachments(&state, chat_id, &body.attachments, &mut image_data).await?;
+    let persona_id = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        let cid = chat_id;
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let attachment_notes = process_web_attachments(
+        &state,
+        chat_id,
+        persona_id,
+        &body.attachments,
+        &mut image_data,
+    )
+    .await?;
     if !attachment_notes.is_empty() {
         let note_text = attachment_notes.join("\n");
         if text.trim().is_empty() {
@@ -1894,17 +1912,6 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let cid = chat_id;
-    let persona_id = if let Some(pid) = body.persona_id {
-        pid
-    } else {
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(cid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
-
     let full_prompt_for_handoff = text.clone();
     let user_msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1971,7 +1978,7 @@ async fn send_and_store_response_with_events(
             }
         }
     } else {
-        response = materialize_response_file_links(&state, chat_id, &response).await?;
+        response = materialize_response_file_links(&state, chat_id, persona_id, &response).await?;
         let delivery = deliver_agent_final_to_contact(
             state.app_state.db.clone(),
             state.app_state.telegram_bots.as_ref(),
@@ -2068,6 +2075,7 @@ fn upload_rel_url_exists(state: &WebState, rel_url: &str) -> bool {
 async fn persist_file_for_web_delivery(
     state: &WebState,
     chat_id: i64,
+    persona_id: i64,
     source_path: &FsPath,
 ) -> Result<String, (StatusCode, String)> {
     let filename = source_path
@@ -2078,14 +2086,7 @@ async fn persist_file_for_web_delivery(
     let bytes = tokio::fs::read(source_path)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let uploads_dir = state
-        .app_state
-        .config
-        .workspace_root_absolute()
-        .join("shared")
-        .join("upload")
-        .join("web")
-        .join(chat_id.to_string());
+    let uploads_dir = web_upload_dir_for_persona(state, chat_id, persona_id);
     tokio::fs::create_dir_all(&uploads_dir)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2096,12 +2097,15 @@ async fn persist_file_for_web_delivery(
     tokio::fs::write(&saved_path, &bytes)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(format!("/api/uploads/web/{chat_id}/{stored_name}"))
+    Ok(format!(
+        "/api/uploads/web/{chat_id}/{persona_id}/{stored_name}"
+    ))
 }
 
 async fn materialize_response_file_links(
     state: &WebState,
     chat_id: i64,
+    persona_id: i64,
     response: &str,
 ) -> Result<String, (StatusCode, String)> {
     let Some(markdown_link_re) = regex::Regex::new(r#"\]\(([^)\n]+)\)"#).ok() else {
@@ -2119,7 +2123,8 @@ async fn materialize_response_file_links(
             continue;
         }
         if let Some(local_path) = resolve_response_local_file_path(state, &target) {
-            let rel = persist_file_for_web_delivery(state, chat_id, &local_path).await?;
+            let rel =
+                persist_file_for_web_delivery(state, chat_id, persona_id, &local_path).await?;
             rewrites.insert(target, rel);
         }
     }
@@ -2131,7 +2136,8 @@ async fn materialize_response_file_links(
             continue;
         }
         if let Some(local_path) = resolve_response_local_file_path(state, &target) {
-            let rel = persist_file_for_web_delivery(state, chat_id, &local_path).await?;
+            let rel =
+                persist_file_for_web_delivery(state, chat_id, persona_id, &local_path).await?;
             rewrites.insert(target, rel);
         }
     }
@@ -2158,7 +2164,8 @@ async fn materialize_response_file_links(
             .join("shared")
             .join(fallback_name);
         if fallback_local.is_file() {
-            let rel = persist_file_for_web_delivery(state, chat_id, &fallback_local).await?;
+            let rel =
+                persist_file_for_web_delivery(state, chat_id, persona_id, &fallback_local).await?;
             updated = updated.replace(&url, &rel);
         } else {
             warn!(target: "web", url = %url, "assistant response referenced missing upload URL");
@@ -2194,6 +2201,10 @@ fn web_upload_dir(state: &WebState, chat_id: i64) -> PathBuf {
         .join("upload")
         .join("web")
         .join(chat_id.to_string())
+}
+
+fn web_upload_dir_for_persona(state: &WebState, chat_id: i64, persona_id: i64) -> PathBuf {
+    web_upload_dir(state, chat_id).join(persona_id.to_string())
 }
 
 fn resolve_upload_tool_path_on_disk(state: &WebState, tool_path: &str) -> Option<PathBuf> {
@@ -2274,6 +2285,7 @@ async fn set_image_data_from_path(
 async fn process_web_attachments(
     state: &WebState,
     chat_id: i64,
+    persona_id: i64,
     attachments: &[SendAttachmentRequest],
     image_data: &mut Option<(String, String)>,
 ) -> Result<Vec<String>, (StatusCode, String)> {
@@ -2282,7 +2294,7 @@ async fn process_web_attachments(
     }
 
     let max_bytes = web_max_document_bytes(&state.app_state.config);
-    let dir = web_upload_dir(state, chat_id);
+    let dir = web_upload_dir_for_persona(state, chat_id, persona_id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2299,7 +2311,7 @@ async fn process_web_attachments(
             .unwrap_or_else(|| format!("web-attachment-{}.bin", idx + 1));
 
         if let Some(tool_path) = att.tool_path.as_deref().filter(|s| !s.trim().is_empty()) {
-            let expected_prefix = format!("upload/web/{chat_id}/");
+            let expected_prefix = format!("upload/web/{chat_id}/{persona_id}/");
             if !tool_path.starts_with(&expected_prefix) {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -2329,7 +2341,7 @@ async fn process_web_attachments(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("file");
-                format!("/api/uploads/web/{chat_id}/{saved_file}")
+                format!("/api/uploads/web/{chat_id}/{persona_id}/{saved_file}")
             });
             set_image_data_from_path(image_data, &disk_path, &mime).await?;
             notes.extend(attachment_notes_for_saved(
@@ -2371,8 +2383,8 @@ async fn process_web_attachments(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let saved_file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
-        let rel_url = format!("/api/uploads/web/{chat_id}/{saved_file}");
+        let tool_path = format!("upload/web/{}/{}/{}", chat_id, persona_id, saved_file);
+        let rel_url = format!("/api/uploads/web/{chat_id}/{persona_id}/{saved_file}");
 
         set_image_data_from_bytes(image_data, &bytes, &mime).await;
 
@@ -2398,8 +2410,18 @@ async fn api_upload(
     require_auth(&headers, state.auth_token.as_deref())?;
 
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    let persona_id = if let Some(pid) = query.persona_id {
+        pid
+    } else {
+        let cid = chat_id;
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
     let max_bytes = web_max_document_bytes(&state.app_state.config);
-    let dir = web_upload_dir(&state, chat_id);
+    let dir = web_upload_dir_for_persona(&state, chat_id, persona_id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2456,8 +2478,8 @@ async fn api_upload(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let saved_file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
-        let rel_url = format!("/api/uploads/web/{chat_id}/{saved_file}");
+        let tool_path = format!("upload/web/{}/{}/{}", chat_id, persona_id, saved_file);
+        let rel_url = format!("/api/uploads/web/{chat_id}/{persona_id}/{saved_file}");
         uploaded = Some(UploadResponse {
             filename: original_name,
             media_type: mime,
@@ -2701,6 +2723,12 @@ struct HookDefinitionUpsertBody {
     action_type: String,
     action_payload_json: Option<String>,
     enabled: Option<bool>,
+    #[serde(default)]
+    scoped_persona_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    creating_persona_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2747,6 +2775,13 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     } else {
         input.to_string()
     }
+}
+
+fn normalize_persona_scope_ids(ids: &[i64]) -> Vec<i64> {
+    let mut out: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 async fn api_skills_get(
@@ -2841,6 +2876,8 @@ async fn api_hooks_get(
                 "action_type": h.action_type,
                 "action_payload_json": h.action_payload_json,
                 "action_payload": payload,
+                "scoped_persona_ids": h.scoped_persona_ids,
+                "is_global": h.scoped_persona_ids.is_none(),
                 "enabled": h.enabled,
                 "updated_at": h.updated_at,
             })
@@ -2855,6 +2892,8 @@ async fn api_hooks_post(
     Json(body): Json<HookDefinitionUpsertBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
     let payload_json = body
         .action_payload_json
         .as_deref()
@@ -2867,6 +2906,80 @@ async fn api_hooks_post(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     let enabled = body.enabled.unwrap_or(true);
+    let scope_raw = body.scope.as_deref().map(str::trim).unwrap_or_default();
+    let scope_normalized = if scope_raw.is_empty() {
+        None
+    } else if scope_raw.eq_ignore_ascii_case("global") {
+        Some("global")
+    } else if scope_raw.eq_ignore_ascii_case("persona") {
+        Some("persona")
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scope must be 'global' or 'persona' when provided".to_string(),
+        ));
+    };
+    let scoped_from_body = body
+        .scoped_persona_ids
+        .as_ref()
+        .map(|ids| normalize_persona_scope_ids(ids));
+    let scoped_persona_ids: Option<Vec<i64>> = if let Some(scope) = scope_normalized {
+        match scope {
+            "global" => None,
+            "persona" => match scoped_from_body {
+                Some(ids) => Some(ids),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "scope=persona requires scoped_persona_ids".to_string(),
+                    ))
+                }
+            },
+            _ => None,
+        }
+    } else if body.id.is_some() {
+        if let Some(ids) = scoped_from_body {
+            Some(ids)
+        } else {
+            let existing_id = body.id.unwrap_or_default();
+            let existing = call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_hook_definition(existing_id)
+            })
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            let Some(existing) = existing else {
+                return Err((StatusCode::NOT_FOUND, "hook not found".to_string()));
+            };
+            existing.scoped_persona_ids
+        }
+    } else if let Some(ids) = scoped_from_body {
+        Some(ids)
+    } else if let Some(creating_persona_id) = body.creating_persona_id {
+        if creating_persona_id <= 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "creating_persona_id must be positive".to_string(),
+            ));
+        }
+        let exists = call_blocking(state.app_state.db.clone(), move |db| {
+            db.persona_exists(chat_id, creating_persona_id)
+        })
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        if !exists {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("creating_persona_id {} not found", creating_persona_id),
+            ));
+        }
+        Some(vec![creating_persona_id])
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "persona scope required: provide scoped_persona_ids or creating_persona_id, or set scope=global"
+                .to_string(),
+        ));
+    };
     let id = call_blocking(state.app_state.db.clone(), move |db| {
         db.upsert_hook_definition(
             body.id,
@@ -2875,6 +2988,7 @@ async fn api_hooks_post(
             body.matcher.as_deref(),
             &body.action_type,
             &payload_json,
+            scoped_persona_ids.as_deref(),
             enabled,
         )
     })
@@ -3690,6 +3804,12 @@ async fn api_personas_create(
         db.create_persona(chat_id, &name_owned, None)
     })
     .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::tools::ensure_persona_shared_dir(
+        std::path::Path::new(state.app_state.config.working_dir()),
+        chat_id,
+        persona_id,
+    )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
@@ -5228,7 +5348,7 @@ mod tests {
         std::fs::write(&local, b"pdf").unwrap();
 
         let input = "[Download](shared/report.pdf)";
-        let output = materialize_response_file_links(&web_state, chat_id, input)
+        let output = materialize_response_file_links(&web_state, chat_id, 1, input)
             .await
             .unwrap();
         assert!(output.contains("/api/uploads/web/997894126/"));
@@ -5253,7 +5373,7 @@ mod tests {
         std::fs::write(shared_dir.join("report.pdf"), b"pdf").unwrap();
 
         let input = "[Download](/api/uploads/web/997894126/report.pdf)";
-        let output = materialize_response_file_links(&web_state, chat_id, input)
+        let output = materialize_response_file_links(&web_state, chat_id, 1, input)
             .await
             .unwrap();
         assert!(output.contains("/api/uploads/web/997894126/"));
@@ -5278,7 +5398,7 @@ mod tests {
         std::fs::write(shared_dir.join("report.pdf"), b"pdf").unwrap();
 
         let input = "(shared/report.pdf)";
-        let output = materialize_response_file_links(&web_state, chat_id, input)
+        let output = materialize_response_file_links(&web_state, chat_id, 1, input)
             .await
             .unwrap();
         assert!(output.contains("/api/uploads/web/997894126/"));

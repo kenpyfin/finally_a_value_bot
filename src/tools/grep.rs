@@ -55,9 +55,11 @@ impl Tool for GrepTool {
             None => return ToolResult::error("Missing 'pattern' parameter".into()),
         };
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let working_dir = super::resolve_tool_working_dir(&self.working_dir);
-        let workspace_root = working_dir.parent().unwrap_or(&working_dir);
-        let resolved_path = super::resolve_tool_path(&working_dir, path);
+        let auth = super::auth_context_from_input(&input);
+        let working_dir =
+            super::resolve_tool_working_dir_for_auth(&self.working_dir, auth.as_ref());
+        let workspace_root = &self.working_dir;
+        let resolved_path = super::resolve_tool_path(workspace_root, &working_dir, path);
         if !is_path_within_workspace_root(&resolved_path, workspace_root) {
             return ToolResult::error(format!(
                 "Path '{}' is outside the workspace root '{}'. \
@@ -68,6 +70,14 @@ grep is limited to workspace files.",
         }
         let resolved_path_str = resolved_path.to_string_lossy().to_string();
         if let Err(msg) = crate::tools::path_guard::check_path(&resolved_path_str) {
+            return ToolResult::error(msg);
+        }
+        if let Err(msg) = super::assert_persona_tool_path_allowed(
+            workspace_root,
+            &resolved_path,
+            auth.as_ref(),
+            false,
+        ) {
             return ToolResult::error(msg);
         }
         let file_glob = input.get("glob").and_then(|v| v.as_str());

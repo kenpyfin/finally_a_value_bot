@@ -17,6 +17,22 @@ Runtime entry point:
 
 - `hook_runtime::run_hooks_for_event_async`
 
+## Shipped hook catalog
+
+On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests from repository **`builtin_hooks/*.hook.json`** into SQLite (see `src/builtin_hooks.rs`). A fresh clone already includes five manifests:
+
+| Manifest file | Event | `action_type` |
+|---------------|-------|---------------|
+| `postdelivery-persona-focus-sync.hook.json` | PostDelivery | `builtin_persona_focus_sync` |
+| `beforeturn-scheduler-policy-context.hook.json` | BeforeTurn | `builtin_scheduler_policy_context` |
+| `pretool-turn-skill-gate.hook.json` | PreToolUse | `builtin_turn_skill_gate` |
+| `prestop-deferred-commitment-guard.hook.json` | PreStop | `builtin_deferred_commitment_guard` |
+| `postbatch-loop-guard.hook.json` | PostToolBatch | `builtin_loop_guard` |
+
+Handlers run in Rust (`hook_runtime.rs`). Manifests are the install-time catalog, not subprocess scripts.
+
+**Not shipped:** PZ terminal cleanup and other optional **command** hooks — operators add scripts under `{WORKSPACE_DIR}/hooks/` and register via API. Legacy `template-*` rows are deleted on migrate.
+
 ## Storage
 
 Hook definitions are persisted in SQLite `hook_definitions`:
@@ -27,6 +43,7 @@ Hook definitions are persisted in SQLite `hook_definitions`:
 - `matcher`
 - `action_type`
 - `action_payload_json`
+- `scoped_persona_ids_json` (`NULL` = global, JSON array = persona-scoped allowlist)
 - `enabled`
 - `updated_at`
 
@@ -105,40 +122,20 @@ Prompt hooks run a small LLM check with JSON-only contract.
 
 Before a matched hook executes, runtime checks:
 
+- Hook scope gate (`scoped_persona_ids_json`) must include the current `persona_id` unless `NULL` (global).
 - `Database::is_hook_allowed_for_persona(chat_id, persona_id, hook_id)`
 
-Default behavior remains allow-all when no persona policy row exists (or allowlist is `NULL`).
+Default policy behavior remains allow-all when no persona policy row exists (or allowlist is `NULL`), but persona-scoped hooks still do not run outside their explicit scope.
 
-## Built-in PZ hook
+## Optional command hooks (e.g. PZ)
 
-Built-in seed now creates `posttool-pz-terminal-cleanup` as:
+Command hooks use scripts under `{WORKSPACE_DIR}/hooks/` or (for shared examples) a path resolved via `builtin_hooks/` only when you place custom scripts there yourself. **PZ is not part of the shipped `*.hook.json` catalog.** Register optional hooks with `register_hook` (preferred) or `POST /api/hooks`.
 
-- `action_type: command`
-- script: `builtin_hooks/pz-terminal-cleanup.py`
-- `enabled: false` (persona-specific opt-in)
+Command hooks may return `effects.memory_tier3_prune`; Rust applies writes via `hook_actions::apply_hook_memory_effects`.
 
-The hook returns `effects.memory_tier3_prune`, and Rust applies memory writes via `hook_actions::apply_hook_memory_effects`.
+## Built-in Rust policy hooks
 
-## Built-in PostDelivery focus-sync hook
-
-Built-in seed also creates `postdelivery-persona-focus-sync` as:
-
-- `event_name: PostDelivery`
-- `action_type: builtin_persona_focus_sync`
-- `enabled: true`
-
-When matched, runtime sets a built-in trigger that runs the post-delivery persona focus sync pipeline (`run_persona_focus_sync_after_delivery`) rather than requiring inline unconditional orchestration.
-
-## Additional built-in policy hooks
-
-Built-in seeds also create:
-
-- `beforeturn-scheduler-policy-context` (`BeforeTurn`, `builtin_scheduler_policy_context`, enabled)
-- `pretool-turn-skill-gate` (`PreToolUse`, `builtin_turn_skill_gate`, enabled)
-- `prestop-deferred-commitment-guard` (`PreStop`, `builtin_deferred_commitment_guard`, enabled)
-- `postbatch-loop-guard` (`PostToolBatch`, `builtin_loop_guard`, enabled)
-
-These replace several former inline prompt/runtime branches with hook-evaluated deterministic policy.
+`builtin_*` action types run inline in `hook_runtime.rs`. PostDelivery focus sync triggers `run_persona_focus_sync_after_delivery` when `builtin_persona_focus_sync` matches.
 
 ## Separation from delivery safeguards
 

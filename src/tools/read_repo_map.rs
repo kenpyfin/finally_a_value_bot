@@ -182,13 +182,18 @@ impl Tool for ReadRepoMapTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        let auth = super::auth_context_from_input(&input);
+        let tool_working_dir =
+            super::resolve_tool_working_dir_for_auth(&self.working_dir, auth.as_ref());
         let root = match input.get("path").and_then(|v| v.as_str()) {
-            Some(path) => {
-                let working_dir = super::resolve_tool_working_dir(&self.working_dir);
-                super::resolve_tool_path(&working_dir, path)
-            }
-            None => self.working_dir.clone(),
+            Some(path) => super::resolve_tool_path(&self.working_dir, &tool_working_dir, path),
+            None => tool_working_dir,
         };
+        if let Err(msg) =
+            super::assert_persona_tool_path_allowed(&self.working_dir, &root, auth.as_ref(), false)
+        {
+            return ToolResult::error(msg);
+        }
 
         let files = collect_files(&root, max_files);
         if files.is_empty() {

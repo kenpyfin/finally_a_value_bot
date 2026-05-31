@@ -134,6 +134,8 @@ pub struct HookDefinitionRecord {
     pub matcher: Option<String>,
     pub action_type: String,
     pub action_payload_json: String,
+    /// `None` means global hook scope; `Some(vec![...])` means explicit persona allowlist.
+    pub scoped_persona_ids: Option<Vec<i64>>,
     pub enabled: bool,
     pub updated_at: String,
 }
@@ -637,7 +639,6 @@ impl Database {
         Self::migrate_background_jobs_shell_schema(&conn)?;
         Self::migrate_personas_prompt_context(&conn)?;
         Self::migrate_hook_policy_schema(&conn)?;
-        Self::seed_default_hook_definitions(&conn)?;
         Self::ensure_builtin_hook_definitions(&conn)?;
 
         Ok(Database {
@@ -1091,6 +1092,7 @@ impl Database {
                 matcher TEXT,
                 action_type TEXT NOT NULL,
                 action_payload_json TEXT NOT NULL DEFAULT '{}',
+                scoped_persona_ids_json TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );
@@ -1107,164 +1109,36 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_persona_hook_skill_policy_chat
                 ON persona_hook_skill_policy(chat_id);",
         )?;
-        Ok(())
-    }
-
-    fn seed_default_hook_definitions(conn: &Connection) -> Result<(), FinallyAValueBotError> {
-        let existing_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM hook_definitions", [], |row| {
-                row.get(0)
-            })?;
-        if existing_count > 0 {
-            return Ok(());
-        }
-
-        let now = Utc::now().to_rfc3339();
-        let defaults = [
-            (
-                "template-pretool-block-example",
-                "PreToolUse",
-                Some("(?i)^dangerous_tool$"),
-                "block",
-                r#"{"reason":"Blocked by default template hook."}"#,
-                0_i64,
-            ),
-            (
-                "template-posttool-context-example",
-                "PostToolUse",
-                None,
-                "add_context",
-                r#"{"additional_context":"Template hook example: inject reminder context after a tool runs."}"#,
-                0_i64,
-            ),
-            (
-                "template-prestop-context-example",
-                "PreStop",
-                Some("(?i)^end_turn$"),
-                "add_context",
-                r#"{"additional_context":"Template hook example: verify user-facing delivery before ending turn."}"#,
-                0_i64,
-            ),
-        ];
-
-        for (name, event_name, matcher, action_type, action_payload_json, enabled) in defaults {
+        if !Self::column_exists(conn, "hook_definitions", "scoped_persona_ids_json")? {
             conn.execute(
-                "INSERT OR IGNORE INTO hook_definitions
-                 (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    name,
-                    event_name,
-                    matcher,
-                    action_type,
-                    action_payload_json,
-                    enabled,
-                    now
-                ],
+                "ALTER TABLE hook_definitions ADD COLUMN scoped_persona_ids_json TEXT",
+                [],
             )?;
         }
-
         Ok(())
     }
 
-    /// Inserts built-in hooks that should exist on every install (including upgrades).
+    /// Sync shipped hooks from repository `builtin_hooks/*.hook.json` into SQLite.
+    ///
+    /// PZ and other optional command hooks are not shipped; operators add those under
+    /// `{WORKSPACE_DIR}/hooks/`.
     fn ensure_builtin_hook_definitions(conn: &Connection) -> Result<(), FinallyAValueBotError> {
-        let now = Utc::now().to_rfc3339();
-        let payload = r#"{"command":"pz-terminal-cleanup.py","timeout_secs":10,"fail_closed":false,"cwd":"shared"}"#;
         conn.execute(
-            "UPDATE hook_definitions
-             SET action_type = 'command',
-                 action_payload_json = ?1,
-                 enabled = 0,
-                 updated_at = ?2
-             WHERE name = 'posttool-pz-terminal-cleanup'
-               AND action_type = 'pz_terminal_cleanup'",
-            params![payload, now],
+            "DELETE FROM hook_definitions WHERE name LIKE 'template-%'",
+            [],
         )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO hook_definitions
-             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "posttool-pz-terminal-cleanup",
-                "PostToolUse",
-                Option::<&str>::None,
-                "command",
-                payload,
-                0_i64,
-                now,
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO hook_definitions
-             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "postdelivery-persona-focus-sync",
-                "PostDelivery",
-                Option::<&str>::None,
-                "builtin_persona_focus_sync",
-                "{}",
-                1_i64,
-                now,
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO hook_definitions
-             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "beforeturn-scheduler-policy-context",
-                "BeforeTurn",
-                Option::<&str>::None,
-                "builtin_scheduler_policy_context",
-                "{}",
-                1_i64,
-                now,
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO hook_definitions
-             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "pretool-turn-skill-gate",
-                "PreToolUse",
-                Option::<&str>::None,
-                "builtin_turn_skill_gate",
-                "{}",
-                1_i64,
-                now,
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO hook_definitions
-             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "prestop-deferred-commitment-guard",
-                "PreStop",
-                Option::<&str>::None,
-                "builtin_deferred_commitment_guard",
-                "{}",
-                1_i64,
-                now,
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO hook_definitions
-             (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "postbatch-loop-guard",
-                "PostToolBatch",
-                Option::<&str>::None,
-                "builtin_loop_guard",
-                "{}",
-                1_i64,
-                now,
-            ],
-        )?;
+        let dir = crate::builtin_hooks::resolve_builtin_hooks_dir_fallback().ok_or_else(|| {
+            FinallyAValueBotError::ToolExecution(
+                "builtin_hooks catalog not found: expected repository builtin_hooks/ with *.hook.json manifests".into(),
+            )
+        })?;
+        let synced = crate::builtin_hooks::sync_shipped_hook_definitions(conn, &dir)?;
+        if synced == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "no shipped hook manifests in '{}'",
+                dir.display()
+            )));
+        }
         Ok(())
     }
 
@@ -2079,11 +1953,20 @@ impl Database {
     ) -> Result<Vec<HookDefinitionRecord>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, event_name, matcher, action_type, action_payload_json, enabled, updated_at
+            "SELECT id, name, event_name, matcher, action_type, action_payload_json, scoped_persona_ids_json, enabled, updated_at
              FROM hook_definitions
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
+            let scoped_persona_ids_raw: Option<String> = row.get(6)?;
+            let scoped_persona_ids =
+                Self::parse_i64_array_json(scoped_persona_ids_raw).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             Ok(HookDefinitionRecord {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -2091,11 +1974,51 @@ impl Database {
                 matcher: row.get(3)?,
                 action_type: row.get(4)?,
                 action_payload_json: row.get(5)?,
-                enabled: row.get::<_, i64>(6)? != 0,
-                updated_at: row.get(7)?,
+                scoped_persona_ids,
+                enabled: row.get::<_, i64>(7)? != 0,
+                updated_at: row.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_hook_definition(
+        &self,
+        id: i64,
+    ) -> Result<Option<HookDefinitionRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, event_name, matcher, action_type, action_payload_json, scoped_persona_ids_json, enabled, updated_at
+             FROM hook_definitions
+             WHERE id = ?1",
+        )?;
+        let row = stmt.query_row(params![id], |row| {
+            let scoped_persona_ids_raw: Option<String> = row.get(6)?;
+            let scoped_persona_ids =
+                Self::parse_i64_array_json(scoped_persona_ids_raw).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+            Ok(HookDefinitionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                event_name: row.get(2)?,
+                matcher: row.get(3)?,
+                action_type: row.get(4)?,
+                action_payload_json: row.get(5)?,
+                scoped_persona_ids,
+                enabled: row.get::<_, i64>(7)? != 0,
+                updated_at: row.get(8)?,
+            })
+        });
+        match row {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn upsert_hook_definition(
@@ -2106,6 +2029,7 @@ impl Database {
         matcher: Option<&str>,
         action_type: &str,
         action_payload_json: &str,
+        scoped_persona_ids: Option<&[i64]>,
         enabled: bool,
     ) -> Result<i64, FinallyAValueBotError> {
         let name = name.trim();
@@ -2142,6 +2066,18 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let enabled_i = if enabled { 1 } else { 0 };
         let matcher_norm = matcher.map(|m| m.trim()).filter(|m| !m.is_empty());
+        let scoped_persona_ids_json = if let Some(ids) = scoped_persona_ids {
+            let mut normalized: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
+            normalized.sort_unstable();
+            normalized.dedup();
+            Some(serde_json::to_string(&normalized).map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "Invalid scoped_persona_ids payload: {e}"
+                ))
+            })?)
+        } else {
+            None
+        };
         if let Some(id) = id {
             let rows = conn.execute(
                 "UPDATE hook_definitions
@@ -2150,15 +2086,17 @@ impl Database {
                      matcher = ?3,
                      action_type = ?4,
                      action_payload_json = ?5,
-                     enabled = ?6,
-                     updated_at = ?7
-                 WHERE id = ?8",
+                     scoped_persona_ids_json = ?6,
+                     enabled = ?7,
+                     updated_at = ?8
+                 WHERE id = ?9",
                 params![
                     name,
                     event_name,
                     matcher_norm,
                     action_type.as_str(),
                     action_payload_json,
+                    scoped_persona_ids_json,
                     enabled_i,
                     now,
                     id
@@ -2173,14 +2111,15 @@ impl Database {
         } else {
             conn.execute(
                 "INSERT INTO hook_definitions
-                 (name, event_name, matcher, action_type, action_payload_json, enabled, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (name, event_name, matcher, action_type, action_payload_json, scoped_persona_ids_json, enabled, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     name,
                     event_name,
                     matcher_norm,
                     action_type.as_str(),
                     action_payload_json,
+                    scoped_persona_ids_json,
                     enabled_i,
                     now
                 ],
@@ -6020,6 +5959,50 @@ mod tests {
         assert_eq!(focus_hook.event_name, "PostDelivery");
         assert_eq!(focus_hook.action_type, "builtin_persona_focus_sync");
         assert!(focus_hook.enabled);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_shipped_hooks_loaded_from_builtin_hooks_catalog() {
+        let (db, dir) = test_db();
+        let hooks = db.list_hook_definitions().unwrap();
+        assert!(
+            !hooks.iter().any(|h| h.name.starts_with("template-")),
+            "template example hooks must not be seeded"
+        );
+        assert!(
+            !hooks
+                .iter()
+                .any(|h| h.name == "posttool-pz-terminal-cleanup"),
+            "PZ hook must not be shipped in builtin catalog"
+        );
+
+        let builtin_names = [
+            "postdelivery-persona-focus-sync",
+            "beforeturn-scheduler-policy-context",
+            "pretool-turn-skill-gate",
+            "prestop-deferred-commitment-guard",
+            "postbatch-loop-guard",
+        ];
+        for name in builtin_names {
+            let hook = hooks
+                .iter()
+                .find(|h| h.name == name)
+                .unwrap_or_else(|| panic!("missing shipped builtin hook {name}"));
+            assert!(
+                hook.action_type.starts_with("builtin_"),
+                "{} must use builtin_* action_type, got {}",
+                name,
+                hook.action_type
+            );
+            assert!(hook.enabled, "{name} should be enabled by default");
+        }
+        assert_eq!(
+            hooks.len(),
+            builtin_names.len(),
+            "fresh DB should contain only the five shipped catalog hooks: {:?}",
+            hooks.iter().map(|h| &h.name).collect::<Vec<_>>()
+        );
         cleanup(&dir);
     }
 }

@@ -79,7 +79,9 @@ Non-zero exit behavior:
 ## Registration flow
 
 1. Build payload JSON for selected action type.
-2. Call `POST /api/hooks` with:
+2. Call the `register_hook` tool with:
    - `name`, `event_name`, `matcher`, `action_type`, `action_payload_json`, `enabled`
+   - default scope is the current persona only
+   - set `global: true` only when the user explicitly asks for cross-persona/global behavior
 3. Confirm with `GET /api/hooks`.
-4. If persona-specific, update allowlist via `PATCH /api/personas/:id/policy`.
+4. Optionally tighten persona allowlists via `PATCH /api/personas/:id/policy` for extra defense.

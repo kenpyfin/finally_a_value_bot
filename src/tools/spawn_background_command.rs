@@ -90,14 +90,20 @@ impl Tool for SpawnBackgroundCommandTool {
             return blocked;
         }
 
-        let working_dir =
-            super::resolve_tool_working_dir(&PathBuf::from(self.config.working_dir()));
+        let workspace_root = PathBuf::from(self.config.working_dir());
+        let tool_working_dir =
+            super::resolve_tool_working_dir_for_auth(&workspace_root, Some(&auth));
         let workdir = input
             .get("workdir")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or(working_dir);
+            .map(|p| super::resolve_tool_path(&workspace_root, &tool_working_dir, p))
+            .unwrap_or(tool_working_dir);
+        if let Err(msg) =
+            super::assert_persona_tool_path_allowed(&workspace_root, &workdir, Some(&auth), true)
+        {
+            return ToolResult::error(msg);
+        }
 
         if let Err(e) = tokio::fs::create_dir_all(&workdir).await {
             return ToolResult::error(format!(

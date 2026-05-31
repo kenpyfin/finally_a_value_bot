@@ -17,6 +17,7 @@ pub mod memory_state;
 pub mod path_guard;
 pub mod read_file;
 pub mod read_repo_map;
+pub mod register_hook;
 pub mod register_tracked_job;
 pub mod schedule;
 pub mod search_history;
@@ -124,6 +125,7 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "add_vault_item"
         | "send_message"
         | "sync_skills"
+        | "register_hook"
         | "schedule_task"
         | "update_scheduled_task"
         | "pause_scheduled_task"
@@ -287,7 +289,47 @@ pub fn check_shadow_workspace_write(workspace_root: &Path, resolved: &Path) -> R
     }
 }
 
-/// Strip redundant `workspace/`, `workspace/shared/`, and `shared/` prefixes when tool cwd is already `.../shared`.
+pub fn shared_global_prefixes() -> [&'static str; 3] {
+    ["ORIGIN", "vault_db", ".venv-vault"]
+}
+
+pub fn workspace_shared_root(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("shared")
+}
+
+pub fn persona_shared_dir(workspace_root: &Path, chat_id: i64, persona_id: i64) -> PathBuf {
+    workspace_shared_root(workspace_root)
+        .join("personas")
+        .join(chat_id.to_string())
+        .join(persona_id.to_string())
+}
+
+pub fn ensure_persona_shared_dir(
+    workspace_root: &Path,
+    chat_id: i64,
+    persona_id: i64,
+) -> Result<PathBuf, String> {
+    let dir = persona_shared_dir(workspace_root, chat_id, persona_id);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "Failed to create persona shared directory '{}': {e}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+fn has_persona_scope(auth: Option<&ToolAuthContext>) -> bool {
+    auth.is_some_and(|a| a.caller_chat_id > 0 && a.caller_persona_id > 0)
+}
+
+fn is_under(path: &Path, root: &Path) -> bool {
+    let resolved_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    resolved_path.starts_with(resolved_root)
+}
+
+/// Strip redundant prefixes when tool cwd is under `.../shared`.
 pub fn normalize_tool_relative_path(working_dir: &Path, path: &str) -> String {
     let mut s = path.trim().to_string();
     if s.is_empty() {
@@ -297,12 +339,14 @@ pub fn normalize_tool_relative_path(working_dir: &Path, path: &str) -> String {
         s = s[2..].to_string();
     }
 
-    let cwd_is_shared = working_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.eq_ignore_ascii_case("shared"));
+    let cwd_is_shared_tree = working_dir.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(name) if name.to_str().is_some_and(|s| s.eq_ignore_ascii_case("shared"))
+        )
+    });
 
-    if !cwd_is_shared {
+    if !cwd_is_shared_tree {
         return s;
     }
 
@@ -349,30 +393,134 @@ fn resolves_under_workspace_data_root(_tool_shared_dir: &Path, normalized: &str)
     })
 }
 
-pub fn resolve_tool_path(working_dir: &Path, path: &str) -> PathBuf {
+pub fn resolve_tool_path(workspace_root: &Path, tool_working_dir: &Path, path: &str) -> PathBuf {
     let candidate = PathBuf::from(path);
     if candidate.is_absolute() {
         return candidate;
     }
 
-    let normalized = normalize_tool_relative_path(working_dir, path);
+    let normalized = normalize_tool_relative_path(tool_working_dir, path);
     if normalized.is_empty() {
-        return working_dir.join(path);
+        return tool_working_dir.join(path);
     }
 
-    if resolves_under_workspace_data_root(working_dir, &normalized) {
-        let data_root = working_dir.parent().unwrap_or(working_dir);
-        return data_root.join(&normalized);
+    let shared_root = workspace_shared_root(workspace_root);
+
+    if let Some(rest) = normalized.strip_prefix("shared/skills/") {
+        return shared_root.join("skills").join(rest);
+    }
+    if let Some(rest) = normalized.strip_prefix("shared/") {
+        let first = std::path::Path::new(rest)
+            .components()
+            .next()
+            .and_then(|c| match c {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if shared_global_prefixes().contains(&first) || first == "skills" {
+            return shared_root.join(rest);
+        }
+        return tool_working_dir.join(rest);
     }
 
-    working_dir.join(&normalized)
+    let first = std::path::Path::new(&normalized)
+        .components()
+        .next()
+        .and_then(|c| match c {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if shared_global_prefixes().contains(&first) {
+        return shared_root.join(&normalized);
+    }
+
+    if resolves_under_workspace_data_root(tool_working_dir, &normalized) {
+        return workspace_root.join(&normalized);
+    }
+
+    tool_working_dir.join(&normalized)
 }
 
 /// Resolve the tool working directory. Always uses the shared workspace (base/shared).
 pub fn resolve_tool_working_dir(base_working_dir: &Path) -> PathBuf {
-    let resolved = base_working_dir.join("shared");
+    let resolved = workspace_shared_root(base_working_dir);
     let _ = std::fs::create_dir_all(&resolved);
     resolved
+}
+
+pub fn resolve_tool_working_dir_for_auth(
+    base_working_dir: &Path,
+    auth: Option<&ToolAuthContext>,
+) -> PathBuf {
+    if has_persona_scope(auth) {
+        let auth = auth.expect("checked above");
+        if let Ok(dir) = ensure_persona_shared_dir(
+            base_working_dir,
+            auth.caller_chat_id,
+            auth.caller_persona_id,
+        ) {
+            return dir;
+        }
+    }
+    resolve_tool_working_dir(base_working_dir)
+}
+
+pub fn assert_persona_tool_path_allowed(
+    workspace_root: &Path,
+    resolved_path: &Path,
+    auth: Option<&ToolAuthContext>,
+    is_write: bool,
+) -> Result<(), String> {
+    if !has_persona_scope(auth) {
+        return Ok(());
+    }
+    let auth = auth.expect("checked above");
+    let shared_root = workspace_shared_root(workspace_root);
+    let persona_root =
+        persona_shared_dir(workspace_root, auth.caller_chat_id, auth.caller_persona_id);
+
+    if is_under(resolved_path, &persona_root)
+        || is_under(resolved_path, &workspace_root.join("runtime"))
+        || is_under(resolved_path, &workspace_root.join("skills"))
+        || is_under(resolved_path, &shared_root.join("skills"))
+    {
+        return Ok(());
+    }
+
+    for prefix in shared_global_prefixes() {
+        if is_under(resolved_path, &shared_root.join(prefix)) {
+            return Ok(());
+        }
+    }
+
+    if auth.is_control_chat() {
+        let chat_personas_root = shared_root
+            .join("personas")
+            .join(auth.caller_chat_id.to_string());
+        if is_under(resolved_path, &chat_personas_root) {
+            return Ok(());
+        }
+    }
+
+    if is_write
+        && (is_under(resolved_path, &shared_root.join("scripts"))
+            || is_under(resolved_path, &shared_root.join("parking")))
+    {
+        return Err(
+            "Write blocked: flat shared paths like `shared/scripts/` and `shared/parking/` are \
+             deprecated. Use `skills/<skill-name>/` (or `shared/skills/<skill-name>/`) for reusable \
+             scripts, or write persona files under `shared/personas/{chat_id}/{persona_id}/`."
+                .to_string(),
+        );
+    }
+
+    Err(format!(
+        "Permission denied: path '{}' is outside the allowed persona scope. Allowed roots: \
+persona folder, shared ORIGIN/vault paths, workspace runtime/skills, and shared/skills.",
+        resolved_path.display()
+    ))
 }
 
 /// Auto-detect the vault search command from the search-vault skill.
@@ -486,6 +634,7 @@ impl ToolRegistry {
             Box::new(register_tracked_job::RegisterTrackedJobTool::new(
                 db.clone(),
             )),
+            Box::new(register_hook::RegisterHookTool::new(db.clone(), config)),
             Box::new(schedule::ScheduleTaskTool::new(
                 db.clone(),
                 config.timezone.clone(),
@@ -797,21 +946,22 @@ mod tests {
 
     #[test]
     fn test_resolve_tool_path_from_shared_cwd() {
-        let shared = std::path::PathBuf::from("/proj/workspace/shared");
+        let root = std::path::PathBuf::from("/proj/workspace");
+        let shared = root.join("shared");
         assert_eq!(
-            resolve_tool_path(&shared, "foo.txt"),
+            resolve_tool_path(&root, &shared, "foo.txt"),
             std::path::PathBuf::from("/proj/workspace/shared/foo.txt")
         );
         assert_eq!(
-            resolve_tool_path(&shared, "workspace/shared/foo.txt"),
+            resolve_tool_path(&root, &shared, "workspace/shared/foo.txt"),
             std::path::PathBuf::from("/proj/workspace/shared/foo.txt")
         );
         assert_eq!(
-            resolve_tool_path(&shared, "workspace/runtime/groups/1/x"),
+            resolve_tool_path(&root, &shared, "workspace/runtime/groups/1/x"),
             std::path::PathBuf::from("/proj/workspace/runtime/groups/1/x")
         );
         assert_eq!(
-            resolve_tool_path(&shared, "shared/ORIGIN/x.md"),
+            resolve_tool_path(&root, &shared, "shared/ORIGIN/x.md"),
             std::path::PathBuf::from("/proj/workspace/shared/ORIGIN/x.md")
         );
     }
@@ -838,6 +988,72 @@ mod tests {
     fn test_resolve_tool_working_dir_shared() {
         let dir = resolve_tool_working_dir(std::path::Path::new("/tmp/work"));
         assert_eq!(dir, std::path::PathBuf::from("/tmp/work/shared"));
+    }
+
+    #[test]
+    fn test_resolve_tool_working_dir_for_auth_persona() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_tool_cwd_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+        };
+        let cwd = resolve_tool_working_dir_for_auth(&root, Some(&auth));
+        assert_eq!(
+            cwd,
+            root.join("shared").join("personas").join("10").join("2")
+        );
+        assert!(cwd.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_assert_persona_tool_path_allowed_rejects_other_persona() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_tool_scope_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+        };
+        let mine = persona_shared_dir(&root, 10, 2).join("x.txt");
+        let other = persona_shared_dir(&root, 10, 3).join("x.txt");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&mine, "ok").unwrap();
+        std::fs::write(&other, "no").unwrap();
+        assert!(assert_persona_tool_path_allowed(&root, &mine, Some(&auth), false).is_ok());
+        assert!(assert_persona_tool_path_allowed(&root, &other, Some(&auth), false).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_assert_persona_tool_path_allowed_rejects_flat_shared_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_tool_scope2_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+        };
+        let flat = root.join("shared").join("scripts").join("a.py");
+        std::fs::create_dir_all(flat.parent().unwrap()).unwrap();
+        let err = assert_persona_tool_path_allowed(&root, &flat, Some(&auth), true).unwrap_err();
+        assert!(err.contains("flat shared paths"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[allow(dead_code)]
