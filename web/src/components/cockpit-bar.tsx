@@ -431,8 +431,9 @@ export function CockpitBar({
               Chat context depth
             </Text>
             <Text size="1" color="gray" className="mt-1 block leading-snug">
-              Minimum user and assistant turns kept at the tail of the trimmed history for each run. Set{' '}
-              <code className="text-[11px]">MAX_HISTORY_MESSAGES</code> ≥ user + assistant mins when turns alternate.
+              Minimum user and assistant dialogue turns kept at the tail of each run (background job status lines are
+              excluded from the model prompt). Set <code className="text-[11px]">MAX_HISTORY_MESSAGES</code> ≥ user +
+              assistant mins when turns alternate.
             </Text>
             {historySuffix ? (
               <Flex mt="2" direction="column" gap="1">

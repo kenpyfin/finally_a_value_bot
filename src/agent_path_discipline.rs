@@ -12,7 +12,7 @@ pub fn strict_path_discipline_section(
 
 Follow these rules on **every** turn for `read_file`, `write_file`, `edit_file`, `apply_search_replace`, `symbol_edit`, `glob`, `grep`, **`bash`**, and **`cursor_agent`** / **`build_skill`**.
 
-**Tool cwd:** `{tool_cwd}` (this is `{workspace_data_root_display}/shared/`). Relative tool paths resolve from here—not from the configuration root and not by prefixing `WORKSPACE_DIR` as `workspace/...`.
+**Tool cwd:** `{tool_cwd}` (persona-scoped under `{workspace_data_root_display}/shared/personas/...` when auth is present). Relative tool paths resolve from here—not from the configuration root and not by prefixing `WORKSPACE_DIR` as `workspace/...`.
 
 ### Allowed patterns (use these)
 

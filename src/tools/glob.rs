@@ -7,6 +7,28 @@ use crate::claude::ToolDefinition;
 
 use super::{schema_object, Tool, ToolResult};
 
+fn split_workspace_prefixed_pattern(
+    workspace_root: &std::path::Path,
+    working_dir: &std::path::Path,
+    pattern: &str,
+) -> Option<(PathBuf, String)> {
+    let rel = PathBuf::from(pattern);
+    let mut comps = rel.components();
+    let first = comps.next()?.as_os_str().to_string_lossy().to_string();
+    if first != "skills" && first != "runtime" {
+        return None;
+    }
+    let wildcard_idx = pattern
+        .char_indices()
+        .find_map(|(idx, ch)| (ch == '*' || ch == '?' || ch == '[').then_some(idx))
+        .unwrap_or(pattern.len());
+    let (base_part, tail_part) = pattern.split_at(wildcard_idx);
+    let base_part = base_part.trim_end_matches('/');
+    let resolved_base = super::resolve_tool_path(workspace_root, working_dir, base_part);
+    let tail = tail_part.trim_start_matches('/').to_string();
+    Some((resolved_base, tail))
+}
+
 pub struct GlobTool {
     working_dir: PathBuf,
 }
@@ -69,13 +91,24 @@ impl Tool for GlobTool {
             return ToolResult::error(msg);
         }
 
-        info!("Glob: {} in {}", pattern, resolved_base.display());
-
-        let full_pattern = if pattern.starts_with('/') {
-            pattern.to_string()
+        let (full_pattern, log_base) = if pattern.starts_with('/') {
+            (pattern.to_string(), pattern.to_string())
+        } else if let Some((prefix_base, tail)) =
+            split_workspace_prefixed_pattern(&self.working_dir, &working_dir, pattern)
+        {
+            let full = if tail.is_empty() {
+                prefix_base.display().to_string()
+            } else {
+                format!("{}/{}", prefix_base.display(), tail)
+            };
+            (full, prefix_base.display().to_string())
         } else {
-            format!("{}/{}", resolved_base.display(), pattern)
+            (
+                format!("{}/{}", resolved_base.display(), pattern),
+                resolved_base.display().to_string(),
+            )
         };
+        info!("Glob: {} in {}", pattern, log_base);
 
         match glob::glob(&full_pattern) {
             Ok(paths) => {
@@ -169,6 +202,29 @@ mod tests {
         let result = tool.execute(json!({"pattern":"*.txt"})).await;
         assert!(!result.is_error);
         assert!(result.content.contains("x.txt"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_glob_resolves_skills_prefix_from_persona_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_glob4_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let work = root.join("workspace");
+        let skills_dir = work.join("skills").join("demo");
+        let persona = work.join("shared").join("personas").join("1").join("1");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::create_dir_all(&persona).unwrap();
+        std::fs::write(skills_dir.join("tool.py"), "").unwrap();
+
+        let tool = GlobTool::new(work.to_str().unwrap());
+        let result = tool
+            .execute(json!({"pattern":"skills/demo/*.py","path":persona.to_str().unwrap()}))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("tool.py"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

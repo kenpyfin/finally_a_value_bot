@@ -140,6 +140,26 @@ pub struct HookDefinitionRecord {
     pub updated_at: String,
 }
 
+impl HookDefinitionRecord {
+    pub fn scoped_for_persona(&self, persona_id: i64) -> bool {
+        self.scoped_persona_ids
+            .as_ref()
+            .map_or(true, |ids| ids.contains(&persona_id))
+    }
+
+    pub fn persona_status(
+        &self,
+        db: &Database,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<(bool, bool, bool), FinallyAValueBotError> {
+        let scoped_for_persona = self.scoped_for_persona(persona_id);
+        let allowed_for_persona = db.is_hook_allowed_for_persona(chat_id, persona_id, self.id)?;
+        let active_for_persona = self.enabled && scoped_for_persona && allowed_for_persona;
+        Ok((scoped_for_persona, allowed_for_persona, active_for_persona))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PersonaHookSkillPolicy {
     pub chat_id: i64,
@@ -5996,6 +6016,10 @@ mod tests {
                 hook.action_type
             );
             assert!(hook.enabled, "{name} should be enabled by default");
+            assert!(
+                hook.scoped_persona_ids.is_none(),
+                "{name} should be globally scoped"
+            );
         }
         assert_eq!(
             hooks.len(),
@@ -6003,6 +6027,104 @@ mod tests {
             "fresh DB should contain only the five shipped catalog hooks: {:?}",
             hooks.iter().map(|h| &h.name).collect::<Vec<_>>()
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_hook_persona_status_fields() {
+        let (db, dir) = test_db();
+        let chat_id = 9007;
+        let owner_persona_id = db
+            .create_persona(chat_id, "owner", None)
+            .expect("create owner persona");
+        let other_persona_id = db
+            .create_persona(chat_id, "other", None)
+            .expect("create other persona");
+        let global_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "global-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"global"}"#,
+                None,
+                true,
+            )
+            .expect("upsert global hook");
+        let scoped_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "scoped-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"scoped"}"#,
+                Some(&[owner_persona_id]),
+                true,
+            )
+            .expect("upsert scoped hook");
+        let disabled_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "disabled-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"disabled"}"#,
+                None,
+                false,
+            )
+            .expect("upsert disabled hook");
+
+        let hooks = db.list_hook_definitions().expect("list hooks");
+        let global_hook = hooks
+            .iter()
+            .find(|h| h.id == global_hook_id)
+            .expect("global hook");
+        let scoped_hook = hooks
+            .iter()
+            .find(|h| h.id == scoped_hook_id)
+            .expect("scoped hook");
+        let disabled_hook = hooks
+            .iter()
+            .find(|h| h.id == disabled_hook_id)
+            .expect("disabled hook");
+
+        let (scoped, allowed, active) = global_hook
+            .persona_status(&db, chat_id, owner_persona_id)
+            .expect("global owner status");
+        assert!(scoped);
+        assert!(allowed);
+        assert!(active);
+
+        let (scoped, allowed, active) = scoped_hook
+            .persona_status(&db, chat_id, owner_persona_id)
+            .expect("scoped owner status");
+        assert!(scoped);
+        assert!(allowed);
+        assert!(active);
+
+        let (scoped, allowed, active) = scoped_hook
+            .persona_status(&db, chat_id, other_persona_id)
+            .expect("scoped other status");
+        assert!(!scoped);
+        assert!(allowed);
+        assert!(!active);
+
+        db.set_persona_hook_skill_policy(chat_id, owner_persona_id, Some(&[]), None)
+            .expect("block all hooks for owner");
+        let (_, allowed, active) = global_hook
+            .persona_status(&db, chat_id, owner_persona_id)
+            .expect("global owner blocked status");
+        assert!(!allowed);
+        assert!(!active);
+
+        let (_, _, active) = disabled_hook
+            .persona_status(&db, chat_id, other_persona_id)
+            .expect("disabled status");
+        assert!(!active);
+
         cleanup(&dir);
     }
 }

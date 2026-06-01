@@ -16,6 +16,22 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Follow-ups:** Optional; known gaps or next steps.
 ```
 
+### 2026-05-31 — Hardened skills path resolution across bash/glob and hook command cwd
+
+- **Area:** tools / hooks / prompt-path discipline
+- **Summary:** Added skill/runtime path remapping for bash launcher commands and glob patterns so persona-scoped cwd no longer sends `skills/...` lookups into `shared/personas/...`. Command hooks now default to workspace root cwd (instead of `shared/`) so relative `skills/...` probes resolve to canonical workspace paths unless a hook explicitly requests `cwd: "shared"`.
+- **Rationale:** Recent runs showed `activate_skill` returning the right skill directory while subsequent bash/glob calls searched under persona folders; hook command defaults had a parallel risk for relative skill paths.
+- **Key files / symbols:** `src/tools/bash.rs` (`maybe_rewrite_leading_tool_path`), `src/tools/glob.rs` (`split_workspace_prefixed_pattern`), `src/hook_executor.rs` (`execute_command_hook` default cwd), `src/agent_path_discipline.rs` (persona-cwd wording), `src/channels/telegram.rs` (caps shell-cwd bullet), plus new tests in `bash.rs`, `glob.rs`, and `hook_executor.rs`.
+- **Follow-ups:** Consider adding a first-class `run_skill_script` tool to remove shell path parsing ambiguity entirely, and enrich bash error text when it detects persona `.../skills/...` misses.
+
+### 2026-05-31 — Persona-centric hook availability UI (skills-style)
+
+- **Area:** hooks / web / frontend
+- **Summary:** Extended `GET /api/hooks` with optional `persona_id` to return per-hook `scoped_for_persona`, `allowed_for_persona`, and `active_for_persona` fields. Updated the Hooks & Skills settings panel to remove the Global/Persona scope editor and instead present a persona-relative hooks catalog, mirroring the skills UX (Restrict hooks to selected + Save policy).
+- **Rationale:** Operators care about “is this hook available for the persona I’m editing right now?”, and the previous Global/Persona toggle was confusing and redundant.
+- **Key files / symbols:** `src/web.rs` (`HooksQuery`, `api_hooks_get`, `hook_definition_to_json`), `src/db.rs` (`HookDefinitionRecord::scoped_for_persona/persona_status`, `test_hook_persona_status_fields`), `web/src/components/settings-hooks-skills.tsx` (hooks catalog + removal of scope/global toggles), `web/src/types.ts` (new optional fields), `web/src/web.rs` tests for persona fields (added `test_api_hooks_get_persona_fields`), `docs/persona-hook-skill-policy.md` (document `GET /api/hooks?persona_id=:id`).
+- **Follow-ups:** Rebuild `web/dist` as part of the deploy flow and consider adding multi-persona scope editing for agent-created hooks if ever needed.
+
 ### 2026-05-30 — Persona-scoped hook definitions with creator-default registration
 
 - **Area:** hooks / db / tools / web

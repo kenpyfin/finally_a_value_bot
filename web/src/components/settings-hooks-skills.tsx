@@ -23,6 +23,28 @@ function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
   return true
 }
 
+function hookStatusSuffix(
+  hook: HookDefinition,
+  activePersonaId: number | null,
+  restrictHooks: boolean,
+  selectedHookIds: Set<number>,
+): string {
+  if (activePersonaId == null) return ''
+  if (!hook.enabled) return ' (disabled)'
+  if (hook.scoped_for_persona === false) {
+    return restrictHooks && selectedHookIds.has(hook.id)
+      ? ' (will be enabled for this persona after save)'
+      : ' (inactive for this persona)'
+  }
+  if (restrictHooks && !selectedHookIds.has(hook.id)) return ' (not in allowlist)'
+  if (!restrictHooks && hook.allowed_for_persona === false) {
+    return ' (blocked by saved allowlist)'
+  }
+  if (restrictHooks && selectedHookIds.has(hook.id)) return ' (allowed)'
+  if (hook.active_for_persona) return ' (active)'
+  return ''
+}
+
 export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Props) {
   const [hooks, setHooks] = useState<HookDefinition[]>([])
   const [skills, setSkills] = useState<SkillRow[]>([])
@@ -31,8 +53,6 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   const [policy, setPolicy] = useState<PersonaHookSkillPolicy | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [togglingHookId, setTogglingHookId] = useState<number | null>(null)
-  const [updatingScopeHookId, setUpdatingScopeHookId] = useState<number | null>(null)
 
   const [restrictHooks, setRestrictHooks] = useState(false)
   const [restrictSkills, setRestrictSkills] = useState(false)
@@ -43,7 +63,11 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const hooksRes = await api<{ hooks?: HookDefinition[] }>('/api/hooks')
+      const hooksPath =
+        activePersonaId != null
+          ? `/api/hooks?persona_id=${activePersonaId}`
+          : '/api/hooks'
+      const hooksRes = await api<{ hooks?: HookDefinition[] }>(hooksPath)
       const hookList = Array.isArray(hooksRes.hooks) ? hooksRes.hooks : []
       setHooks(hookList)
 
@@ -174,6 +198,39 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
     if (activePersonaId == null) return
     setSaving(true)
     try {
+      if (!useDefaults && restrictHooks) {
+        const hookIdsToEnableScope = hooks
+          .filter(
+            (hook) =>
+              selectedHookIds.has(hook.id) &&
+              hook.scoped_for_persona === false &&
+              Array.isArray(hook.scoped_persona_ids),
+          )
+          .map((hook) => hook.id)
+
+        for (const hookId of hookIdsToEnableScope) {
+          const hook = hooks.find((h) => h.id === hookId)
+          if (!hook || !Array.isArray(hook.scoped_persona_ids)) continue
+          const nextScope = Array.from(
+            new Set([...hook.scoped_persona_ids, activePersonaId]),
+          ).sort((a, b) => a - b)
+          await api('/api/hooks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: hook.id,
+              name: hook.name,
+              event_name: hook.event_name,
+              matcher: hook.matcher ?? null,
+              action_type: hook.action_type,
+              action_payload_json: hook.action_payload_json,
+              scoped_persona_ids: nextScope,
+              enabled: hook.enabled,
+            }),
+          })
+        }
+      }
+
       await api(`/api/personas/${activePersonaId}/policy`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -191,173 +248,26 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
     }
   }
 
-  async function toggleHookEnabled(hook: HookDefinition, enabled: boolean) {
-    setTogglingHookId(hook.id)
-    try {
-      await api('/api/hooks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: hook.id,
-          name: hook.name,
-          event_name: hook.event_name,
-          matcher: hook.matcher ?? null,
-          action_type: hook.action_type,
-          action_payload_json: hook.action_payload_json,
-          scoped_persona_ids: hook.scoped_persona_ids,
-          enabled,
-        }),
-      })
-      await load()
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setTogglingHookId(null)
-    }
-  }
-
-  async function setHookScope(hook: HookDefinition, makeGlobal: boolean) {
-    if (!makeGlobal && activePersonaId == null) {
-      onError('Select a persona first to scope this hook to a persona.')
-      return
-    }
-    setUpdatingScopeHookId(hook.id)
-    try {
-      await api('/api/hooks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: hook.id,
-          name: hook.name,
-          event_name: hook.event_name,
-          matcher: hook.matcher ?? null,
-          action_type: hook.action_type,
-          action_payload_json: hook.action_payload_json,
-          enabled: hook.enabled,
-          scope: makeGlobal ? 'global' : 'persona',
-          scoped_persona_ids: makeGlobal ? null : [activePersonaId],
-        }),
-      })
-      await load()
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setUpdatingScopeHookId(null)
-    }
-  }
-
   if (loading) {
     return <Text size="2" color="gray">Loading hook and skill policies…</Text>
   }
 
   return (
     <Flex direction="column" gap="3">
-      <Text size="2" weight="bold">Hook definitions</Text>
-      <Text size="1" color="gray">
-        Hook creation/editing is handled by the agent via the <code>create-hook</code> skill.
-        Settings provides catalog visibility and per-persona assignment only.
-      </Text>
-      <Flex direction="column" gap="2">
-        {hooks.length === 0 ? (
-          <Text size="1" color="gray">No hooks defined yet.</Text>
-        ) : (
-          hooks.map((hook) => {
-            const payload = hook.action_payload ?? {}
-            const command =
-              hook.action_type.toLowerCase() === 'command' &&
-              typeof payload.command === 'string'
-                ? payload.command
-                : null
-            return (
-              <Flex key={hook.id} align="center" gap="2" wrap="wrap">
-                {activePersonaId != null && restrictHooks ? (
-                  <Checkbox
-                    size="1"
-                    checked={selectedHookIds.has(hook.id)}
-                    disabled={saving}
-                    onCheckedChange={(checked) =>
-                      toggleHookId(hook.id, checked === true)
-                    }
-                  />
-                ) : null}
-                <Text size="1" className="min-w-[180px] font-mono">
-                  #{hook.id} {hook.name}
-                </Text>
-                <Text size="1" color="gray">{hook.event_name}</Text>
-                <Text size="1" color={hook.enabled ? 'green' : 'gray'}>
-                  {hook.enabled ? 'enabled' : 'disabled'}
-                </Text>
-                <Text size="1" color="gray">
-                  scope:{' '}
-                  {hook.is_global
-                    ? 'global'
-                    : `persona:${(hook.scoped_persona_ids ?? []).join(',') || 'none'}`}
-                </Text>
-                <Text as="label" size="1">
-                  <Flex align="center" gap="2">
-                    <Switch
-                      size="1"
-                      checked={hook.enabled}
-                      disabled={saving || togglingHookId === hook.id}
-                      onCheckedChange={(checked) =>
-                        void toggleHookEnabled(hook, checked === true)
-                      }
-                    />
-                    {hook.enabled ? 'On' : 'Off'}
-                  </Flex>
-                </Text>
-                {hook.matcher ? <Text size="1" color="gray">matcher: {hook.matcher}</Text> : null}
-                <Text size="1" color="gray">action: {hook.action_type}</Text>
-                {command ? <Text size="1" color="gray">command: {command}</Text> : null}
-                <Flex gap="1">
-                  <Button
-                    size="1"
-                    variant="soft"
-                    disabled={
-                      saving ||
-                      togglingHookId === hook.id ||
-                      updatingScopeHookId === hook.id ||
-                      hook.is_global
-                    }
-                    onClick={() => void setHookScope(hook, true)}
-                  >
-                    Global
-                  </Button>
-                  <Button
-                    size="1"
-                    variant="soft"
-                    disabled={
-                      saving ||
-                      togglingHookId === hook.id ||
-                      updatingScopeHookId === hook.id ||
-                      activePersonaId == null ||
-                      (!hook.is_global &&
-                        hook.scoped_persona_ids?.length === 1 &&
-                        hook.scoped_persona_ids[0] === activePersonaId)
-                    }
-                    onClick={() => void setHookScope(hook, false)}
-                  >
-                    Scope to active persona
-                  </Button>
-                </Flex>
-              </Flex>
-            )
-          })
-        )}
-      </Flex>
-
       <Text size="2" weight="bold">
         Persona policy {activePersonaId != null ? `(persona #${activePersonaId})` : ''}
       </Text>
       {activePersonaId == null ? (
         <Text size="1" color="gray">
-          Select a persona to edit per-persona hook/skill allowlists.
+          Select a persona to edit per-persona hook/skill availability.
         </Text>
       ) : (
         <Flex direction="column" gap="3">
           <Text size="1" color="gray">
-            Default is allow-all. Turn on restriction below, pick hooks/skills with checkboxes,
-            then save. Clear all and save to block everything in that category.
+            Default is allow-all. Turn on restriction below, pick hooks/skills with checkboxes in
+            the catalogs, then save. Clear all and save to block everything in that category.
+            Hook creation and enable/disable are handled by the agent via the{' '}
+            <code>create-hook</code> skill.
           </Text>
 
           <Flex direction="column" gap="1">
@@ -402,7 +312,7 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
             {restrictHooks ? (
               <Text size="1" color="gray">
                 {selectedHookIds.size} of {hooks.length} hooks allowed
-                {hooks.length === 0 ? ' — create hooks above first' : ''}
+                {hooks.length === 0 ? ' — create hooks via agent first' : ''}
               </Text>
             ) : (
               <Text size="1" color="gray">All hooks allowed for this persona.</Text>
@@ -486,6 +396,61 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
             {policy?.uses_default_skills ? 'allow-all' : 'restricted'}.
             {policyDirty ? ' Unsaved changes.' : ''}
           </Text>
+        </Flex>
+      )}
+
+      <Text size="2" weight="bold">Hooks catalog</Text>
+      <Text size="1" color="gray">
+        {hooks.length} defined
+        {activePersonaId != null
+          ? ' — status reflects the active persona; checkboxes when hook restriction is on'
+          : ' — select a persona to see per-persona availability'}.
+      </Text>
+      {hooks.length === 0 ? (
+        <Text size="1" color="gray">No hooks defined yet.</Text>
+      ) : (
+        <Flex direction="column" gap="1" className="max-h-[360px] overflow-y-auto">
+          {hooks.map((hook) => {
+            const payload = hook.action_payload ?? {}
+            const command =
+              hook.action_type.toLowerCase() === 'command' &&
+              typeof payload.command === 'string'
+                ? payload.command
+                : null
+            const statusSuffix = hookStatusSuffix(
+              hook,
+              activePersonaId,
+              restrictHooks,
+              selectedHookIds,
+            )
+            return (
+              <Flex key={hook.id} align="start" gap="2">
+                {activePersonaId != null && restrictHooks ? (
+                  <Checkbox
+                    size="1"
+                    className="mt-0.5"
+                    checked={selectedHookIds.has(hook.id)}
+                    disabled={saving}
+                    onCheckedChange={(checked) =>
+                      toggleHookId(hook.id, checked === true)
+                    }
+                  />
+                ) : null}
+                <Text size="1" color={!hook.enabled ? 'gray' : undefined}>
+                  <strong>
+                    #{hook.id} {hook.name}
+                  </strong>
+                  {statusSuffix}
+                  {' — '}
+                  {hook.event_name}
+                  {' · '}
+                  {hook.action_type}
+                  {hook.matcher ? ` · matcher: ${hook.matcher}` : ''}
+                  {command ? ` · command: ${command}` : ''}
+                </Text>
+              </Flex>
+            )
+          })}
         </Flex>
       )}
 

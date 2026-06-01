@@ -75,6 +75,9 @@ export type HookDefinition = {
   is_global: boolean
   enabled: boolean
   updated_at: string
+  scoped_for_persona?: boolean
+  allowed_for_persona?: boolean
+  active_for_persona?: boolean
 }
 
 export type PersonaHookSkillPolicy = {

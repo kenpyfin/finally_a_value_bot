@@ -210,7 +210,7 @@ pub async fn execute_command_hook(
                 other
             )));
         }
-        None => config.workspace_root_absolute().join("shared"),
+        None => config.workspace_root_absolute(),
     };
 
     let mut cmd = tokio::process::Command::new(&hook_path);
@@ -468,6 +468,46 @@ print(json.dumps({
             .map(|m| m.terminal_pz_post_ids)
             .unwrap_or_default();
         assert_eq!(ids, vec!["PZ-20260528-X".to_string()]);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_command_hook_defaults_cwd_to_workspace_root() {
+        let tmp = std::env::temp_dir().join(format!("fab_hook_cwd_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(tmp.join("hooks")).expect("hooks dir");
+        fs::create_dir_all(tmp.join("shared")).expect("shared dir");
+        fs::create_dir_all(tmp.join("skills").join("demo")).expect("skills dir");
+        fs::write(tmp.join("skills").join("demo").join("probe.txt"), "ok").expect("probe");
+
+        let script = tmp.join("hooks").join("cwd-check.py");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+_ = sys.stdin.read()
+exists = pathlib.Path("skills/demo/probe.txt").exists()
+print(json.dumps({"permission":"allow","additional_context":"ok" if exists else "missing"}))
+"#,
+        )
+        .expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod");
+
+        let mut config = test_config();
+        config.workspace_dir = tmp.to_string_lossy().to_string();
+        let payload = HookCommandPayload {
+            command: "cwd-check.py".to_string(),
+            timeout_secs: Some(10),
+            fail_closed: Some(true),
+            cwd: None,
+        };
+        let out = execute_command_hook(&config, &payload, "{}")
+            .await
+            .expect("execute");
+        assert_eq!(out.additional_context.as_deref(), Some("ok"));
         let _ = fs::remove_dir_all(tmp);
     }
 }

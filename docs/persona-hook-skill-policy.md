@@ -49,4 +49,6 @@ This preserves backward compatibility for existing personas.
 - `PATCH /api/personas/:persona_id/policy`
 - `GET /api/skills` — full discovered catalog (`remote` for API/cross-platform skills)
 - `GET /api/skills?persona_id=:id` — same catalog plus `allowed_for_persona` per row (does not hide skills)
-- `GET/POST/DELETE /api/hooks` and `/api/hooks/:id` (global hook catalog)
+- `GET /api/hooks` — full hook catalog
+- `GET /api/hooks?persona_id=:id` — same catalog plus `scoped_for_persona`, `allowed_for_persona`, and `active_for_persona` per row (does not hide hooks)
+- `GET/POST/DELETE /api/hooks` and `/api/hooks/:id` (hook catalog management; scope/enable via agent preferred)

@@ -2741,6 +2741,11 @@ struct SkillsQuery {
     persona_id: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct HooksQuery {
+    persona_id: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct PersonaPolicyPatchBody {
     /// `null` => default allow-all. `[]` => explicit allow-none.
@@ -2853,36 +2858,82 @@ async fn api_skills_get(
     })))
 }
 
+fn hook_definition_to_json(
+    h: crate::db::HookDefinitionRecord,
+    persona_status: Option<(bool, bool, bool)>,
+) -> serde_json::Value {
+    let payload = serde_json::from_str::<serde_json::Value>(&h.action_payload_json)
+        .unwrap_or_else(|_| json!({}));
+    let mut row = json!({
+        "id": h.id,
+        "name": h.name,
+        "event_name": h.event_name,
+        "matcher": h.matcher,
+        "action_type": h.action_type,
+        "action_payload_json": h.action_payload_json,
+        "action_payload": payload,
+        "scoped_persona_ids": h.scoped_persona_ids,
+        "is_global": h.scoped_persona_ids.is_none(),
+        "enabled": h.enabled,
+        "updated_at": h.updated_at,
+    });
+    if let Some((scoped_for_persona, allowed_for_persona, active_for_persona)) = persona_status {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("scoped_for_persona".into(), json!(scoped_for_persona));
+            obj.insert("allowed_for_persona".into(), json!(allowed_for_persona));
+            obj.insert("active_for_persona".into(), json!(active_for_persona));
+        }
+    }
+    row
+}
+
 async fn api_hooks_get(
     headers: HeaderMap,
     State(state): State<WebState>,
+    Query(query): Query<HooksQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let hooks = call_blocking(state.app_state.db.clone(), move |db| {
-        db.list_hook_definitions()
+    let persona_id = query.persona_id;
+    let chat_id = if persona_id.is_some() {
+        let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+        ensure_web_binding_for_universal(&state, chat_id).await?;
+        if let Some(pid) = persona_id {
+            let exists = call_blocking(state.app_state.db.clone(), move |db| {
+                db.persona_exists(chat_id, pid)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if !exists {
+                return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+            }
+        }
+        Some(chat_id)
+    } else {
+        None
+    };
+
+    let db = state.app_state.db.clone();
+    let hooks_json = call_blocking(db, move |db| {
+        let hooks = db.list_hook_definitions()?;
+        let rows = if let (Some(chat_id), Some(pid)) = (chat_id, persona_id) {
+            hooks
+                .into_iter()
+                .map(|h| {
+                    let status = h.persona_status(db, chat_id, pid)?;
+                    Ok(hook_definition_to_json(h, Some(status)))
+                })
+                .collect::<Result<Vec<_>, crate::error::FinallyAValueBotError>>()?
+        } else {
+            hooks
+                .into_iter()
+                .map(|h| hook_definition_to_json(h, None))
+                .collect()
+        };
+        Ok::<Vec<serde_json::Value>, crate::error::FinallyAValueBotError>(rows)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let hooks_json: Vec<serde_json::Value> = hooks
-        .into_iter()
-        .map(|h| {
-            let payload = serde_json::from_str::<serde_json::Value>(&h.action_payload_json)
-                .unwrap_or_else(|_| json!({}));
-            json!({
-                "id": h.id,
-                "name": h.name,
-                "event_name": h.event_name,
-                "matcher": h.matcher,
-                "action_type": h.action_type,
-                "action_payload_json": h.action_payload_json,
-                "action_payload": payload,
-                "scoped_persona_ids": h.scoped_persona_ids,
-                "is_global": h.scoped_persona_ids.is_none(),
-                "enabled": h.enabled,
-                "updated_at": h.updated_at,
-            })
-        })
-        .collect();
+
     Ok(Json(json!({ "ok": true, "hooks": hooks_json })))
 }
 
@@ -5553,6 +5604,249 @@ mod tests {
             request_hub: RequestHub::default(),
             limits,
         }
+    }
+
+    #[tokio::test]
+    async fn test_api_hooks_get_persona_fields() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = web_state
+            .app_state
+            .config
+            .universal_chat_id
+            .unwrap_or(997894126_i64);
+        let db = web_state.app_state.db.clone();
+
+        let owner_persona_id = db
+            .create_persona(chat_id, "owner", None)
+            .expect("create owner persona");
+        let other_persona_id = db
+            .create_persona(chat_id, "other", None)
+            .expect("create other persona");
+
+        let global_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "global-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"global"}"#,
+                None,
+                true,
+            )
+            .expect("upsert global hook");
+        let scoped_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "scoped-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"scoped"}"#,
+                Some(&[owner_persona_id]),
+                true,
+            )
+            .expect("upsert scoped hook");
+        let disabled_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "disabled-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"disabled"}"#,
+                None,
+                false,
+            )
+            .expect("upsert disabled hook");
+
+        let res_owner = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(owner_persona_id),
+            }),
+        )
+        .await;
+        let body_owner = res_owner.expect("owner ok").0;
+        let hooks_owner = body_owner
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .expect("hooks array");
+
+        let find_hook = |id: i64| {
+            hooks_owner
+                .iter()
+                .find(|h| h.get("id").and_then(|v| v.as_i64()) == Some(id))
+                .expect("hook exists")
+        };
+
+        let global_hook = find_hook(global_hook_id);
+        assert_eq!(
+            global_hook
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            global_hook
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            global_hook
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let scoped_hook = find_hook(scoped_hook_id);
+        assert_eq!(
+            scoped_hook
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let disabled_hook = find_hook(disabled_hook_id);
+        assert_eq!(
+            disabled_hook
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let res_other = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(other_persona_id),
+            }),
+        )
+        .await;
+        let body_other = res_other.expect("other ok").0;
+        let hooks_other = body_other
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .expect("hooks array");
+        let find_hook_other = |id: i64| {
+            hooks_other
+                .iter()
+                .find(|h| h.get("id").and_then(|v| v.as_i64()) == Some(id))
+                .expect("hook exists")
+        };
+
+        let scoped_hook_other = find_hook_other(scoped_hook_id);
+        assert_eq!(
+            scoped_hook_other
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            scoped_hook_other
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook_other
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let res_missing = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(99999),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(res_missing, Err((StatusCode::NOT_FOUND, _))),
+            "expected 404 for missing persona"
+        );
+
+        db.set_persona_hook_skill_policy(chat_id, owner_persona_id, Some(&[]), None)
+            .expect("block all hooks for owner");
+        let res_owner_blocked = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(owner_persona_id),
+            }),
+        )
+        .await;
+        let body_owner_blocked = res_owner_blocked.expect("owner ok").0;
+        let hooks_owner_blocked = body_owner_blocked
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .expect("hooks array");
+        let find_hook_blocked = |id: i64| {
+            hooks_owner_blocked
+                .iter()
+                .find(|h| h.get("id").and_then(|v| v.as_i64()) == Some(id))
+                .expect("hook exists")
+        };
+
+        let global_hook_blocked = find_hook_blocked(global_hook_id);
+        assert_eq!(
+            global_hook_blocked
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            global_hook_blocked
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            global_hook_blocked
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let scoped_hook_blocked = find_hook_blocked(scoped_hook_id);
+        assert_eq!(
+            scoped_hook_blocked
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook_blocked
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            scoped_hook_blocked
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 
     #[tokio::test]

@@ -4310,7 +4310,7 @@ fn build_system_prompt(
 ) -> String {
     let caps = format!(
         r#"## Tool groups (names only; use tool schemas for parameters)
-- **Shell:** bash — follow **Path discipline (strict)**; never use `workspace/` prefixes or `workspace/skills/` in shell paths (tool cwd is `shared/`)
+- **Shell:** bash — follow **Path discipline (strict)**; never use `workspace/` prefixes or `workspace/skills/` in shell paths (tool cwd is persona-scoped under `shared/personas/{chat_id}/{persona_id}/`)
 - **Browser:** browser (agent-browser CLI only; never via bash)
 - **Files / repo:** read_file, write_file, edit_file, apply_search_replace, read_repo_map, symbol_edit (when enabled), glob, grep
 - **Web:** web_search, web_fetch
@@ -4470,6 +4470,58 @@ fn strip_transport_persona_prefix(text: &str) -> String {
     rest.to_string()
 }
 
+/// True when a stored row is operational plumbing (background shell/agent status) and should
+/// not appear in LLM dialogue history. Rows remain in the DB and web UI.
+pub(crate) fn is_operational_stored_message(msg: &StoredMessage) -> bool {
+    if msg.is_from_bot {
+        is_operational_bot_content(&strip_transport_persona_prefix(&msg.content))
+    } else {
+        is_operational_user_content(msg.content.trim())
+    }
+}
+
+fn is_operational_user_content(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    t.starts_with("##INTERNAL_SHELL_SUCCESS_FOLLOWUP##")
+        || t.starts_with("##INTERNAL_SHELL_FAILURE_RETRY##")
+        || t.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX)
+        || t.starts_with("[scheduler]:")
+}
+
+/// User-visible artifacts imply a substantive assistant reply worth keeping in dialogue history.
+fn assistant_content_has_dialogue_artifact(text: &str) -> bool {
+    text.contains("![") || text.contains("/api/uploads/")
+}
+
+fn is_operational_bot_content(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if assistant_content_has_dialogue_artifact(t) {
+        return false;
+    }
+    if t.starts_with("Background command started (job `")
+        || t.starts_with("Background command cancelled (job `")
+        || t.starts_with("Background command could not be started (job `")
+    {
+        return true;
+    }
+    if t.starts_with("Your background command finished.") {
+        return true;
+    }
+    if t.starts_with("The background command failed.") {
+        return true;
+    }
+    if t.starts_with("Background job `") {
+        return true;
+    }
+    false
+}
+
 fn history_to_claude_messages(
     history: &[StoredMessage],
     _bot_username: &str,
@@ -4478,6 +4530,9 @@ fn history_to_claude_messages(
     let mut messages = Vec::new();
 
     for msg in history {
+        if is_operational_stored_message(msg) {
+            continue;
+        }
         let role = if msg.is_from_bot { "assistant" } else { "user" };
 
         let content = if msg.is_from_bot {
@@ -5502,6 +5557,7 @@ pub fn archive_conversation(data_dir: &str, chat_id: i64, messages: &[Message]) 
 mod tests {
     use super::*;
     use crate::db::StoredMessage;
+    use serde_json::json;
 
     #[test]
     fn test_workspace_data_path_display_absolute_unchanged() {
@@ -5733,6 +5789,81 @@ mod tests {
         let messages = history_to_claude_messages(&history, "bot", false);
         // Should be empty (leading + trailing assistant removed)
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_is_operational_stored_message_bot_status() {
+        let ack = make_msg(
+            "1",
+            "bot",
+            "Background command started (job `abc`). You'll receive another message when it finishes.",
+            true,
+            "2024-01-01T00:00:01Z",
+        );
+        assert!(is_operational_stored_message(&ack));
+        let delivery = make_msg(
+            "2",
+            "bot",
+            "Your background command finished.\n\nBackground job `abc` — completed successfully (exit 0)\nTask: hotify",
+            true,
+            "2024-01-01T00:00:02Z",
+        );
+        assert!(is_operational_stored_message(&delivery));
+        let reply = make_msg(
+            "3",
+            "bot",
+            "V11 is ready.\n\n![PZ.png](/api/uploads/web/1/PZ.png)",
+            true,
+            "2024-01-01T00:00:03Z",
+        );
+        assert!(!is_operational_stored_message(&reply));
+    }
+
+    #[test]
+    fn test_is_operational_stored_message_internal_shell_user() {
+        let followup = make_msg(
+            "1",
+            "web-user",
+            "##INTERNAL_SHELL_SUCCESS_FOLLOWUP##\nA background shell command completed.",
+            false,
+            "2024-01-01T00:00:01Z",
+        );
+        assert!(is_operational_stored_message(&followup));
+        let user = make_msg("2", "web-user", "use cfg 1", false, "2024-01-01T00:00:02Z");
+        assert!(!is_operational_stored_message(&user));
+    }
+
+    #[test]
+    fn test_history_to_claude_messages_excludes_operational_bot_rows() {
+        let history = vec![
+            make_msg("1", "web-user", "use cfg 1", false, "2024-01-01T00:00:01Z"),
+            make_msg(
+                "2",
+                "bot",
+                "Background command started (job `x`). You'll receive another message when it finishes.",
+                true,
+                "2024-01-01T00:00:02Z",
+            ),
+            make_msg(
+                "3",
+                "bot",
+                "V12 is ready for review.\n\n![PZ.png](/api/uploads/web/1/PZ.png)",
+                true,
+                "2024-01-01T00:00:03Z",
+            ),
+            make_msg("4", "web-user", "try again", false, "2024-01-01T00:00:04Z"),
+        ];
+        let messages = history_to_claude_messages(&history, "bot", false);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        if let MessageContent::Text(t) = &messages[1].content {
+            assert!(!t.contains("Background command started"));
+            assert!(t.contains("V12 is ready"));
+        } else {
+            panic!("expected text assistant reply");
+        }
+        assert_eq!(messages[2].role, "user");
     }
 
     #[test]

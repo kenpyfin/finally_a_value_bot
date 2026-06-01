@@ -57,3 +57,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tower = "0.5"
+tempfile = "3"

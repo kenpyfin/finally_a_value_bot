@@ -16,6 +16,28 @@ use super::bash_safety::{
 };
 use super::{schema_object, Tool, ToolResult};
 
+fn maybe_rewrite_leading_tool_path(
+    workspace_root: &std::path::Path,
+    working_dir: &std::path::Path,
+    command: &str,
+) -> Option<String> {
+    let trimmed = command.trim_start();
+    let mut parts = trimmed.split_whitespace();
+    let launcher = parts.next()?;
+    if !matches!(
+        launcher,
+        "python" | "python3" | "node" | "bash" | "sh" | "pwsh" | "powershell"
+    ) {
+        return None;
+    }
+    let script = parts.next()?;
+    if !(script.starts_with("skills/") || script.starts_with("runtime/")) {
+        return None;
+    }
+    let resolved = super::resolve_tool_path(workspace_root, working_dir, script);
+    Some(trimmed.replacen(script, &resolved.to_string_lossy(), 1))
+}
+
 pub struct BashTool {
     working_dir: PathBuf,
     safety_execution_mode: String,
@@ -115,6 +137,8 @@ impl Tool for BashTool {
         if let Some(blocked) = check_expensive_shell_search(&command, confirmed) {
             return blocked;
         }
+        let command = maybe_rewrite_leading_tool_path(&self.working_dir, &working_dir, &command)
+            .unwrap_or(command);
 
         info!("Executing bash: {}", redact_secrets_internal(&command));
 
@@ -188,6 +212,24 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn test_rewrite_leading_tool_path_for_skills() {
+        let workspace = std::path::PathBuf::from("/tmp/workspace");
+        let persona = workspace
+            .join("shared")
+            .join("personas")
+            .join("1")
+            .join("1");
+        let rewritten = maybe_rewrite_leading_tool_path(
+            &workspace,
+            &persona,
+            "python3 skills/read-email/read_email_tool.py --help",
+        )
+        .expect("rewrite expected");
+        let normalized = rewritten.replace('\\', "/");
+        assert!(normalized.contains("skills/read-email/read_email_tool.py"));
     }
 
     #[tokio::test]
