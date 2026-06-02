@@ -4,6 +4,14 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-01 — Message dates in web UI and bot history context
+
+- **Area:** web / channels / agent prompt
+- **Summary:** Web thread timestamps now show date when the message is not from today (with full datetime on hover). Chat history fed to the LLM includes ISO `at` on `<user_message>` and `<assistant_message>` wrappers so the agent can tell when each stored turn was sent.
+- **Rationale:** UI only showed clock time; the model had order and “now” but not per-message dates unless it searched or exported.
+- **Key files / symbols:** `web/src/lib/format-message-time.ts`, `web/src/components/thread-pane.tsx`, `src/channels/telegram.rs` (`format_user_message`, `format_assistant_history_message`, `history_to_claude_messages`, system prompt bullet).
+- **Follow-ups:** Optional day-separator chips in the thread viewport if operators want stronger visual grouping.
+
 ## Template (copy per entry)
 
 ```markdown

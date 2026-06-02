@@ -19,6 +19,7 @@ pub mod read_file;
 pub mod read_repo_map;
 pub mod register_hook;
 pub mod register_tracked_job;
+pub mod run_skill_script;
 pub mod schedule;
 pub mod search_history;
 pub mod search_vault;
@@ -575,7 +576,7 @@ impl ToolRegistry {
                 config.working_dir(),
                 config.safety_execution_mode.clone(),
                 config.safety_risky_categories.clone(),
-                runtime_toggles,
+                runtime_toggles.clone(),
             )),
             Box::new(browser::BrowserTool::new(
                 &config.runtime_data_dir(),
@@ -659,6 +660,11 @@ impl ToolRegistry {
             Box::new(activate_skill::ActivateSkillTool::new_with_dirs_and_db(
                 config.skill_discovery_dirs(),
                 db.clone(),
+            )),
+            Box::new(run_skill_script::RunSkillScriptTool::new_with_dirs_and_db(
+                config.skill_discovery_dirs(),
+                db.clone(),
+                runtime_toggles.clone(),
             )),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(tiered_memory::ReadTieredMemoryTool::new(

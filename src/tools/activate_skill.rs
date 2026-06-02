@@ -121,6 +121,12 @@ impl Tool for ActivateSkillTool {
                 if !meta.deps.is_empty() {
                     result.push_str(&format!("Dependencies: {}\n", meta.deps.join(", ")));
                 }
+                if let Some(hint) = super::run_skill_script::format_run_skill_script_hint(
+                    &meta.name,
+                    &meta.dir_path,
+                ) {
+                    result.push_str(&hint);
+                }
                 result.push_str("\n## Instructions\n\n");
                 result.push_str(&body);
                 ToolResult::success(result)
@@ -192,6 +198,26 @@ mod tests {
             .content
             .contains("Use pdflatex to convert documents."));
         assert!(result.content.contains("Skill directory:"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_activate_skill_includes_run_skill_script_hint() {
+        let dir = test_dir();
+        let skill_dir = dir.join("mail");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: mail\ndescription: Mail skill\ndeps:\n  - python3\n---\n# Mail\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("read_mail_tool.py"), "# tool\n").unwrap();
+
+        let tool = ActivateSkillTool::new(dir.to_str().unwrap());
+        let result = tool.execute(json!({"skill_name": "mail"})).await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("run_skill_script"));
+        assert!(result.content.contains("read_mail_tool.py"));
         cleanup(&dir);
     }
 

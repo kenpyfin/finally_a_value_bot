@@ -97,7 +97,7 @@ Put **when-to-activate** guidance in frontmatter (`when_to_use`), not only here,
 - **Write for the agent.** The SKILL.md body is loaded for the model after `activate_skill`. Be direct: "Run this command", "Use this tool", "Return this format".
 - **Be specific.** Include exact commands, file paths, API patterns. Avoid vague instructions like "configure as needed".
 - **Split routing vs procedures.** Keep matchable triggers in `when_to_use` and `description`; keep long procedures in the body.
-- **Bundle scripts.** If the skill needs helper scripts (Python, bash, etc.), put them in the skill directory. Reference them with relative paths: `skills/my-skill/helper.py`.
+- **Bundle scripts.** If the skill needs helper scripts (Python, bash, etc.), put them in the skill directory. In the SKILL.md body, document execution with **`run_skill_script`** (e.g. `run_skill_script(skill_name="my-skill", script="helper.py", args=[...])`). Use `skills/my-skill/helper.py` only for **file tool** reads, not bash from persona cwd.
 - **Credentials in .env.** If the skill needs API keys or secrets, instruct the user to create `skills/my-skill/.env` with the required variables. Never hardcode secrets.
 - **API Caution.** For any skill that makes API calls, you MUST be cautious about rate limits and usage. Optimize the call efficiency (e.g. batching, caching, or avoiding redundant calls) and include error handling for rate limit hits (e.g. 429 status codes).
 - **Keep it focused.** One skill = one capability. Don't create a mega-skill that does everything.

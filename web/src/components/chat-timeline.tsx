@@ -3,6 +3,7 @@ import { Badge, Card, Flex, Text } from '@radix-ui/themes'
 import { StickToBottom } from 'use-stick-to-bottom'
 import { cn } from '../lib/utils'
 import { messageBubbleVariants } from '../lib/ui'
+import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 import { MessageMarkdown } from './message-markdown'
 import type { MessageItem } from '../types'
 
@@ -25,8 +26,12 @@ export function ChatTimeline({ messages }: ChatTimelineProps) {
                   <Badge color={m.is_from_bot ? 'teal' : 'gray'} variant="soft">
                     {m.sender_name}
                   </Badge>
-                  <Text size="1" color="gray">
-                    {new Date(m.timestamp).toLocaleTimeString()}
+                  <Text
+                    size="1"
+                    color="gray"
+                    title={formatMessageTimestampTitle(new Date(m.timestamp))}
+                  >
+                    {formatMessageTimestamp(new Date(m.timestamp))}
                   </Text>
                 </Flex>
                 <MessageMarkdown content={m.content} />

@@ -29,6 +29,7 @@ import {
   makeMarkdownText,
 } from '@assistant-ui/react-ui'
 import remarkGfm from 'remark-gfm'
+import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 
 function asObject(value: unknown): Record<string, unknown> {
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
@@ -81,9 +82,13 @@ function ToolCallCard(props: ToolCallMessagePartProps) {
 
 function MessageTimestamp({ align }: { align: 'left' | 'right' }) {
   const createdAt = useMessage((m) => m.createdAt)
-  const formatted = createdAt ? createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
+  const formatted = createdAt ? formatMessageTimestamp(createdAt) : ''
+  const title = createdAt ? formatMessageTimestampTitle(createdAt) : undefined
   return (
-    <div className={align === 'right' ? 'mc-msg-time mc-msg-time-right' : 'mc-msg-time'}>
+    <div
+      className={align === 'right' ? 'mc-msg-time mc-msg-time-right' : 'mc-msg-time'}
+      title={title}
+    >
       {formatted}
     </div>
   )
