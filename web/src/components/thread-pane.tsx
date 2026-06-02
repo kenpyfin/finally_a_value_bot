@@ -227,6 +227,8 @@ export type ThreadPaneProps = {
   initialMessages: ThreadMessageLike[]
   runtimeKey: string
   draftText: string
+  /** If true, avoid resetting thread runtime while new assistant text is streaming in. */
+  isStreaming?: boolean
   onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
@@ -278,6 +280,7 @@ export const ThreadPane = React.memo(function ThreadPane({
   initialMessages,
   runtimeKey,
   draftText,
+  isStreaming = false,
   onDraftTextChange,
   bookmarkedMessageIds,
   onToggleBookmark,
@@ -306,11 +309,15 @@ export const ThreadPane = React.memo(function ThreadPane({
     },
   })
   const lastInitialMessagesRef = React.useRef<ThreadMessageLike[]>(initialMessages)
+  const lastRuntimeKeyRef = React.useRef(runtimeKey)
   React.useEffect(() => {
-    if (lastInitialMessagesRef.current === initialMessages) return
+    const runtimeKeyChanged = lastRuntimeKeyRef.current !== runtimeKey
+    if (!runtimeKeyChanged && isStreaming) return
+    if (!runtimeKeyChanged && lastInitialMessagesRef.current === initialMessages) return
     runtime.thread.reset(initialMessages)
     lastInitialMessagesRef.current = initialMessages
-  }, [initialMessages, runtime])
+    lastRuntimeKeyRef.current = runtimeKey
+  }, [initialMessages, runtime, runtimeKey, isStreaming])
   const uiContextValue = React.useMemo<ThreadPaneUiContextValue>(
     () => ({
       bookmarkedMessageIds,

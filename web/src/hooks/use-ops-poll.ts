@@ -1,12 +1,18 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 import type { BackgroundJobItem, Persona, QueueLane } from '../types'
-import { fetchOpsPollBundle, type OpsPollBundle } from '../api/ops-fetch'
+import {
+  fetchOpsPollBundle,
+  pickQueueLaneForPersona,
+  sumPendingOnOtherPersonas,
+  type OpsPollBundle,
+} from '../api/ops-fetch'
 
 type UseOpsPollArgs = {
   chatId: number | null
+  activePersonaId: number | null
   docVisible: boolean
-  pendingRunIdsLength: number
+  pendingRunsForActivePersona: number
   setPersonas: React.Dispatch<React.SetStateAction<Persona[]>>
 }
 
@@ -16,11 +22,14 @@ type UseOpsPollArgs = {
  */
 export function useOpsPoll({
   chatId,
+  activePersonaId,
   docVisible,
-  pendingRunIdsLength,
+  pendingRunsForActivePersona,
   setPersonas,
 }: UseOpsPollArgs): {
   queueLane: QueueLane | null
+  queueLanesAll: QueueLane[]
+  otherPersonasPending: number
   backgroundActiveCount: number
   backgroundJobs: BackgroundJobItem[]
   invalidateOps: (chatIdOverride?: number | null) => Promise<void>
@@ -39,9 +48,15 @@ export function useOpsPoll({
     refetchInterval: (q) => {
       if (chatId == null) return false
       const d = q.state.data
-      const qp = (d?.queueLane?.pending ?? 0) > 0
+      const lanes = d?.queueLanes ?? []
+      const activeLane = pickQueueLaneForPersona(lanes, activePersonaId)
+      const qp = (activeLane?.pending ?? 0) > 0
+      const otherPending = sumPendingOnOtherPersonas(lanes, activePersonaId) > 0
       const activePending =
-        qp || pendingRunIdsLength > 0 || (d?.backgroundActiveCount ?? 0) > 0
+        qp
+        || otherPending
+        || pendingRunsForActivePersona > 0
+        || (d?.backgroundActiveCount ?? 0) > 0
       const baseMs = activePending ? 2500 : 10000
       return docVisible ? baseMs : 60000
     },
@@ -54,7 +69,15 @@ export function useOpsPoll({
     }
   }, [query.data?.personasSnapshot, setPersonas])
 
-  const queueLane = query.data?.queueLane ?? null
+  const queueLanesAll = query.data?.queueLanes ?? []
+  const queueLane = useMemo(
+    () => pickQueueLaneForPersona(queueLanesAll, activePersonaId),
+    [queueLanesAll, activePersonaId],
+  )
+  const otherPersonasPending = useMemo(
+    () => sumPendingOnOtherPersonas(queueLanesAll, activePersonaId),
+    [queueLanesAll, activePersonaId],
+  )
   const backgroundActiveCount = query.data?.backgroundActiveCount ?? 0
   const backgroundJobs = query.data?.backgroundJobs ?? []
 
@@ -67,5 +90,12 @@ export function useOpsPoll({
     [chatId, queryClient],
   )
 
-  return { queueLane, backgroundActiveCount, backgroundJobs, invalidateOps }
+  return {
+    queueLane,
+    queueLanesAll,
+    otherPersonasPending,
+    backgroundActiveCount,
+    backgroundJobs,
+    invalidateOps,
+  }
 }

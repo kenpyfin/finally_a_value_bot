@@ -48,6 +48,9 @@ struct WebState {
     run_hub: RunHub,
     request_hub: RequestHub,
     limits: WebLimits,
+    /// Cache for `ensure_web_binding_for_universal` to avoid repeated DB writes on every
+    /// `/api/history` poll while this server process is alive.
+    web_binding_universal_done: Arc<Mutex<Option<i64>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -437,6 +440,9 @@ struct ScheduleUpdateRequest {
 #[derive(Debug, Deserialize)]
 struct RunStatusQuery {
     run_id: String,
+    /// When true, include `timeline_events` count in the response.
+    /// Defaults to `false` to keep polling cheap.
+    timeline_events: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,7 +551,14 @@ async fn ensure_web_binding_for_universal(
     state: &WebState,
     chat_id: i64,
 ) -> Result<(), (StatusCode, String)> {
+    // Web always resolves to the same universal chat id; cache to avoid repeated writes.
     let cid = chat_id;
+    {
+        let guard = state.web_binding_universal_done.lock().await;
+        if guard.is_some_and(|id| id == cid) {
+            return Ok(());
+        }
+    }
     call_blocking(state.app_state.db.clone(), move |db| {
         db.upsert_chat(cid, None, "web")?;
         db.link_channel(cid, BOT_INSTANCE_WEB, "web", "default")?;
@@ -553,6 +566,10 @@ async fn ensure_web_binding_for_universal(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        let mut guard = state.web_binding_universal_done.lock().await;
+        *guard = Some(cid);
+    }
     Ok(())
 }
 
@@ -613,6 +630,9 @@ async fn api_history(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
+    let start = Instant::now();
+    let requested_day = query.day.clone();
+    let requested_limit = query.limit;
 
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
@@ -621,7 +641,7 @@ async fn api_history(
     let cid2 = chat_id;
     let pid = persona_id;
 
-    let messages = if let Some(ref day) = query.day {
+    let messages = if let Some(ref day) = requested_day {
         let (from_date, to_date) = day_range(day);
         call_blocking(state.app_state.db.clone(), move |db| {
             db.get_messages_for_date_range(
@@ -635,17 +655,18 @@ async fn api_history(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        let mut msgs = call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_all_messages(cid2, pid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if let Some(limit) = query.limit {
-            if msgs.len() > limit {
-                msgs = msgs[msgs.len() - limit..].to_vec();
-            }
+        match requested_limit {
+            Some(limit) => call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_recent_messages(cid2, pid, limit)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            None => call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_all_messages(cid2, pid)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
         }
-        msgs
     };
 
     let items: Vec<HistoryItem> = messages
@@ -658,6 +679,18 @@ async fn api_history(
             timestamp: m.timestamp,
         })
         .collect();
+
+    info!(
+        target: "web",
+        endpoint = "/api/history",
+        chat_id = chat_id,
+        persona_id = persona_id,
+        day = ?requested_day,
+        limit = ?requested_limit,
+        returned_messages = items.len(),
+        duration_ms = start.elapsed().as_millis(),
+        "History fetched"
+    );
 
     Ok(Json(json!({
         "ok": true,
@@ -1455,12 +1488,17 @@ async fn api_run_status(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let run_key = query.run_id.clone();
-    let timeline_count = call_blocking(state.app_state.db.clone(), {
-        let run_key = run_key.clone();
-        move |db| Ok(db.get_run_timeline_events(&run_key, 500)?.len() as i64)
-    })
-    .await
-    .unwrap_or(0);
+    let include_timeline_events = query.timeline_events.unwrap_or(false);
+    let timeline_count = if include_timeline_events {
+        call_blocking(state.app_state.db.clone(), {
+            let run_key = run_key.clone();
+            move |db| Ok(db.get_run_timeline_events(&run_key, 500)?.len() as i64)
+        })
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
 
     let hb_opt = call_blocking(state.app_state.db.clone(), {
         let run_key = run_key.clone();
@@ -1561,6 +1599,7 @@ async fn api_queue_diagnostics(
         }
         rows.push(json!({
             "chat_id": lane.chat_id,
+            "persona_id": lane.persona_id,
             "pending": lane.pending,
             "active_for_ms": lane.active_for_ms,
             "oldest_wait_ms": lane.oldest_wait_ms,
@@ -4883,6 +4922,7 @@ pub async fn start_web_server(state: Arc<AppState>) {
         run_hub: RunHub::default(),
         request_hub: RequestHub::default(),
         limits,
+        web_binding_universal_done: Arc::new(Mutex::new(None)),
     };
 
     let router = build_router(web_state);
@@ -5603,6 +5643,7 @@ mod tests {
             run_hub: RunHub::default(),
             request_hub: RequestHub::default(),
             limits,
+            web_binding_universal_done: Arc::new(Mutex::new(None)),
         }
     }
 

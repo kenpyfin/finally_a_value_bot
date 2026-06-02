@@ -1,10 +1,35 @@
 import { api } from './client'
 import type { BackgroundJobItem, Persona, QueueLane } from '../types'
 
-export async function fetchQueueLaneForChat(chatId: number): Promise<QueueLane | null> {
+export async function fetchQueueLanesForChat(chatId: number): Promise<QueueLane[]> {
   const data = await api<import('../types').QueueDiagnosticsResponse>('/api/queue_diagnostics')
   const lanes = Array.isArray(data.lanes) ? data.lanes : []
-  return lanes.find((l) => l.chat_id === chatId) ?? null
+  return lanes.filter((l) => l.chat_id === chatId)
+}
+
+export function pickQueueLaneForPersona(
+  lanes: QueueLane[],
+  personaId: number | null,
+): QueueLane | null {
+  if (personaId != null && personaId > 0) {
+    const match = lanes.find((l) => l.persona_id === personaId)
+    if (match) return match
+  }
+  return lanes[0] ?? null
+}
+
+export async function fetchQueueLaneForPersona(
+  chatId: number,
+  personaId: number | null,
+): Promise<QueueLane | null> {
+  const lanes = await fetchQueueLanesForChat(chatId)
+  return pickQueueLaneForPersona(lanes, personaId)
+}
+
+/** @deprecated Use fetchQueueLaneForPersona */
+export async function fetchQueueLaneForChat(chatId: number): Promise<QueueLane | null> {
+  const lanes = await fetchQueueLanesForChat(chatId)
+  return lanes[0] ?? null
 }
 
 export async function fetchBackgroundLaneForChat(
@@ -53,22 +78,31 @@ export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> 
 }
 
 export type OpsPollBundle = {
-  queueLane: QueueLane | null
+  queueLanes: QueueLane[]
   backgroundActiveCount: number
   backgroundJobs: BackgroundJobItem[]
   personasSnapshot: Persona[]
 }
 
 export async function fetchOpsPollBundle(chatId: number): Promise<OpsPollBundle> {
-  const [queueLane, background, personasSnapshot] = await Promise.all([
-    fetchQueueLaneForChat(chatId),
+  const [queueLanes, background, personasSnapshot] = await Promise.all([
+    fetchQueueLanesForChat(chatId),
     fetchBackgroundJobsSnapshot(chatId),
     fetchPersonasSnapshot(chatId),
   ])
   return {
-    queueLane,
+    queueLanes,
     backgroundActiveCount: background.activeCount,
     backgroundJobs: background.jobs,
     personasSnapshot,
   }
+}
+
+export function sumPendingOnOtherPersonas(
+  lanes: QueueLane[],
+  activePersonaId: number | null,
+): number {
+  return lanes
+    .filter((l) => activePersonaId == null || l.persona_id !== activePersonaId)
+    .reduce((sum, l) => sum + (l.pending ?? 0), 0)
 }

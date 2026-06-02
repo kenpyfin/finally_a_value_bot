@@ -1224,7 +1224,7 @@ async fn handle_message(
         text.chars().take(100).collect::<String>()
     );
 
-    // Queue agent work by canonical chat so responses are serialized per contact.
+    // Queue agent work per (canonical chat, persona) so different personas can run in parallel.
     let state_spawn = state.clone();
     let bot_spawn = bot.clone();
     let chat_id_spawn = msg.chat.id;

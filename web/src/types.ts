@@ -198,6 +198,7 @@ export type QueueItem = {
 
 export type QueueLane = {
   chat_id: number
+  persona_id: number
   pending: number
   active_for_ms: number
   oldest_wait_ms: number

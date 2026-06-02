@@ -96,7 +96,8 @@ The agent loop branches only on these three; any other value is treated like a f
 - **Agent background jobs** (`background_jobs` table, `job_kind=agent`): enqueued via web/scheduler handoff (`##BACKGROUND_JOB_HANDOFF##`); worker runs `process_with_agent_with_events` in a Tokio task; final reply via `deliver_agent_final_to_contact`.
 - **Shell background jobs** (`job_kind=shell`): core tool `spawn_background_command` runs the command in tmux (`background_shell_tmux_session_prefix`), logs under `runtime/background_jobs/{job_id}/`, and a monitor loop finalizes when the session ends and delivers results to the user. On success (default), an agent background job summarizes outputs; on failure, an agent job may diagnose and retry. Not available in Docker when tmux is disabled.
 - **Tracked external jobs** (`job_kind=tracked`): core tool `register_tracked_job` inserts the external system's id (e.g. ComfyUI `prompt_id`) into `background_jobs` so the cockpit queue matches user-visible job ids; does not count toward the one active shell/handoff slot per chat.
-- **Ops visibility**: `GET /api/queue_diagnostics` returns foreground queue lanes plus `background_by_chat`; `GET /api/background_jobs` lists job rows with heartbeats.
+- **Foreground agent queue** (`ChatRunQueue`): one FIFO worker per `(canonical chat_id, persona_id)` so different personas in the same contact can run agent turns in parallel; the same persona stays strictly serialized. Telegram, Discord, WhatsApp, web send, and scheduler due tasks all enqueue into this queue.
+- **Ops visibility**: `GET /api/queue_diagnostics` returns one lane row per `(chat_id, persona_id)` plus `background_by_chat`; `GET /api/background_jobs` lists job rows with heartbeats.
 
 ### Main vs Sub-Agent Tools
 

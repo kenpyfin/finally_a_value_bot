@@ -4,6 +4,14 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-02 — Per-persona agent queue lanes
+
+- **Area:** queue / channels / web
+- **Summary:** `ChatRunQueue` now uses one FIFO lane per `(chat_id, persona_id)` instead of per `chat_id`, so different personas in the same contact can run foreground agent turns concurrently. Same persona remains serialized. Diagnostics lanes include `persona_id`; web cockpit and queue dialog are persona-aware (optional “All personas” merge view).
+- **Rationale:** Sessions, history, memory, and tool cwd were already per persona; chat-wide serialization forced Persona B to wait on Persona A’s long runs.
+- **Key files / symbols:** `src/chat_queue.rs` (`QueueLaneKey`, `PersonaLane`, unit tests); `src/web.rs` (`api_queue_diagnostics`); `web/src/api/ops-fetch.ts`, `web/src/hooks/use-ops-poll.ts`, `web/src/main.tsx`, `web/src/components/cockpit-bar.tsx`; `src/channels/telegram.rs` (enqueue comment).
+- **Follow-ups:** Background handoff still limits one active job per chat (`count_active_background_jobs_for_chat`); split by persona if operators need parallel background work across personas.
+
 ### 2026-06-01 — Message dates in web UI and bot history context
 
 - **Area:** web / channels / agent prompt

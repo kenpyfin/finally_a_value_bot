@@ -38,6 +38,8 @@ export type CockpitBarProps = {
   appearance: 'dark' | 'light'
   statusText: string
   queueLane: QueueLane | null
+  /** Pending agent runs on other personas in this chat (when > 0). */
+  otherPersonasPending?: number
   backgroundActiveCount: number
   installationStatus: InstallationStatus | null
   onQueueClick: () => void
@@ -66,6 +68,7 @@ export function CockpitBar({
   appearance,
   statusText,
   queueLane,
+  otherPersonasPending = 0,
   backgroundActiveCount,
   installationStatus,
   onQueueClick,
@@ -172,10 +175,16 @@ export function CockpitBar({
     void saveMemo()
   }, [memoBusy, memoDirty, memoTooLong, saveMemo])
 
+  const otherHint =
+    otherPersonasPending > 0
+      ? ` · +${otherPersonasPending} other persona${otherPersonasPending === 1 ? '' : 's'}`
+      : ''
   const queueLabel =
     pending > 0
-      ? `${pending} pending${oldestWaitMs > 0 ? ` · ${Math.round(oldestWaitMs / 1000)}s wait` : ''}${queueError ? ' (!)' : ''}`
-      : `idle${queueError ? ' (!)' : ''}`
+      ? `${pending} pending${oldestWaitMs > 0 ? ` · ${Math.round(oldestWaitMs / 1000)}s wait` : ''}${otherHint}${queueError ? ' (!)' : ''}`
+      : otherPersonasPending > 0
+        ? `idle${otherHint}${queueError ? ' (!)' : ''}`
+        : `idle${queueError ? ' (!)' : ''}`
 
   useEffect(() => {
     if (selectedBookmark == null) {

@@ -152,6 +152,12 @@ Telegram message
 - Scheduler gets `Arc<AppState>` at spawn time
 - Tools that need `Bot` or `Database` hold their own clones/arcs (passed at construction)
 
+### Foreground agent queue
+
+- `ChatRunQueue` (`src/chat_queue.rs`) serializes **foreground** agent runs (Telegram/Discord/WhatsApp/web send, scheduler due tasks) with one FIFO worker per **`(canonical chat_id, persona_id)`**.
+- Different personas in the same contact can run in parallel; the same persona stays one-at-a-time.
+- `GET /api/queue_diagnostics` returns one lane per persona; web cockpit filters to the active persona (optional “All personas” in the queue dialog).
+
 ### Multi-chat permission model
 
 - `control_chat_ids` in `finally-a-value-bot.config.yaml` defines privileged chats.

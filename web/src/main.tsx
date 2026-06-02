@@ -54,6 +54,7 @@ import {
   type PersonaBulletinHistorySuffix,
   type PersonaHistorySuffixSide,
   type PersonaMessageBookmark,
+  type QueueItem,
   type ScheduleTask,
 } from './types'
 
@@ -87,6 +88,8 @@ function parsePersonaBulletinHistorySuffix(raw: unknown): PersonaBulletinHistory
 }
 
 type Appearance = 'dark' | 'light'
+
+type PendingRun = { runId: string; personaId: number }
 type UiTheme =
   | 'green'
   | 'blue'
@@ -469,10 +472,11 @@ function App() {
   const [newScheduleValue, setNewScheduleValue] = useState('0 9 * * *')
   const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
   const [bindings, setBindings] = useState<ChannelBinding[]>([])
-  const [pendingRunIds, setPendingRunIds] = useState<string[]>([])
+  const [pendingRuns, setPendingRuns] = useState<PendingRun[]>([])
   const [stoppingRunIds, setStoppingRunIds] = useState<string[]>([])
   const [stoppingBackgroundJobIds, setStoppingBackgroundJobIds] = useState<string[]>([])
   const [queueDialogOpen, setQueueDialogOpen] = useState(false)
+  const [queueShowAllPersonas, setQueueShowAllPersonas] = useState(false)
   const [scheduleDetailTask, setScheduleDetailTask] = useState<ScheduleTask | null>(null)
   const [scheduleDetailPrompt, setScheduleDetailPrompt] = useState('')
   const [scheduleDetailScheduleType, setScheduleDetailScheduleType] = useState<'cron' | 'once'>('cron')
@@ -485,7 +489,6 @@ function App() {
   const [agentsMdBusy, setAgentsMdBusy] = useState(false)
   const [agentsMdError, setAgentsMdError] = useState('')
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
-  const [historyPollUntilMs, setHistoryPollUntilMs] = useState<number>(0)
   const [draftByThreadKey, setDraftByThreadKey] = useState<Record<string, string>>({})
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [settingsError, setSettingsError] = useState('')
@@ -556,12 +559,34 @@ function App() {
   }, [desktopSidebarWidth])
 
   const docVisible = useDocumentVisible()
-  const { queueLane, backgroundActiveCount, backgroundJobs, invalidateOps } = useOpsPoll({
-    chatId,
-    docVisible,
-    pendingRunIdsLength: pendingRunIds.length,
-    setPersonas,
-  })
+  const pendingRunsForActivePersona = useMemo(
+    () =>
+      pendingRuns.filter(
+        (r) => activePersonaId != null && activePersonaId > 0 && r.personaId === activePersonaId,
+      ),
+    [pendingRuns, activePersonaId],
+  )
+  const { queueLane, queueLanesAll, otherPersonasPending, backgroundActiveCount, backgroundJobs, invalidateOps } =
+    useOpsPoll({
+      chatId,
+      activePersonaId,
+      docVisible,
+      pendingRunsForActivePersona: pendingRunsForActivePersona.length,
+      setPersonas,
+    })
+
+  const queueDialogItems = useMemo(() => {
+    if (queueShowAllPersonas) {
+      const merged: QueueItem[] = []
+      for (const lane of queueLanesAll) {
+        for (const it of lane.items ?? []) {
+          merged.push(it)
+        }
+      }
+      return merged
+    }
+    return queueLane?.items ?? []
+  }, [queueShowAllPersonas, queueLanesAll, queueLane?.items])
 
   const historySeedRef = useRef<ThreadMessageLike[]>([])
   const historyVisibleLimitRef = useRef<number>(historyVisibleLimit)
@@ -980,20 +1005,207 @@ function App() {
             if (!prev[threadKey]) return prev
             return { ...prev, [threadKey]: '' }
           })
-          setPendingRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId]))
+          const pid = activePersonaId != null && activePersonaId > 0 ? activePersonaId : 0
+          setPendingRuns((prev) =>
+            prev.some((r) => r.runId === runId)
+              ? prev
+              : [...prev, { runId, personaId: pid }],
+          )
           setStatusText('Queued')
-          // A background-handoff run can finish quickly while its final reply arrives later.
-          // Keep history fresh for a short window after sending.
-          setHistoryPollUntilMs(Date.now() + 2 * 60 * 1000)
-          yield {
-            content: [
-              {
-                type: 'text',
-                text: 'Queued. I will send the final reply when this run completes.',
-              },
-            ],
+          // Create assistant bubble immediately; SSE deltas will append real text.
+          yield { content: [{ type: 'text', text: '' }] }
+
+          const chatIdForRun = chatId
+          const personaIdForRun = activePersonaId
+
+          const parseJsonObject = (raw: string): Record<string, unknown> | null => {
+            try {
+              const parsed = JSON.parse(raw) as Record<string, unknown>
+              if (parsed && typeof parsed === 'object') return parsed
+              return null
+            } catch {
+              return null
+            }
+          }
+
+          type SseEvent = { event: string; data: string; id?: string }
+
+          async function* parseSseEvents(resp: Response): AsyncGenerator<SseEvent, void, unknown> {
+            const body = resp.body
+            if (!body) return
+
+            const reader = body.getReader()
+            const decoder = new TextDecoder('utf-8')
+
+            let buffer = ''
+            let eventName: string | undefined
+            let eventId: string | undefined
+            let dataLines: string[] = []
+
+            while (true) {
+              const { value, done } = await reader.read()
+              if (done) break
+              buffer += decoder.decode(value, { stream: true })
+
+              while (true) {
+                const newlineIdx = buffer.indexOf('\n')
+                if (newlineIdx < 0) break
+
+                const line = buffer.slice(0, newlineIdx).replace(/\r$/, '')
+                buffer = buffer.slice(newlineIdx + 1)
+
+                if (line === '') {
+                  if (dataLines.length > 0) {
+                    yield {
+                      event: eventName ?? 'message',
+                      data: dataLines.join('\n'),
+                      id: eventId,
+                    }
+                  }
+                  eventName = undefined
+                  eventId = undefined
+                  dataLines = []
+                  continue
+                }
+
+                if (line.startsWith(':')) continue
+                if (line.startsWith('event:')) {
+                  eventName = line.slice('event:'.length).trim()
+                  continue
+                }
+                if (line.startsWith('id:')) {
+                  eventId = line.slice('id:'.length).trim()
+                  continue
+                }
+                if (line.startsWith('data:')) {
+                  dataLines.push(line.slice('data:'.length).trimStart())
+                }
+              }
+            }
+
+            if (dataLines.length > 0) {
+              yield { event: eventName ?? 'message', data: dataLines.join('\n'), id: eventId }
+            }
+          }
+
+          let completedOrError = false
+          let seenAnyDelta = false
+
+          let pendingDelta = ''
+          let lastFlushMs = Date.now()
+          const sseSubscribeStartMs = Date.now()
+          let firstDeltaLatencyMs: number | null = null
+
+          const sseUrl = `/api/stream?run_id=${encodeURIComponent(runId)}`
+          const sseResp = await fetch(sseUrl, { headers: makeHeaders(), signal: options.abortSignal })
+          if (!sseResp.ok) {
+            throw new Error(`stream subscribe failed (HTTP ${sseResp.status})`)
+          }
+
+          try {
+            for await (const evt of parseSseEvents(sseResp)) {
+              if (options.abortSignal.aborted) break
+
+              if (evt.event === 'status') {
+                const obj = parseJsonObject(evt.data)
+                const message = typeof obj?.message === 'string' ? obj.message : null
+                if (message) setStatusText(message)
+                continue
+              }
+
+              if (evt.event === 'delta') {
+                const obj = parseJsonObject(evt.data)
+                const delta = typeof obj?.delta === 'string' ? obj.delta : ''
+                if (!delta) continue
+
+                seenAnyDelta = true
+                if (firstDeltaLatencyMs == null) {
+                  firstDeltaLatencyMs = Date.now() - sseSubscribeStartMs
+                }
+                pendingDelta += delta
+
+                // Throttle yields to avoid token-by-token re-renders.
+                const nowMs = Date.now()
+                if (nowMs - lastFlushMs >= 50) {
+                  yield { content: [{ type: 'text', text: pendingDelta }] }
+                  pendingDelta = ''
+                  lastFlushMs = nowMs
+                }
+                continue
+              }
+
+              if (evt.event === 'done') {
+                if (pendingDelta) {
+                  yield { content: [{ type: 'text', text: pendingDelta }] }
+                  pendingDelta = ''
+                }
+                completedOrError = true
+                setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
+                setStatusText('Done')
+                if (chatIdForRun != null) {
+                  void loadHistory(chatIdForRun, personaIdForRun ?? undefined)
+                  if (personaIdForRun != null && personaIdForRun > 0) {
+                    void loadPersonaBulletin(personaIdForRun)
+                  }
+                }
+                const doneLatencyMs = Date.now() - sseSubscribeStartMs
+                if (import.meta.env?.DEV && typeof console !== 'undefined' && console.debug) {
+                  console.debug('[web][stream]', {
+                    runId,
+                    chatId: chatIdForRun,
+                    personaId: personaIdForRun,
+                    firstDeltaLatencyMs,
+                    doneLatencyMs,
+                  })
+                }
+                break
+              }
+
+              if (evt.event === 'error') {
+                if (pendingDelta) {
+                  yield { content: [{ type: 'text', text: pendingDelta }] }
+                  pendingDelta = ''
+                }
+                completedOrError = true
+                const obj = parseJsonObject(evt.data)
+                const errorText = typeof obj?.error === 'string' ? obj.error : 'unknown error'
+                if (!seenAnyDelta) {
+                  yield { content: [{ type: 'text', text: `Error: ${errorText}` }] }
+                }
+                setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
+                setStatusText('Error')
+                const doneLatencyMs = Date.now() - sseSubscribeStartMs
+                if (import.meta.env?.DEV && typeof console !== 'undefined' && console.debug) {
+                  console.debug('[web][stream][error]', {
+                    runId,
+                    chatId: chatIdForRun,
+                    personaId: personaIdForRun,
+                    firstDeltaLatencyMs,
+                    doneLatencyMs,
+                    errorText,
+                  })
+                }
+                break
+              }
+            }
+          } catch (e) {
+            if (!options.abortSignal.aborted) {
+              const msg = e instanceof Error ? e.message : String(e)
+              if (!seenAnyDelta) {
+                yield { content: [{ type: 'text', text: `Error: ${msg}` }] }
+              }
+              setStatusText('Error')
+              completedOrError = true
+            }
+          } finally {
+            if (!completedOrError && !options.abortSignal.aborted) {
+              // Stream ended unexpectedly (connection closed, etc.)
+              setStatusText('Done')
+            }
+            setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
           }
         } finally {
+          // No-op: keep existing structure for future error instrumentation.
         }
       },
     }),
@@ -1549,65 +1761,8 @@ function App() {
     if (reloadBulletin && activePersonaId != null) {
       void loadPersonaBulletin(activePersonaId)
     }
-    setHistoryPollUntilMs(Date.now() + 2 * 60 * 1000)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId, activePersonaId, backgroundJobs])
-
-  useEffect(() => {
-    if (chatId == null) return
-    if (backgroundActiveCount <= 0) return
-    const extendTo = Date.now() + 5 * 60 * 1000
-    setHistoryPollUntilMs((prev) => (prev > extendTo ? prev : extendTo))
-  }, [chatId, backgroundActiveCount])
-
-  useEffect(() => {
-    if (pendingRunIds.length === 0) return
-    let cancelled = false
-    const interval = setInterval(() => {
-      ; (async () => {
-        const completed: string[] = []
-        for (const runId of pendingRunIds) {
-          try {
-            const status = await api<{ done?: boolean }>(
-              `/api/run_status?run_id=${encodeURIComponent(runId)}`,
-            )
-            if (status.done === true) completed.push(runId)
-          } catch {
-            // run not found / auth issue / transient error: leave pending
-          }
-        }
-        if (cancelled || completed.length === 0) return
-        setPendingRunIds((prev) => prev.filter((id) => !completed.includes(id)))
-        setStatusText('Done')
-        void loadHistory(chatId, activePersonaId ?? undefined)
-        if (activePersonaId != null) {
-          void loadPersonaBulletin(activePersonaId)
-        }
-        setHistoryPollUntilMs(Date.now() + 2 * 60 * 1000)
-      })()
-    }, 2500)
-    return () => {
-      cancelled = true
-      clearInterval(interval)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingRunIds, chatId, activePersonaId])
-
-  useEffect(() => {
-    if (chatId == null) return
-    if (historyPollUntilMs <= Date.now()) return
-    let cancelled = false
-    const interval = setInterval(() => {
-      if (cancelled) return
-      if (historyPollUntilMs <= Date.now()) return
-      loadHistory(chatId, activePersonaId ?? undefined).catch(() => { })
-    }, 10000)
-    return () => {
-      cancelled = true
-      clearInterval(interval)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatId, activePersonaId, historyPollUntilMs])
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}`
 
@@ -2154,10 +2309,20 @@ function App() {
                     <Dialog.Content style={{ maxWidth: 920 }}>
                       <Dialog.Title>Run queue</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
-                        Pending and running agent work for this chat (FIFO). Queued items can be removed immediately; running items can be stopped.
+                        Pending and running agent work (FIFO per persona). Queued items can be removed immediately; running items can be stopped.
                       </Dialog.Description>
+                      <Flex align="center" gap="3" mb="2">
+                        <label className="flex cursor-pointer items-center gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={queueShowAllPersonas}
+                            onChange={(e) => setQueueShowAllPersonas(e.target.checked)}
+                          />
+                          All personas
+                        </label>
+                      </Flex>
                       <div className="max-h-[min(420px,60vh)] overflow-auto rounded-md border p-2" style={appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }}>
-                        {(queueLane?.items?.length ?? 0) === 0 ? (
+                        {queueDialogItems.length === 0 ? (
                           <Text size="2" color="gray">No queued runs (lane idle or diagnostics loading).</Text>
                         ) : (
                           <>
@@ -2175,7 +2340,7 @@ function App() {
                                 </tr>
                               </thead>
                               <tbody>
-                                {(queueLane?.items ?? []).map((it) => {
+                                {queueDialogItems.map((it) => {
                                   const isStopping = stoppingRunIds.includes(it.run_id)
                                   const isRunning = it.state === 'running'
                                   return (
@@ -2206,7 +2371,7 @@ function App() {
                               </tbody>
                             </table>
                             <div className="flex flex-col gap-2 md:hidden">
-                              {(queueLane?.items ?? []).map((it) => {
+                              {queueDialogItems.map((it) => {
                                 const isStopping = stoppingRunIds.includes(it.run_id)
                                 const isRunning = it.state === 'running'
                                 return (
@@ -3122,6 +3287,7 @@ function App() {
                     appearance={appearance}
                     statusText={statusText}
                     queueLane={queueLane}
+                    otherPersonasPending={otherPersonasPending}
                     backgroundActiveCount={backgroundActiveCount}
                     installationStatus={installationStatus}
                     onQueueClick={() => setQueueDialogOpen(true)}
@@ -3203,6 +3369,7 @@ function App() {
                     adapter={adapter}
                     initialMessages={historySeed}
                     runtimeKey={runtimeKey}
+                    isStreaming={pendingRunsForActivePersona.length > 0}
                     draftText={activeDraftText}
                     onDraftTextChange={handleDraftTextChange}
                     bookmarkedMessageIds={bookmarkedMessageIds}
