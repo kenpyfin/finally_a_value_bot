@@ -57,7 +57,7 @@ The main chat agent is the single orchestrator: it decides when to reply directl
 3. **Main agent loop** (up to `max_tool_iterations`):
    - Call LLM via `state.llm.send_message(system_prompt, messages, Some(tool_defs))`.
    - Parse **stop_reason** from the response (see [Stop reason](#stop-reason) below):
-     - `end_turn` or `max_tokens` → extract text, save session, return response.
+     - `end_turn`, `max_tokens`, or derived `ask_clarification` → extract text, save session, return response (see below).
      - `tool_use` → for each `ResponseContentBlock::ToolUse`, call `tools.execute_with_auth(name, input, tool_auth)`, append `ContentBlock::ToolResult` to messages, continue loop.
 4. **Timeouts**: LLM round 180s, tool execution 120s.
 
@@ -74,8 +74,13 @@ The `workflows` table still receives **post-run** updates when `WORKFLOW_AUTO_LE
 | `end_turn` | Model finished; raw: `stop`, `end_turn`, or missing |
 | `tool_use` | Model requested tool calls; raw: `tool_use`, `tool_calls` |
 | `max_tokens` | Hit token limit; raw: `max_tokens`, `length` |
+| `ask_clarification` | Derived when `end_turn`/`max_tokens` text genuinely asks the user (questions, “which do you prefer”, etc.); skips deferred-commitment nudge and post-delivery QC |
 
-The agent loop branches only on these three; any other value is treated like a finished turn.
+The agent loop branches on these; any other value is treated like a finished turn.
+
+### Post-delivery quality evaluation (PDQE)
+
+After the **first** user-visible reply is delivered (`deliver_agent_final_to_contact` or channel equivalent), an optional async evaluator may run (`RESPONSE_QUALITY_EVALUATOR_ENABLED`, Perplexity via `PERPLEXITY_API_KEY`). It judges the delivered answer against the session goal in `[current_request]` (`src/agent_turn_context.rs`), not the first message in history. On **fail** with sufficient confidence, at most one corrective foreground run is enqueued on the persona lane with `[quality_eval_feedback]` (`quality_eval_max_nudges_per_run`). Implementation: `src/response_quality_evaluator.rs`, wired from `src/channels/telegram.rs` (`maybe_spawn_post_delivery_quality_eval`). The **post-tool evaluator** (PTE) uses the same Perplexity sidecar and session-goal framing between tool rounds (`src/post_tool_evaluator.rs`).
 
 ### Tool Registry and Execution
 

@@ -321,6 +321,14 @@ pub async fn run_hooks_for_event_async(
                 }
             }
             "builtin_deferred_commitment_guard" => {
+                if input
+                    .stop_reason
+                    .as_deref()
+                    .map(|s| s == "ask_clarification")
+                    .unwrap_or(false)
+                {
+                    break;
+                }
                 let should_reject = signal_bool(input, "deferred_commitment_should_reject");
                 let nudge_count = signal_u64(input, "deferred_commitment_nudges");
                 let nudge_max = signal_u64(input, "deferred_commitment_max_nudges");

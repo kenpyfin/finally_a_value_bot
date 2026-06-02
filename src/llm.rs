@@ -185,6 +185,29 @@ pub fn create_provider(config: &Config) -> Box<dyn LlmProvider> {
     }
 }
 
+/// Sidecar LLM for PTE / PDQE (Perplexity Sonar via OpenAI-compatible API). Never used for the main agent loop.
+pub fn create_evaluator_provider(
+    config: &Config,
+) -> Result<Box<dyn LlmProvider>, FinallyAValueBotError> {
+    let key = config
+        .perplexity_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            FinallyAValueBotError::Config(
+                "PERPLEXITY_API_KEY is required when post-tool or post-delivery evaluators are enabled"
+                    .into(),
+            )
+        })?;
+    let mut eval_config = config.clone();
+    eval_config.llm_provider = "openai".into();
+    eval_config.api_key = key.to_string();
+    eval_config.model = config.evaluator_model.clone();
+    eval_config.llm_base_url = Some(config.evaluator_base_url.clone());
+    Ok(create_provider(&eval_config))
+}
+
 /// Hot-swappable main agent LLM (model changes from Web UI without full process restart).
 pub struct LlmHandle {
     model: std::sync::RwLock<String>,
@@ -688,6 +711,9 @@ fn normalize_stop_reason(reason: Option<String>) -> Option<String> {
         Some("max_tokens") | Some("length") => Some("max_tokens".into()),
         Some("end_turn") => Some("end_turn".into()),
         Some(r) if r.eq_ignore_ascii_case("stop") => Some("end_turn".into()),
+        Some("clarification") | Some("ask_user") | Some("needs_clarification") => {
+            Some("ask_clarification".into())
+        }
         Some(other) => Some(other.to_string()),
     }
 }

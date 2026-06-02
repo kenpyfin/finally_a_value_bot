@@ -305,6 +305,9 @@ pub fn spawn_background_job(
                 is_scheduled_task: false,
                 is_background_job: true,
                 run_key: Some(job_id.clone()),
+                is_quality_nudge: false,
+                quality_nudge_parent_run_key: None,
+                quality_feedback: None,
             },
             Some(&prompt),
             None,
@@ -316,7 +319,7 @@ pub fn spawn_background_job(
         let _ = hb_forward.await;
 
         let (raw_output, raw_success) = match bg_result {
-            Ok(text) => (text, true),
+            Ok(agent_out) => (agent_out.response, true),
             Err(e) => (format!("Background job error: {e}"), false),
         };
         let _ = if raw_success {

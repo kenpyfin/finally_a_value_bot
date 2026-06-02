@@ -15,7 +15,8 @@ use crate::db::call_blocking;
 use crate::db::StoredMessage;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::telegram::{
-    archive_conversation, process_with_agent_with_events, AgentRequestContext, AppState,
+    archive_conversation, maybe_spawn_post_delivery_quality_eval, process_with_agent_with_events,
+    AgentRequestContext, AppState,
 };
 
 struct Handler {
@@ -382,6 +383,9 @@ impl EventHandler for Handler {
                         is_scheduled_task: false,
                         is_background_job: false,
                         run_key: None,
+                        is_quality_nudge: false,
+                        quality_nudge_parent_run_key: None,
+                        quality_feedback: None,
                     },
                     None,
                     image_data,
@@ -390,26 +394,40 @@ impl EventHandler for Handler {
                 )
                 .await
                 {
-                    Ok(response) => {
+                    Ok(agent_out) => {
                         drop(typing);
-                            if !response.is_empty() {
-                            match crate::channel::deliver_agent_final_to_contact(
+                        let to_send = if agent_out.response.trim().is_empty() {
+                            "Done.".to_string()
+                        } else {
+                            agent_out.response.clone()
+                        };
+                        if !to_send.is_empty() {
+                            let delivered = match crate::channel::deliver_agent_final_to_contact(
                                 app_state.db.clone(),
                                 app_state.telegram_bots.as_ref(),
                                 app_state.discord_http.as_ref(),
                                 &app_state.config.bot_username,
                                 canonical_chat_id,
                                 persona_id,
-                                &response,
+                                &to_send,
                                 Some(app_state.config.workspace_root_absolute()),
                             )
                             .await
                             {
-                                Ok(_) => {}
+                                Ok(_) => true,
                                 Err(e) => {
                                     tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Discord only");
-                                    send_discord_response_to_http(&http, channel_id_for_send, &response)
+                                    send_discord_response_to_http(&http, channel_id_for_send, &to_send)
                                         .await;
+                                    true
+                                }
+                            };
+                            if delivered {
+                                if let Some(ctx) = agent_out.post_delivery_eval {
+                                    maybe_spawn_post_delivery_quality_eval(
+                                        app_state.clone(),
+                                        ctx,
+                                    );
                                 }
                             }
                         }

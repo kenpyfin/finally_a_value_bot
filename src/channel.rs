@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use teloxide::prelude::*;
 
-use crate::channels::telegram::send_response_result;
+use crate::channels::telegram::{send_response_result, strip_embedded_bulletin_focus};
 use crate::db::{call_blocking, Database, StoredMessage};
 use crate::final_delivery_dedupe::{
     find_send_message_dedupe_anchor, plan_agent_final_delivery, AgentFinalDeliveryPlan,
@@ -81,7 +81,8 @@ pub async fn deliver_and_store_bot_message(
     text: &str,
     workspace_root: Option<PathBuf>,
 ) -> Result<(), String> {
-    let text = &with_persona_indicator(db.clone(), persona_id, text).await;
+    let text = strip_embedded_bulletin_focus(text);
+    let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
     if is_web_chat(db.clone(), chat_id).await {
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -149,7 +150,8 @@ pub async fn deliver_to_contact(
     text: &str,
     workspace_root: Option<PathBuf>,
 ) -> Result<(), String> {
-    let text = &with_persona_indicator(db.clone(), persona_id, text).await;
+    let text = strip_embedded_bulletin_focus(text);
+    let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
     let msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
         chat_id: canonical_chat_id,
@@ -276,7 +278,8 @@ pub async fn deliver_agent_final_to_contact(
     raw_final: &str,
     workspace_root: Option<PathBuf>,
 ) -> Result<AgentFinalDeliveryOutcome, String> {
-    let indicated = with_persona_indicator(db.clone(), persona_id, raw_final).await;
+    let cleaned = strip_embedded_bulletin_focus(raw_final);
+    let indicated = with_persona_indicator(db.clone(), persona_id, &cleaned).await;
 
     let recent_res = call_blocking(db.clone(), {
         let cid = canonical_chat_id;
@@ -313,12 +316,12 @@ pub async fn deliver_agent_final_to_contact(
                 bot_username,
                 canonical_chat_id,
                 persona_id,
-                raw_final,
+                &cleaned,
                 workspace_root,
             )
             .await?;
             Ok(AgentFinalDeliveryOutcome {
-                response_for_client: raw_final.to_string(),
+                response_for_client: cleaned,
             })
         }
         AgentFinalDeliveryPlan::DeliverSuffixOnly(suffix) => {

@@ -1,5 +1,6 @@
 pub mod agent_history;
 pub mod agent_path_discipline;
+pub mod agent_turn_context;
 pub mod background_jobs;
 pub mod background_shell;
 pub mod builtin_hooks;
@@ -27,6 +28,7 @@ pub mod memory;
 pub mod persona;
 pub mod persona_shared_migrate;
 pub mod post_tool_evaluator;
+pub mod response_quality_evaluator;
 pub mod runtime_toggles;
 pub mod safety_redaction;
 pub mod scheduler;

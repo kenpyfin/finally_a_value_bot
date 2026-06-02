@@ -131,6 +131,7 @@ fn build_report() -> DoctorReport {
     );
 
     check_config(&mut report);
+    check_evaluator_api_key(&mut report);
     check_shadow_workspace(&mut report);
     check_legacy_flat_shared(&mut report);
     check_path(&mut report);
@@ -164,6 +165,39 @@ fn check_config(report: &mut DoctorReport) {
             err.to_string(),
             Some("Fix FINALLY_A_VALUE_BOT_CONFIG or create a valid config file.".to_string()),
         ),
+    }
+}
+
+fn check_evaluator_api_key(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let needs_key = config.post_tool_evaluator_enabled || config.response_quality_evaluator_enabled;
+    if !needs_key {
+        return;
+    }
+    let configured = config
+        .perplexity_api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty());
+    if configured {
+        report.push(
+            "evaluator.perplexity_key",
+            "Perplexity API key (PTE/PDQE)",
+            CheckStatus::Pass,
+            "PERPLEXITY_API_KEY is set".to_string(),
+            None,
+        );
+    } else {
+        report.push(
+            "evaluator.perplexity_key",
+            "Perplexity API key (PTE/PDQE)",
+            CheckStatus::Warn,
+            "PERPLEXITY_API_KEY is missing".to_string(),
+            Some(
+                "Post-tool and post-delivery evaluators use Perplexity (EVALUATOR_MODEL/EVALUATOR_BASE_URL); set PERPLEXITY_API_KEY in .env.".to_string(),
+            ),
+        );
     }
 }
 

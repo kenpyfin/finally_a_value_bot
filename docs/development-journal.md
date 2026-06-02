@@ -4,6 +4,22 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-02 — Post-delivery quality evaluation (PDQE) + Perplexity evaluators
+
+- **Area:** agent loop / channels / config / evaluators
+- **Summary:** Added async post-delivery QC after the first reply is delivered: Perplexity sidecar (`PERPLEXITY_API_KEY`, `EVALUATOR_MODEL`, `EVALUATOR_BASE_URL`) judges the answer against `[current_request]` (`SessionGoalContext`). On fail, one corrective foreground run per `run_key` via `ChatRunQueue` with `[quality_eval_feedback]`. PTE now uses the same evaluator provider and session goal. Derived `ask_clarification` stop reason skips deferred-commitment nudge and PDQE.
+- **Rationale:** Catch incomplete or off-goal replies without blocking the first delivery; align evaluators with task-first context instead of first history message.
+- **Key files / symbols:** `src/response_quality_evaluator.rs`, `src/agent_turn_context.rs`, `src/llm.rs` (`create_evaluator_provider`), `src/channels/telegram.rs` (`AgentProcessResult`, `maybe_spawn_post_delivery_quality_eval`, `enqueue_quality_corrective_run_for_contact`, `effective_stop_reason`); wired delivery spawn in web/discord/whatsapp/scheduler; `src/post_tool_evaluator.rs`; `src/hook_runtime.rs` (`builtin_deferred_commitment_guard`); config env in `src/config.rs`, `.env.example`, `src/doctor.rs`.
+- **Follow-ups:** Tune `QUALITY_EVAL_MIN_CONFIDENCE` / channel allowlist from production false-positive rate; optional web timeline UI for `quality_eval_*` events.
+
+### 2026-06-02 — Strip inline `[bulletin_focus]` from assistant dialogue history
+
+- **Area:** channels / message delivery / agent prompt
+- **Summary:** Added `strip_embedded_bulletin_focus` to remove LLM-appended `[bulletin_focus]` appendix blocks from stored assistant messages at delivery time and when loading history for the model. Bulletin remains once in `[persona_context]` from DB; prior turns no longer replay stale operator snapshots.
+- **Rationale:** The model was appending multiline bulletin cards to every assistant reply; those blocks were stored verbatim and repeated across all `prior_turn` messages, bloating context and duplicating the live bulletin.
+- **Key files / symbols:** `src/channels/telegram.rs` (`strip_embedded_bulletin_focus`, `sanitize_bot_dialogue_content`, `history_to_claude_messages`); `src/channel.rs` (`deliver_and_store_bot_message`, `deliver_to_contact`, `deliver_agent_final_to_contact`); `src/tools/bulletin.rs` (tool description); system prompt Bulletin + memory sync line.
+- **Follow-ups:** Existing DB rows are cleaned at read time; optional one-off DB migration if web UI should hide historical appendix blocks too.
+
 ### 2026-06-02 — Env-only secret redaction (no regex heuristics)
 
 - **Area:** safety redaction / tools / channels / hooks

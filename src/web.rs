@@ -35,7 +35,8 @@ use crate::hook_executor::validate_command_payload;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
+    archive_conversation, maybe_spawn_post_delivery_quality_eval, process_with_agent_with_events,
+    AgentEvent, AgentRequestContext, AppState,
 };
 use std::time::SystemTime;
 
@@ -1978,7 +1979,7 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut response = process_with_agent_with_events(
+    let agent_out = process_with_agent_with_events(
         &state.app_state,
         AgentRequestContext {
             caller_channel: "web",
@@ -1988,6 +1989,9 @@ async fn send_and_store_response_with_events(
             is_scheduled_task: false,
             is_background_job: false,
             run_key: run_key.map(|s| s.to_string()),
+            is_quality_nudge: false,
+            quality_nudge_parent_run_key: None,
+            quality_feedback: None,
         },
         None,
         image_data,
@@ -1996,6 +2000,9 @@ async fn send_and_store_response_with_events(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut response = agent_out.response;
+    let post_delivery_eval = agent_out.post_delivery_eval;
 
     let mut background_job_id: Option<String> = None;
     let mut background_job_queued = false;
@@ -2042,6 +2049,9 @@ async fn send_and_store_response_with_events(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         response = delivery.response_for_client;
+        if let Some(ctx) = post_delivery_eval {
+            maybe_spawn_post_delivery_quality_eval(state.app_state.clone(), ctx);
+        }
     }
 
     let mut out = json!({

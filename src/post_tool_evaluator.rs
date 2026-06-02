@@ -1,6 +1,7 @@
 //! Post-Tool Evaluator (PTE): evaluates whether a task is complete after tool execution.
 //! Called after each tool iteration to decide whether to continue the agent loop or synthesize a final response.
 
+use crate::agent_turn_context::extract_session_goal;
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
@@ -28,16 +29,16 @@ pub struct PteResult {
 /// Build the PTE system prompt with principles and memory context baked in.
 fn build_pte_system_prompt(principles_content: &str, memory_context: &str) -> String {
     let mut prompt = String::from(
-        r#"You are a task-completion evaluator. Given the agent's principles, memory context, the user's original request, and the tool results so far, determine whether the task is complete.
+        r#"You are a task-completion evaluator. Judge whether the session goal (`current_request`) is fulfilled by tool results so far.
 
 Output JSON only: {"action": "continue" | "complete", "reason": "brief rationale"}
 
 Rules:
-- "complete" = all aspects of the user's request have been fulfilled by the tool results
-- "continue" = the task needs more steps, or the results are partial/inconclusive
-- Consider the agent's principles when evaluating: if principles require confirmation, verification, or follow-up steps, the task is not complete until those are done
-- Consider memory context: if the user has ongoing projects or preferences that affect what "done" means, factor those in
-- If in doubt, say "continue" — it is safer to let the LLM decide than to prematurely stop
+- "complete" = the session goal (`current_request`) is fulfilled by tool results
+- "continue" = more steps needed, or results are partial/inconclusive for that goal
+- Prior turns and bulletin/memory are background — judge only `current_request`
+- Consider principles as constraints only
+- If in doubt, say "continue"
 - Keep reason concise (one sentence)
 "#,
     );
@@ -57,39 +58,8 @@ Rules:
     prompt
 }
 
-/// Extract the original user request from the conversation (first user message text).
-fn extract_original_request(messages: &[Message]) -> String {
-    for msg in messages {
-        if msg.role == "user" {
-            match &msg.content {
-                MessageContent::Text(t) => {
-                    let truncated = if t.chars().count() > 500 {
-                        format!("{}...", t.chars().take(500).collect::<String>())
-                    } else {
-                        t.clone()
-                    };
-                    return truncated;
-                }
-                MessageContent::Blocks(blocks) => {
-                    for block in blocks {
-                        if let ContentBlock::Text { text } = block {
-                            let truncated = if text.chars().count() > 500 {
-                                format!("{}...", text.chars().take(500).collect::<String>())
-                            } else {
-                                text.clone()
-                            };
-                            return truncated;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    "(no user request found)".to_string()
-}
-
 /// Build a summary of the most recent tool calls and results.
-fn build_tool_results_summary(
+pub fn build_tool_results_summary(
     env_redactor: &EnvSecretRedactor,
     messages: &[Message],
     max_messages: usize,
@@ -233,13 +203,21 @@ fn build_pte_user_prompt(
     iteration: usize,
     max_iterations: usize,
 ) -> String {
-    let original_request = extract_original_request(messages);
+    let goal = extract_session_goal(messages, Some(env_redactor));
     let tool_summary = build_tool_results_summary(env_redactor, messages, 6);
-
-    format!(
-        "Original user request: {}\n\nTools called and their results:\n{}\nCurrent iteration: {} of {}",
-        original_request, tool_summary, iteration + 1, max_iterations
-    )
+    let mut prompt = format!(
+        "Session goal (current_request): {}\n\nTools called and their results:\n{}\nCurrent iteration: {} of {}",
+        goal.current_request, tool_summary, iteration + 1, max_iterations
+    );
+    if goal.is_short_reply {
+        prompt.push_str("\nShort-reply turn: yes\n");
+        if let Some(ref d) = goal.disambiguation_assistant {
+            prompt.push_str("Disambiguation (prior assistant excerpt):\n");
+            prompt.push_str(d);
+            prompt.push('\n');
+        }
+    }
+    prompt
 }
 
 /// Evaluate whether the task is complete after tool execution.
@@ -275,14 +253,6 @@ pub async fn evaluate_completion(
         });
     }
 
-    let mut llm_config = config.clone();
-    let model = config.post_tool_evaluator_model.trim();
-    if !model.is_empty() {
-        llm_config.model = model.to_string();
-    } else if !config.orchestrator_model.trim().is_empty() {
-        llm_config.model = config.orchestrator_model.trim().to_string();
-    }
-
     let system_prompt = build_pte_system_prompt(principles_content, memory_context);
     let user_prompt = build_pte_user_prompt(
         env_redactor,
@@ -296,7 +266,16 @@ pub async fn evaluate_completion(
         content: MessageContent::Text(user_prompt),
     }];
 
-    let provider = llm::create_provider(&llm_config);
+    let provider = match llm::create_evaluator_provider(config) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("PTE skipped: {e}");
+            return Ok(PteResult {
+                action: PteAction::Continue,
+                reason: String::new(),
+            });
+        }
+    };
     let response = provider
         .send_message(&system_prompt, pte_messages, None)
         .await?;
@@ -402,26 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_original_request() {
-        let messages = vec![
-            Message {
-                role: "user".into(),
-                content: MessageContent::Text("Hello, help me".into()),
-            },
-            Message {
-                role: "assistant".into(),
-                content: MessageContent::Text("Sure!".into()),
-            },
-        ];
-        let req = extract_original_request(&messages);
-        assert_eq!(req, "Hello, help me");
-    }
-
-    #[test]
-    fn test_extract_original_request_empty() {
-        let messages: Vec<Message> = vec![];
-        let req = extract_original_request(&messages);
-        assert_eq!(req, "(no user request found)");
+    fn test_build_pte_user_prompt_session_goal() {
+        use crate::safety_redaction::EnvSecretRedactor;
+        let messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Text(
+                "[current_request]\nFix the login bug\n[/current_request]".into(),
+            ),
+        }];
+        let redactor = EnvSecretRedactor::empty();
+        let prompt = build_pte_user_prompt(&redactor, &messages, 0, 5);
+        assert!(prompt.contains("Session goal (current_request):"));
+        assert!(prompt.contains("Fix the login bug"));
     }
 
     #[test]

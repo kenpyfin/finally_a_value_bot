@@ -58,7 +58,7 @@ Supported `action_type` values:
 - `builtin_persona_focus_sync` (built-in PostDelivery bulletin/memory sync trigger)
 - `builtin_scheduler_policy_context` (BeforeTurn scheduled-run policy context)
 - `builtin_turn_skill_gate` (PreToolUse schedule/modify activation gate)
-- `builtin_deferred_commitment_guard` (PreStop deferred-work guard)
+- `builtin_deferred_commitment_guard` (PreStop deferred-work guard; no-op when `stop_reason` is `ask_clarification`)
 - `builtin_loop_guard` (PostToolBatch discovery/edit loop guard)
 
 `pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.

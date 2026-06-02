@@ -18,7 +18,10 @@ use crate::final_delivery_dedupe::{
     find_send_message_dedupe_anchor, plan_agent_final_delivery, AgentFinalDeliveryPlan,
 };
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
-use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
+use crate::telegram::{
+    maybe_spawn_post_delivery_quality_eval, process_with_agent_with_events, AgentRequestContext,
+    AppState,
+};
 
 // --- Webhook query params for verification ---
 
@@ -560,6 +563,9 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 is_scheduled_task: false,
                                 is_background_job: false,
                                 run_key: None,
+                                is_quality_nudge: false,
+                                quality_nudge_parent_run_key: None,
+                                quality_feedback: None,
                             },
                             None,
                             image_data,
@@ -568,15 +574,15 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                         )
                         .await
                         {
-                            Ok(response) => {
-                                if response.is_empty() {
+                            Ok(agent_out) => {
+                                if agent_out.response.trim().is_empty() {
                                     return;
                                 }
 
                                 let indicated = with_persona_indicator(
                                     app_state.db.clone(),
                                     persona_id,
-                                    &response,
+                                    &agent_out.response,
                                 )
                                 .await;
 
@@ -632,6 +638,10 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                     db.store_message(&bot_msg)
                                 })
                                 .await;
+
+                                if let Some(ctx) = agent_out.post_delivery_eval {
+                                    maybe_spawn_post_delivery_quality_eval(app_state.clone(), ctx);
+                                }
                             }
                             Err(e) => {
                                 error!("Error processing WhatsApp message: {e}");

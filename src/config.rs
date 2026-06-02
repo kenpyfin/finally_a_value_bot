@@ -234,6 +234,31 @@ fn default_post_tool_evaluator_enabled() -> bool {
 fn default_post_tool_evaluator_model() -> String {
     String::new()
 }
+
+fn default_response_quality_evaluator_enabled() -> bool {
+    false
+}
+
+fn default_evaluator_model() -> String {
+    "sonar".into()
+}
+
+fn default_evaluator_base_url() -> String {
+    "https://api.perplexity.ai".into()
+}
+
+fn default_quality_eval_max_nudges_per_run() -> usize {
+    1
+}
+
+fn default_quality_eval_min_confidence() -> f64 {
+    0.7
+}
+
+fn default_quality_eval_channels() -> String {
+    "telegram,web".into()
+}
+
 fn default_hook_command_timeout_secs() -> u64 {
     10
 }
@@ -518,6 +543,30 @@ pub struct Config {
     /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_post_tool_evaluator_model")]
     pub post_tool_evaluator_model: String,
+    /// Post-delivery quality evaluator (PDQE): async QC after user receives the reply.
+    #[serde(default = "default_response_quality_evaluator_enabled")]
+    pub response_quality_evaluator_enabled: bool,
+    /// Perplexity API key for PTE/PDQE sidecar (never falls back to LLM_API_KEY).
+    #[serde(default)]
+    pub perplexity_api_key: Option<String>,
+    /// Perplexity model for evaluators (`sonar`, `sonar-pro`, …).
+    #[serde(default = "default_evaluator_model")]
+    pub evaluator_model: String,
+    /// OpenAI-compatible base URL for evaluators.
+    #[serde(default = "default_evaluator_base_url")]
+    pub evaluator_base_url: String,
+    /// Legacy alias: maps to evaluator_model when set.
+    #[serde(default = "default_post_tool_evaluator_model")]
+    pub response_quality_evaluator_model: String,
+    /// Max corrective agent runs per parent run_key after PDQE fail.
+    #[serde(default = "default_quality_eval_max_nudges_per_run")]
+    pub quality_eval_max_nudges_per_run: usize,
+    /// Minimum LLM confidence (0–1) to enqueue a corrective run on PDQE fail.
+    #[serde(default = "default_quality_eval_min_confidence")]
+    pub quality_eval_min_confidence: f64,
+    /// Comma-separated channels where PDQE runs (`telegram`, `web`, …).
+    #[serde(default = "default_quality_eval_channels")]
+    pub quality_eval_channels: String,
     /// Default timeout in seconds for command hooks.
     #[serde(default = "default_hook_command_timeout_secs")]
     pub hook_command_timeout_secs: u64,
@@ -958,6 +1007,25 @@ impl Config {
                 default_post_tool_evaluator_enabled(),
             ),
             post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
+            response_quality_evaluator_enabled: Self::env_bool(
+                "RESPONSE_QUALITY_EVALUATOR_ENABLED",
+                default_response_quality_evaluator_enabled(),
+            ),
+            perplexity_api_key: Self::env("PERPLEXITY_API_KEY"),
+            evaluator_model: Self::env("EVALUATOR_MODEL").unwrap_or_else(default_evaluator_model),
+            evaluator_base_url: Self::env("EVALUATOR_BASE_URL")
+                .unwrap_or_else(default_evaluator_base_url),
+            response_quality_evaluator_model: Self::env("RESPONSE_QUALITY_EVALUATOR_MODEL")
+                .unwrap_or_default(),
+            quality_eval_max_nudges_per_run: Self::env_usize(
+                "QUALITY_EVAL_MAX_NUDGES_PER_RUN",
+                default_quality_eval_max_nudges_per_run(),
+            ),
+            quality_eval_min_confidence: Self::env("QUALITY_EVAL_MIN_CONFIDENCE")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_quality_eval_min_confidence),
+            quality_eval_channels: Self::env("QUALITY_EVAL_CHANNELS")
+                .unwrap_or_else(default_quality_eval_channels),
             hook_command_timeout_secs: Self::env_u64(
                 "HOOK_COMMAND_TIMEOUT_SECS",
                 default_hook_command_timeout_secs(),
@@ -1162,6 +1230,30 @@ impl Config {
         }
         if self.web_session_idle_ttl_seconds == 0 {
             self.web_session_idle_ttl_seconds = default_web_session_idle_ttl_seconds();
+        }
+        // Evaluator model aliases (legacy env names).
+        if !self.response_quality_evaluator_model.trim().is_empty() {
+            self.evaluator_model = self.response_quality_evaluator_model.trim().to_string();
+        }
+        if !self.post_tool_evaluator_model.trim().is_empty() {
+            self.evaluator_model = self.post_tool_evaluator_model.trim().to_string();
+        }
+        self.evaluator_model = self.evaluator_model.trim().to_string();
+        if self.evaluator_model.is_empty() {
+            self.evaluator_model = default_evaluator_model();
+        }
+        self.evaluator_base_url = self.evaluator_base_url.trim().to_string();
+        if self.evaluator_base_url.is_empty() {
+            self.evaluator_base_url = default_evaluator_base_url();
+        }
+        self.quality_eval_channels = self.quality_eval_channels.trim().to_string();
+        if self.quality_eval_channels.is_empty() {
+            self.quality_eval_channels = default_quality_eval_channels();
+        }
+        if self.quality_eval_min_confidence.is_nan()
+            || !(0.0..=1.0).contains(&self.quality_eval_min_confidence)
+        {
+            self.quality_eval_min_confidence = default_quality_eval_min_confidence();
         }
         if self.max_document_size_mb == 0 {
             self.max_document_size_mb = default_max_document_size_mb();
@@ -1577,6 +1669,14 @@ pub fn test_config() -> Config {
         tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
+        response_quality_evaluator_enabled: false,
+        perplexity_api_key: None,
+        evaluator_model: default_evaluator_model(),
+        evaluator_base_url: default_evaluator_base_url(),
+        response_quality_evaluator_model: String::new(),
+        quality_eval_max_nudges_per_run: default_quality_eval_max_nudges_per_run(),
+        quality_eval_min_confidence: default_quality_eval_min_confidence(),
+        quality_eval_channels: default_quality_eval_channels(),
         hook_command_timeout_secs: default_hook_command_timeout_secs(),
         hook_prompt_timeout_secs: default_hook_prompt_timeout_secs(),
         hook_prompt_model: String::new(),
