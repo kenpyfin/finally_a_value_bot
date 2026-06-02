@@ -1723,8 +1723,8 @@ function App() {
   }, [activePersonaId])
 
   useEffect(() => {
-    setPendingRunIds([])
-  }, [chatId, activePersonaId])
+    setPendingRuns([])
+  }, [chatId])
 
   useEffect(() => {
     prevBgJobStatusByIdRef.current = new Map()
