@@ -29,6 +29,7 @@ import {
   makeMarkdownText,
 } from '@assistant-ui/react-ui'
 import remarkGfm from 'remark-gfm'
+import { historiesEqual } from '../lib/history-sync'
 import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -313,7 +314,12 @@ export const ThreadPane = React.memo(function ThreadPane({
   React.useEffect(() => {
     const runtimeKeyChanged = lastRuntimeKeyRef.current !== runtimeKey
     if (!runtimeKeyChanged && isStreaming) return
-    if (!runtimeKeyChanged && lastInitialMessagesRef.current === initialMessages) return
+    if (
+      !runtimeKeyChanged
+      && historiesEqual(lastInitialMessagesRef.current, initialMessages)
+    ) {
+      return
+    }
     runtime.thread.reset(initialMessages)
     lastInitialMessagesRef.current = initialMessages
     lastRuntimeKeyRef.current = runtimeKey

@@ -13,7 +13,6 @@ use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact};
 use crate::config::Config;
 use crate::db::{call_blocking, BackgroundJob};
 use crate::job_heartbeat::{spawn_shared_heartbeat, HeartbeatSignal, JobType};
-use crate::safety_redaction::redact_secrets_user_visible;
 use crate::telegram::AppState;
 
 const MAX_DELIVERY_OUTPUT_LEN: usize = 30_000;
@@ -724,7 +723,7 @@ pub async fn finalize_shell_job(
         output.truncate(MAX_DELIVERY_OUTPUT_LEN);
         output.push_str("\n... (output truncated)");
     }
-    let output = redact_secrets_user_visible(&output);
+    let output = state.env_redactor.redact(&output);
     let success = exit_code == 0;
 
     // Persist terminal state before agent handoff enqueue: `try_enqueue_background_handoff`

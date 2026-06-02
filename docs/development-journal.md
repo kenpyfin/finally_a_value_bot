@@ -4,6 +4,30 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-02 — Env-only secret redaction (no regex heuristics)
+
+- **Area:** safety redaction / tools / channels / hooks
+- **Summary:** Replaced `redact_secrets_internal` / `redact_secrets_user_visible` regex and long-token heuristics with `EnvSecretRedactor`: at startup, parse values from env-like files (`.env`, `.env.local`, `*.env`, etc.) under config root, workspace, and `builtin_skills/`, then redact only exact literal substrings (longest-first). LinkedIn URLs and other benign long tokens are no longer masked unless they exactly match an env value.
+- **Rationale:** Heuristic redaction false-positived on URLs (`?token=`), assignment-like keys, and 40+ character path segments echoed in tool output; users saw `[REDACTED_SECRET]` in normal links.
+- **Key files / symbols:** `src/safety_redaction.rs` (`EnvSecretRedactor::discover`, `redact`); `src/tools/path_guard.rs` (`pub fn is_env_like_name`); `AppState.env_redactor`; wired through `ToolRegistry::execute`, `apply_output_safeguards`, scheduler, TSA, PTE, hooks, background shell.
+- **Follow-ups:** Restart bot after editing any env-like file to refresh the catalog; optional hot-reload if operators need it.
+
+### 2026-06-02 — Omit assistant bookmarks from persona context
+
+- **Area:** channels / agent prompt
+- **Summary:** `format_bookmarks_section` now includes user-pinned user messages only; assistant bookmark previews are excluded from `[persona_context]` because bulletin focus and prior_turn assistant history already carry that context.
+- **Rationale:** Bookmarked assistant snippets duplicated bulletin/status focus inside the background block on every run.
+- **Key files / symbols:** `src/channels/telegram.rs` (`format_bookmarks_section`, Conversation Memory bullet in `build_system_prompt`).
+- **Follow-ups:** None.
+
+### 2026-06-02 — Task-first context restructuring
+
+- **Area:** channels / agent prompt / memory rendering
+- **Summary:** Split the triggering user message into a final `[current_request]` block; prior turns are tagged `context="prior_turn"`. `[persona_context]` gets a background-only banner; memory/bulletin section labels and system prompt **Task scope** clarify that the current ask is the primary goal. `workspace/AGENTS.md` adds turn-scope guidance.
+- **Rationale:** Bulletin, memory, and history competed as implicit tasks; the model did extra work when the latest ask was indistinguishable from background context.
+- **Key files / symbols:** `src/channels/telegram.rs` (`split_trailing_user_request`, `build_current_request_from_message`, `format_current_request_message`, `latest_user_text`, `build_persona_context_message`, `build_system_prompt`); `src/memory.rs` (`render_persona_context_memory_with_options` heading); `workspace/AGENTS.md`; `docs/architecture_review.md`.
+- **Follow-ups:** Monitor whether operators want a cockpit toggle for minimal history tail (1+1) on task-heavy personas.
+
 ### 2026-06-02 — Per-persona agent queue lanes
 
 - **Area:** queue / channels / web

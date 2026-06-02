@@ -1135,19 +1135,30 @@ function App() {
               }
 
               if (evt.event === 'done') {
+                const doneObj = parseJsonObject(evt.data)
+                const responseText =
+                  typeof doneObj?.response === 'string' ? doneObj.response : ''
                 if (pendingDelta) {
                   yield { content: [{ type: 'text', text: pendingDelta }] }
                   pendingDelta = ''
+                } else if (responseText && !seenAnyDelta) {
+                  // Agent runs do not emit TextDelta today; the final text arrives on `done`.
+                  yield { content: [{ type: 'text', text: responseText }] }
+                  seenAnyDelta = true
                 }
                 completedOrError = true
-                setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
-                setStatusText('Done')
                 if (chatIdForRun != null) {
-                  void loadHistory(chatIdForRun, personaIdForRun ?? undefined)
-                  if (personaIdForRun != null && personaIdForRun > 0) {
-                    void loadPersonaBulletin(personaIdForRun)
+                  try {
+                    await loadHistory(chatIdForRun, personaIdForRun ?? undefined)
+                    if (personaIdForRun != null && personaIdForRun > 0) {
+                      await loadPersonaBulletin(personaIdForRun)
+                    }
+                  } catch {
+                    // History sync failed; streamed `response` text (if any) remains visible.
                   }
                 }
+                setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
+                setStatusText('Done')
                 const doneLatencyMs = Date.now() - sseSubscribeStartMs
                 if (import.meta.env?.DEV && typeof console !== 'undefined' && console.debug) {
                   console.debug('[web][stream]', {
@@ -1199,8 +1210,15 @@ function App() {
             }
           } finally {
             if (!completedOrError && !options.abortSignal.aborted) {
-              // Stream ended unexpectedly (connection closed, etc.)
+              // Stream ended without `done`/`error`; reconcile from DB once.
               setStatusText('Done')
+              if (chatIdForRun != null) {
+                try {
+                  await loadHistory(chatIdForRun, personaIdForRun ?? undefined)
+                } catch {
+                  // ignore
+                }
+              }
             }
             setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
           }
@@ -1763,6 +1781,27 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId, activePersonaId, backgroundJobs])
+
+  // Lightweight refresh for cross-channel / background replies (no SSE for those paths).
+  useEffect(() => {
+    if (chatId == null) return
+    if (!docVisible) return
+    if (pendingRunsForActivePersona.length > 0) return
+    const shouldPollFast = backgroundActiveCount > 0 || (queueLane?.pending ?? 0) > 0
+    const intervalMs = shouldPollFast ? 5000 : 30000
+    const interval = setInterval(() => {
+      void loadHistory(chatId, activePersonaId ?? undefined).catch(() => { })
+    }, intervalMs)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    chatId,
+    activePersonaId,
+    docVisible,
+    pendingRunsForActivePersona.length,
+    backgroundActiveCount,
+    queueLane?.pending,
+  ])
 
   const runtimeKey = `${chatId ?? 0}-${activePersonaId ?? 0}`
 

@@ -45,7 +45,7 @@ use teloxide::prelude::*;
 use crate::claude::ToolDefinition;
 use crate::config::Config;
 use crate::db::Database;
-use crate::safety_redaction::redact_secrets_internal;
+use crate::safety_redaction::EnvSecretRedactor;
 
 pub struct ToolResult {
     pub content: String,
@@ -262,6 +262,7 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    env_redactor: Arc<EnvSecretRedactor>,
 }
 
 /// Path to the mistaken nested copy agents sometimes create under tool cwd (`shared/workspace/`).
@@ -561,6 +562,7 @@ impl ToolRegistry {
         bot: Bot,
         db: Arc<Database>,
         runtime_toggles: std::sync::Arc<crate::runtime_toggles::RuntimeToggles>,
+        env_redactor: Arc<EnvSecretRedactor>,
     ) -> Self {
         let working_dir = PathBuf::from(config.working_dir());
         if let Err(e) = std::fs::create_dir_all(&working_dir) {
@@ -577,6 +579,7 @@ impl ToolRegistry {
                 config.safety_execution_mode.clone(),
                 config.safety_risky_categories.clone(),
                 runtime_toggles.clone(),
+                env_redactor.clone(),
             )),
             Box::new(browser::BrowserTool::new(
                 &config.runtime_data_dir(),
@@ -751,7 +754,14 @@ impl ToolRegistry {
         if !social_added.is_empty() {
             tracing::info!("Social feed tools registered: {}", social_added.join(", "));
         }
-        ToolRegistry { tools }
+        ToolRegistry {
+            tools,
+            env_redactor,
+        }
+    }
+
+    pub fn env_redactor(&self) -> &EnvSecretRedactor {
+        &self.env_redactor
     }
 
     pub fn add_tool(&mut self, tool: Box<dyn Tool>) {
@@ -802,7 +812,7 @@ impl ToolRegistry {
             if tool.name() == name {
                 let started = Instant::now();
                 let mut result = tool.execute(input).await;
-                result.content = redact_secrets_internal(&result.content);
+                result.content = self.env_redactor.redact(&result.content);
                 result.duration_ms = Some(started.elapsed().as_millis());
                 result.bytes = result.content.len();
                 if result.is_error && result.error_type.is_none() {

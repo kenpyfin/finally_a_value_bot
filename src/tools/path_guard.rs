@@ -34,7 +34,8 @@ const CREDENTIAL_FILES: &[&str] = &[
     "secrets.json",
 ];
 
-fn is_env_like_name(component: &str) -> bool {
+/// True for `.env`, `.env.local`, `mercari.env`, etc. (used by path blocking and secret redaction discovery).
+pub fn is_env_like_name(component: &str) -> bool {
     let lower = component.to_ascii_lowercase();
     lower == ".env" || lower.starts_with(".env.") || lower.ends_with(".env")
 }

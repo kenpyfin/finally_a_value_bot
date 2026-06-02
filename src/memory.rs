@@ -1200,7 +1200,7 @@ pub fn render_persona_context_memory_with_options(
         return String::new();
     }
 
-    let mut out = String::from("## Memory (active context)\n\n");
+    let mut out = String::from("## Memory (background reference)\n\n");
     out.push_str(&sections.join("\n"));
     out
 }

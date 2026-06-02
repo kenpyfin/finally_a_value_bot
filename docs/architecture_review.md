@@ -37,7 +37,9 @@ Before the loop starts, the system builds everything the LLM needs to know.
 | Principles          | `AGENTS.md`                  | User-defined rules and identity               |
 | Vault paths         | Config                       | Vector DB endpoints, search tools             |
 
-**Initial messages (prepended):** `[system_runtime_context]`, optional scheduler policy, then **`[persona_context]`** (compiled `memory_state.json` prose via `render_memory_for_llm`, operator memo, bookmarks). No raw JSON in prompts; Active Project Context auto-upsert removed.
+**Initial messages (prepended):** `[system_runtime_context]`, optional scheduler policy, then **`[persona_context]`** (compiled `memory_state.json` prose, operator memo, bookmarks — prefixed with a background-only banner). Prior chat turns follow as `<user_message context="prior_turn">` / `<assistant_message context="prior_turn">`. The triggering user ask is always the final message, wrapped in **`[current_request]`** (not mixed into history). No raw JSON in prompts; Active Project Context auto-upsert removed.
+
+The system prompt includes **## Task scope (read first)**: `[current_request]` is the primary goal; `[persona_context]` and Tier 1 are background reference only unless the current ask needs them.
 
 
 **Learned workflows (SQLite, post-run only):** The shared agent path does **not** append a `# Learned Workflow Hint` from the DB at run start. Tool-using runs may still update `workflows` and promote recurring successes into tiered memory `workflow_principles`. See [`docs/workflow.md`](workflow.md).
@@ -49,7 +51,7 @@ Two paths to load history:
 - **Session resume** — deserialize saved session JSON, append new messages since last save
 - **DB history** — load from stored messages table, convert to LLM message format
 
-Then: non-text tool turns are stripped, and `trim_to_recent_balanced()` keeps the shortest suffix that still has at least **N** user and **N** assistant text messages (global defaults from config with optional per-persona overrides from the `personas` row; see `MAX_HISTORY_MESSAGES` and `RECENT_HISTORY_MIN_*` in `src/config.rs`). There is no separate `compact_messages()` / `max_session_messages` pass in the current codebase.
+Then: non-text tool turns are stripped, and `trim_to_recent_balanced()` keeps the shortest suffix that still has at least **N** user and **N** assistant text messages (global defaults from config with optional per-persona overrides from the `personas` row; see `MAX_HISTORY_MESSAGES` and `RECENT_HISTORY_MIN_*` in `src/config.rs`). The trailing user turn is then split into **`[current_request]`**; remaining turns are tagged `context="prior_turn"`. Token trimming (`trim_to_token_budget`) never removes prepended runtime/persona blocks or the final `[current_request]`.
 
 ### 1.3 Tool Registry
 

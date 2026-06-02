@@ -5,7 +5,7 @@ use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock}
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
 use crate::llm;
-use crate::safety_redaction::redact_secrets_internal;
+use crate::safety_redaction::EnvSecretRedactor;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -89,7 +89,11 @@ fn extract_original_request(messages: &[Message]) -> String {
 }
 
 /// Build a summary of the most recent tool calls and results.
-fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> String {
+fn build_tool_results_summary(
+    env_redactor: &EnvSecretRedactor,
+    messages: &[Message],
+    max_messages: usize,
+) -> String {
     let mut out = String::new();
     let start = messages.len().saturating_sub(max_messages);
 
@@ -109,7 +113,7 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                             out.push_str(&format!(
                                 "Tool called: {} with {}\n",
                                 name,
-                                redact_secrets_internal(&input_preview)
+                                env_redactor.redact(&input_preview)
                             ));
                         }
                         ContentBlock::ToolResult {
@@ -128,7 +132,7 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                             out.push_str(&format!(
                                 "Result ({}): {}\n",
                                 status,
-                                redact_secrets_internal(&preview)
+                                env_redactor.redact(&preview)
                             ));
                         }
                         _ => {}
@@ -142,10 +146,7 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                     } else {
                         t.clone()
                     };
-                    out.push_str(&format!(
-                        "Assistant: {}\n",
-                        redact_secrets_internal(&preview)
-                    ));
+                    out.push_str(&format!("Assistant: {}\n", env_redactor.redact(&preview)));
                 }
             }
         }
@@ -226,9 +227,14 @@ fn has_repeated_no_progress_signatures(messages: &[Message]) -> bool {
 }
 
 /// Build the user message for PTE evaluation.
-fn build_pte_user_prompt(messages: &[Message], iteration: usize, max_iterations: usize) -> String {
+fn build_pte_user_prompt(
+    env_redactor: &EnvSecretRedactor,
+    messages: &[Message],
+    iteration: usize,
+    max_iterations: usize,
+) -> String {
     let original_request = extract_original_request(messages);
-    let tool_summary = build_tool_results_summary(messages, 6);
+    let tool_summary = build_tool_results_summary(env_redactor, messages, 6);
 
     format!(
         "Original user request: {}\n\nTools called and their results:\n{}\nCurrent iteration: {} of {}",
@@ -240,6 +246,7 @@ fn build_pte_user_prompt(messages: &[Message], iteration: usize, max_iterations:
 /// Returns Continue immediately if PTE is disabled.
 pub async fn evaluate_completion(
     config: &Config,
+    env_redactor: &EnvSecretRedactor,
     principles_content: &str,
     memory_context: &str,
     messages: &[Message],
@@ -277,7 +284,12 @@ pub async fn evaluate_completion(
     }
 
     let system_prompt = build_pte_system_prompt(principles_content, memory_context);
-    let user_prompt = build_pte_user_prompt(messages, iteration, config.max_tool_iterations);
+    let user_prompt = build_pte_user_prompt(
+        env_redactor,
+        messages,
+        iteration,
+        config.max_tool_iterations,
+    );
 
     let pte_messages = vec![Message {
         role: "user".into(),

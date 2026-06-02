@@ -1,287 +1,370 @@
-use regex::{Captures, Regex};
-use std::sync::OnceLock;
+//! Literal secret redaction from env-like files on disk only (no regex heuristics).
 
-const REDACTED: &str = "[REDACTED_SECRET]";
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-fn literal_secret_patterns() -> &'static [Regex] {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        vec![
-            Regex::new(r"\bapify_api_[A-Za-z0-9]{16,}\b").expect("valid apify token regex"),
-            Regex::new(r"\bsk-[A-Za-z0-9_-]{16,}\b").expect("valid sk token regex"),
-            Regex::new(r"\bghp_[A-Za-z0-9]{20,}\b").expect("valid github token regex"),
-            Regex::new(r"\bAIza[0-9A-Za-z_-]{20,}\b").expect("valid google api key regex"),
-        ]
-    })
+use tracing::info;
+
+use crate::builtin_skills;
+use crate::config::Config;
+use crate::tools::path_guard::is_env_like_name;
+
+pub const REDACTED: &str = "[REDACTED_SECRET]";
+
+const DEFAULT_MIN_VALUE_LEN: usize = 8;
+const MAX_WALK_DEPTH: usize = 12;
+const MAX_ENV_FILES: usize = 200;
+const MAX_NEEDLES: usize = 500;
+const MAX_ENV_FILE_BYTES: u64 = 256 * 1024;
+
+const SKIP_DIR_NAMES: &[&str] = &[".git", "node_modules", "target", "runtime"];
+
+const PLACEHOLDER_VALUES: &[&str] = &[
+    "changeme",
+    "change_me",
+    "your_api_key",
+    "your_api_key_here",
+    "your-api-key",
+    "insert_key_here",
+    "replace_me",
+    "placeholder",
+    "xxx",
+    "todo",
+    "fixme",
+    "example",
+    "dummy",
+    "test",
+    "secret",
+    "password",
+];
+
+/// Redacts only literal values parsed from env-like files at startup.
+#[derive(Debug, Clone)]
+pub struct EnvSecretRedactor {
+    needles: Vec<String>,
 }
 
-fn auth_header_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b(authorization\s*:\s*bearer\s+)([A-Za-z0-9._\-]{12,})"#)
-            .expect("valid bearer regex")
-    })
-}
-
-fn query_secret_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)([?&](?:api[_-]?key|token|access[_-]?token|authorization)=)([^&\s"'`]+)"#)
-            .expect("valid query secret regex")
-    })
-}
-
-fn assignment_secret_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(
-            r#"(?i)\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|API_KEY|PASSWORD|PASS|PRIVATE_KEY|ACCESS_KEY|AUTH)\b\s*[:=]\s*)(['"]?)([^,\s'"`]{6,})(['"]?)"#,
-        )
-        .expect("valid assignment regex")
-    })
-}
-
-fn long_token_like_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"\b[A-Za-z0-9_-]{40,}\b").expect("valid long token regex"))
-}
-
-fn extension_after_dot(rest: &str) -> Option<&str> {
-    let s = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let after_dot = s.strip_prefix('.')?;
-    let end = after_dot
-        .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(after_dot.len());
-    if end == 0 {
-        return None;
-    }
-    Some(&after_dot[..end])
-}
-
-fn is_model_weight_extension(ext: &str) -> bool {
-    ext.eq_ignore_ascii_case("safetensors")
-        || ext.eq_ignore_ascii_case("ckpt")
-        || ext.eq_ignore_ascii_case("pth")
-        || ext.eq_ignore_ascii_case("bin")
-        || ext.eq_ignore_ascii_case("onnx")
-        || ext.eq_ignore_ascii_case("gguf")
-        || ext.eq_ignore_ascii_case("ggml")
-        || ext.eq_ignore_ascii_case("pt")
-}
-
-fn is_common_media_extension(ext: &str) -> bool {
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "jpg"
-            | "jpeg"
-            | "png"
-            | "gif"
-            | "webp"
-            | "bmp"
-            | "tif"
-            | "tiff"
-            | "heic"
-            | "heif"
-            | "mp4"
-            | "mov"
-            | "avi"
-            | "webm"
-            | "mkv"
-    )
-}
-
-/// True when `rest` begins (after optional ASCII whitespace) with a dotted filename extension
-/// that should keep the preceding long token intact in tool echoes (paths, attachments, LoRA names).
-fn is_followed_by_preservable_file_extension(rest: &str) -> bool {
-    let Some(ext) = extension_after_dot(rest) else {
-        return false;
-    };
-    is_model_weight_extension(ext) || is_common_media_extension(ext)
-}
-
-fn likely_secret_token(token: &str) -> bool {
-    let has_letter = token.chars().any(|c| c.is_ascii_alphabetic());
-    let has_digit = token.chars().any(|c| c.is_ascii_digit());
-    let punctuation_count = token
-        .chars()
-        .filter(|c| *c == '_' || *c == '-' || *c == '.')
-        .count();
-    has_letter && has_digit && (token.len() >= 48 || punctuation_count >= 2)
-}
-
-/// Known-secret patterns only: explicit env-like assignments, bearer headers, query secrets, common key prefixes.
-/// No heuristic long-token masking — safe for assistant text shown to users (filenames and long benign strings stay intact).
-pub fn redact_secrets_user_visible(text: &str) -> String {
-    redact_targeted_secrets(text)
-}
-
-/// Same as targeted redaction plus a conservative long-token heuristic for logs, tool payloads, and internal prompts.
-pub fn redact_secrets_internal(text: &str) -> String {
-    apply_long_token_fallback(&redact_targeted_secrets(text))
-}
-
-fn redact_targeted_secrets(text: &str) -> String {
-    let mut redacted = text.to_string();
-
-    for pattern in literal_secret_patterns() {
-        redacted = pattern.replace_all(&redacted, REDACTED).into_owned();
-    }
-
-    redacted = auth_header_regex()
-        .replace_all(&redacted, |caps: &Captures<'_>| {
-            format!("{}{}", &caps[1], REDACTED)
-        })
-        .into_owned();
-    redacted = query_secret_regex()
-        .replace_all(&redacted, |caps: &Captures<'_>| {
-            format!("{}{}", &caps[1], REDACTED)
-        })
-        .into_owned();
-    redacted = assignment_secret_regex()
-        .replace_all(&redacted, |caps: &Captures<'_>| {
-            format!("{}{}{}{}", &caps[1], &caps[2], REDACTED, &caps[4])
-        })
-        .into_owned();
-
-    redacted
-}
-
-fn apply_long_token_fallback(redacted: &str) -> String {
-    let re = long_token_like_regex();
-    let mut out = String::with_capacity(redacted.len());
-    let mut last_end = 0usize;
-    for m in re.find_iter(redacted) {
-        out.push_str(&redacted[last_end..m.start()]);
-        let token = m.as_str();
-        let after = &redacted[m.end()..];
-        if is_followed_by_preservable_file_extension(after) || !likely_secret_token(token) {
-            out.push_str(token);
-        } else {
-            out.push_str(REDACTED);
+impl EnvSecretRedactor {
+    pub fn empty() -> Self {
+        Self {
+            needles: Vec::new(),
         }
-        last_end = m.end();
     }
-    out.push_str(&redacted[last_end..]);
-    out
+
+    pub fn discover(config: &Config) -> Self {
+        let min_value_len = std::env::var("ENV_REDACT_MIN_VALUE_LEN")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&n| (4..=128).contains(&n))
+            .unwrap_or(DEFAULT_MIN_VALUE_LEN);
+
+        let mut allowed_roots: Vec<PathBuf> = vec![config.workspace_root_absolute()];
+        if let Ok(Some(config_env)) = Config::resolve_config_path() {
+            if let Some(parent) = config_env.parent() {
+                allowed_roots.push(parent.to_path_buf());
+            }
+            allowed_roots.push(config_env);
+        }
+        if let Some(builtin) = builtin_skills::resolve_builtin_skills_dir(config) {
+            allowed_roots.push(builtin);
+        }
+        allowed_roots.sort();
+        allowed_roots.dedup();
+
+        let mut env_files: Vec<PathBuf> = Vec::new();
+        let mut files_scanned = 0usize;
+
+        if let Ok(Some(config_env)) = Config::resolve_config_path() {
+            if config_env.is_file() && should_load_env_file(&config_env) {
+                push_env_file(&mut env_files, config_env, &mut files_scanned);
+            }
+        }
+
+        for root in &allowed_roots {
+            if root.is_dir() {
+                walk_for_env_files(root, &allowed_roots, 0, &mut env_files, &mut files_scanned);
+            }
+        }
+
+        let mut value_set: HashSet<String> = HashSet::new();
+        for path in &env_files {
+            if value_set.len() >= MAX_NEEDLES {
+                break;
+            }
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    for (_key, value) in parse_env_content(&content) {
+                        if value_set.len() >= MAX_NEEDLES {
+                            break;
+                        }
+                        if should_redact_value(&value, min_value_len) {
+                            value_set.insert(value);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "redaction",
+                        path = %path.display(),
+                        "Failed to read env file for redaction catalog: {e}"
+                    );
+                }
+            }
+        }
+
+        let mut needles: Vec<String> = value_set.into_iter().collect();
+        expand_url_encoded_needles(&mut needles);
+        needles.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        needles.dedup();
+
+        info!(
+            target: "redaction",
+            env_files = env_files.len(),
+            needles = needles.len(),
+            min_value_len = min_value_len,
+            "Env-only secret redaction catalog built"
+        );
+
+        Self { needles }
+    }
+
+    pub fn redact(&self, text: &str) -> String {
+        if self.needles.is_empty() {
+            return text.to_string();
+        }
+        let mut out = text.to_string();
+        for needle in &self.needles {
+            if needle.is_empty() {
+                continue;
+            }
+            if out.contains(needle) {
+                out = out.replace(needle, REDACTED);
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub fn from_needles(needles: Vec<String>) -> Self {
+        let mut needles = needles;
+        needles.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        Self { needles }
+    }
+}
+
+fn should_load_env_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| is_env_like_name(name) && !is_sample_or_example_env(name))
+}
+
+fn is_sample_or_example_env(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.contains(".example") || lower.contains(".sample")
+}
+
+fn push_env_file(files: &mut Vec<PathBuf>, path: PathBuf, count: &mut usize) {
+    if *count >= MAX_ENV_FILES {
+        return;
+    }
+    if files.iter().any(|p| p == &path) {
+        return;
+    }
+    files.push(path);
+    *count += 1;
+}
+
+fn path_under_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    allowed_roots.iter().any(|root| {
+        let root_resolved = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        resolved.starts_with(&root_resolved)
+    })
+}
+
+fn walk_for_env_files(
+    dir: &Path,
+    allowed_roots: &[PathBuf],
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    files_scanned: &mut usize,
+) {
+    if depth > MAX_WALK_DEPTH || *files_scanned >= MAX_ENV_FILES {
+        return;
+    }
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in read_dir.flatten() {
+        if *files_scanned >= MAX_ENV_FILES {
+            return;
+        }
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if path.is_dir() {
+            if SKIP_DIR_NAMES.iter().any(|s| name == *s) {
+                continue;
+            }
+            walk_for_env_files(&path, allowed_roots, depth + 1, out, files_scanned);
+        } else if path.is_file() {
+            if !is_env_like_name(&name) || is_sample_or_example_env(&name) {
+                continue;
+            }
+            if std::fs::metadata(&path)
+                .map(|m| m.len() <= MAX_ENV_FILE_BYTES)
+                .unwrap_or(false)
+                && path_under_allowed_roots(&path, allowed_roots)
+            {
+                push_env_file(out, path, files_scanned);
+            }
+        }
+    }
+}
+
+fn parse_env_content(content: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let value = parse_env_value(raw_value.trim());
+        if !value.is_empty() {
+            pairs.push((key, value));
+        }
+    }
+    pairs
+}
+
+fn parse_env_value(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    if (raw.starts_with('"') && raw.ends_with('"'))
+        || (raw.starts_with('\'') && raw.ends_with('\''))
+    {
+        let inner = &raw[1..raw.len().saturating_sub(1)];
+        return inner.to_string();
+    }
+    raw.to_string()
+}
+
+fn should_redact_value(value: &str, min_len: usize) -> bool {
+    let trimmed = value.trim();
+    if trimmed.len() < min_len {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if PLACEHOLDER_VALUES.iter().any(|p| lower == *p) {
+        return false;
+    }
+    if lower.starts_with("your_") || lower.starts_with("replace_") || lower.contains("example.com")
+    {
+        return false;
+    }
+    true
+}
+
+fn expand_url_encoded_needles(needles: &mut Vec<String>) {
+    let mut extra = Vec::new();
+    for needle in needles.iter() {
+        let encoded = urlencoding::encode(needle);
+        if encoded != needle.as_str() {
+            extra.push(encoded.into_owned());
+        }
+    }
+    needles.extend(extra);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_secrets_internal, redact_secrets_user_visible, REDACTED};
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_env(dir: &Path, name: &str, body: &str) {
+        fs::write(dir.join(name), body).unwrap();
+    }
 
     #[test]
-    fn internal_redacts_long_token_via_fallback() {
-        let input = "x=lLLWRw8DBX4S99wN4ra4XRlLC1nkpv30zPHoABCDEFGHIJKLMNOP"; // len >= 48, mixed
-        let out = redact_secrets_internal(input);
-        assert!(!out.contains("lLLWRw"));
+    fn redacts_literal_env_value() {
+        let redactor = EnvSecretRedactor::from_needles(vec!["supersecret12345678".to_string()]);
+        let out = redactor.redact("token=supersecret12345678 done");
+        assert!(!out.contains("supersecret"));
         assert!(out.contains(REDACTED));
     }
 
     #[test]
-    fn user_visible_preserves_long_token_without_explicit_secret_context() {
-        let input = "x=lLLWRw8DBX4S99wN4ra4XRlLC1nkpv30zPHoABCDEFGHIJKLMNOP";
-        let out = redact_secrets_user_visible(input);
-        assert_eq!(input, out);
+    fn preserves_linkedin_url_when_not_in_env() {
+        let redactor = EnvSecretRedactor::empty();
+        let url = "https://www.linkedin.com/jobs/view/4123789234567890123";
+        assert_eq!(redactor.redact(url), url);
     }
 
     #[test]
-    fn user_visible_preserves_long_pdf_filename() {
+    fn preserves_token_assignment_without_env_value() {
+        let redactor = EnvSecretRedactor::empty();
+        let input = "token=not_a_real_secret_value_abcdef";
+        assert_eq!(redactor.redact(input), input);
+    }
+
+    #[test]
+    fn preserves_long_filename_without_env_value() {
+        let redactor = EnvSecretRedactor::empty();
         let name = "Capital_One_Senior_PM_Resume_v2_ABC987xyzABCDEFGHIJ_KLMNOP";
-        assert!(name.len() >= 40);
         let input = format!("Generated {name}.pdf — review when ready.");
-        let out = redact_secrets_user_visible(&input);
-        assert!(out.contains(".pdf"));
-        assert!(out.contains(name));
-        assert!(!out.contains(REDACTED));
+        assert_eq!(redactor.redact(&input), input);
     }
 
     #[test]
-    fn internal_can_redact_long_pdf_basename_fallback() {
-        let name = "Capital_One_Senior_PM_Resume_v2_ABC987xyzABCDEFGHIJ_KLMNOP";
-        let input = format!("Attachment: {name}.pdf");
-        let out = redact_secrets_internal(&input);
-        assert!(out.contains(".pdf")); // punctuation splits word boundary typically before .
-        assert!(!out.contains(name));
+    fn longest_needle_first_avoids_partial_leak() {
+        let redactor = EnvSecretRedactor::from_needles(vec![
+            "shortsec12".to_string(),
+            "shortsec12345678".to_string(),
+        ]);
+        let out = redactor.redact("value=shortsec12345678");
+        assert!(!out.contains("shortsec12"));
         assert!(out.contains(REDACTED));
     }
 
     #[test]
-    fn internal_preserves_long_instagram_style_jpeg_basename() {
-        let basename = "s_official_1778931955_3898285836361751814_4607385765";
-        assert!(basename.len() >= 40);
-        let input = format!("parking/ayana.{basename}.jpg");
-        let out = redact_secrets_internal(&input);
-        assert!(
-            out.contains(basename),
-            "expected Instagram-style basename preserved, got: {out}"
+    fn discover_loads_env_like_file() {
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("skills").join("foo");
+        fs::create_dir_all(&skills).unwrap();
+        write_env(&skills, ".env", "API_KEY=supersecret12345678\nSHORT=abc\n");
+
+        let mut config = crate::config::test_config();
+        config.workspace_dir = tmp.path().to_string_lossy().to_string();
+
+        let redactor = EnvSecretRedactor::discover(&config);
+        let out = redactor.redact("leak supersecret12345678 end");
+        assert!(out.contains(REDACTED));
+        assert!(!out.contains("supersecret12345678"));
+        assert!(redactor.redact("SHORT=abc").contains("abc"));
+    }
+
+    #[test]
+    fn parse_env_handles_quotes_and_export() {
+        let pairs = parse_env_content(
+            r#"
+# comment
+export FOO="quoted value here"
+BAR=plain
+"#,
         );
-        assert!(out.contains(".jpg"));
-        assert!(!out.contains(REDACTED));
-    }
-
-    #[test]
-    fn internal_preserves_long_lora_basename_before_safetensors() {
-        let basename = "pz_face_character_lora_v3_final_mix_abc123def456ghi789jkl012mno";
-        assert!(basename.len() >= 40);
-        let input = format!("remember the correct LoRA is {basename}.safetensors for the swap job");
-        let out = redact_secrets_internal(&input);
-        assert!(
-            out.contains(basename),
-            "expected LoRA basename preserved, got: {out}"
-        );
-        assert!(out.contains(".safetensors"));
-        assert!(!out.contains(REDACTED));
-    }
-
-    #[test]
-    fn redacts_apify_tokens_via_query_param_in_both_modes() {
-        let input = "token=test_api_lLLWRw8DBX4S99wN4ra4XRlLC1nkpv30zPHo";
-        let out_vis = redact_secrets_user_visible(input);
-        let out_int = redact_secrets_internal(input);
-        assert!(!out_vis.contains("test_api_"));
-        assert!(out_vis.contains(REDACTED));
-        assert!(!out_int.contains("test_api_"));
-        assert!(out_int.contains(REDACTED));
-    }
-
-    #[test]
-    fn redacts_secret_assignments_and_bearer_headers_in_user_visible() {
-        let input = "API_KEY=sk-proj-1234567890abcdefghijklmno\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz123456";
-        let output = redact_secrets_user_visible(input);
-        assert!(!output.contains("sk-proj-1234567890abcdefghijklmno"));
-        assert!(!output.contains("abcdefghijklmnopqrstuvwxyz123456"));
-        assert!(output.contains("API_KEY=[REDACTED_SECRET]"));
-        assert!(output.contains("Authorization: Bearer [REDACTED_SECRET]"));
-    }
-
-    #[test]
-    fn redacts_query_param_tokens_in_user_visible() {
-        let input = "https://example.com?api_key=secretvalue123456&ok=1";
-        let output = redact_secrets_user_visible(input);
-        assert!(output.contains("api_key=[REDACTED_SECRET]"));
-        assert!(output.contains("&ok=1"));
-    }
-
-    #[test]
-    fn keeps_short_non_secret_values_user_visible() {
-        let input = "api key label, token-ish word: keyboard";
-        let output = redact_secrets_user_visible(input);
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn internal_redacts_via_literal_prefix() {
-        let input = "k=ghp_fake123456789012345678901234567890";
-        let out = redact_secrets_internal(input);
-        assert!(!out.contains("ghp_"));
-        assert!(out.contains(REDACTED));
-    }
-
-    #[test]
-    fn user_visible_redacts_via_literal_prefix() {
-        let input = "k=ghp_fake123456789012345678901234567890";
-        let out = redact_secrets_user_visible(input);
-        assert!(!out.contains("ghp_"));
-        assert!(out.contains(REDACTED));
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].1, "quoted value here");
+        assert_eq!(pairs[1].1, "plain");
     }
 }

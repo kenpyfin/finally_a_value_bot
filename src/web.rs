@@ -1236,7 +1236,18 @@ async fn api_send_stream(
                                 )
                                 .await;
                         }
-                        AgentEvent::FinalResponse { .. } => {}
+                        AgentEvent::FinalResponse { text } => {
+                            if !text.is_empty() {
+                                run_hub
+                                    .publish(
+                                        &run_id_for_events,
+                                        "delta",
+                                        json!({"delta": text}).to_string(),
+                                        run_history_limit,
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             });
@@ -5615,15 +5626,18 @@ mod tests {
         let mut telegram_bots = std::collections::HashMap::new();
         telegram_bots.insert(crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY, bot.clone());
         let runtime_toggles = crate::runtime_toggles::RuntimeToggles::new(cfg.tool_output_debug);
+        let env_redactor =
+            std::sync::Arc::new(crate::safety_redaction::EnvSecretRedactor::discover(&cfg));
         let state = AppState {
             config: cfg.clone(),
+            env_redactor: env_redactor.clone(),
             runtime_toggles: runtime_toggles.clone(),
             telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),
             skills: SkillManager::from_skills_dirs(cfg.skill_discovery_dirs()),
             llm,
-            tools: ToolRegistry::new(&cfg, bot, db, runtime_toggles),
+            tools: ToolRegistry::new(&cfg, bot, db, runtime_toggles, env_redactor),
             discord_http: Arc::new(std::collections::HashMap::new()),
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
             background_job_control: crate::background_jobs::BackgroundJobControl::default(),

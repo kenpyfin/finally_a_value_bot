@@ -4,7 +4,7 @@ use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
 use crate::llm;
-use crate::safety_redaction::redact_secrets_internal;
+use crate::safety_redaction::EnvSecretRedactor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
@@ -320,6 +320,7 @@ pub async fn execute_command_hook(
 
 pub async fn execute_prompt_hook(
     config: &Config,
+    env_redactor: &EnvSecretRedactor,
     payload: &HookPromptPayload,
     hook_input_json: &str,
 ) -> Result<HookOutput, FinallyAValueBotError> {
@@ -344,7 +345,7 @@ pub async fn execute_prompt_hook(
         .unwrap_or(config.hook_prompt_timeout_secs);
     let fail_closed = payload.fail_closed.unwrap_or(false);
     let rendered_prompt = payload.prompt.replace("$ARGUMENTS", hook_input_json);
-    let rendered_prompt = redact_secrets_internal(&rendered_prompt);
+    let rendered_prompt = env_redactor.redact(&rendered_prompt);
     let messages = vec![Message {
         role: "user".to_string(),
         content: MessageContent::Text(rendered_prompt),

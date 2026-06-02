@@ -7,7 +7,7 @@ use tracing::info;
 use crate::runtime_toggles::RuntimeToggles;
 
 use crate::claude::ToolDefinition;
-use crate::safety_redaction::redact_secrets_internal;
+use crate::safety_redaction::EnvSecretRedactor;
 use crate::tools::command_runner::{build_command_with_env, shell_command};
 
 use super::bash_safety::{
@@ -43,6 +43,7 @@ pub struct BashTool {
     safety_execution_mode: String,
     safety_risky_categories: Vec<String>,
     runtime_toggles: Arc<RuntimeToggles>,
+    env_redactor: Arc<EnvSecretRedactor>,
 }
 
 impl BashTool {
@@ -57,6 +58,7 @@ impl BashTool {
                 "package".into(),
             ],
             RuntimeToggles::new(false),
+            Arc::new(EnvSecretRedactor::empty()),
         )
     }
 
@@ -65,12 +67,14 @@ impl BashTool {
         safety_execution_mode: String,
         safety_risky_categories: Vec<String>,
         runtime_toggles: Arc<RuntimeToggles>,
+        env_redactor: Arc<EnvSecretRedactor>,
     ) -> Self {
         Self {
             working_dir: PathBuf::from(working_dir),
             safety_execution_mode,
             safety_risky_categories,
             runtime_toggles,
+            env_redactor,
         }
     }
 }
@@ -140,7 +144,7 @@ impl Tool for BashTool {
         let command = maybe_rewrite_leading_tool_path(&self.working_dir, &working_dir, &command)
             .unwrap_or(command);
 
-        info!("Executing bash: {}", redact_secrets_internal(&command));
+        info!("Executing bash: {}", self.env_redactor.redact(&command));
 
         let spec = shell_command(&command);
         let result = tokio::time::timeout(

@@ -74,6 +74,17 @@ src/
 
 ## Architecture overview
 
+### Secret redaction
+
+The bot redacts **only literal values** loaded from **env-like files** on disk at startup (`.env`, `.env.local`, names ending in `.env` such as `mercari.env`; excludes `*.example` / `*.sample`). Implementation: `src/safety_redaction.rs` (`EnvSecretRedactor::discover`, `redact`). Sources: configuration `.env` (`FINALLY_A_VALUE_BOT_CONFIG` or `./.env`), files under `WORKSPACE_DIR`, and resolved `builtin_skills/` when present.
+
+- Values shorter than 8 characters (or `ENV_REDACT_MIN_VALUE_LEN` when set at process start) are not redacted.
+- Placeholder values (`changeme`, `your_api_key_here`, etc.) are skipped.
+- **Restart the bot** after changing any env-like file so the catalog refreshes.
+- Secrets not stored in env-like files are **not** redacted (inline chat secrets, generated tokens, etc.).
+
+Redaction runs on tool results, logs, hook/TSA/PTE prompts, scheduler delivery, final assistant output safeguards, and background-shell output.
+
 ### Related documentation
 
 | Topic | Doc |

@@ -11,6 +11,7 @@ use crate::error::FinallyAValueBotError;
 use crate::hook_executor::{
     execute_command_hook, execute_prompt_hook, HookCommandPayload, HookOutput, HookPromptPayload,
 };
+use crate::safety_redaction::EnvSecretRedactor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEventName {
@@ -189,6 +190,7 @@ pub fn run_hooks_for_event(
 pub async fn run_hooks_for_event_async(
     db: Arc<Database>,
     config: &Config,
+    env_redactor: &EnvSecretRedactor,
     event: HookEventName,
     input: &HookRunInput,
 ) -> Result<HookRunResult, FinallyAValueBotError> {
@@ -285,7 +287,8 @@ pub async fn run_hooks_for_event_async(
                         hook.name
                     ))
                 })?;
-                let output = execute_prompt_hook(config, &payload, &hook_input_json).await?;
+                let output =
+                    execute_prompt_hook(config, env_redactor, &payload, &hook_input_json).await?;
                 apply_output(&mut out, output, &hook.name);
                 if out.blocked_reason.is_some() {
                     break;
@@ -398,6 +401,7 @@ mod tests {
             .block_on(run_hooks_for_event_async(
                 db.clone(),
                 &crate::config::test_config(),
+                &crate::safety_redaction::EnvSecretRedactor::empty(),
                 HookEventName::PreToolUse,
                 &HookRunInput {
                     chat_id,
@@ -437,6 +441,7 @@ mod tests {
             .block_on(run_hooks_for_event_async(
                 db.clone(),
                 &crate::config::test_config(),
+                &crate::safety_redaction::EnvSecretRedactor::empty(),
                 HookEventName::PostToolBatch,
                 &HookRunInput {
                     chat_id,
@@ -476,6 +481,7 @@ mod tests {
             .block_on(run_hooks_for_event_async(
                 db.clone(),
                 &crate::config::test_config(),
+                &crate::safety_redaction::EnvSecretRedactor::empty(),
                 HookEventName::PostToolBatch,
                 &HookRunInput {
                     chat_id,
@@ -522,6 +528,7 @@ mod tests {
             .block_on(run_hooks_for_event_async(
                 db.clone(),
                 &crate::config::test_config(),
+                &crate::safety_redaction::EnvSecretRedactor::empty(),
                 HookEventName::PreToolUse,
                 &HookRunInput {
                     chat_id,
@@ -558,6 +565,7 @@ mod tests {
             .block_on(run_hooks_for_event_async(
                 db.clone(),
                 &crate::config::test_config(),
+                &crate::safety_redaction::EnvSecretRedactor::empty(),
                 HookEventName::PostDelivery,
                 &HookRunInput {
                     chat_id,
@@ -594,6 +602,7 @@ mod tests {
             .block_on(run_hooks_for_event_async(
                 db.clone(),
                 &crate::config::test_config(),
+                &crate::safety_redaction::EnvSecretRedactor::empty(),
                 HookEventName::PreToolUse,
                 &HookRunInput {
                     chat_id,

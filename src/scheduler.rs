@@ -18,7 +18,6 @@ use crate::error::FinallyAValueBotError;
 use crate::job_heartbeat::{
     signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
 };
-use crate::safety_redaction::{redact_secrets_internal, redact_secrets_user_visible};
 use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 fn channel_from_chat_type(chat_type: &str) -> &'static str {
@@ -528,7 +527,7 @@ async fn run_scheduled_agent_and_finalize(
                 };
             }
 
-            let response_text = redact_secrets_user_visible(&response_text);
+            let response_text = state.env_redactor.redact(&response_text);
             match deliver_agent_final_to_contact(
                 state.db.clone(),
                 state.telegram_bots.as_ref(),
@@ -572,7 +571,7 @@ async fn run_scheduled_agent_and_finalize(
                     }
                 }
                 Err(e) => {
-                    let redacted_error = redact_secrets_internal(&e.to_string());
+                    let redacted_error = state.env_redactor.redact(&e.to_string());
                     let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
                         "scheduled task #{} delivery failed: {}",
                         task_id, redacted_error
@@ -595,8 +594,8 @@ async fn run_scheduled_agent_and_finalize(
             drop(evt_tx);
             let _ = hb_forward.await;
             let raw_error = e.to_string();
-            let redacted_error_internal = redact_secrets_internal(&raw_error);
-            let redacted_error_user = redact_secrets_user_visible(&raw_error);
+            let redacted_error_internal = state.env_redactor.redact(&raw_error);
+            let redacted_error_user = state.env_redactor.redact(&raw_error);
             error!(
                 "Scheduler: task #{} failed: {}",
                 task_id, redacted_error_internal
