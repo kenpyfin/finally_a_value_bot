@@ -4,6 +4,14 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-02 — Pre-delivery PDQE gate + remove main-agent `send_message`
+
+- **Area:** agent loop / channels / delivery / evaluators
+- **Summary:** Removed `SendMessageTool` from the main agent registry so users receive a single user-visible reply per run. PDQE now runs synchronously in-loop via `finish_turn_with_quality_gate` before `AgentEvent::FinalResponse` and channel delivery; on fail with budget, injects `[quality_eval_feedback]` and continues the loop. Async corrective runs (`maybe_spawn_post_delivery_quality_eval`, `enqueue_quality_corrective_run_for_contact`) and `AgentProcessResult::post_delivery_eval` were removed. Persona focus sync runs only after PDQE pass. Tool trace for PDQE uses up to 48 messages from the current run (`build_pdqe_tool_trace` with `protected_message_count`). `send_message`-anchor final dedupe was dropped; `plan_agent_final_delivery` is always full unless empty body.
+- **Rationale:** Mid-run `send_message` plus final reply and async PDQE corrective runs caused duplicate bubbles (especially PZ hotify). QC-first delivery should not show drafts or second full agent messages.
+- **Key files / symbols:** `src/tools/mod.rs` (unregister tool; `send_message.rs` kept for internal/helpers); `src/channels/telegram.rs` (`finish_turn_with_quality_gate`, `try_finish_agent_turn`, `run_post_delivery_hooks_before_gate`, `build_system_prompt`); `src/response_quality_evaluator.rs`; `src/channel.rs`, `src/final_delivery_dedupe.rs`; `src/web.rs`, `src/channels/{discord,whatsapp}.rs`, `src/scheduler.rs`; `workspace/skills/send-attachment/SKILL.md`; `ARCHITECTURE.md`, `TEST.md` §11.
+- **Follow-ups:** Optional shared `prepare_final_for_delivery` for non-web channels; tune `QUALITY_EVAL_*` latency vs false positives in production.
+
 ### 2026-06-02 — Post-delivery quality evaluation (PDQE) + Perplexity evaluators
 
 - **Area:** agent loop / channels / config / evaluators

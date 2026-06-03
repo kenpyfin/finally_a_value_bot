@@ -302,16 +302,11 @@ pub struct AgentRequestContext<'a> {
     pub is_scheduled_task: bool,
     pub is_background_job: bool,
     pub run_key: Option<String>,
-    /// Set when this run is a PDQE corrective follow-up.
-    pub is_quality_nudge: bool,
-    pub quality_nudge_parent_run_key: Option<String>,
-    pub quality_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AgentProcessResult {
     pub response: String,
-    pub post_delivery_eval: Option<crate::response_quality_evaluator::PostDeliveryEvalContext>,
 }
 
 fn normalize_intent_signature(text: &str) -> String {
@@ -1519,9 +1514,6 @@ async fn handle_message(
                 is_scheduled_task: false,
                 is_background_job: false,
                 run_key: None,
-                is_quality_nudge: false,
-                quality_nudge_parent_run_key: None,
-                quality_feedback: None,
             },
             None,
             image_data,
@@ -1613,11 +1605,7 @@ async fn handle_message(
                         true
                     }
                 };
-                if delivered {
-                    if let Some(ctx) = agent_out.post_delivery_eval {
-                        maybe_spawn_post_delivery_quality_eval(state_spawn.clone(), ctx);
-                    }
-                }
+                let _delivered = delivered;
             }
             Err(e) => {
                 error!("Error processing message: {}", e);
@@ -1671,62 +1659,8 @@ fn guess_image_media_type(data: &[u8]) -> String {
     }
 }
 
-fn agent_process_result(
-    state: &AppState,
-    context: &AgentRequestContext<'_>,
-    run_key: &str,
-    stop_reason: &str,
-    response: String,
-    messages: &[Message],
-    principles_content: &str,
-    is_conversational: bool,
-    tool_names: &[String],
-    agent_history_basename: Option<String>,
-) -> AgentProcessResult {
-    let post_delivery_eval =
-        if context.is_quality_nudge || !state.config.response_quality_evaluator_enabled {
-            None
-        } else {
-            let session_goal = crate::agent_turn_context::extract_session_goal(
-                messages,
-                Some(state.env_redactor.as_ref()),
-            );
-            let intent_signature = Some(normalize_intent_signature(&session_goal.current_request));
-            let principles_excerpt = if principles_content.chars().count() > 2000 {
-                format!(
-                    "{}...",
-                    principles_content.chars().take(2000).collect::<String>()
-                )
-            } else {
-                principles_content.to_string()
-            };
-            Some(crate::response_quality_evaluator::PostDeliveryEvalContext {
-                run_key: run_key.to_string(),
-                chat_id: context.chat_id,
-                persona_id: context.persona_id,
-                caller_channel: context.caller_channel.to_string(),
-                chat_type: context.chat_type.to_string(),
-                stop_reason: stop_reason.to_string(),
-                delivered_text: response.clone(),
-                session_goal,
-                tool_trace_summary: crate::response_quality_evaluator::build_pdqe_tool_trace(
-                    state.env_redactor.as_ref(),
-                    messages,
-                ),
-                principles_excerpt,
-                is_scheduled_task: context.is_scheduled_task,
-                is_quality_nudge: false,
-                is_conversational,
-                intent_signature,
-                tool_names: tool_names.to_vec(),
-                agent_history_basename,
-                runtime_data_dir: state.config.runtime_data_dir(),
-            })
-        };
-    AgentProcessResult {
-        response,
-        post_delivery_eval,
-    }
+fn agent_process_result(response: String) -> AgentProcessResult {
+    AgentProcessResult { response }
 }
 
 pub async fn process_with_agent(
@@ -2105,7 +2039,6 @@ pub async fn process_with_agent_with_events(
     let Some(current_request) = current_request else {
         return Ok(AgentProcessResult {
             response: "I didn't receive any message to process.".into(),
-            post_delivery_eval: None,
         });
     };
 
@@ -2153,12 +2086,6 @@ pub async fn process_with_agent_with_events(
     prepended.extend(history_messages);
     prepended.push(build_current_request_from_message(current_request));
     messages = prepended;
-    if let Some(ref feedback) = context.quality_feedback {
-        messages.push(Message {
-            role: "user".into(),
-            content: MessageContent::Text(feedback.clone()),
-        });
-    }
     let protected_message_count = messages.len();
 
     let latest_user_text = latest_user_text(&messages);
@@ -2170,14 +2097,11 @@ pub async fn process_with_agent_with_events(
     let intent = classify_user_intent(&latest_user_text, has_image_input);
     let is_conversational = matches!(intent, UserIntent::Conversational);
     let mut run_tool_names: Vec<String> = Vec::new();
-    let mut tool_defs = match intent {
+    let tool_defs = match intent {
         UserIntent::Conversational => Vec::new(),
         UserIntent::Question => state.tools.definitions_filtered(true),
         UserIntent::Task => state.tools.definitions(),
     };
-    if context.is_scheduled_task {
-        tool_defs.retain(|d| d.name != "send_message");
-    }
     let tool_auth = ToolAuthContext {
         caller_channel: context.caller_channel.to_string(),
         caller_chat_id: chat_id,
@@ -2275,6 +2199,7 @@ pub async fn process_with_agent_with_events(
     let mut discovery_streak_count: usize = 0;
     let mut deferred_commitment_nudges: usize = 0;
     let mut agent_history_basename: Option<String> = None;
+    let mut pdqe_retries: usize = 0;
 
     macro_rules! save_run_history {
         ($stop_reason:expr) => {{
@@ -2344,10 +2269,7 @@ pub async fn process_with_agent_with_events(
     if let Some(reason) = before_turn_hooks.blocked_reason {
         let blocked = format!("This run was blocked before execution: {reason}");
         let _ = save_run_history!("hook_block_before_turn");
-        return Ok(AgentProcessResult {
-            response: blocked,
-            post_delivery_eval: None,
-        });
+        return Ok(AgentProcessResult { response: blocked });
     }
     if !before_turn_hooks.additional_contexts.is_empty() {
         messages.push(Message {
@@ -2359,41 +2281,45 @@ pub async fn process_with_agent_with_events(
         });
     }
 
-    macro_rules! agent_ok {
-        ($stop:expr, $resp:expr) => {
-            return Ok(agent_process_result(
-                state,
-                &context,
-                &run_key,
-                $stop,
-                $resp,
-                &messages,
-                &principles_content,
-                is_conversational,
-                &run_tool_names,
-                agent_history_basename.clone(),
-            ));
-        };
-    }
+    'agent_loop: for iteration in 0..state.config.max_tool_iterations {
+        macro_rules! finish_turn {
+            ($stop:expr, $resp:expr) => {{
+                if let Some(result) = try_finish_agent_turn(
+                    state,
+                    &context,
+                    event_tx,
+                    &run_key,
+                    chat_id,
+                    persona_id,
+                    $stop,
+                    $resp,
+                    &system_prompt,
+                    &mut messages,
+                    protected_message_count,
+                    &mut pdqe_retries,
+                    &mut history_iterations,
+                    &principles_content,
+                    is_conversational,
+                    &run_tool_names,
+                    &mut agent_history_basename,
+                    iteration > 0,
+                    &user_msg_preview,
+                    run_start,
+                    &initial_llm_snapshot_json,
+                )
+                .await?
+                {
+                    return Ok(result);
+                }
+            }};
+        }
 
-    for iteration in 0..state.config.max_tool_iterations {
         if cancel
             .as_ref()
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(false)
         {
-            return Ok(agent_process_result(
-                state,
-                &context,
-                &run_key,
-                "cancelled",
-                "Run cancelled.".to_string(),
-                &messages,
-                &principles_content,
-                is_conversational,
-                &run_tool_names,
-                agent_history_basename.clone(),
-            ));
+            finish_turn!("cancelled", "Run cancelled.".to_string());
         }
         if let Some(tx) = event_tx {
             let _ = tx.send(AgentEvent::Iteration {
@@ -2423,7 +2349,7 @@ pub async fn process_with_agent_with_events(
 
         let llm_start = std::time::Instant::now();
         let response = {
-            let messages = messages.clone();
+            let llm_messages = messages.clone();
             let tool_defs = if tool_defs.is_empty() {
                 None
             } else {
@@ -2434,7 +2360,7 @@ pub async fn process_with_agent_with_events(
                     std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
                     state
                         .llm
-                        .send_message(&system_prompt, messages.clone(), tool_defs),
+                        .send_message(&system_prompt, llm_messages, tool_defs),
                 ),
                 cancel.as_ref(),
             )
@@ -2459,19 +2385,34 @@ pub async fn process_with_agent_with_events(
                         state.config.max_tool_iterations,
                         LLM_ROUND_TIMEOUT_SECS
                     );
-                    agent_history_basename = save_run_history!("llm_timeout");
-                    return Ok(agent_process_result(
+                    if let Some(r) = try_finish_agent_turn(
                         state,
                         &context,
+                        event_tx,
                         &run_key,
+                        chat_id,
+                        persona_id,
                         "llm_timeout",
                         "The request took too long after the last step. Please try again or break your request into smaller steps.".to_string(),
-                        &messages,
+                        &system_prompt,
+                        &mut messages,
+                        protected_message_count,
+                        &mut pdqe_retries,
+                        &mut history_iterations,
                         &principles_content,
                         is_conversational,
                         &run_tool_names,
-                        agent_history_basename.clone(),
-                    ));
+                        &mut agent_history_basename,
+                        iteration > 0,
+                        &user_msg_preview,
+                        run_start,
+                        &initial_llm_snapshot_json,
+                    )
+                    .await?
+                    {
+                        return Ok(r);
+                    }
+                    continue 'agent_loop;
                 }
                 Err(()) => {
                     info!(
@@ -2479,18 +2420,34 @@ pub async fn process_with_agent_with_events(
                         iteration + 1,
                         state.config.max_tool_iterations
                     );
-                    return Ok(agent_process_result(
+                    if let Some(r) = try_finish_agent_turn(
                         state,
                         &context,
+                        event_tx,
                         &run_key,
+                        chat_id,
+                        persona_id,
                         "cancelled",
                         "Run cancelled.".to_string(),
-                        &messages,
+                        &system_prompt,
+                        &mut messages,
+                        protected_message_count,
+                        &mut pdqe_retries,
+                        &mut history_iterations,
                         &principles_content,
                         is_conversational,
                         &run_tool_names,
-                        agent_history_basename.clone(),
-                    ));
+                        &mut agent_history_basename,
+                        iteration > 0,
+                        &user_msg_preview,
+                        run_start,
+                        &initial_llm_snapshot_json,
+                    )
+                    .await?
+                    {
+                        return Ok(r);
+                    }
+                    continue 'agent_loop;
                 }
             }
         };
@@ -2557,7 +2514,7 @@ pub async fn process_with_agent_with_events(
             } else {
                 guarded_text
             };
-            if final_text.trim() == "Done." && !had_send_message_tool_call(&messages) {
+            if final_text.trim() == "Done." {
                 if let Some(recovered) = recover_latest_assistant_text(&messages) {
                     final_text = recovered;
                 }
@@ -2654,49 +2611,13 @@ pub async fn process_with_agent_with_events(
                     continue;
                 }
             }
-            if let Some(summary) = run_post_delivery_hooks_and_builtin_focus_sync(
-                state,
-                &context,
-                event_tx,
-                &run_key,
-                chat_id,
-                persona_id,
-                &stop_reason,
-                &mut final_text,
-                &system_prompt,
-                &messages,
-                iteration > 0,
-            )
-            .await
-            {
-                if let Some(last) = history_iterations.last_mut() {
-                    last.hook_events.push(summary);
-                }
-            }
-            if let Some(tx) = event_tx {
-                let _ = tx.send(AgentEvent::FinalResponse {
-                    text: final_text.clone(),
-                });
-            }
             info!(
-                "Main agent finished: stop_reason={}, final_response_len={}, total_iterations={}",
+                "Main agent finishing: stop_reason={}, final_response_len={}, total_iterations={}",
                 stop_reason,
                 final_text.len(),
                 iteration + 1
             );
-            agent_history_basename = save_run_history!(&stop_reason);
-            return Ok(agent_process_result(
-                state,
-                &context,
-                &run_key,
-                &stop_reason,
-                final_text,
-                &messages,
-                &principles_content,
-                is_conversational,
-                &run_tool_names,
-                agent_history_basename.clone(),
-            ));
+            finish_turn!(&stop_reason, final_text);
         }
 
         if stop_reason == "tool_use" {
@@ -2787,7 +2708,7 @@ pub async fn process_with_agent_with_events(
                     })
                     .await;
 
-                    let input_str = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
+                    let input_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
                     let input_preview = if input_str.len() > 10000 {
                         format!("{}...", &input_str[..10000])
                     } else {
@@ -3014,7 +2935,34 @@ pub async fn process_with_agent_with_events(
                                     state.config.max_tool_iterations,
                                     name
                                 );
-                                agent_ok!("cancelled", "Run cancelled.".to_string());
+                                if let Some(r) = try_finish_agent_turn(
+                                    state,
+                                    &context,
+                                    event_tx,
+                                    &run_key,
+                                    chat_id,
+                                    persona_id,
+                                    "cancelled",
+                                    "Run cancelled.".to_string(),
+                                    &system_prompt,
+                                    &mut messages,
+                                    protected_message_count,
+                                    &mut pdqe_retries,
+                                    &mut history_iterations,
+                                    &principles_content,
+                                    is_conversational,
+                                    &run_tool_names,
+                                    &mut agent_history_basename,
+                                    iteration > 0,
+                                    &user_msg_preview,
+                                    run_start,
+                                    &initial_llm_snapshot_json,
+                                )
+                                .await?
+                                {
+                                    return Ok(r);
+                                }
+                                continue 'agent_loop;
                             }
                         }
                     };
@@ -3338,13 +3286,7 @@ pub async fn process_with_agent_with_events(
                     role: "assistant".into(),
                     content: MessageContent::Text(stall_text.clone()),
                 });
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(AgentEvent::FinalResponse {
-                        text: stall_text.clone(),
-                    });
-                }
-                agent_history_basename = save_run_history!("loop_guard_stalled");
-                agent_ok!("loop_guard_stalled", stall_text);
+                finish_turn!("loop_guard_stalled", stall_text);
             }
 
             // If this iteration only wrote memory, return the assistant's authored
@@ -3366,42 +3308,17 @@ pub async fn process_with_agent_with_events(
                     &state.config,
                     state.env_redactor.as_ref(),
                 );
-                let mut final_text = if guarded_text.trim().is_empty() {
+                let final_text = if guarded_text.trim().is_empty() {
                     "Done.".to_string()
                 } else {
                     guarded_text
                 };
-                if let Some(summary) = run_post_delivery_hooks_and_builtin_focus_sync(
-                    state,
-                    &context,
-                    event_tx,
-                    &run_key,
-                    chat_id,
-                    persona_id,
-                    "memory_write_short_circuit",
-                    &mut final_text,
-                    &system_prompt,
-                    &messages,
-                    true,
-                )
-                .await
-                {
-                    if let Some(last) = history_iterations.last_mut() {
-                        last.hook_events.push(summary);
-                    }
-                }
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(AgentEvent::FinalResponse {
-                        text: final_text.clone(),
-                    });
-                }
                 info!(
-                    "Main agent finished: stop_reason=tool_use(memory_write_short_circuit), final_response_len={}, total_iterations={}",
+                    "Main agent finishing: stop_reason=tool_use(memory_write_short_circuit), final_response_len={}, total_iterations={}",
                     final_text.len(),
                     iteration + 1
                 );
-                agent_history_basename = save_run_history!("memory_write_short_circuit");
-                agent_ok!("memory_write_short_circuit", final_text);
+                finish_turn!("memory_write_short_circuit", final_text);
             }
 
             // Post-Tool Evaluator: check if task is complete after tool execution
@@ -3433,7 +3350,7 @@ pub async fn process_with_agent_with_events(
                             iteration + 1,
                             state.config.max_tool_iterations
                         );
-                        agent_ok!("cancelled", "Run cancelled.".to_string());
+                        finish_turn!("cancelled", "Run cancelled.".to_string());
                     }
                     Ok(Ok(pte_result)) if pte_result.action == PteAction::Complete => {
                         info!(
@@ -3473,11 +3390,35 @@ pub async fn process_with_agent_with_events(
                                     state.config.max_tool_iterations,
                                     LLM_ROUND_TIMEOUT_SECS
                                 );
-                                agent_ok!(
+                                if let Some(r) = try_finish_agent_turn(
+                                    state,
+                                    &context,
+                                    event_tx,
+                                    &run_key,
+                                    chat_id,
+                                    persona_id,
                                     "pte_synthesis_timeout",
                                     "Task completed, but I couldn't generate a final summary in time."
-                                        .to_string()
-                                );
+                                        .to_string(),
+                                    &system_prompt,
+                                    &mut messages,
+                                    protected_message_count,
+                                    &mut pdqe_retries,
+                                    &mut history_iterations,
+                                    &principles_content,
+                                    is_conversational,
+                                    &run_tool_names,
+                                    &mut agent_history_basename,
+                                    iteration > 0,
+                                    &user_msg_preview,
+                                    run_start,
+                                    &initial_llm_snapshot_json,
+                                )
+                                .await?
+                                {
+                                    return Ok(r);
+                                }
+                                continue 'agent_loop;
                             }
                             Err(()) => {
                                 info!(
@@ -3485,7 +3426,34 @@ pub async fn process_with_agent_with_events(
                                     iteration + 1,
                                     state.config.max_tool_iterations
                                 );
-                                agent_ok!("cancelled", "Run cancelled.".to_string());
+                                if let Some(r) = try_finish_agent_turn(
+                                    state,
+                                    &context,
+                                    event_tx,
+                                    &run_key,
+                                    chat_id,
+                                    persona_id,
+                                    "cancelled",
+                                    "Run cancelled.".to_string(),
+                                    &system_prompt,
+                                    &mut messages,
+                                    protected_message_count,
+                                    &mut pdqe_retries,
+                                    &mut history_iterations,
+                                    &principles_content,
+                                    is_conversational,
+                                    &run_tool_names,
+                                    &mut agent_history_basename,
+                                    iteration > 0,
+                                    &user_msg_preview,
+                                    run_start,
+                                    &initial_llm_snapshot_json,
+                                )
+                                .await?
+                                {
+                                    return Ok(r);
+                                }
+                                continue 'agent_loop;
                             }
                         };
 
@@ -3521,73 +3489,35 @@ pub async fn process_with_agent_with_events(
                             &state.config,
                             state.env_redactor.as_ref(),
                         );
-                        let mut final_text = if guarded_text.trim().is_empty() {
+                        let final_text = if guarded_text.trim().is_empty() {
                             "Done.".to_string()
                         } else {
                             guarded_text
                         };
-                        if let Some(summary) = run_post_delivery_hooks_and_builtin_focus_sync(
-                            state,
-                            &context,
-                            event_tx,
-                            &run_key,
-                            chat_id,
-                            persona_id,
-                            "pte_complete",
-                            &mut final_text,
-                            &system_prompt,
-                            &messages,
-                            iteration > 0,
-                        )
-                        .await
-                        {
-                            if let Some(last) = history_iterations.last_mut() {
-                                last.hook_events.push(summary);
-                            }
-                        }
-                        if let Some(tx) = event_tx {
-                            let _ = tx.send(AgentEvent::FinalResponse {
-                                text: final_text.clone(),
-                            });
-                        }
                         info!(
-                            "Main agent finished (PTE complete): final_response_len={}, total_iterations={}",
+                            "Main agent finishing (PTE complete): final_response_len={}, total_iterations={}",
                             final_text.len(),
                             iteration + 1
                         );
-                        agent_history_basename = save_run_history!("pte_complete");
-                        agent_ok!("pte_complete", final_text);
+                        finish_turn!("pte_complete", final_text);
                     }
                     Ok(Ok(pte_result)) if pte_result.action == PteAction::AskUser => {
                         let ask_text = format!(
                             "I paused because progress is stalled: {}. Choose: retry now, wait, or adjust the request.",
                             pte_result.reason
                         );
-                        if let Some(tx) = event_tx {
-                            let _ = tx.send(AgentEvent::FinalResponse {
-                                text: ask_text.clone(),
-                            });
-                        }
-                        agent_history_basename = save_run_history!("pte_ask_user");
-                        agent_ok!("pte_ask_user", ask_text);
+                        finish_turn!("pte_ask_user", ask_text);
                     }
                     Ok(Ok(pte_result)) if pte_result.action == PteAction::StopWithSummary => {
                         let summary_text = format!(
                             "I stopped this run to avoid repeated no-progress loops. {}",
                             pte_result.reason
                         );
-                        if let Some(tx) = event_tx {
-                            let _ = tx.send(AgentEvent::FinalResponse {
-                                text: summary_text.clone(),
-                            });
-                        }
-                        agent_history_basename = save_run_history!("pte_stop_with_summary");
-                        agent_ok!("pte_stop_with_summary", summary_text);
+                        finish_turn!("pte_stop_with_summary", summary_text);
                     }
                     Ok(Ok(pte_result)) if pte_result.action == PteAction::HandoffBackground => {
                         if context.caller_channel == "web" && !context.is_background_job {
-                            agent_history_basename = save_run_history!("pte_background_handoff");
-                            agent_ok!(
+                            finish_turn!(
                                 "pte_background_handoff",
                                 format!(
                                     "{}\npte_handoff\n{}",
@@ -3631,8 +3561,7 @@ pub async fn process_with_agent_with_events(
                         iteration + 1,
                         state.config.max_tool_iterations
                     );
-                    agent_history_basename = save_run_history!("background_handoff");
-                    agent_ok!(
+                    finish_turn!(
                         "background_handoff",
                         format!(
                             "{}\ntimeout\n{}",
@@ -3688,13 +3617,7 @@ pub async fn process_with_agent_with_events(
                     role: "assistant".into(),
                     content: MessageContent::Text(timeout_msg.clone()),
                 });
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(AgentEvent::FinalResponse {
-                        text: timeout_msg.clone(),
-                    });
-                }
-                agent_history_basename = save_run_history!("tool_timeout");
-                agent_ok!("tool_timeout", timeout_msg);
+                finish_turn!("tool_timeout", timeout_msg);
             }
 
             continue;
@@ -3721,41 +3644,12 @@ pub async fn process_with_agent_with_events(
             role: "assistant".into(),
             content: MessageContent::Text(assistant_text.clone()),
         });
-        let mut returned_text = if assistant_text.is_empty() {
+        let returned_text = if assistant_text.is_empty() {
             "(no response)".to_string()
         } else {
             assistant_text.clone()
         };
-        if let Some(summary) = run_post_delivery_hooks_and_builtin_focus_sync(
-            state,
-            &context,
-            event_tx,
-            &run_key,
-            chat_id,
-            persona_id,
-            &stop_reason,
-            &mut returned_text,
-            &system_prompt,
-            &messages,
-            iteration > 0,
-        )
-        .await
-        {
-            if let Some(last) = history_iterations.last_mut() {
-                last.hook_events.push(summary);
-            }
-        }
-        agent_history_basename = save_run_history!(&stop_reason);
-        if assistant_text.is_empty() {
-            agent_ok!(&stop_reason, returned_text);
-        } else {
-            if let Some(tx) = event_tx {
-                let _ = tx.send(AgentEvent::FinalResponse {
-                    text: returned_text.clone(),
-                });
-            }
-            agent_ok!(&stop_reason, returned_text);
-        }
+        finish_turn!(&stop_reason, returned_text);
     }
 
     // Max iterations reached
@@ -3768,13 +3662,8 @@ pub async fn process_with_agent_with_events(
         role: "assistant".into(),
         content: MessageContent::Text(max_iter_msg.clone()),
     });
-    if let Some(tx) = event_tx {
-        let _ = tx.send(AgentEvent::FinalResponse {
-            text: max_iter_msg.clone(),
-        });
-    }
-    let mut final_text = max_iter_msg.clone();
-    if let Some(summary) = run_post_delivery_hooks_and_builtin_focus_sync(
+    let mut final_text = max_iter_msg;
+    match finish_turn_with_quality_gate(
         state,
         &context,
         event_tx,
@@ -3784,31 +3673,89 @@ pub async fn process_with_agent_with_events(
         "max_iterations",
         &mut final_text,
         &system_prompt,
-        &messages,
-        true,
-    )
-    .await
-    {
-        if let Some(last) = history_iterations.last_mut() {
-            last.hook_events.push(summary);
-        }
-    }
-    agent_history_basename = save_run_history!("max_iterations");
-    Ok(agent_process_result(
-        state,
-        &context,
-        &run_key,
-        "max_iterations",
-        final_text,
-        &messages,
+        &mut messages,
+        protected_message_count,
+        &mut pdqe_retries,
+        &mut history_iterations,
         &principles_content,
         is_conversational,
         &run_tool_names,
-        agent_history_basename,
-    ))
+        &mut agent_history_basename,
+        true,
+        &user_msg_preview,
+        run_start,
+        &initial_llm_snapshot_json,
+    )
+    .await?
+    {
+        FinishTurnOutcome::Complete(r) => Ok(r),
+        FinishTurnOutcome::Retry => Ok(agent_process_result(
+            "I reached the maximum number of tool iterations. Here's what I was working on — please try breaking your request into smaller steps.".to_string(),
+        )),
+    }
 }
 
-async fn run_post_delivery_hooks_and_builtin_focus_sync(
+#[derive(Debug)]
+enum FinishTurnOutcome {
+    Complete(AgentProcessResult),
+    Retry,
+}
+
+async fn try_finish_agent_turn(
+    state: &AppState,
+    context: &AgentRequestContext<'_>,
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    run_key: &str,
+    chat_id: i64,
+    persona_id: i64,
+    stop_reason: &str,
+    response: String,
+    system_prompt: &str,
+    messages: &mut Vec<Message>,
+    protected_message_count: usize,
+    pdqe_retries: &mut usize,
+    history_iterations: &mut Vec<IterationRecord>,
+    principles_content: &str,
+    is_conversational: bool,
+    run_tool_names: &[String],
+    agent_history_basename: &mut Option<String>,
+    had_tool_calls: bool,
+    user_msg_preview: &str,
+    run_start: std::time::Instant,
+    initial_llm_snapshot_json: &str,
+) -> anyhow::Result<Option<AgentProcessResult>> {
+    let mut final_text = response;
+    match finish_turn_with_quality_gate(
+        state,
+        context,
+        event_tx,
+        run_key,
+        chat_id,
+        persona_id,
+        stop_reason,
+        &mut final_text,
+        system_prompt,
+        messages,
+        protected_message_count,
+        pdqe_retries,
+        history_iterations,
+        principles_content,
+        is_conversational,
+        run_tool_names,
+        agent_history_basename,
+        had_tool_calls,
+        user_msg_preview,
+        run_start,
+        initial_llm_snapshot_json,
+    )
+    .await?
+    {
+        FinishTurnOutcome::Complete(r) => Ok(Some(r)),
+        FinishTurnOutcome::Retry => Ok(None),
+    }
+}
+
+async fn finish_turn_with_quality_gate(
     state: &AppState,
     context: &AgentRequestContext<'_>,
     event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
@@ -3818,11 +3765,248 @@ async fn run_post_delivery_hooks_and_builtin_focus_sync(
     stop_reason: &str,
     final_text: &mut String,
     system_prompt: &str,
-    messages: &[Message],
+    messages: &mut Vec<Message>,
+    protected_message_count: usize,
+    pdqe_retries: &mut usize,
+    history_iterations: &mut Vec<IterationRecord>,
+    principles_content: &str,
+    is_conversational: bool,
+    run_tool_names: &[String],
+    agent_history_basename: &mut Option<String>,
     had_tool_calls: bool,
-) -> Option<String> {
-    let mut should_run_focus_sync = false;
-    let mut hook_summary: Option<String> = None;
+    user_msg_preview: &str,
+    run_start: std::time::Instant,
+    initial_llm_snapshot_json: &str,
+) -> anyhow::Result<FinishTurnOutcome> {
+    let (hook_summary, should_run_focus_sync) = run_post_delivery_hooks_before_gate(
+        state,
+        context,
+        event_tx,
+        run_key,
+        chat_id,
+        persona_id,
+        stop_reason,
+        final_text,
+    )
+    .await;
+    if let Some(summary) = hook_summary {
+        if let Some(last) = history_iterations.last_mut() {
+            last.hook_events.push(summary);
+        }
+    }
+
+    let session_goal = crate::agent_turn_context::extract_session_goal(
+        messages,
+        Some(state.env_redactor.as_ref()),
+    );
+    let principles_excerpt = if principles_content.chars().count() > 2000 {
+        format!(
+            "{}...",
+            principles_content.chars().take(2000).collect::<String>()
+        )
+    } else {
+        principles_content.to_string()
+    };
+    let pdqe_ctx = crate::response_quality_evaluator::PostDeliveryEvalContext {
+        run_key: run_key.to_string(),
+        chat_id: context.chat_id,
+        persona_id: context.persona_id,
+        caller_channel: context.caller_channel.to_string(),
+        chat_type: context.chat_type.to_string(),
+        stop_reason: stop_reason.to_string(),
+        delivered_text: final_text.clone(),
+        session_goal: session_goal.clone(),
+        tool_trace_summary: crate::response_quality_evaluator::build_pdqe_tool_trace(
+            state.env_redactor.as_ref(),
+            messages,
+            protected_message_count,
+        ),
+        principles_excerpt,
+        is_scheduled_task: context.is_scheduled_task,
+        is_conversational,
+        intent_signature: Some(normalize_intent_signature(&session_goal.current_request)),
+        tool_names: run_tool_names.to_vec(),
+        agent_history_basename: agent_history_basename.clone(),
+        runtime_data_dir: state.config.runtime_data_dir(),
+    };
+
+    if crate::response_quality_evaluator::should_skip_pdqe(&state.config, &pdqe_ctx).is_none() {
+        crate::response_quality_evaluator::append_quality_timeline(
+            state.db.clone(),
+            run_key,
+            chat_id,
+            persona_id,
+            "quality_eval_started",
+            "{}",
+        )
+        .await;
+
+        match crate::response_quality_evaluator::evaluate_delivery_quality(
+            &state.config,
+            state.env_redactor.as_ref(),
+            &pdqe_ctx,
+        )
+        .await
+        {
+            Ok(verdict) => {
+                let payload = serde_json::json!({
+                    "verdict": format!("{:?}", verdict.kind),
+                    "confidence": verdict.confidence,
+                })
+                .to_string();
+                match verdict.kind {
+                    crate::response_quality_evaluator::QualityVerdictKind::Pass
+                    | crate::response_quality_evaluator::QualityVerdictKind::Skip => {
+                        crate::response_quality_evaluator::append_quality_timeline(
+                            state.db.clone(),
+                            run_key,
+                            chat_id,
+                            persona_id,
+                            "quality_eval_pass",
+                            &payload,
+                        )
+                        .await;
+                        crate::response_quality_evaluator::log_pdqe_to_agent_history(
+                            &pdqe_ctx,
+                            "quality_eval_pass",
+                            &format!("confidence={}", verdict.confidence),
+                        );
+                    }
+                    crate::response_quality_evaluator::QualityVerdictKind::Fail => {
+                        let max_nudges = state.config.quality_eval_max_nudges_per_run;
+                        let min_conf = state.config.quality_eval_min_confidence;
+                        let should_retry =
+                            verdict.confidence >= min_conf && *pdqe_retries < max_nudges;
+                        if should_retry {
+                            *pdqe_retries += 1;
+                            let feedback =
+                                crate::response_quality_evaluator::build_quality_feedback_message(
+                                    &session_goal,
+                                    &verdict,
+                                );
+                            crate::response_quality_evaluator::log_pdqe_to_agent_history(
+                                &pdqe_ctx,
+                                "quality_eval_fail",
+                                &format!(
+                                    "retry={}/{} confidence={}",
+                                    pdqe_retries, max_nudges, verdict.confidence
+                                ),
+                            );
+                            crate::response_quality_evaluator::append_quality_timeline(
+                                state.db.clone(),
+                                run_key,
+                                chat_id,
+                                persona_id,
+                                "quality_eval_retry",
+                                &payload,
+                            )
+                            .await;
+                            messages.push(Message {
+                                role: "assistant".into(),
+                                content: MessageContent::Text(final_text.clone()),
+                            });
+                            messages.push(Message {
+                                role: "user".into(),
+                                content: MessageContent::Text(feedback),
+                            });
+                            return Ok(FinishTurnOutcome::Retry);
+                        }
+                        tracing::warn!(
+                            run_key = %run_key,
+                            pdqe_retries = *pdqe_retries,
+                            confidence = verdict.confidence,
+                            "PDQE fail: delivering last candidate (budget exhausted or low confidence)"
+                        );
+                        crate::response_quality_evaluator::log_pdqe_to_agent_history(
+                            &pdqe_ctx,
+                            "quality_eval_fail_deliver_anyway",
+                            &format!("confidence={}", verdict.confidence),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("PDQE evaluation failed (fail-open): {e}");
+                crate::response_quality_evaluator::log_pdqe_to_agent_history(
+                    &pdqe_ctx,
+                    "quality_eval_error",
+                    &e.to_string(),
+                );
+            }
+        }
+    }
+
+    if should_run_focus_sync {
+        run_persona_focus_sync_after_delivery(
+            state,
+            chat_id,
+            persona_id,
+            context.caller_channel,
+            system_prompt,
+            messages,
+            final_text.len(),
+            had_tool_calls,
+            context.is_background_job,
+        )
+        .await;
+    }
+
+    if let Some(tx) = event_tx {
+        let _ = tx.send(AgentEvent::FinalResponse {
+            text: final_text.clone(),
+        });
+    }
+
+    let stop_reason_owned = stop_reason.to_string();
+    let record = AgentRunRecord {
+        timestamp: chrono::Utc::now(),
+        channel: context.caller_channel.to_string(),
+        user_message_preview: user_msg_preview.to_string(),
+        total_iterations: history_iterations.len(),
+        iterations: std::mem::take(history_iterations),
+        stop_reason: stop_reason_owned.clone(),
+        total_duration_ms: run_start.elapsed().as_millis(),
+        initial_llm_snapshot: Some(initial_llm_snapshot_json.to_string()),
+    };
+    *agent_history_basename = write_agent_history_run(
+        &state.config.runtime_data_dir(),
+        chat_id,
+        persona_id,
+        &record,
+    );
+    let run_key_for_db = run_key.to_string();
+    tokio::spawn({
+        let db = state.db.clone();
+        async move {
+            let _ = call_blocking(db.clone(), move |db| {
+                db.append_run_timeline_event(
+                    &run_key_for_db,
+                    chat_id,
+                    persona_id,
+                    "run_finished",
+                    Some(&format!(r#"{{"stop_reason":"{}"}}"#, stop_reason_owned)),
+                )?;
+                Ok(())
+            })
+            .await;
+        }
+    });
+
+    Ok(FinishTurnOutcome::Complete(agent_process_result(
+        final_text.clone(),
+    )))
+}
+
+async fn run_post_delivery_hooks_before_gate(
+    state: &AppState,
+    context: &AgentRequestContext<'_>,
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    run_key: &str,
+    chat_id: i64,
+    persona_id: i64,
+    stop_reason: &str,
+    final_text: &mut String,
+) -> (Option<String>, bool) {
     if let Ok(post_delivery_hook) = run_hooks_for_event_async(
         state.db.clone(),
         &state.config,
@@ -3851,28 +4035,14 @@ async fn run_post_delivery_hooks_and_builtin_focus_sync(
             &post_delivery_hook,
         )
         .await;
-        hook_summary = hook_event_summary(HookEventName::PostDelivery, None, &post_delivery_hook);
         if !post_delivery_hook.additional_contexts.is_empty() {
             final_text.push_str("\n\n");
             final_text.push_str(&post_delivery_hook.additional_contexts.join("\n"));
         }
-        should_run_focus_sync = post_delivery_hook.run_persona_focus_sync;
+        let summary = hook_event_summary(HookEventName::PostDelivery, None, &post_delivery_hook);
+        return (summary, post_delivery_hook.run_persona_focus_sync);
     }
-    if should_run_focus_sync {
-        run_persona_focus_sync_after_delivery(
-            state,
-            chat_id,
-            persona_id,
-            context.caller_channel,
-            system_prompt,
-            messages,
-            final_text.len(),
-            had_tool_calls,
-            context.is_background_job,
-        )
-        .await;
-    }
-    hook_summary
+    (None, false)
 }
 
 fn ensure_persona_memory_file_exists(state: &AppState, chat_id: i64, persona_id: i64) {
@@ -4163,8 +4333,7 @@ fn should_apply_generic_loop_guard(tool_name: &str) -> bool {
 fn is_progress_tool_use(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "send_message"
-            | "spawn_background_command"
+        "spawn_background_command"
             | "write_file"
             | "edit_file"
             | "apply_search_replace"
@@ -4285,23 +4454,6 @@ fn is_memory_write_tool(tool_name: &str) -> bool {
             | "write_memory_state"
             | "patch_memory_state"
     )
-}
-
-fn had_send_message_tool_call(messages: &[Message]) -> bool {
-    messages.iter().any(|m| {
-        if m.role != "assistant" {
-            return false;
-        }
-        match &m.content {
-            MessageContent::Blocks(blocks) => blocks.iter().any(|b| {
-                matches!(
-                    b,
-                    ContentBlock::ToolUse { name, .. } if name == "send_message"
-                )
-            }),
-            _ => false,
-        }
-    })
 }
 
 fn recover_latest_assistant_text(messages: &[Message]) -> Option<String> {
@@ -4801,7 +4953,6 @@ fn build_system_prompt(
 - **Browser:** browser (agent-browser CLI only; never via bash)
 - **Files / repo:** read_file, write_file, edit_file, apply_search_replace, read_repo_map, symbol_edit (when enabled), glob, grep
 - **Web:** web_search, web_fetch
-- **Chat / delivery:** send_message (attachments and user-visible files)
 - **Scheduling:** schedule_task, update_scheduled_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history (runtime enforces `schedule-job` activation before create/update)
 - **History / export:** export_chat, search_chat_history
 - **Media:** user images arrive as image blocks
@@ -4833,13 +4984,12 @@ fn build_system_prompt(
 You have access to the following capabilities:
 {caps}
 
-The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when calling send_message, schedule, export_chat, tiered memory, or memory(chat_daily) tools.
+The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when calling schedule, export_chat, tiered memory, or memory(chat_daily) tools.
 
 For serving files to users:
-- For any generated artifact that users should open/download (PDF, image, markdown, zip, etc.), call `send_message` with `attachment_path` using an absolute local file path.
-- Never fabricate `/api/uploads/...` links in plain text. The upload URL must come from the attachment flow.
-- If your final response references a file, send the attachment first so the returned URL is valid immediately.
-- If `send_message` already delivered the substantive user-facing explanation (especially with an attachment), do **not** restate that narrative in your final assistant message; put only genuinely new information (brief confirmation or nothing).
+- Put artifacts in your **final assistant message** using markdown image or file links with **absolute local file paths** (e.g. `![caption](/abs/path/to/file.png)` or `[label](/abs/path/to/doc.pdf)`).
+- Never fabricate `/api/uploads/...` URLs in plain text; the platform materializes local paths at delivery (web upload URLs, Telegram workspace images).
+- Include the substantive explanation in the final message together with any attachment paths.
 
 When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. **Identity and Tier 1** (long-term facts, workflow principles) are compiled into the system prompt under **# Identity and long-term memory (Tier 1)**. **Tier 2**, bulletin focus, operator focus, and bookmarks are in the **[persona_context]** message at conversation start; Tier 3 appears there only when needed as fallback recent focus. Tier 2 is durable knowledge only (user terminology, known steps, preferences), not active project status. Bulletin is the operator snapshot of recent focus; your task is always `[current_request]`. Tier 3 is short-lived scratch context and should not duplicate bulletin status lines. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use read_tiered_memory/write_tiered_memory for explicit tier edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
 
@@ -5200,11 +5350,6 @@ fn format_tool_status(name: &str, input: &serde_json::Value) -> String {
         }
         "read_memory" | "write_memory" | "tiered_memory_read" | "tiered_memory_write" => {
             return format!("🧠 Memory: {name}");
-        }
-        "send_message" => {
-            if let Some(msg) = str_field("message") {
-                return format!("💬 Sending: {msg}");
-            }
         }
         _ => {}
     }
@@ -6089,166 +6234,6 @@ pub fn archive_conversation(data_dir: &str, chat_id: i64, messages: &[Message]) 
     }
     if let Err(e) = std::fs::write(&path, &content) {
         tracing::warn!("Failed to archive conversation to {}: {e}", path.display());
-    }
-}
-
-/// Spawn async PDQE after successful delivery.
-pub fn maybe_spawn_post_delivery_quality_eval(
-    state: Arc<AppState>,
-    ctx: crate::response_quality_evaluator::PostDeliveryEvalContext,
-) {
-    if crate::response_quality_evaluator::should_skip_pdqe(&state.config, &ctx).is_some() {
-        return;
-    }
-    let config = state.config.clone();
-    let db = state.db.clone();
-    let env_redactor = state.env_redactor.clone();
-    tokio::spawn(async move {
-        match crate::response_quality_evaluator::run_post_delivery_eval_task(
-            &config,
-            db,
-            env_redactor.as_ref(),
-            ctx,
-        )
-        .await
-        {
-            Ok(crate::response_quality_evaluator::PdqFollowUp::CorrectiveRun {
-                feedback,
-                chat_id,
-                persona_id,
-                caller_channel,
-                chat_type,
-                parent_run_key,
-            }) => {
-                enqueue_quality_corrective_run_for_contact(
-                    state,
-                    chat_id,
-                    persona_id,
-                    &caller_channel,
-                    &chat_type,
-                    parent_run_key,
-                    feedback,
-                )
-                .await;
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("PDQE task error: {e}"),
-        }
-    });
-}
-
-/// Enqueue a corrective foreground agent run on the persona lane.
-pub async fn enqueue_quality_corrective_run_for_contact(
-    state: Arc<AppState>,
-    chat_id: i64,
-    persona_id: i64,
-    caller_channel: &str,
-    chat_type: &str,
-    parent_run_key: String,
-    feedback: String,
-) {
-    use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
-    let channel = caller_channel.to_string();
-    let chat_type_owned = chat_type.to_string();
-    let meta = QueueEnqueueMeta {
-        run_id: format!("quality-nudge:{}", uuid::Uuid::new_v4()),
-        persona_id,
-        source: match channel.as_str() {
-            "telegram" => QueueSource::Telegram,
-            "discord" => QueueSource::Discord,
-            "whatsapp" => QueueSource::Whatsapp,
-            "scheduler" => QueueSource::Scheduler,
-            _ => QueueSource::Web,
-        },
-        label: "quality corrective".to_string(),
-        project_id: None,
-        workflow_id: None,
-    };
-    let state_for_job = state.clone();
-    let _ = state
-        .chat_queue
-        .enqueue_with_meta(chat_id, meta, move |cancel| {
-            let state = state_for_job.clone();
-            let channel = channel.clone();
-            let chat_type_owned = chat_type_owned.clone();
-            let parent_run_key = parent_run_key.clone();
-            let feedback = feedback.clone();
-            async move {
-                run_quality_corrective_job(
-                    state,
-                    chat_id,
-                    persona_id,
-                    channel,
-                    chat_type_owned,
-                    parent_run_key,
-                    feedback,
-                    cancel,
-                )
-                .await;
-            }
-        })
-        .await;
-}
-
-async fn run_quality_corrective_job(
-    state: Arc<AppState>,
-    chat_id: i64,
-    persona_id: i64,
-    caller_channel: String,
-    chat_type: String,
-    parent_run_key: String,
-    feedback: String,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-) {
-    let runtime_chat_type = chat_type.as_str();
-    let result = process_with_agent_with_events(
-        &state,
-        AgentRequestContext {
-            caller_channel: caller_channel.as_str(),
-            chat_id,
-            chat_type: runtime_chat_type,
-            persona_id,
-            is_scheduled_task: false,
-            is_background_job: false,
-            run_key: Some(format!("quality-nudge:{}", uuid::Uuid::new_v4())),
-            is_quality_nudge: true,
-            quality_nudge_parent_run_key: Some(parent_run_key),
-            quality_feedback: Some(feedback),
-        },
-        None,
-        None,
-        None,
-        Some(cancel),
-    )
-    .await;
-
-    let Ok(agent_out) = result else {
-        return;
-    };
-    let to_send = if agent_out.response.trim().is_empty() {
-        "Done.".to_string()
-    } else {
-        agent_out.response
-    };
-    if to_send.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
-        return;
-    }
-    let ws_root = state.config.workspace_root_absolute();
-    if let Ok(outcome) = crate::channel::deliver_agent_final_to_contact(
-        state.db.clone(),
-        state.telegram_bots.as_ref(),
-        state.discord_http.as_ref(),
-        &state.config.bot_username,
-        chat_id,
-        persona_id,
-        &to_send,
-        Some(ws_root),
-    )
-    .await
-    {
-        if !outcome.response_for_client.is_empty() {
-            let _ = outcome;
-        }
     }
 }
 

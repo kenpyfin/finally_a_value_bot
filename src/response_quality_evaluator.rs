@@ -1,12 +1,12 @@
-//! Post-Delivery Quality Evaluator (PDQE): async QC after the user receives a reply.
+//! Pre-delivery Quality Evaluator (PDQE): synchronous QC before the user receives a reply.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::warn;
 
-use crate::agent_history::{append_pdqe_step_to_agent_history, truncate_preview};
+use crate::agent_history::append_pdqe_step_to_agent_history;
 use crate::agent_turn_context::SessionGoalContext;
 use crate::channels::telegram::BACKGROUND_JOB_HANDOFF_PREFIX;
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
@@ -19,6 +19,7 @@ use crate::post_tool_evaluator::build_tool_results_summary;
 use crate::safety_redaction::EnvSecretRedactor;
 
 const EVAL_TIMEOUT_SECS: u64 = 60;
+const PDQE_TOOL_TRACE_MAX_MESSAGES: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityVerdictKind {
@@ -35,7 +36,7 @@ pub struct QualityVerdict {
     pub confidence: f64,
 }
 
-/// Context captured at end of an agent run for post-delivery evaluation.
+/// Context for pre-delivery quality evaluation (in-loop gate).
 #[derive(Debug, Clone)]
 pub struct PostDeliveryEvalContext {
     pub run_key: String,
@@ -49,7 +50,6 @@ pub struct PostDeliveryEvalContext {
     pub tool_trace_summary: String,
     pub principles_excerpt: String,
     pub is_scheduled_task: bool,
-    pub is_quality_nudge: bool,
     pub is_conversational: bool,
     pub intent_signature: Option<String>,
     pub tool_names: Vec<String>,
@@ -72,14 +72,11 @@ pub fn should_skip_pdqe(config: &Config, ctx: &PostDeliveryEvalContext) -> Optio
     if !config.response_quality_evaluator_enabled {
         return Some("disabled");
     }
-    if ctx.is_quality_nudge {
-        return Some("quality_nudge_run");
-    }
     if !quality_eval_channel_allowed(config, &ctx.caller_channel) {
         return Some("channel_not_allowed");
     }
-    if ctx.stop_reason == "ask_clarification" {
-        return Some("ask_clarification");
+    if ctx.stop_reason == "ask_clarification" || ctx.stop_reason == "cancelled" {
+        return Some("stop_reason");
     }
     if ctx.delivered_text.trim().is_empty() {
         return Some("empty_delivery");
@@ -94,17 +91,6 @@ pub fn should_skip_pdqe(config: &Config, ctx: &PostDeliveryEvalContext) -> Optio
         return Some("no_session_goal");
     }
     None
-}
-
-fn quality_nudge_count_for_run(
-    db: &crate::db::Database,
-    run_key: &str,
-) -> Result<usize, FinallyAValueBotError> {
-    let events = db.get_run_timeline_events(run_key, 64)?;
-    Ok(events
-        .iter()
-        .filter(|e| e.event_type == "quality_nudge_enqueued")
-        .count())
 }
 
 pub fn build_quality_feedback_message(
@@ -125,7 +111,7 @@ pub fn build_quality_feedback_message(
 
 fn build_pdqe_system_prompt(principles_excerpt: &str) -> String {
     let mut prompt = String::from(
-        r#"You are a post-delivery quality evaluator. Judge whether the delivered assistant reply satisfies the session goal (`current_request`) for this turn.
+        r#"You are a pre-delivery quality evaluator. Judge whether the candidate assistant reply satisfies the session goal (`current_request`) for this turn.
 
 Output JSON only:
 {"verdict":"pass"|"fail"|"skip","issues":["..."],"feedback_for_agent":"one paragraph","confidence":0.0}
@@ -149,7 +135,7 @@ Rules:
 
 fn build_pdqe_user_prompt(ctx: &PostDeliveryEvalContext) -> String {
     let mut prompt = format!(
-        "Session goal (current_request):\n{}\n\nDelivered reply:\n{}\n\nTool trace:\n{}\nStop reason: {}\n",
+        "Session goal (current_request):\n{}\n\nCandidate reply:\n{}\n\nTool trace:\n{}\nStop reason: {}\n",
         ctx.session_goal.current_request,
         ctx.delivered_text,
         ctx.tool_trace_summary,
@@ -198,7 +184,11 @@ pub fn parse_evaluator_json_response(text: &str) -> Result<QualityVerdict, Final
         "pass" => QualityVerdictKind::Pass,
         "fail" => QualityVerdictKind::Fail,
         "skip" => QualityVerdictKind::Skip,
-        _ => QualityVerdictKind::Skip,
+        other => {
+            return Err(FinallyAValueBotError::Config(format!(
+                "PDQE unknown verdict: {other}"
+            )));
+        }
     };
     Ok(QualityVerdict {
         kind,
@@ -209,25 +199,9 @@ pub fn parse_evaluator_json_response(text: &str) -> Result<QualityVerdict, Final
 }
 
 fn fast_path_verdict(config: &Config, ctx: &PostDeliveryEvalContext) -> Option<QualityVerdict> {
-    if ctx.is_conversational {
-        return Some(QualityVerdict {
-            kind: QualityVerdictKind::Pass,
-            issues: vec![],
-            feedback_for_agent: String::new(),
-            confidence: 1.0,
-        });
-    }
-    let goal = ctx.session_goal.current_request.to_ascii_lowercase();
-    let reply = ctx.delivered_text.to_ascii_lowercase();
-    if reply.trim() == "done." && goal.len() > 20 && !goal.contains('?') {
-        return Some(QualityVerdict {
-            kind: QualityVerdictKind::Fail,
-            issues: vec!["empty_done".into()],
-            feedback_for_agent:
-                "The reply was only \"Done.\" but the session goal required substantive work."
-                    .into(),
-            confidence: 0.9,
-        });
+    let reply = ctx.delivered_text.trim();
+    if reply.is_empty() {
+        return None;
     }
     if ctx.stop_reason == "ask_clarification" && reply.contains('?') {
         return Some(QualityVerdict {
@@ -288,20 +262,7 @@ pub async fn evaluate_delivery_quality(
     parse_evaluator_json_response(&text)
 }
 
-#[derive(Debug, Clone)]
-pub enum PdqFollowUp {
-    None,
-    CorrectiveRun {
-        feedback: String,
-        chat_id: i64,
-        persona_id: i64,
-        caller_channel: String,
-        chat_type: String,
-        parent_run_key: String,
-    },
-}
-
-fn log_pdqe_to_agent_history(ctx: &PostDeliveryEvalContext, step: &str, detail: &str) {
+pub fn log_pdqe_to_agent_history(ctx: &PostDeliveryEvalContext, step: &str, detail: &str) {
     let Some(ref basename) = ctx.agent_history_basename else {
         return;
     };
@@ -321,8 +282,8 @@ fn log_pdqe_to_agent_history(ctx: &PostDeliveryEvalContext, step: &str, detail: 
     }
 }
 
-async fn append_timeline(
-    db: std::sync::Arc<Database>,
+pub async fn append_quality_timeline(
+    db: Arc<Database>,
     run_key: &str,
     chat_id: i64,
     persona_id: i64,
@@ -340,189 +301,16 @@ async fn append_timeline(
     .await;
 }
 
-pub async fn run_post_delivery_eval_task(
-    config: &Config,
-    db: Arc<Database>,
+/// Build tool trace summary for PDQE from messages in the current run.
+pub fn build_pdqe_tool_trace(
     env_redactor: &EnvSecretRedactor,
-    ctx: PostDeliveryEvalContext,
-) -> Result<PdqFollowUp, FinallyAValueBotError> {
-    if let Some(skip) = should_skip_pdqe(config, &ctx) {
-        log_pdqe_to_agent_history(&ctx, "quality_eval_skipped", skip);
-        return Ok(PdqFollowUp::None);
-    }
-
-    log_pdqe_to_agent_history(&ctx, "quality_eval_started", &ctx.run_key);
-    append_timeline(
-        db.clone(),
-        &ctx.run_key,
-        ctx.chat_id,
-        ctx.persona_id,
-        "quality_eval_started",
-        "{}",
-    )
-    .await;
-
-    let verdict = match evaluate_delivery_quality(config, env_redactor, &ctx).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("PDQE evaluation failed (fail-open): {e}");
-            log_pdqe_to_agent_history(&ctx, "quality_eval_error", &e.to_string());
-            return Ok(PdqFollowUp::None);
-        }
-    };
-
-    let payload = serde_json::json!({
-        "verdict": format!("{:?}", verdict.kind),
-        "issues": verdict.issues,
-        "feedback_preview": verdict.feedback_for_agent.chars().take(200).collect::<String>(),
-        "confidence": verdict.confidence,
-    })
-    .to_string();
-
-    match verdict.kind {
-        QualityVerdictKind::Pass => {
-            info!(
-                run_key = %ctx.run_key,
-                "PDQE pass (confidence={})",
-                verdict.confidence
-            );
-            log_pdqe_to_agent_history(
-                &ctx,
-                "quality_eval_pass",
-                &format!("confidence={}", verdict.confidence),
-            );
-            append_timeline(
-                db.clone(),
-                &ctx.run_key,
-                ctx.chat_id,
-                ctx.persona_id,
-                "quality_eval_pass",
-                &payload,
-            )
-            .await;
-            Ok(PdqFollowUp::None)
-        }
-        QualityVerdictKind::Skip => {
-            info!(run_key = %ctx.run_key, "PDQE skip");
-            log_pdqe_to_agent_history(&ctx, "quality_eval_skip", "");
-            Ok(PdqFollowUp::None)
-        }
-        QualityVerdictKind::Fail => {
-            info!(
-                run_key = %ctx.run_key,
-                "PDQE fail (confidence={}): {}",
-                verdict.confidence,
-                verdict.feedback_for_agent
-            );
-            let fail_detail = format!(
-                "confidence={}; issues={}; feedback={}",
-                verdict.confidence,
-                if verdict.issues.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    verdict.issues.join(", ")
-                },
-                truncate_preview(&verdict.feedback_for_agent, 400)
-            );
-            log_pdqe_to_agent_history(&ctx, "quality_eval_fail", &fail_detail);
-            append_timeline(
-                db.clone(),
-                &ctx.run_key,
-                ctx.chat_id,
-                ctx.persona_id,
-                "quality_eval_fail",
-                &payload,
-            )
-            .await;
-
-            if config.workflow_auto_learn {
-                if let Some(ref sig) = ctx.intent_signature {
-                    let steps_json =
-                        serde_json::to_string(&ctx.tool_names).unwrap_or_else(|_| "[]".into());
-                    let reason = format!("quality_eval:{}", verdict.issues.join(","));
-                    let chat_id = ctx.chat_id;
-                    let sig = sig.clone();
-                    let _ = call_blocking(db.clone(), move |d| {
-                        d.upsert_workflow_learning(
-                            chat_id,
-                            &sig,
-                            &steps_json,
-                            "[]",
-                            "",
-                            "failure",
-                            Some(reason.as_str()),
-                            "{}",
-                            false,
-                            0.0,
-                        )
-                    })
-                    .await;
-                }
-            }
-
-            let nudge_cap = config.quality_eval_max_nudges_per_run;
-            let existing = call_blocking(db.clone(), {
-                let run_key = ctx.run_key.clone();
-                move |d| quality_nudge_count_for_run(d, &run_key)
-            })
-            .await
-            .unwrap_or(0);
-
-            if existing >= nudge_cap {
-                info!(run_key = %ctx.run_key, "PDQE corrective nudge skipped: budget exhausted");
-                log_pdqe_to_agent_history(
-                    &ctx,
-                    "quality_nudge_skipped",
-                    "budget exhausted for run_key",
-                );
-                return Ok(PdqFollowUp::None);
-            }
-
-            if verdict.confidence < config.quality_eval_min_confidence {
-                info!(
-                    run_key = %ctx.run_key,
-                    "PDQE corrective nudge skipped: confidence {} < {}",
-                    verdict.confidence,
-                    config.quality_eval_min_confidence
-                );
-                log_pdqe_to_agent_history(
-                    &ctx,
-                    "quality_nudge_skipped",
-                    &format!(
-                        "confidence {} < min {}",
-                        verdict.confidence, config.quality_eval_min_confidence
-                    ),
-                );
-                return Ok(PdqFollowUp::None);
-            }
-
-            let feedback = build_quality_feedback_message(&ctx.session_goal, &verdict);
-            log_pdqe_to_agent_history(&ctx, "quality_nudge_enqueued", &ctx.run_key);
-            append_timeline(
-                db,
-                &ctx.run_key,
-                ctx.chat_id,
-                ctx.persona_id,
-                "quality_nudge_enqueued",
-                &payload,
-            )
-            .await;
-
-            Ok(PdqFollowUp::CorrectiveRun {
-                feedback,
-                chat_id: ctx.chat_id,
-                persona_id: ctx.persona_id,
-                caller_channel: ctx.caller_channel.clone(),
-                chat_type: ctx.chat_type.clone(),
-                parent_run_key: ctx.run_key.clone(),
-            })
-        }
-    }
-}
-
-/// Build tool trace summary for PDQE from messages.
-pub fn build_pdqe_tool_trace(env_redactor: &EnvSecretRedactor, messages: &[Message]) -> String {
-    build_tool_results_summary(env_redactor, messages, 8)
+    messages: &[Message],
+    run_start_index: usize,
+) -> String {
+    let start = run_start_index.min(messages.len());
+    let slice = &messages[start..];
+    let window = slice.len().min(PDQE_TOOL_TRACE_MAX_MESSAGES);
+    build_tool_results_summary(env_redactor, slice, window)
 }
 
 #[cfg(test)]

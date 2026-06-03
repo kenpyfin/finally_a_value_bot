@@ -124,7 +124,6 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "patch_memory_state"
         | "update_bulletin_focus"
         | "add_vault_item"
-        | "send_message"
         | "sync_skills"
         | "register_hook"
         | "schedule_task"
@@ -559,7 +558,7 @@ fn detect_vault_search_command(config: &Config) -> Option<String> {
 impl ToolRegistry {
     pub fn new(
         config: &Config,
-        bot: Bot,
+        _bot: Bot,
         db: Arc<Database>,
         runtime_toggles: std::sync::Arc<crate::runtime_toggles::RuntimeToggles>,
         env_redactor: Arc<EnvSecretRedactor>,
@@ -628,12 +627,6 @@ impl ToolRegistry {
             Box::new(web_search::WebSearchTool::new(
                 config.tavily_api_key.clone(),
                 config.web_search_searxng_url.clone(),
-            )),
-            Box::new(send_message::SendMessageTool::new_with_config(
-                bot,
-                db.clone(),
-                config.bot_username.clone(),
-                config.clone(),
             )),
             Box::new(register_tracked_job::RegisterTrackedJobTool::new(
                 db.clone(),

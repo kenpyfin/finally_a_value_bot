@@ -15,8 +15,7 @@ use crate::db::call_blocking;
 use crate::db::StoredMessage;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::telegram::{
-    archive_conversation, maybe_spawn_post_delivery_quality_eval, process_with_agent_with_events,
-    AgentRequestContext, AppState,
+    archive_conversation, process_with_agent_with_events, AgentRequestContext, AppState,
 };
 
 struct Handler {
@@ -383,9 +382,6 @@ impl EventHandler for Handler {
                         is_scheduled_task: false,
                         is_background_job: false,
                         run_key: None,
-                        is_quality_nudge: false,
-                        quality_nudge_parent_run_key: None,
-                        quality_feedback: None,
                     },
                     None,
                     image_data,
@@ -422,14 +418,7 @@ impl EventHandler for Handler {
                                     true
                                 }
                             };
-                            if delivered {
-                                if let Some(ctx) = agent_out.post_delivery_eval {
-                                    maybe_spawn_post_delivery_quality_eval(
-                                        app_state.clone(),
-                                        ctx,
-                                    );
-                                }
-                            }
+                            let _delivered = delivered;
                         }
                     }
                     Err(e) => {

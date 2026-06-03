@@ -187,15 +187,15 @@ Since FinallyAValueBot is a multi-platform bot with external dependencies (LLM A
 
 ---
 
-## 11. Tool -- Mid-Conversation Messaging
+## 11. Final reply delivery and attachments
 
 
 | #    | User Story                     | Steps                                                   | Expected                                           |
 | ---- | ------------------------------ | ------------------------------------------------------- | -------------------------------------------------- |
-| 11.1 | Progress update                | "Send 'Processing...' first, then tell me today's date" | Receive TWO messages: progress + final reply       |
-| 11.2 | Only send_message              | "Use send_message to say 'test' and nothing else"       | Receive exactly ONE message "test", no empty reply |
-| 11.3 | Cross-chat send (regular user) | "Send a message to chat_id 99999"                       | Permission denied                                  |
-| 11.4 | Cross-chat send (control chat) | From control_chat_id, specify another chat_id           | Message sent successfully                          |
+| 11.1 | Single final message           | "Tell me today's date"                                  | Receive exactly ONE bot message with the answer    |
+| 11.2 | Final reply with local image   | Generate an image, reply with `![img](/abs/path.png)`   | One bot message; web shows `/api/uploads/...` URL    |
+| 11.3 | PDQE retry (if enabled)        | Prompt that fails QC then passes on retry               | User sees one final message (no draft + corrective) |
+| 11.4 | Cross-chat send (legacy skill) | From control chat, use send-attachment skill to another chat | Works via skill script only, not main-agent tool |
 
 
 ---

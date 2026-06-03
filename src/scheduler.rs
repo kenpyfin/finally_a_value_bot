@@ -18,10 +18,7 @@ use crate::error::FinallyAValueBotError;
 use crate::job_heartbeat::{
     signal_from_agent_event, spawn_shared_heartbeat, HeartbeatSignal, JobType,
 };
-use crate::telegram::{
-    maybe_spawn_post_delivery_quality_eval, process_with_agent_with_events, AgentRequestContext,
-    AppState,
-};
+use crate::telegram::{process_with_agent_with_events, AgentRequestContext, AppState};
 
 fn channel_from_chat_type(chat_type: &str) -> &'static str {
     match chat_type {
@@ -445,9 +442,6 @@ async fn run_scheduled_agent_and_finalize(
             is_scheduled_task: true,
             is_background_job: false,
             run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
-            is_quality_nudge: false,
-            quality_nudge_parent_run_key: None,
-            quality_feedback: None,
         },
         Some(&prompt),
         None,
@@ -500,7 +494,6 @@ async fn run_scheduled_agent_and_finalize(
         Ok(Ok(agent_out)) => {
             drop(evt_tx);
             let _ = hb_forward.await;
-            let post_delivery_eval = agent_out.post_delivery_eval;
             let mut response_text = if agent_out.response.trim().is_empty() {
                 format!("Scheduled task #{} completed.", task_id)
             } else {
@@ -553,7 +546,7 @@ async fn run_scheduled_agent_and_finalize(
                             target: "scheduler",
                             task_id = task_id,
                             chat_id = chat_id,
-                            "Skipping duplicate scheduled delivery: agent final redundant vs recent send_message"
+                            "Skipping scheduled delivery: empty final body"
                         );
                         let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
                             "scheduled task #{} completed (duplicate delivery skipped)",
@@ -574,9 +567,6 @@ async fn run_scheduled_agent_and_finalize(
                         } else {
                             summary_text
                         };
-                        if let Some(ctx) = post_delivery_eval {
-                            maybe_spawn_post_delivery_quality_eval(state.clone(), ctx);
-                        }
                         (true, Some(summary))
                     }
                 }
