@@ -12,6 +12,14 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Key files / symbols:** `src/tools/mod.rs` (unregister tool; `send_message.rs` kept for internal/helpers); `src/channels/telegram.rs` (`finish_turn_with_quality_gate`, `try_finish_agent_turn`, `run_post_delivery_hooks_before_gate`, `build_system_prompt`); `src/response_quality_evaluator.rs`; `src/channel.rs`, `src/final_delivery_dedupe.rs`; `src/web.rs`, `src/channels/{discord,whatsapp}.rs`, `src/scheduler.rs`; `workspace/skills/send-attachment/SKILL.md`; `ARCHITECTURE.md`, `TEST.md` §11.
 - **Follow-ups:** Optional shared `prepare_final_for_delivery` for non-web channels; tune `QUALITY_EVAL_*` latency vs false positives in production.
 
+### 2026-06-02 — Deterministic authored workflows (tool + skill)
+
+- **Area:** workflow engine / tools / skills / hooks / config
+- **Summary:** Added YAML-based authored workflows with a Rust step executor (`tool`, `script`, `bash`, `set`, `deliver`). Exposed `list_workflows`, `read_workflow`, `write_workflow`, `validate_workflow`, and `run_workflow` tools; builtin skills `create-workflow` and `modify-workflow` with activation gates (mirror `modify-skill`). LLM invokes workflows via `run_workflow` in the normal agent loop — no pre-LLM shortcut.
+- **Rationale:** Operators need repeatable step sequences without probabilistic tool ordering; skills teach authoring while tools validate, persist, and execute.
+- **Key files / symbols:** `src/workflow_engine/` (`execute_workflow`, `WorkflowCatalog`), `src/tools/workflow.rs`, `src/workflow_activation_gate.rs`, `src/hook_runtime.rs` (`builtin_turn_skill_gate` workflow signals), `src/channels/telegram.rs` (registration + turn gates + system prompt), `builtin_skills/create-workflow/`, `builtin_skills/modify-workflow/`, `docs/deterministic-workflows.md`, `workspace/workflows/echo-demo.workflow.yaml`
+- **Follow-ups:** Phase 2: `agent`/`when`/`foreach` steps; scheduler `[workflow:id]` unattended path; web cockpit list/run.
+
 ### 2026-06-02 — Post-delivery quality evaluation (PDQE) + Perplexity evaluators
 
 - **Area:** agent loop / channels / config / evaluators

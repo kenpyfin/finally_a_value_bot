@@ -41,6 +41,8 @@ pub mod tool_skill_agent;
 pub mod tools;
 pub mod transcribe;
 pub mod web;
+pub mod workflow_activation_gate;
+pub mod workflow_engine;
 pub use channels::discord;
 pub use channels::telegram;
 pub use channels::whatsapp;

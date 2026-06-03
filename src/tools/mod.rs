@@ -33,6 +33,7 @@ pub mod vault_add;
 pub mod web_fetch;
 pub mod web_html;
 pub mod web_search;
+pub mod workflow;
 pub mod write_file;
 
 use std::sync::Arc;
@@ -234,7 +235,7 @@ pub fn authorize_chat_persona_access(
     Ok(())
 }
 
-fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serde_json::Value {
+pub fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serde_json::Value {
     let mut obj = match input {
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),

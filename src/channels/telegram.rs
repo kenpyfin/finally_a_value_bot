@@ -463,6 +463,12 @@ pub async fn run_bot(
             app_state_slot.clone(),
         ),
     ));
+    crate::tools::workflow::register_workflow_tools(
+        &config,
+        db.clone(),
+        app_state_slot.clone(),
+        &mut tools,
+    );
 
     let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
     info!(
@@ -2144,6 +2150,10 @@ pub async fn process_with_agent_with_events(
     const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 3600;
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
     const REQUIRED_MODIFY_SKILL: &str = crate::skill_activation_gate::REQUIRED_MODIFY_SKILL;
+    const REQUIRED_CREATE_WORKFLOW_SKILL: &str =
+        crate::workflow_activation_gate::REQUIRED_CREATE_WORKFLOW_SKILL;
+    const REQUIRED_MODIFY_WORKFLOW_SKILL: &str =
+        crate::workflow_activation_gate::REQUIRED_MODIFY_WORKFLOW_SKILL;
     const LOOP_SIGNATURE_REPEAT_THRESHOLD: usize = 3;
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
     const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 15;
@@ -2188,7 +2198,18 @@ pub async fn process_with_agent_with_events(
     let mut history_iterations: Vec<IterationRecord> = Vec::new();
     let mut schedule_skill_activated_this_turn = false;
     let mut modify_skill_activated_this_turn = false;
+    let mut create_workflow_skill_activated_this_turn = false;
+    let mut modify_workflow_skill_activated_this_turn = false;
     let skills_data_dir = state.config.skills_data_dir_absolute();
+    let workflow_catalog = if state.config.workflow_engine_enabled {
+        Some(crate::workflow_engine::WorkflowCatalog::new(
+            state.config.workspace_root_absolute(),
+            &state.config.workflow_definitions_dir,
+            state.config.workflow_allow_persona_scope,
+        ))
+    } else {
+        None
+    };
     let tool_shared_dir =
         crate::tools::resolve_tool_working_dir(Path::new(state.config.working_dir()));
     let mut last_tool_signature: Option<String> = None;
@@ -2737,6 +2758,33 @@ pub async fn process_with_agent_with_events(
                             &tool_shared_dir,
                         ) && !modify_skill_activated_this_turn;
 
+                    let write_workflow_exists = name == "write_workflow"
+                        && hook_input_for_exec
+                            .get("yaml")
+                            .and_then(|v| v.as_str())
+                            .and_then(|yaml| {
+                                crate::workflow_engine::parse_workflow_yaml(yaml)
+                                    .ok()
+                                    .and_then(|def| {
+                                        workflow_catalog.as_ref().map(|catalog| {
+                                            catalog.exists(&def.id, chat_id, persona_id)
+                                        })
+                                    })
+                            })
+                            .unwrap_or(false);
+                    let missing_create_workflow_skill =
+                        crate::workflow_activation_gate::requires_create_workflow_activation(
+                            name,
+                            &hook_input_for_exec,
+                            write_workflow_exists,
+                        ) && !create_workflow_skill_activated_this_turn;
+                    let missing_modify_workflow_skill =
+                        crate::workflow_activation_gate::requires_modify_workflow_activation(
+                            name,
+                            &hook_input_for_exec,
+                            write_workflow_exists,
+                        ) && !modify_workflow_skill_activated_this_turn;
+
                     let pre_tool_hook = run_hooks_for_event_async(
                         state.db.clone(),
                         &state.config,
@@ -2751,7 +2799,9 @@ pub async fn process_with_agent_with_events(
                             tool_input: Some(hook_input_for_exec.clone()),
                             runtime_signals: Some(serde_json::json!({
                                 "requires_schedule_skill": missing_schedule_skill,
-                                "requires_modify_skill": missing_modify_skill
+                                "requires_modify_skill": missing_modify_skill,
+                                "requires_create_workflow_skill": missing_create_workflow_skill,
+                                "requires_modify_workflow_skill": missing_modify_workflow_skill
                             })),
                             ..HookRunInput::default()
                         },
@@ -2823,6 +2873,14 @@ pub async fn process_with_agent_with_events(
                     let activates_required_modify_skill = name == "activate_skill"
                         && requested_skill_name
                             .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_MODIFY_SKILL))
+                            .unwrap_or(false);
+                    let activates_required_create_workflow_skill = name == "activate_skill"
+                        && requested_skill_name
+                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_CREATE_WORKFLOW_SKILL))
+                            .unwrap_or(false);
+                    let activates_required_modify_workflow_skill = name == "activate_skill"
+                        && requested_skill_name
+                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_MODIFY_WORKFLOW_SKILL))
                             .unwrap_or(false);
                     // TSA: allow or deny before execution
                     let tsa_deny = if state.config.tool_skill_agent_enabled {
@@ -3004,6 +3062,24 @@ pub async fn process_with_agent_with_events(
                             iteration + 1,
                             state.config.max_tool_iterations,
                             REQUIRED_MODIFY_SKILL
+                        );
+                    }
+                    if activates_required_create_workflow_skill && !result.is_error {
+                        create_workflow_skill_activated_this_turn = true;
+                        info!(
+                            "Main agent iteration {}/{}: required create-workflow skill activated ({})",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            REQUIRED_CREATE_WORKFLOW_SKILL
+                        );
+                    }
+                    if activates_required_modify_workflow_skill && !result.is_error {
+                        modify_workflow_skill_activated_this_turn = true;
+                        info!(
+                            "Main agent iteration {}/{}: required modify-workflow skill activated ({})",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            REQUIRED_MODIFY_WORKFLOW_SKILL
                         );
                     }
 
@@ -4999,6 +5075,12 @@ For skills:
 - **Run a skill script:** after `activate_skill`, use **`run_skill_script`** with `skill_name`, `script`, and optional `args` — do not use bash with `../../../../skills` or other parent traversals
 - **New skill:** activate `create-skill`, then use `build_skill` (or `write_file` at `skills/<name>/SKILL.md` only when creating a brand-new directory)
 - **Update / modify / change an existing skill:** activate `modify-skill` first in the same turn, read current `SKILL.md`, then `build_skill` or targeted file edits under `skills/<name>/`
+
+For authored workflows (deterministic step sequences in YAML under `workflows/`):
+- **List / read:** `list_workflows`, `read_workflow`
+- **Create:** activate `create-workflow`, then `write_workflow` (or `validate_workflow` first)
+- **Modify:** activate `modify-workflow` first in the same turn, then `read_workflow` + `write_workflow`
+- **Run:** `run_workflow` executes steps in fixed order (do not re-implement the same steps with ad-hoc bash)
 
 For scheduling:
 - Runtime enforces `schedule-job` activation before `schedule_task`/`update_scheduled_task`

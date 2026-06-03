@@ -211,6 +211,22 @@ fn default_project_auto_association_strictness() -> String {
     "balanced".into()
 }
 
+pub fn default_workflow_engine_enabled() -> bool {
+    true
+}
+
+pub fn default_workflow_definitions_dir() -> String {
+    "workflows".into()
+}
+
+pub fn default_workflow_allow_persona_scope() -> bool {
+    true
+}
+
+pub fn default_workflow_max_steps() -> usize {
+    50
+}
+
 fn default_orchestrator_enabled() -> bool {
     true
 }
@@ -656,6 +672,18 @@ pub struct Config {
     /// Project auto-linking mode: strict | balanced | loose.
     #[serde(default = "default_project_auto_association_strictness")]
     pub project_auto_association_strictness: String,
+    /// Enable authored deterministic workflow tools (list/read/write/validate/run_workflow).
+    #[serde(default = "default_workflow_engine_enabled")]
+    pub workflow_engine_enabled: bool,
+    /// Subdirectory under workspace data root for global workflow YAML files.
+    #[serde(default = "default_workflow_definitions_dir")]
+    pub workflow_definitions_dir: String,
+    /// Allow persona-scoped workflow overrides under shared/personas/{chat}/{persona}/workflows/.
+    #[serde(default = "default_workflow_allow_persona_scope")]
+    pub workflow_allow_persona_scope: bool,
+    /// Maximum steps per workflow execution.
+    #[serde(default = "default_workflow_max_steps")]
+    pub workflow_max_steps: usize,
 }
 
 impl Config {
@@ -1125,6 +1153,17 @@ impl Config {
                 .unwrap_or_else(default_workflow_replay_strictness),
             project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
                 .unwrap_or_else(default_project_auto_association_strictness),
+            workflow_engine_enabled: Self::env_bool(
+                "WORKFLOW_ENGINE_ENABLED",
+                default_workflow_engine_enabled(),
+            ),
+            workflow_definitions_dir: Self::env("WORKFLOW_DEFINITIONS_DIR")
+                .unwrap_or_else(default_workflow_definitions_dir),
+            workflow_allow_persona_scope: Self::env_bool(
+                "WORKFLOW_ALLOW_PERSONA_SCOPE",
+                default_workflow_allow_persona_scope(),
+            ),
+            workflow_max_steps: Self::env_usize("WORKFLOW_MAX_STEPS", default_workflow_max_steps()),
         }
     }
 
@@ -1709,6 +1748,10 @@ pub fn test_config() -> Config {
         workflow_min_success_repetitions: default_workflow_min_success_repetitions(),
         workflow_replay_strictness: default_workflow_replay_strictness(),
         project_auto_association_strictness: default_project_auto_association_strictness(),
+        workflow_engine_enabled: default_workflow_engine_enabled(),
+        workflow_definitions_dir: default_workflow_definitions_dir(),
+        workflow_allow_persona_scope: default_workflow_allow_persona_scope(),
+        workflow_max_steps: default_workflow_max_steps(),
     }
 }
 

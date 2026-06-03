@@ -105,6 +105,7 @@ Workflows are **not** installed from the repo. A fresh DB has an empty `workflow
 
 ## Related docs
 
+- [`deterministic-workflows.md`](deterministic-workflows.md) — **authored** YAML workflows (`run_workflow` tool), distinct from learned workflows above.
 - [`runtime-gap-analysis.md`](runtime-gap-analysis.md) — deferred items (e.g. strict replay, management tools).
 - [`development-journal.md`](development-journal.md) — 2026-04-01 entry (projects/workflows/timeline).
 

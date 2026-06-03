@@ -524,6 +524,10 @@ fn default_config() -> Config {
         workflow_min_success_repetitions: 2,
         workflow_replay_strictness: "adaptive".into(),
         project_auto_association_strictness: "balanced".into(),
+        workflow_engine_enabled: crate::config::default_workflow_engine_enabled(),
+        workflow_definitions_dir: crate::config::default_workflow_definitions_dir(),
+        workflow_allow_persona_scope: crate::config::default_workflow_allow_persona_scope(),
+        workflow_max_steps: crate::config::default_workflow_max_steps(),
     }
 }
 
