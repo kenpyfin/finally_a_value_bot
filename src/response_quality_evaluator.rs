@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::agent_history::{append_pdqe_step_to_agent_history, truncate_preview};
 use crate::agent_turn_context::SessionGoalContext;
 use crate::channels::telegram::BACKGROUND_JOB_HANDOFF_PREFIX;
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
@@ -52,6 +53,9 @@ pub struct PostDeliveryEvalContext {
     pub is_conversational: bool,
     pub intent_signature: Option<String>,
     pub tool_names: Vec<String>,
+    /// Basename of the run's `agent_history/*.md` file (set when the main loop saved history).
+    pub agent_history_basename: Option<String>,
+    pub runtime_data_dir: String,
 }
 
 pub fn quality_eval_channel_allowed(config: &Config, channel: &str) -> bool {
@@ -297,6 +301,26 @@ pub enum PdqFollowUp {
     },
 }
 
+fn log_pdqe_to_agent_history(ctx: &PostDeliveryEvalContext, step: &str, detail: &str) {
+    let Some(ref basename) = ctx.agent_history_basename else {
+        return;
+    };
+    if let Err(e) = append_pdqe_step_to_agent_history(
+        &ctx.runtime_data_dir,
+        ctx.chat_id,
+        ctx.persona_id,
+        basename,
+        step,
+        detail,
+    ) {
+        warn!(
+            run_key = %ctx.run_key,
+            basename = %basename,
+            "Failed to append PDQE step to agent history: {e}"
+        );
+    }
+}
+
 async fn append_timeline(
     db: std::sync::Arc<Database>,
     run_key: &str,
@@ -322,10 +346,12 @@ pub async fn run_post_delivery_eval_task(
     env_redactor: &EnvSecretRedactor,
     ctx: PostDeliveryEvalContext,
 ) -> Result<PdqFollowUp, FinallyAValueBotError> {
-    if should_skip_pdqe(config, &ctx).is_some() {
+    if let Some(skip) = should_skip_pdqe(config, &ctx) {
+        log_pdqe_to_agent_history(&ctx, "quality_eval_skipped", skip);
         return Ok(PdqFollowUp::None);
     }
 
+    log_pdqe_to_agent_history(&ctx, "quality_eval_started", &ctx.run_key);
     append_timeline(
         db.clone(),
         &ctx.run_key,
@@ -340,6 +366,7 @@ pub async fn run_post_delivery_eval_task(
         Ok(v) => v,
         Err(e) => {
             warn!("PDQE evaluation failed (fail-open): {e}");
+            log_pdqe_to_agent_history(&ctx, "quality_eval_error", &e.to_string());
             return Ok(PdqFollowUp::None);
         }
     };
@@ -359,6 +386,11 @@ pub async fn run_post_delivery_eval_task(
                 "PDQE pass (confidence={})",
                 verdict.confidence
             );
+            log_pdqe_to_agent_history(
+                &ctx,
+                "quality_eval_pass",
+                &format!("confidence={}", verdict.confidence),
+            );
             append_timeline(
                 db.clone(),
                 &ctx.run_key,
@@ -372,6 +404,7 @@ pub async fn run_post_delivery_eval_task(
         }
         QualityVerdictKind::Skip => {
             info!(run_key = %ctx.run_key, "PDQE skip");
+            log_pdqe_to_agent_history(&ctx, "quality_eval_skip", "");
             Ok(PdqFollowUp::None)
         }
         QualityVerdictKind::Fail => {
@@ -381,6 +414,17 @@ pub async fn run_post_delivery_eval_task(
                 verdict.confidence,
                 verdict.feedback_for_agent
             );
+            let fail_detail = format!(
+                "confidence={}; issues={}; feedback={}",
+                verdict.confidence,
+                if verdict.issues.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    verdict.issues.join(", ")
+                },
+                truncate_preview(&verdict.feedback_for_agent, 400)
+            );
+            log_pdqe_to_agent_history(&ctx, "quality_eval_fail", &fail_detail);
             append_timeline(
                 db.clone(),
                 &ctx.run_key,
@@ -426,6 +470,11 @@ pub async fn run_post_delivery_eval_task(
 
             if existing >= nudge_cap {
                 info!(run_key = %ctx.run_key, "PDQE corrective nudge skipped: budget exhausted");
+                log_pdqe_to_agent_history(
+                    &ctx,
+                    "quality_nudge_skipped",
+                    "budget exhausted for run_key",
+                );
                 return Ok(PdqFollowUp::None);
             }
 
@@ -436,10 +485,19 @@ pub async fn run_post_delivery_eval_task(
                     verdict.confidence,
                     config.quality_eval_min_confidence
                 );
+                log_pdqe_to_agent_history(
+                    &ctx,
+                    "quality_nudge_skipped",
+                    &format!(
+                        "confidence {} < min {}",
+                        verdict.confidence, config.quality_eval_min_confidence
+                    ),
+                );
                 return Ok(PdqFollowUp::None);
             }
 
             let feedback = build_quality_feedback_message(&ctx.session_goal, &verdict);
+            log_pdqe_to_agent_history(&ctx, "quality_nudge_enqueued", &ctx.run_key);
             append_timeline(
                 db,
                 &ctx.run_key,

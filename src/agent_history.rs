@@ -14,6 +14,9 @@ pub const MAX_INITIAL_LLM_SNAPSHOT_BYTES: usize = 800 * 1024;
 /// Markdown delimiter between the iteration trace and the optional first-turn LLM snapshot (web + debugging).
 pub const SNAPSHOT_SECTION_START: &str = "\n## Initial LLM prompt (debug snapshot)\n";
 
+/// Appended after the main run body when post-delivery quality evaluation runs.
+pub const QUALITY_EVAL_SECTION_START: &str = "\n## Post-delivery quality evaluation\n";
+
 /// Max bytes read for a single agent history file (web UI / API).
 pub const MAX_AGENT_HISTORY_READ_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -288,18 +291,51 @@ pub fn format_initial_llm_snapshot_json(
     s
 }
 
+/// Append one PDQE (or similar) step to an existing run markdown file.
+pub fn append_pdqe_step_to_agent_history(
+    data_dir: &str,
+    chat_id: i64,
+    persona_id: i64,
+    basename: &str,
+    step: &str,
+    detail: &str,
+) -> std::io::Result<()> {
+    if !is_valid_agent_history_filename(basename) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid agent history basename",
+        ));
+    }
+    let path = history_dir(data_dir, chat_id, persona_id).join(basename);
+    let mut content = std::fs::read_to_string(&path)?;
+    if !content.contains(QUALITY_EVAL_SECTION_START) {
+        content.push_str(QUALITY_EVAL_SECTION_START);
+    }
+    let at = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    content.push_str(&format!(
+        "- **{at}** `{step}`{}\n",
+        if detail.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", detail.trim())
+        }
+    ));
+    std::fs::write(&path, content)
+}
+
 /// Persist a run record to disk. Rotates old files if count exceeds MAX_HISTORY_FILES.
+/// Returns the written basename (`YYYYMMDD-HHMMSS.md`) on success.
 pub fn write_agent_history_run(
     data_dir: &str,
     chat_id: i64,
     persona_id: i64,
     record: &AgentRunRecord,
-) {
+) -> Option<String> {
     let dir = history_dir(data_dir, chat_id, persona_id);
 
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("Failed to create agent_history dir {}: {e}", dir.display());
-        return;
+        return None;
     }
 
     let filename = format!("{}.md", record.timestamp.format("%Y%m%d-%H%M%S"));
@@ -308,7 +344,7 @@ pub fn write_agent_history_run(
 
     if let Err(e) = std::fs::write(&path, &content) {
         tracing::warn!("Failed to write agent history to {}: {e}", path.display());
-        return;
+        return None;
     }
 
     info!(
@@ -319,6 +355,7 @@ pub fn write_agent_history_run(
     );
 
     rotate_old_files(&dir);
+    Some(filename)
 }
 
 fn rotate_old_files(dir: &PathBuf) {
@@ -349,4 +386,55 @@ pub fn truncate_preview(s: &str, max_chars: usize) -> String {
     }
     let boundary = s.floor_char_boundary(max_chars);
     format!("{}...", &s[..boundary])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn append_pdqe_step_adds_section_and_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let chat_id = 1_i64;
+        let persona_id = 2_i64;
+        let record = AgentRunRecord {
+            timestamp: Utc.with_ymd_and_hms(2026, 6, 2, 12, 0, 0).unwrap(),
+            channel: "web".into(),
+            user_message_preview: "hello".into(),
+            iterations: vec![],
+            total_iterations: 0,
+            stop_reason: "end_turn".into(),
+            total_duration_ms: 1,
+            initial_llm_snapshot: None,
+        };
+        let basename = write_agent_history_run(data_dir, chat_id, persona_id, &record).unwrap();
+        append_pdqe_step_to_agent_history(
+            data_dir,
+            chat_id,
+            persona_id,
+            &basename,
+            "quality_eval_started",
+            "run-1",
+        )
+        .unwrap();
+        append_pdqe_step_to_agent_history(
+            data_dir,
+            chat_id,
+            persona_id,
+            &basename,
+            "quality_eval_pass",
+            "confidence=0.95",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(
+            history_dir_path(data_dir, chat_id, persona_id).join(&basename),
+        )
+        .unwrap();
+        assert!(content.contains(QUALITY_EVAL_SECTION_START.trim()));
+        assert!(content.contains("`quality_eval_started`"));
+        assert!(content.contains("`quality_eval_pass`"));
+        assert!(content.contains("confidence=0.95"));
+    }
 }

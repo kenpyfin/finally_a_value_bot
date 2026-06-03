@@ -1681,6 +1681,7 @@ fn agent_process_result(
     principles_content: &str,
     is_conversational: bool,
     tool_names: &[String],
+    agent_history_basename: Option<String>,
 ) -> AgentProcessResult {
     let post_delivery_eval =
         if context.is_quality_nudge || !state.config.response_quality_evaluator_enabled {
@@ -1718,6 +1719,8 @@ fn agent_process_result(
                 is_conversational,
                 intent_signature,
                 tool_names: tool_names.to_vec(),
+                agent_history_basename,
+                runtime_data_dir: state.config.runtime_data_dir(),
             })
         };
     AgentProcessResult {
@@ -2271,6 +2274,7 @@ pub async fn process_with_agent_with_events(
     let mut legacy_edit_without_block_count: usize = 0;
     let mut discovery_streak_count: usize = 0;
     let mut deferred_commitment_nudges: usize = 0;
+    let mut agent_history_basename: Option<String> = None;
 
     macro_rules! save_run_history {
         ($stop_reason:expr) => {{
@@ -2285,7 +2289,7 @@ pub async fn process_with_agent_with_events(
                 total_duration_ms: run_start.elapsed().as_millis(),
                 initial_llm_snapshot: Some(initial_llm_snapshot_json.clone()),
             };
-            write_agent_history_run(
+            let basename = write_agent_history_run(
                 &state.config.runtime_data_dir(),
                 chat_id,
                 persona_id,
@@ -2308,6 +2312,7 @@ pub async fn process_with_agent_with_events(
                     .await;
                 }
             });
+            basename
         }};
     }
 
@@ -2338,7 +2343,7 @@ pub async fn process_with_agent_with_events(
     .await;
     if let Some(reason) = before_turn_hooks.blocked_reason {
         let blocked = format!("This run was blocked before execution: {reason}");
-        save_run_history!("hook_block_before_turn");
+        let _ = save_run_history!("hook_block_before_turn");
         return Ok(AgentProcessResult {
             response: blocked,
             post_delivery_eval: None,
@@ -2366,6 +2371,7 @@ pub async fn process_with_agent_with_events(
                 &principles_content,
                 is_conversational,
                 &run_tool_names,
+                agent_history_basename.clone(),
             ));
         };
     }
@@ -2386,6 +2392,7 @@ pub async fn process_with_agent_with_events(
                 &principles_content,
                 is_conversational,
                 &run_tool_names,
+                agent_history_basename.clone(),
             ));
         }
         if let Some(tx) = event_tx {
@@ -2442,7 +2449,7 @@ pub async fn process_with_agent_with_events(
                         llm_start.elapsed().as_millis(),
                         e
                     );
-                    save_run_history!("llm_error");
+                    let _ = save_run_history!("llm_error");
                     return Err(e.into());
                 }
                 Ok(Err(_)) => {
@@ -2452,7 +2459,7 @@ pub async fn process_with_agent_with_events(
                         state.config.max_tool_iterations,
                         LLM_ROUND_TIMEOUT_SECS
                     );
-                    save_run_history!("llm_timeout");
+                    agent_history_basename = save_run_history!("llm_timeout");
                     return Ok(agent_process_result(
                         state,
                         &context,
@@ -2463,6 +2470,7 @@ pub async fn process_with_agent_with_events(
                         &principles_content,
                         is_conversational,
                         &run_tool_names,
+                        agent_history_basename.clone(),
                     ));
                 }
                 Err(()) => {
@@ -2481,6 +2489,7 @@ pub async fn process_with_agent_with_events(
                         &principles_content,
                         is_conversational,
                         &run_tool_names,
+                        agent_history_basename.clone(),
                     ));
                 }
             }
@@ -2675,7 +2684,7 @@ pub async fn process_with_agent_with_events(
                 final_text.len(),
                 iteration + 1
             );
-            save_run_history!(&stop_reason);
+            agent_history_basename = save_run_history!(&stop_reason);
             return Ok(agent_process_result(
                 state,
                 &context,
@@ -2686,6 +2695,7 @@ pub async fn process_with_agent_with_events(
                 &principles_content,
                 is_conversational,
                 &run_tool_names,
+                agent_history_basename.clone(),
             ));
         }
 
@@ -3333,7 +3343,7 @@ pub async fn process_with_agent_with_events(
                         text: stall_text.clone(),
                     });
                 }
-                save_run_history!("loop_guard_stalled");
+                agent_history_basename = save_run_history!("loop_guard_stalled");
                 agent_ok!("loop_guard_stalled", stall_text);
             }
 
@@ -3390,7 +3400,7 @@ pub async fn process_with_agent_with_events(
                     final_text.len(),
                     iteration + 1
                 );
-                save_run_history!("memory_write_short_circuit");
+                agent_history_basename = save_run_history!("memory_write_short_circuit");
                 agent_ok!("memory_write_short_circuit", final_text);
             }
 
@@ -3545,7 +3555,7 @@ pub async fn process_with_agent_with_events(
                             final_text.len(),
                             iteration + 1
                         );
-                        save_run_history!("pte_complete");
+                        agent_history_basename = save_run_history!("pte_complete");
                         agent_ok!("pte_complete", final_text);
                     }
                     Ok(Ok(pte_result)) if pte_result.action == PteAction::AskUser => {
@@ -3558,7 +3568,7 @@ pub async fn process_with_agent_with_events(
                                 text: ask_text.clone(),
                             });
                         }
-                        save_run_history!("pte_ask_user");
+                        agent_history_basename = save_run_history!("pte_ask_user");
                         agent_ok!("pte_ask_user", ask_text);
                     }
                     Ok(Ok(pte_result)) if pte_result.action == PteAction::StopWithSummary => {
@@ -3571,12 +3581,12 @@ pub async fn process_with_agent_with_events(
                                 text: summary_text.clone(),
                             });
                         }
-                        save_run_history!("pte_stop_with_summary");
+                        agent_history_basename = save_run_history!("pte_stop_with_summary");
                         agent_ok!("pte_stop_with_summary", summary_text);
                     }
                     Ok(Ok(pte_result)) if pte_result.action == PteAction::HandoffBackground => {
                         if context.caller_channel == "web" && !context.is_background_job {
-                            save_run_history!("pte_background_handoff");
+                            agent_history_basename = save_run_history!("pte_background_handoff");
                             agent_ok!(
                                 "pte_background_handoff",
                                 format!(
@@ -3621,7 +3631,7 @@ pub async fn process_with_agent_with_events(
                         iteration + 1,
                         state.config.max_tool_iterations
                     );
-                    save_run_history!("background_handoff");
+                    agent_history_basename = save_run_history!("background_handoff");
                     agent_ok!(
                         "background_handoff",
                         format!(
@@ -3683,7 +3693,7 @@ pub async fn process_with_agent_with_events(
                         text: timeout_msg.clone(),
                     });
                 }
-                save_run_history!("tool_timeout");
+                agent_history_basename = save_run_history!("tool_timeout");
                 agent_ok!("tool_timeout", timeout_msg);
             }
 
@@ -3735,7 +3745,7 @@ pub async fn process_with_agent_with_events(
                 last.hook_events.push(summary);
             }
         }
-        save_run_history!(&stop_reason);
+        agent_history_basename = save_run_history!(&stop_reason);
         if assistant_text.is_empty() {
             agent_ok!(&stop_reason, returned_text);
         } else {
@@ -3783,7 +3793,7 @@ pub async fn process_with_agent_with_events(
             last.hook_events.push(summary);
         }
     }
-    save_run_history!("max_iterations");
+    agent_history_basename = save_run_history!("max_iterations");
     Ok(agent_process_result(
         state,
         &context,
@@ -3794,6 +3804,7 @@ pub async fn process_with_agent_with_events(
         &principles_content,
         is_conversational,
         &run_tool_names,
+        agent_history_basename,
     ))
 }
 
