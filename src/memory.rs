@@ -135,14 +135,98 @@ pub struct LegacyActiveProjectMemory {
     pub updated_at: String,
 }
 
+/// Vault SOP reference stored in Tier 2 memory (`tier2.sops`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SopPointer {
+    /// Short handle for matching tasks (e.g. `pz-post-pipeline`).
+    #[serde(default)]
+    pub id: String,
+    /// Vault-relative path (must start with `ORIGIN/`).
+    pub vault_path: String,
+    /// Optional one-line hint; full procedure is always loaded from `vault_path`.
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl SopPointer {
+    pub fn derive_id_from_vault_path(vault_path: &str) -> String {
+        Path::new(vault_path.trim())
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sop")
+            .to_ascii_lowercase()
+            .replace(' ', "-")
+    }
+
+    pub fn normalized_vault_path(vault_path: &str) -> String {
+        let t = vault_path.trim().trim_start_matches("./");
+        if t.starts_with("ORIGIN/") {
+            t.to_string()
+        } else if t.starts_with("origin/") {
+            format!("ORIGIN/{}", &t[7..])
+        } else {
+            t.to_string()
+        }
+    }
+
+    /// Parse a legacy Tier 2 line or `write_tiered_memory` SOP row into a pointer.
+    pub fn from_legacy_line(line: &str) -> Option<Self> {
+        let mut t = line.trim();
+        if let Some(rest) = t.strip_prefix("- SOP|") {
+            let parts: Vec<&str> = rest.splitn(3, '|').collect();
+            if parts.len() >= 2 {
+                let vault_path = Self::normalized_vault_path(parts[1]);
+                if !vault_path.starts_with("ORIGIN/") {
+                    return None;
+                }
+                let id = parts[0].trim();
+                let summary = parts.get(2).map(|s| s.trim()).unwrap_or("").to_string();
+                return Some(Self {
+                    id: if id.is_empty() {
+                        Self::derive_id_from_vault_path(&vault_path)
+                    } else {
+                        id.to_string()
+                    },
+                    vault_path,
+                    summary,
+                });
+            }
+        }
+        t = t.strip_prefix("SOP:").unwrap_or(t).trim();
+        let lower = t.to_ascii_lowercase();
+        let origin_idx = lower.find("origin/")?;
+        let vault_path = Self::normalized_vault_path(&t[origin_idx..]);
+        if !vault_path.starts_with("ORIGIN/") {
+            return None;
+        }
+        let before = t[..origin_idx].trim().trim_end_matches(['—', '-', ':']);
+        let summary = before
+            .strip_prefix("SOP")
+            .unwrap_or(before)
+            .trim()
+            .trim_start_matches(':')
+            .trim()
+            .to_string();
+        Some(Self {
+            id: Self::derive_id_from_vault_path(&vault_path),
+            vault_path,
+            summary,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Tier2Memory {
     #[serde(default)]
     pub user_terminology: Vec<String>,
+    /// Standard Operating Procedures — pointers to vault markdown only.
     #[serde(default)]
-    pub known_steps: Vec<String>,
+    pub sops: Vec<SopPointer>,
     #[serde(default)]
     pub preferences: Vec<String>,
+    /// Legacy `known_steps` strings; migrated on `normalize`, not persisted.
+    #[serde(default, rename = "known_steps", skip_serializing)]
+    pub legacy_known_steps: Vec<String>,
     #[serde(default, rename = "active_projects", skip_serializing)]
     pub legacy_active_projects: Vec<LegacyActiveProjectMemory>,
     #[serde(skip)]
@@ -152,9 +236,30 @@ pub struct Tier2Memory {
 #[derive(Debug, Clone, Default)]
 pub struct Tier2LegacyMigrationStats {
     pub moved_terminology: usize,
-    pub moved_known_steps: usize,
+    pub moved_sops: usize,
     pub moved_preferences: usize,
     pub dropped_active_projects: usize,
+    pub legacy_known_steps_to_principles: usize,
+}
+
+pub fn dedupe_sops(mut sops: Vec<SopPointer>) -> Vec<SopPointer> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for mut sop in sops.drain(..) {
+        sop.vault_path = SopPointer::normalized_vault_path(&sop.vault_path);
+        if sop.vault_path.is_empty() || !sop.vault_path.starts_with("ORIGIN/") {
+            continue;
+        }
+        if sop.id.trim().is_empty() {
+            sop.id = SopPointer::derive_id_from_vault_path(&sop.vault_path);
+        }
+        sop.summary = sop.summary.trim().to_string();
+        let key = sop.vault_path.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(sop);
+        }
+    }
+    out.into_iter().take(20).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -216,6 +321,28 @@ pub struct PersonaMemoryState {
 }
 
 impl PersonaMemoryState {
+    fn migrate_tier2_legacy_known_steps(&mut self) {
+        if self.tier2.legacy_known_steps.is_empty() {
+            return;
+        }
+        let mut principles = self.tier1.workflow_principles.clone();
+        let mut migrated = 0usize;
+        for line in self.tier2.legacy_known_steps.drain(..) {
+            if let Some(sop) = SopPointer::from_legacy_line(&line) {
+                self.tier2.sops.push(sop);
+                migrated += 1;
+            } else {
+                let t = line.trim();
+                if !t.is_empty() {
+                    principles.push(t.to_string());
+                }
+            }
+        }
+        if migrated > 0 || !principles.is_empty() {
+            self.tier1.workflow_principles = dedupe_trimmed_lines(&principles);
+        }
+    }
+
     pub fn normalize(&mut self) {
         self.meta.version = MEMORY_SCHEMA_VERSION;
         self.identity.non_negotiables = dedupe_trimmed_lines(&self.identity.non_negotiables);
@@ -236,10 +363,8 @@ impl PersonaMemoryState {
             .into_iter()
             .take(40)
             .collect();
-        self.tier2.known_steps = dedupe_trimmed_lines(&self.tier2.known_steps)
-            .into_iter()
-            .take(40)
-            .collect();
+        self.migrate_tier2_legacy_known_steps();
+        self.tier2.sops = dedupe_sops(std::mem::take(&mut self.tier2.sops));
         self.tier2.preferences = dedupe_trimmed_lines(&self.tier2.preferences)
             .into_iter()
             .take(40)
@@ -248,11 +373,13 @@ impl PersonaMemoryState {
 
         if !self.tier2.legacy_active_projects.is_empty() {
             let mut terminology = self.tier2.user_terminology.clone();
-            let mut known_steps = self.tier2.known_steps.clone();
+            let mut sops = self.tier2.sops.clone();
             let mut preferences = self.tier2.preferences.clone();
+            let mut principles = self.tier1.workflow_principles.clone();
             let mut moved_terminology = 0usize;
-            let mut moved_known_steps = 0usize;
+            let mut moved_sops = 0usize;
             let mut moved_preferences = 0usize;
+            let mut legacy_known_steps_to_principles = 0usize;
             let mut dropped = 0usize;
             for p in self.tier2.legacy_active_projects.drain(..) {
                 let summary = p.summary.trim();
@@ -278,12 +405,18 @@ impl PersonaMemoryState {
                     moved_terminology += 1;
                     continue;
                 }
+                if let Some(sop) = SopPointer::from_legacy_line(summary) {
+                    sops.push(sop);
+                    moved_sops += 1;
+                    continue;
+                }
                 if lower.starts_with("step:")
                     || lower.starts_with("known step:")
+                    || lower.starts_with("sop:")
                     || lower.starts_with("[step]")
                 {
-                    known_steps.push(summary.to_string());
-                    moved_known_steps += 1;
+                    principles.push(summary.to_string());
+                    legacy_known_steps_to_principles += 1;
                     continue;
                 }
                 if lower.starts_with("pref:")
@@ -294,27 +427,25 @@ impl PersonaMemoryState {
                     moved_preferences += 1;
                     continue;
                 }
-                // Default migration bucket for durable-ish legacy lines.
-                known_steps.push(summary.to_string());
-                moved_known_steps += 1;
+                principles.push(summary.to_string());
+                legacy_known_steps_to_principles += 1;
             }
             self.tier2.user_terminology = dedupe_trimmed_lines(&terminology)
                 .into_iter()
                 .take(40)
                 .collect();
-            self.tier2.known_steps = dedupe_trimmed_lines(&known_steps)
-                .into_iter()
-                .take(40)
-                .collect();
+            self.tier2.sops = dedupe_sops(sops);
             self.tier2.preferences = dedupe_trimmed_lines(&preferences)
                 .into_iter()
                 .take(40)
                 .collect();
+            self.tier1.workflow_principles = dedupe_trimmed_lines(&principles);
             self.tier2.legacy_migration = Some(Tier2LegacyMigrationStats {
                 moved_terminology,
-                moved_known_steps,
+                moved_sops,
                 moved_preferences,
                 dropped_active_projects: dropped,
+                legacy_known_steps_to_principles,
             });
         }
 
@@ -646,17 +777,18 @@ impl MemoryManager {
             |this: &MemoryManager, mut state: PersonaMemoryState| -> PersonaMemoryState {
                 if let Some(stats) = state.tier2.legacy_migration.clone() {
                     let _ = this.append_persona_memory_event(
-                        chat_id,
-                        persona_id,
-                        "memory_state_migrated_tier2_knowledge",
-                        "system",
-                        json!({
-                            "moved_terminology": stats.moved_terminology,
-                            "moved_known_steps": stats.moved_known_steps,
-                            "moved_preferences": stats.moved_preferences,
-                            "dropped_active_projects": stats.dropped_active_projects,
-                        }),
-                    );
+                    chat_id,
+                    persona_id,
+                    "memory_state_migrated_tier2_knowledge",
+                    "system",
+                    json!({
+                        "moved_terminology": stats.moved_terminology,
+                        "moved_sops": stats.moved_sops,
+                        "legacy_known_steps_to_principles": stats.legacy_known_steps_to_principles,
+                        "moved_preferences": stats.moved_preferences,
+                        "dropped_active_projects": stats.dropped_active_projects,
+                    }),
+                );
                     let _ = this.write_persona_memory_state(chat_id, persona_id, state.clone());
                     state.tier2.legacy_migration = None;
                 }
@@ -718,6 +850,17 @@ impl MemoryManager {
                 return Err(format!(
                     "workflow_memory confidence out of range for intent '{}'",
                     entry.intent_signature
+                ));
+            }
+        }
+        for (i, sop) in state.tier2.sops.iter().enumerate() {
+            let path = sop.vault_path.trim();
+            if path.is_empty() {
+                return Err(format!("tier2.sops[{i}].vault_path cannot be empty"));
+            }
+            if !path.starts_with("ORIGIN/") {
+                return Err(format!(
+                    "tier2.sops[{i}].vault_path must start with ORIGIN/ (got '{path}')"
                 ));
             }
         }
@@ -974,8 +1117,12 @@ fn legacy_markdown_to_state(markdown: &str) -> PersonaMemoryState {
         },
         tier2: Tier2Memory {
             user_terminology: Vec::new(),
-            known_steps: tier2_known_steps,
+            sops: tier2_known_steps
+                .into_iter()
+                .filter_map(|line| SopPointer::from_legacy_line(&line))
+                .collect(),
             preferences: Vec::new(),
+            legacy_known_steps: Vec::new(),
             legacy_active_projects: Vec::new(),
             legacy_migration: None,
         },
@@ -1095,24 +1242,42 @@ pub fn render_identity_and_tier1_for_system(
     out
 }
 
-/// Tier 2/3, learned workflows, and links for the `[persona_context]` message block.
+/// Tier 2/3 and links for the `[persona_context]` message block.
 pub fn render_persona_context_memory_with_options(
     state: &PersonaMemoryState,
     suppress_recent_focus: bool,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
+    if !state.tier2.sops.is_empty() {
+        let mut block = String::from("### SOPs (Tier 2)\n\n");
+        for sop in &state.tier2.sops {
+            if sop.vault_path.trim().is_empty() {
+                continue;
+            }
+            let id = if sop.id.trim().is_empty() {
+                SopPointer::derive_id_from_vault_path(&sop.vault_path)
+            } else {
+                sop.id.trim().to_string()
+            };
+            if sop.summary.trim().is_empty() {
+                block.push_str(&format!("- **{id}** → `{}`\n", sop.vault_path.trim()));
+            } else {
+                block.push_str(&format!(
+                    "- **{id}** → `{}` — {}\n",
+                    sop.vault_path.trim(),
+                    sop.summary.trim()
+                ));
+            }
+        }
+        sections.push(block);
+    }
+
     let mut tier2_lines: Vec<String> = Vec::new();
     for t in &state.tier2.user_terminology {
         let s = t.trim();
         if !s.is_empty() {
             tier2_lines.push(format!("- Terminology: {s}"));
-        }
-    }
-    for s in &state.tier2.known_steps {
-        let s = s.trim();
-        if !s.is_empty() {
-            tier2_lines.push(format!("- Known step: {s}"));
         }
     }
     for p in &state.tier2.preferences {
@@ -1205,7 +1370,7 @@ pub fn render_persona_context_memory_with_options(
     out
 }
 
-/// Tier 2/3, learned workflows, and links for the `[persona_context]` message block.
+/// Tier 2/3 and links for the `[persona_context]` message block.
 pub fn render_persona_context_memory(state: &PersonaMemoryState) -> String {
     render_persona_context_memory_with_options(state, false)
 }
@@ -1260,8 +1425,21 @@ pub fn render_memory_markdown(state: &PersonaMemoryState) -> String {
     for term in &state.tier2.user_terminology {
         out.push_str(&format!("- Terminology|{}\n", term.trim()));
     }
-    for step in &state.tier2.known_steps {
-        out.push_str(&format!("- KnownStep|{}\n", step.trim()));
+    if !state.tier2.sops.is_empty() {
+        out.push_str("### SOPs\n\n");
+        for sop in &state.tier2.sops {
+            let id = if sop.id.trim().is_empty() {
+                SopPointer::derive_id_from_vault_path(&sop.vault_path)
+            } else {
+                sop.id.trim().to_string()
+            };
+            out.push_str(&format!(
+                "- SOP|{id}|{}|{}\n",
+                sop.vault_path.trim(),
+                sop.summary.trim()
+            ));
+        }
+        out.push('\n');
     }
     for pref in &state.tier2.preferences {
         out.push_str(&format!("- Preference|{}\n", pref.trim()));
@@ -1287,7 +1465,7 @@ fn render_memory_field_legend_compact() -> String {
         "tier1.stable_facts[]: long-lived durable facts.",
         "tier1.workflow_principles[]: reusable workflow rules from repeated success.",
         "tier2.user_terminology[]: user-specific terms, aliases, and phrasing.",
-        "tier2.known_steps[]: reusable procedures that reliably solve user tasks.",
+        "tier2.sops[]: vault SOP pointers ({ id, vault_path, summary }); load vault_path from ORIGIN when executing.",
         "tier2.preferences[]: durable operating preferences and defaults.",
         "tier3.recent_focus[]: short-term focus items; passive context only; capped to 15.",
         "workflow_memory.intents[]: learned intent-pattern retention entries.",
@@ -1474,7 +1652,7 @@ mod tests {
         let mut state = PersonaMemoryState::default();
         state.tier1.stable_facts = vec![];
         state.tier2.user_terminology = vec![];
-        state.tier2.known_steps = vec![];
+        state.tier2.sops = vec![];
         state.tier2.preferences = vec![];
         state.tier3.recent_focus = vec![];
         mm.write_persona_memory_state(100, 1, state).unwrap();
@@ -1704,12 +1882,18 @@ mod tests {
     fn test_render_persona_context_memory_renders_tier2_knowledge() {
         let mut state = PersonaMemoryState::default();
         state.tier2.user_terminology = vec!["PZ means Persona Zero".into()];
-        state.tier2.known_steps = vec!["Collect approval before publishing".into()];
+        state.tier2.sops.push(SopPointer {
+            id: "publish-gate".into(),
+            vault_path: "ORIGIN/Operations/SOPs/Publish.md".into(),
+            summary: "Collect approval before publishing".into(),
+        });
         state.tier2.preferences = vec!["Use V4 face reference by default".into()];
         let out = render_persona_context_memory(&state);
+        assert!(out.contains("### SOPs (Tier 2)"));
         assert!(out.contains("### Tier 2 knowledge"));
         assert!(out.contains("Terminology: PZ means Persona Zero"));
-        assert!(out.contains("Known step: Collect approval before publishing"));
+        assert!(out.contains("**publish-gate**"));
+        assert!(out.contains("ORIGIN/Operations/SOPs/Publish.md"));
         assert!(out.contains("Preference: Use V4 face reference by default"));
     }
 
@@ -1750,9 +1934,9 @@ mod tests {
             .any(|s| s.contains("Use V4 default")));
         assert!(!state
             .tier2
-            .known_steps
+            .sops
             .iter()
-            .any(|s| s.contains("Published")));
+            .any(|s| s.summary.contains("Published")));
         let events = std::fs::read_to_string(mm.persona_memory_events_path(300, 2)).unwrap();
         assert!(events.contains("memory_state_migrated_tier2_knowledge"));
         cleanup(&dir);

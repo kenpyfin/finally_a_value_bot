@@ -40,7 +40,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         label: "OpenAI",
         protocol: ProviderProtocol::OpenAiCompat,
         default_base_url: "https://api.openai.com/v1",
-        models: &["gpt-5.2", "gpt-5", "gpt-5-mini"],
+        models: &["gpt-5.4", "gpt-5.2", "gpt-5-mini"],
     },
     ProviderPreset {
         id: "openrouter",
@@ -160,7 +160,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         label: "xAI",
         protocol: ProviderProtocol::OpenAiCompat,
         default_base_url: "https://api.x.ai/v1",
-        models: &["grok-4", "grok-3"],
+        models: &["grok-4.3", "grok-4", "grok-3"],
     },
     ProviderPreset {
         id: "huggingface",

@@ -8,6 +8,8 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
 
+// Provider/model prompts retired — Web UI Settings → LLM; presets kept for future CLI use.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct ProviderPreset {
     id: &'static str,
@@ -16,12 +18,13 @@ struct ProviderPreset {
     models: &'static [&'static str],
 }
 
+#[allow(dead_code)]
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "openai",
         label: "OpenAI",
         default_base_url: "https://api.openai.com/v1",
-        models: &["gpt-5.2", "gpt-5", "gpt-5-mini"],
+        models: &["gpt-5.4", "gpt-5.2", "gpt-5-mini"],
     },
     ProviderPreset {
         id: "openrouter",
@@ -125,7 +128,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: "xai",
         label: "xAI",
         default_base_url: "https://api.x.ai/v1",
-        models: &["grok-4", "grok-3"],
+        models: &["grok-4.3", "grok-4", "grok-3"],
     },
     ProviderPreset {
         id: "huggingface",
@@ -150,6 +153,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
 ];
 
+#[allow(dead_code)]
 fn find_provider_preset(provider: &str) -> Option<&'static ProviderPreset> {
     PROVIDER_PRESETS
         .iter()
@@ -205,6 +209,7 @@ fn prompt_line(
     }
 }
 
+#[allow(dead_code)]
 fn prompt_provider(default_provider: &str) -> Result<Option<String>, FinallyAValueBotError> {
     println!();
     println!("Select LLM provider (press Enter for default):");
@@ -243,6 +248,7 @@ fn prompt_provider(default_provider: &str) -> Result<Option<String>, FinallyAVal
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OllamaTagsResponse {
     models: Vec<OllamaModel>,
 }
@@ -252,6 +258,7 @@ struct OllamaModel {
     name: String,
 }
 
+#[allow(dead_code)]
 fn ollama_tags_url(base_url: &str) -> String {
     let mut base = base_url.trim().trim_end_matches('/').to_string();
     if base.ends_with("/v1") {
@@ -263,6 +270,7 @@ fn ollama_tags_url(base_url: &str) -> String {
     format!("{base}/api/tags")
 }
 
+#[allow(dead_code)]
 fn detect_ollama_models(base_url: &str) -> Vec<String> {
     let tags_url = ollama_tags_url(base_url);
     let client = match reqwest::blocking::Client::builder()
@@ -283,6 +291,7 @@ fn detect_ollama_models(base_url: &str) -> Vec<String> {
     parsed.models.into_iter().map(|m| m.name).collect()
 }
 
+#[allow(dead_code)]
 fn prompt_model(
     provider: &str,
     default_model: &str,
@@ -375,14 +384,9 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Fina
         escape_env_val(&config.agent_display_name)
     ));
     lines.push("".into());
-    lines.push("# LLM".into());
-    lines.push(format!(
-        "LLM_PROVIDER={}",
-        escape_env_val(&config.llm_provider)
-    ));
-    lines.push(format!("LLM_API_KEY={}", escape_env_val(&config.api_key)));
-    if !config.model.is_empty() {
-        lines.push(format!("LLM_MODEL={}", escape_env_val(&config.model)));
+    lines.push("# LLM — API keys in .env; provider + model in Web UI → Settings → LLM".into());
+    if !config.api_key.is_empty() {
+        lines.push(format!("LLM_API_KEY={}", escape_env_val(&config.api_key)));
     }
     if let Some(ref u) = config.llm_base_url {
         if !u.is_empty() {
@@ -437,6 +441,7 @@ fn default_config() -> Config {
         max_document_size_mb: 100,
         workspace_dir: "./workspace".into(),
         openai_api_key: None,
+        gemini_api_key: None,
         timezone: "UTC".into(),
         allowed_groups: vec![],
         control_chat_ids: vec![],
@@ -520,14 +525,7 @@ fn default_config() -> Config {
         background_shell_auto_retry_max: 1,
         background_shell_auto_agent_on_success: true,
         runtime_reliability_profile: "balanced".into(),
-        workflow_auto_learn: true,
-        workflow_min_success_repetitions: 2,
-        workflow_replay_strictness: "adaptive".into(),
         project_auto_association_strictness: "balanced".into(),
-        workflow_engine_enabled: crate::config::default_workflow_engine_enabled(),
-        workflow_definitions_dir: crate::config::default_workflow_definitions_dir(),
-        workflow_allow_persona_scope: crate::config::default_workflow_allow_persona_scope(),
-        workflow_max_steps: crate::config::default_workflow_max_steps(),
     }
 }
 
@@ -564,71 +562,13 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
         None => return Ok(false),
     };
 
-    let provider = match prompt_provider(&existing.llm_provider)? {
-        Some(v) => v,
-        None => return Ok(false),
-    };
-    let preset = find_provider_preset(&provider);
-
-    let provider_changed = !provider.eq_ignore_ascii_case(&existing.llm_provider);
-    let default_base_url = if provider_changed {
-        preset
-            .map(|p| p.default_base_url.to_string())
-            .unwrap_or_default()
-    } else {
-        existing.llm_base_url.clone().unwrap_or_else(|| {
-            preset
-                .map(|p| p.default_base_url.to_string())
-                .unwrap_or_default()
-        })
-    };
-    let llm_base_url = match prompt_line("LLM base URL (optional)", Some(&default_base_url), false)?
-    {
-        Some(v) => {
-            let t = v.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        }
-        None => return Ok(false),
-    };
-
-    let api_default = existing.api_key.clone();
-    let api_prompt = if provider.eq_ignore_ascii_case("ollama")
-        || provider.eq_ignore_ascii_case("llama")
-        || provider.eq_ignore_ascii_case("llamacpp")
-    {
-        "LLM API key (optional for local providers: ollama/llama)"
-    } else {
-        "LLM API key"
-    };
+    println!(
+        "LLM provider and model are configured in Web UI → Settings → LLM (not written to .env)."
+    );
     let api_key = match prompt_line(
-        api_prompt,
-        Some(&api_default),
-        !(provider.eq_ignore_ascii_case("ollama")
-            || provider.eq_ignore_ascii_case("llama")
-            || provider.eq_ignore_ascii_case("llamacpp")),
-    )? {
-        Some(v) => v,
-        None => return Ok(false),
-    };
-
-    let default_model = if provider_changed || existing.model.trim().is_empty() {
-        preset
-            .and_then(|p| p.models.first().copied())
-            .unwrap_or("gpt-5.2")
-            .to_string()
-    } else {
-        existing.model.clone()
-    };
-    let model = match prompt_model(
-        &provider,
-        &default_model,
-        llm_base_url
-            .as_deref()
-            .unwrap_or(preset.map(|p| p.default_base_url).unwrap_or("")),
+        "LLM API key (optional legacy ANTHROPIC_API_KEY / LLM_API_KEY; prefer provider-specific keys in .env)",
+        Some(&existing.api_key),
+        false,
     )? {
         Some(v) => v,
         None => return Ok(false),
@@ -663,10 +603,10 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
     out.telegram_bot_token = telegram_bot_token;
     out.bot_username = bot_username;
     out.agent_display_name = agent_display_name;
-    out.llm_provider = provider;
+    out.llm_provider.clear();
+    out.model.clear();
+    out.llm_base_url = None;
     out.api_key = api_key;
-    out.model = model;
-    out.llm_base_url = llm_base_url;
     out.workspace_dir = workspace_dir;
     out.timezone = timezone;
     out.post_deserialize()?;

@@ -89,7 +89,8 @@ Redaction runs on tool results, logs, hook/TSA/PTE prompts, scheduler delivery, 
 
 | Topic | Doc |
 | --- | --- |
-| Learned workflows (SQLite persistence, post-run learning, memory promotion) | [`docs/workflow.md`](docs/workflow.md) |
+| Vault SOPs (workflows as procedure context) | [`docs/sops.md`](docs/sops.md) |
+| Deprecated SQLite learned workflows | [`docs/workflow.md`](docs/workflow.md) |
 | Runtime parity / deferred agent-runtime items | [`docs/runtime-gap-analysis.md`](docs/runtime-gap-analysis.md) |
 
 ### Data flow

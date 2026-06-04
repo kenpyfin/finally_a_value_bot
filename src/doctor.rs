@@ -131,6 +131,7 @@ fn build_report() -> DoctorReport {
     );
 
     check_config(&mut report);
+    check_llm_provider_base_url(&mut report);
     check_evaluator_api_key(&mut report);
     check_shadow_workspace(&mut report);
     check_legacy_flat_shared(&mut report);
@@ -165,6 +166,50 @@ fn check_config(report: &mut DoctorReport) {
             err.to_string(),
             Some("Fix FINALLY_A_VALUE_BOT_CONFIG or create a valid config file.".to_string()),
         ),
+    }
+}
+
+fn check_llm_provider_base_url(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let provider = crate::llm_catalog::resolve_catalog_provider_id(&config.llm_provider);
+    if provider != "xai" {
+        return;
+    }
+    let base = config
+        .llm_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://api.openai.com/v1");
+    let openai_default = base.eq_ignore_ascii_case("https://api.openai.com/v1");
+    if openai_default {
+        report.push(
+            "llm.xai_base_url",
+            "xAI Grok base URL",
+            CheckStatus::Warn,
+            format!("LLM_PROVIDER=xai but LLM_BASE_URL resolves to {base} (OpenAI default)"),
+            Some(
+                "Select xAI in Web UI → Settings → LLM and set XAI_API_KEY in .env, or set LLM_BASE_URL=https://api.x.ai/v1.".to_string(),
+            ),
+        );
+    } else if !base.contains("api.x.ai") {
+        report.push(
+            "llm.xai_base_url",
+            "xAI Grok base URL",
+            CheckStatus::Warn,
+            format!("LLM_PROVIDER=xai with unexpected LLM_BASE_URL={base}"),
+            Some("Expected https://api.x.ai/v1 unless you use a deliberate proxy.".to_string()),
+        );
+    } else {
+        report.push(
+            "llm.xai_base_url",
+            "xAI Grok base URL",
+            CheckStatus::Pass,
+            format!("LLM_BASE_URL={base}"),
+            None,
+        );
     }
 }
 

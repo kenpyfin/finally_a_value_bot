@@ -1138,23 +1138,6 @@ async fn api_send_stream(
                                 )
                                 .await;
                         }
-                        AgentEvent::WorkflowSelected {
-                            workflow_id,
-                            confidence,
-                        } => {
-                            run_hub
-                                .publish(
-                                    &run_id_for_events,
-                                    "workflow_selected",
-                                    json!({
-                                        "workflow_id": workflow_id,
-                                        "confidence": confidence
-                                    })
-                                    .to_string(),
-                                    run_history_limit,
-                                )
-                                .await;
-                        }
                         AgentEvent::ToolStart {
                             tool_use_id,
                             name,
@@ -2030,6 +2013,10 @@ async fn send_and_store_response_with_events(
             }
         }
     } else {
+        let ws_root = state.app_state.config.workspace_root_absolute();
+        response = crate::final_delivery_media::normalize_assistant_artifact_references(
+            &response, &ws_root, chat_id, persona_id,
+        );
         response = materialize_response_file_links(&state, chat_id, persona_id, &response).await?;
         let delivery = deliver_agent_final_to_contact(
             state.app_state.db.clone(),
@@ -2062,46 +2049,25 @@ async fn send_and_store_response_with_events(
     Ok(Json(out))
 }
 
-fn resolve_response_local_file_path(state: &WebState, raw: &str) -> Option<PathBuf> {
+fn resolve_response_local_file_path(
+    state: &WebState,
+    chat_id: i64,
+    persona_id: i64,
+    raw: &str,
+) -> Option<PathBuf> {
     let trimmed = raw
         .trim()
         .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
-    if trimmed.is_empty()
-        || trimmed.starts_with("/api/uploads/")
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("data:")
-        || trimmed.starts_with("mailto:")
-        || trimmed.starts_with('#')
-    {
+    if trimmed.starts_with('#') || trimmed.starts_with("mailto:") {
         return None;
     }
-
-    let workspace_root = state.app_state.config.workspace_root_absolute();
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let as_path = PathBuf::from(trimmed);
-    if as_path.is_absolute() {
-        candidates.push(as_path);
-    } else {
-        candidates.push(workspace_root.join(trimmed));
-        candidates.push(workspace_root.join("shared").join(trimmed));
-
-        if let Some(stripped) = trimmed.strip_prefix("./") {
-            candidates.push(workspace_root.join(stripped));
-            candidates.push(workspace_root.join("shared").join(stripped));
-        }
-        if let Some(stripped) = trimmed.strip_prefix("shared/") {
-            candidates.push(workspace_root.join("shared").join(stripped));
-        }
-        if let Some(repo_root) = workspace_root.parent() {
-            candidates.push(repo_root.join(trimmed));
-            if let Some(stripped) = trimmed.strip_prefix("workspace/") {
-                candidates.push(repo_root.join(stripped));
-            }
-        }
-    }
-
-    candidates.into_iter().find(|p| p.is_file())
+    crate::final_delivery_media::resolve_workspace_artifact_path(
+        &state.app_state.config.workspace_root_absolute(),
+        Some(chat_id),
+        Some(persona_id),
+        trimmed,
+        crate::final_delivery_media::ArtifactResolveKind::AnyFile,
+    )
 }
 
 fn upload_rel_url_exists(state: &WebState, rel_url: &str) -> bool {
@@ -2174,7 +2140,9 @@ async fn materialize_response_file_links(
         if rewrites.contains_key(&target) {
             continue;
         }
-        if let Some(local_path) = resolve_response_local_file_path(state, &target) {
+        if let Some(local_path) =
+            resolve_response_local_file_path(state, chat_id, persona_id, &target)
+        {
             let rel =
                 persist_file_for_web_delivery(state, chat_id, persona_id, &local_path).await?;
             rewrites.insert(target, rel);
@@ -2187,7 +2155,9 @@ async fn materialize_response_file_links(
         if rewrites.contains_key(&target) {
             continue;
         }
-        if let Some(local_path) = resolve_response_local_file_path(state, &target) {
+        if let Some(local_path) =
+            resolve_response_local_file_path(state, chat_id, persona_id, &target)
+        {
             let rel =
                 persist_file_for_web_delivery(state, chat_id, persona_id, &local_path).await?;
             rewrites.insert(target, rel);
@@ -2209,13 +2179,9 @@ async fn materialize_response_file_links(
             warn!(target: "web", url = %url, "assistant response referenced missing upload URL");
             continue;
         }
-        let fallback_local = state
-            .app_state
-            .config
-            .workspace_root_absolute()
-            .join("shared")
-            .join(fallback_name);
-        if fallback_local.is_file() {
+        if let Some(fallback_local) =
+            resolve_response_local_file_path(state, chat_id, persona_id, fallback_name)
+        {
             let rel =
                 persist_file_for_web_delivery(state, chat_id, persona_id, &fallback_local).await?;
             updated = updated.replace(&url, &rel);
@@ -4447,7 +4413,8 @@ fn mask_setting_value(value: &str) -> String {
 }
 
 fn is_llm_ready(cfg: &Config) -> bool {
-    !cfg.api_key.is_empty() || matches!(cfg.llm_provider.as_str(), "ollama" | "llama" | "llamacpp")
+    crate::llm_catalog::is_api_key_configured_for_provider(&cfg.llm_provider)
+        || crate::llm_catalog::any_provider_api_key_configured()
 }
 
 fn is_channel_ready(cfg: &Config) -> bool {
@@ -4511,6 +4478,8 @@ async fn api_contacts_bindings(
 struct LlmModelPatchRequest {
     model: String,
     #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
     custom: bool,
 }
 
@@ -4572,17 +4541,23 @@ async fn api_llm_get(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let cfg = &state.app_state.config;
-    let provider_id = crate::llm_catalog::resolve_catalog_provider_id(&cfg.llm_provider);
+    let provider_id =
+        crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
     let preset = crate::llm_catalog::find_provider(&provider_id);
     let current_model = state.app_state.llm.current_model();
-    let model_source = call_blocking(state.app_state.db.clone(), |db| {
+    let (model_source, provider_source) = call_blocking(state.app_state.db.clone(), |db| {
         let settings = db.list_app_settings()?;
-        Ok(settings.iter().any(|s| {
+        let model_source = settings.iter().any(|s| {
             s.key
                 .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
                 && !s.value.trim().is_empty()
-        }))
+        });
+        let provider_source = settings.iter().any(|s| {
+            s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
+                && !s.value.trim().is_empty()
+        });
+        Ok((model_source, provider_source))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4597,20 +4572,27 @@ async fn api_llm_get(
         .iter()
         .any(|m| m.id == current_model && !m.from_active_config);
 
+    let providers: Vec<serde_json::Value> =
+        crate::llm_catalog::providers_catalog_json(&provider_id, &current_model)
+            .into_iter()
+            .filter_map(|p| serde_json::to_value(p).ok())
+            .collect();
+
     Ok(Json(json!({
         "ok": true,
         "provider": {
             "id": provider_id,
-            "env_provider": cfg.llm_provider.trim(),
             "label": preset.map(|p| p.label).unwrap_or("Unknown provider"),
         },
-        "api_key_configured": is_llm_ready(cfg),
+        "provider_source": if provider_source { "app_settings" } else { "default" },
+        "api_key_configured": crate::llm_catalog::is_api_key_configured_for_provider(&provider_id),
         "model": current_model,
         "model_in_catalog": in_catalog,
-        "model_source": if model_source { "app_settings" } else { "env" },
+        "model_source": if model_source { "app_settings" } else { "default" },
         "catalog": catalog,
+        "providers": providers,
         "catalog_source": "static_curated",
-        "cost_reference_note": "Curated catalog (not live from Google/Anthropic). Approximate USD per 1M tokens — verify on your provider billing page.",
+        "cost_reference_note": "Curated catalog (not live from provider APIs). Put API keys in repo-root .env only (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or LLM_API_KEY). Approximate USD per 1M tokens — verify on your provider billing page.",
         "custom_model_allowed": true,
     })))
 }
@@ -4625,8 +4607,12 @@ async fn api_llm_patch(
     if model.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "model is required".into()));
     }
-    let provider_id =
-        crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.config.llm_provider);
+    let provider_id = body
+        .provider
+        .as_deref()
+        .map(crate::llm_catalog::resolve_catalog_provider_id)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| state.app_state.llm.current_provider());
     if !body.custom && !crate::llm_catalog::model_allowed_for_provider(&provider_id, &model, false)
     {
         return Err((
@@ -4638,15 +4624,23 @@ async fn api_llm_patch(
         ));
     }
 
-    state
+    let (provider_saved, model_saved) = state
         .app_state
         .llm
-        .set_model(model.clone())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .apply_selection(provider_id.clone(), model.clone())
+        .map_err(|e| {
+            if e.contains("No API key") {
+                (StatusCode::BAD_REQUEST, e)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e)
+            }
+        })?;
 
-    let model_saved = model.clone();
+    let provider_db = provider_saved.clone();
+    let model_db = model_saved.clone();
     call_blocking(state.app_state.db.clone(), move |db| {
-        db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_saved)?;
+        db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_PROVIDER, &provider_db)?;
+        db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_db)?;
         Ok(())
     })
     .await
@@ -4654,9 +4648,13 @@ async fn api_llm_patch(
 
     Ok(Json(json!({
         "ok": true,
-        "model": model,
+        "provider": {
+            "id": provider_saved,
+        },
+        "model": model_saved,
+        "provider_source": "app_settings",
         "model_source": "app_settings",
-        "message": "Model updated. New chats use this model immediately.",
+        "message": "Provider and model updated. New agent runs use this selection immediately.",
     })))
 }
 
@@ -5483,6 +5481,42 @@ mod tests {
         assert!(output.contains("/api/uploads/web/997894126/"));
         assert_ne!(input, output);
 
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_after_bare_normalize_persona_scoped_image() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = 997894126_i64;
+        let persona_id = 24_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let persona_dir = workspace_root
+            .join("shared")
+            .join("personas")
+            .join(chat_id.to_string())
+            .join(persona_id.to_string());
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        let img = persona_dir.join("PZ-foo.png");
+        std::fs::write(&img, [137u8, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+
+        let raw = "Preview:\n\nPZ-foo.png\n\nOK?";
+        let normalized = crate::final_delivery_media::normalize_assistant_artifact_references(
+            &raw,
+            &workspace_root,
+            chat_id,
+            persona_id,
+        );
+        let output = materialize_response_file_links(&web_state, chat_id, persona_id, &normalized)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/24/"));
+        assert!(output.contains("![PZ-foo.png]"));
         let urls = extract_upload_urls_from_text(&output);
         assert_eq!(urls.len(), 1);
         assert!(upload_rel_url_exists(&web_state, &urls[0]));

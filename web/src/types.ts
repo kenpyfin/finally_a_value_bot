@@ -88,14 +88,24 @@ export type PersonaHookSkillPolicy = {
   updated_at?: string | null
 }
 
+export type LlmProviderOption = {
+  id: string
+  label: string
+  api_key_configured: boolean
+  api_key_env_hints: string[]
+  models: LlmCatalogModel[]
+}
+
 export type LlmConfigResponse = {
   ok?: boolean
   provider?: { id: string; label: string }
+  provider_source?: 'app_settings' | 'default'
   api_key_configured?: boolean
   model?: string
   model_in_catalog?: boolean
-  model_source?: 'env' | 'app_settings'
+  model_source?: 'app_settings' | 'default'
   catalog?: LlmCatalogModel[]
+  providers?: LlmProviderOption[]
   cost_reference_note?: string
   custom_model_allowed?: boolean
 }

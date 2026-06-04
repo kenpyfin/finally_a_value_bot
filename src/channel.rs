@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use teloxide::prelude::*;
 
-use crate::channels::telegram::{send_response_result, strip_embedded_bulletin_focus};
+use crate::channels::telegram::{
+    send_response_result, strip_embedded_bulletin_focus, WorkspaceAutoImageContext,
+};
 use crate::db::{call_blocking, Database, StoredMessage};
 use crate::final_delivery_dedupe::{plan_agent_final_delivery, AgentFinalDeliveryPlan};
+use crate::final_delivery_media::normalize_assistant_artifact_references;
 use crate::tools::auth_context_from_input;
 
 pub async fn is_web_chat(db: Arc<Database>, chat_id: i64) -> bool {
@@ -94,8 +97,14 @@ pub async fn deliver_and_store_bot_message(
             .await
             .map_err(|e| format!("Failed to store web message: {e}"))
     } else {
-        let send_result =
-            send_response_result(bot, ChatId(chat_id), text, None, workspace_root.as_deref()).await;
+        let auto_images = workspace_root
+            .as_ref()
+            .map(|root| WorkspaceAutoImageContext {
+                root,
+                chat_id,
+                persona_id,
+            });
+        let send_result = send_response_result(bot, ChatId(chat_id), text, None, auto_images).await;
         let msg = StoredMessage {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
@@ -201,14 +210,17 @@ pub async fn deliver_to_contact(
                     .or_else(|| telegram_bots.get(&crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY));
                 if let Some(bot) = tg_bot {
                     if let Ok(chat_id) = b.channel_handle.parse::<i64>() {
-                        if let Err(e) = send_response_result(
-                            bot,
-                            ChatId(chat_id),
-                            text,
-                            None,
-                            workspace_root.as_deref(),
-                        )
-                        .await
+                        let auto_images =
+                            workspace_root
+                                .as_ref()
+                                .map(|root| WorkspaceAutoImageContext {
+                                    root,
+                                    chat_id: canonical_chat_id,
+                                    persona_id,
+                                });
+                        if let Err(e) =
+                            send_response_result(bot, ChatId(chat_id), text, None, auto_images)
+                                .await
                         {
                             let err_str = e.to_string();
                             if !err_str.contains("chat not found")
@@ -261,6 +273,21 @@ pub struct AgentFinalDeliveryOutcome {
 }
 
 /// Agent loop completion only: plan delivery (empty-body skip) then [`deliver_to_contact`].
+fn normalize_final_for_delivery(
+    raw_final: &str,
+    workspace_root: Option<&Path>,
+    canonical_chat_id: i64,
+    persona_id: i64,
+) -> String {
+    let cleaned = strip_embedded_bulletin_focus(raw_final);
+    match workspace_root {
+        Some(root) => {
+            normalize_assistant_artifact_references(&cleaned, root, canonical_chat_id, persona_id)
+        }
+        None => cleaned,
+    }
+}
+
 pub async fn deliver_agent_final_to_contact(
     db: Arc<Database>,
     telegram_bots: &HashMap<i64, Bot>,
@@ -271,7 +298,12 @@ pub async fn deliver_agent_final_to_contact(
     raw_final: &str,
     workspace_root: Option<PathBuf>,
 ) -> Result<AgentFinalDeliveryOutcome, String> {
-    let cleaned = strip_embedded_bulletin_focus(raw_final);
+    let cleaned = normalize_final_for_delivery(
+        raw_final,
+        workspace_root.as_deref(),
+        canonical_chat_id,
+        persona_id,
+    );
     let indicated = with_persona_indicator(db.clone(), persona_id, &cleaned).await;
     let plan = plan_agent_final_delivery(None, &indicated);
 
@@ -293,6 +325,12 @@ pub async fn deliver_agent_final_to_contact(
             })
         }
         AgentFinalDeliveryPlan::DeliverSuffixOnly(suffix) => {
+            let suffix = normalize_final_for_delivery(
+                &suffix,
+                workspace_root.as_deref(),
+                canonical_chat_id,
+                persona_id,
+            );
             deliver_to_contact(
                 db.clone(),
                 telegram_bots,

@@ -45,13 +45,6 @@ pub fn signal_from_agent_event(evt: &AgentEvent) -> Option<HeartbeatSignal> {
             "iteration {}",
             iteration
         ))),
-        AgentEvent::WorkflowSelected {
-            workflow_id,
-            confidence,
-        } => Some(HeartbeatSignal::Progress(format!(
-            "selected workflow {} (confidence {:.2})",
-            workflow_id, confidence
-        ))),
         AgentEvent::ToolStart { name, .. } => Some(HeartbeatSignal::ToolStart(name.clone())),
         AgentEvent::ToolResult { name, is_error, .. } => Some(HeartbeatSignal::ToolResult {
             tool: name.clone(),

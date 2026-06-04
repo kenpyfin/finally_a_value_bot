@@ -33,7 +33,6 @@ pub mod vault_add;
 pub mod web_fetch;
 pub mod web_html;
 pub mod web_search;
-pub mod workflow;
 pub mod write_file;
 
 use std::sync::Arc;

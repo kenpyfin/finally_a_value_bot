@@ -3,7 +3,7 @@ name: schedule-job
 description: Preflight and validation for cron and one-time scheduled tasks before schedule_task or update_scheduled_task.
 when_to_use: |
   Always activate before creating or changing timing on scheduled_tasks rows (schedule_task / update_scheduled_task). Use when the user asks about cron expressions, one-time runs, or timezone handling for the bot scheduler.
-  Not for learned workflows / workflow_id hints — those are separate from cron scheduling in this codebase.
+  Not for vault SOPs — when the user means a workflow/pipeline procedure, follow the ORIGIN vault SOP (search_vault), not cron alone.
 license: MIT
 compatibility:
   os:
@@ -18,7 +18,7 @@ compatibility:
 
 Use this skill when a user asks to **create**, **change**, or **reason about** a **cron / one-time scheduled task** (rows in `scheduled_tasks`, tools `schedule_task` / `update_scheduled_task` / pause / resume / cancel).
 
-**Not the same as learned workflows:** “Workflow” in this codebase usually means **learned intent hints** (`workflows` table, optional `workflow_id` on queue items). That is unrelated to **when** a prompt runs. Do not use workflow docs or queue workflow IDs to configure cron schedules.
+**Not vault SOPs:** Standard Operating Procedures live in the ORIGIN vault (markdown). Cron only sets *when* a job runs; the SOP defines *what* to do when it fires. Do not confuse scheduling with executing a pipeline — load the vault SOP (`search_vault`) when running scheduled generation jobs.
 
 ## Non-negotiable policy
 
@@ -75,7 +75,7 @@ The script prints JSON with normalized output and explicit timezone assumptions.
 
 - Pass `task_id` (from `list_scheduled_tasks`).
 - Optional fields: `status`, `persona_id`, `prompt`, and/or **`schedule_type` + `schedule_value`** together (with optional `timezone` for preflight).
-- Do not confuse with learned workflows; this only updates the scheduled row.
+- Do not confuse with authored YAML workflows; this only updates the scheduled row.
 
 ## Examples
 

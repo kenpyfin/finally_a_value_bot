@@ -61,9 +61,9 @@ The main chat agent is the single orchestrator: it decides when to reply directl
      - `tool_use` → for each `ResponseContentBlock::ToolUse`, call `tools.execute_with_auth(name, input, tool_auth)`, append `ContentBlock::ToolResult` to messages, continue loop.
 4. **Timeouts**: LLM round 180s, tool execution 120s.
 
-### Learned workflows (SQLite)
+### Standard Operating Procedures (vault)
 
-The `workflows` table still receives **post-run** updates when `WORKFLOW_AUTO_LEARN` is on and the run used tools (`upsert_workflow_learning`). After repeated successes, a line may be promoted into **tiered memory** as `tier1.workflow_principles` (rendered in the memory section of the prompt). There is **no** run-start `# Learned Workflow Hint` append from SQL. See [`docs/workflow.md`](docs/workflow.md).
+Operating procedures live as markdown in the ORIGIN vault (e.g. `ORIGIN/Operations/SOPs/`). The agent loads them via `search_vault` / `read_file` and executes with skills (`run_skill_script`). See [`docs/sops.md`](docs/sops.md). Deterministic YAML workflows (`run_workflow`) and SQLite learned workflows were removed.
 
 ### Stop Reason
 

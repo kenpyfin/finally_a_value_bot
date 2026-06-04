@@ -329,10 +329,6 @@ pub enum AgentEvent {
     Iteration {
         iteration: usize,
     },
-    WorkflowSelected {
-        workflow_id: i64,
-        confidence: f64,
-    },
     ToolStart {
         tool_use_id: String,
         name: String,
@@ -463,13 +459,6 @@ pub async fn run_bot(
             app_state_slot.clone(),
         ),
     ));
-    crate::tools::workflow::register_workflow_tools(
-        &config,
-        db.clone(),
-        app_state_slot.clone(),
-        &mut tools,
-    );
-
     let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
     info!(
         "Tool registry initialized ({} tools): {}",
@@ -1579,12 +1568,17 @@ async fn handle_message(
                 {
                     Ok(outcome) if !outcome.response_for_client.is_empty() => {
                         if outcome.response_for_client != to_send {
+                            let auto_ctx = WorkspaceAutoImageContext {
+                                root: ws_root.as_path(),
+                                chat_id: canonical_chat_id_spawn,
+                                persona_id,
+                            };
                             send_response(
                                 &bot_spawn,
                                 chat_id_spawn,
                                 &outcome.response_for_client,
                                 thread_id_spawn,
-                                Some(ws_root.as_path()),
+                                Some(auto_ctx),
                             )
                             .await;
                         }
@@ -1600,12 +1594,17 @@ async fn handle_message(
                     }
                     Err(e) => {
                         tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Telegram only");
+                        let auto_ctx = WorkspaceAutoImageContext {
+                            root: ws_root.as_path(),
+                            chat_id: canonical_chat_id_spawn,
+                            persona_id,
+                        };
                         send_response(
                             &bot_spawn,
                             chat_id_spawn,
                             &to_send,
                             thread_id_spawn,
-                            Some(ws_root.as_path()),
+                            Some(auto_ctx),
                         )
                         .await;
                         true
@@ -1972,6 +1971,7 @@ pub async fn process_with_agent_with_events(
         .with_timezone(&tz)
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
+    let (sops_caps_line, sops_body) = sops_prompt_sections();
     let system_prompt = build_system_prompt(
         &state.config.bot_username,
         &principles_content,
@@ -1986,6 +1986,8 @@ pub async fn process_with_agent_with_events(
         &workspace_data_root_display,
         &config_env_summary,
         identity_tier1_system.as_str(),
+        &sops_caps_line,
+        &sops_body,
     );
 
     // Background-job runs are detached and do not consume foreground chat context while running.
@@ -2090,7 +2092,15 @@ pub async fn process_with_agent_with_events(
         });
     }
     prepended.extend(history_messages);
-    prepended.push(build_current_request_from_message(current_request));
+    prepended.push(build_current_request_from_message(current_request.clone()));
+    if let Some(steer) =
+        crate::sop_context_gate::sop_request_steer(&latest_user_text_from_message(&current_request))
+    {
+        prepended.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text(steer),
+        });
+    }
     messages = prepended;
     let protected_message_count = messages.len();
 
@@ -2150,10 +2160,6 @@ pub async fn process_with_agent_with_events(
     const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 3600;
     const REQUIRED_SCHEDULING_SKILL: &str = "schedule-job";
     const REQUIRED_MODIFY_SKILL: &str = crate::skill_activation_gate::REQUIRED_MODIFY_SKILL;
-    const REQUIRED_CREATE_WORKFLOW_SKILL: &str =
-        crate::workflow_activation_gate::REQUIRED_CREATE_WORKFLOW_SKILL;
-    const REQUIRED_MODIFY_WORKFLOW_SKILL: &str =
-        crate::workflow_activation_gate::REQUIRED_MODIFY_WORKFLOW_SKILL;
     const LOOP_SIGNATURE_REPEAT_THRESHOLD: usize = 3;
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
     const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 15;
@@ -2198,18 +2204,7 @@ pub async fn process_with_agent_with_events(
     let mut history_iterations: Vec<IterationRecord> = Vec::new();
     let mut schedule_skill_activated_this_turn = false;
     let mut modify_skill_activated_this_turn = false;
-    let mut create_workflow_skill_activated_this_turn = false;
-    let mut modify_workflow_skill_activated_this_turn = false;
     let skills_data_dir = state.config.skills_data_dir_absolute();
-    let workflow_catalog = if state.config.workflow_engine_enabled {
-        Some(crate::workflow_engine::WorkflowCatalog::new(
-            state.config.workspace_root_absolute(),
-            &state.config.workflow_definitions_dir,
-            state.config.workflow_allow_persona_scope,
-        ))
-    } else {
-        None
-    };
     let tool_shared_dir =
         crate::tools::resolve_tool_working_dir(Path::new(state.config.working_dir()));
     let mut last_tool_signature: Option<String> = None;
@@ -2487,6 +2482,15 @@ pub async fn process_with_agent_with_events(
             .join("");
 
         let stop_reason = effective_stop_reason(provider_stop, &assistant_text, &messages);
+        let stop_reason = if response
+            .content
+            .iter()
+            .any(|block| matches!(block, ResponseContentBlock::ToolUse { .. }))
+        {
+            "tool_use".to_string()
+        } else {
+            stop_reason
+        };
 
         let assistant_text_preview = if assistant_text.len() > 10000 {
             format!(
@@ -2758,33 +2762,6 @@ pub async fn process_with_agent_with_events(
                             &tool_shared_dir,
                         ) && !modify_skill_activated_this_turn;
 
-                    let write_workflow_exists = name == "write_workflow"
-                        && hook_input_for_exec
-                            .get("yaml")
-                            .and_then(|v| v.as_str())
-                            .and_then(|yaml| {
-                                crate::workflow_engine::parse_workflow_yaml(yaml)
-                                    .ok()
-                                    .and_then(|def| {
-                                        workflow_catalog.as_ref().map(|catalog| {
-                                            catalog.exists(&def.id, chat_id, persona_id)
-                                        })
-                                    })
-                            })
-                            .unwrap_or(false);
-                    let missing_create_workflow_skill =
-                        crate::workflow_activation_gate::requires_create_workflow_activation(
-                            name,
-                            &hook_input_for_exec,
-                            write_workflow_exists,
-                        ) && !create_workflow_skill_activated_this_turn;
-                    let missing_modify_workflow_skill =
-                        crate::workflow_activation_gate::requires_modify_workflow_activation(
-                            name,
-                            &hook_input_for_exec,
-                            write_workflow_exists,
-                        ) && !modify_workflow_skill_activated_this_turn;
-
                     let pre_tool_hook = run_hooks_for_event_async(
                         state.db.clone(),
                         &state.config,
@@ -2800,8 +2777,6 @@ pub async fn process_with_agent_with_events(
                             runtime_signals: Some(serde_json::json!({
                                 "requires_schedule_skill": missing_schedule_skill,
                                 "requires_modify_skill": missing_modify_skill,
-                                "requires_create_workflow_skill": missing_create_workflow_skill,
-                                "requires_modify_workflow_skill": missing_modify_workflow_skill
                             })),
                             ..HookRunInput::default()
                         },
@@ -2873,14 +2848,6 @@ pub async fn process_with_agent_with_events(
                     let activates_required_modify_skill = name == "activate_skill"
                         && requested_skill_name
                             .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_MODIFY_SKILL))
-                            .unwrap_or(false);
-                    let activates_required_create_workflow_skill = name == "activate_skill"
-                        && requested_skill_name
-                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_CREATE_WORKFLOW_SKILL))
-                            .unwrap_or(false);
-                    let activates_required_modify_workflow_skill = name == "activate_skill"
-                        && requested_skill_name
-                            .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_MODIFY_WORKFLOW_SKILL))
                             .unwrap_or(false);
                     // TSA: allow or deny before execution
                     let tsa_deny = if state.config.tool_skill_agent_enabled {
@@ -3064,25 +3031,6 @@ pub async fn process_with_agent_with_events(
                             REQUIRED_MODIFY_SKILL
                         );
                     }
-                    if activates_required_create_workflow_skill && !result.is_error {
-                        create_workflow_skill_activated_this_turn = true;
-                        info!(
-                            "Main agent iteration {}/{}: required create-workflow skill activated ({})",
-                            iteration + 1,
-                            state.config.max_tool_iterations,
-                            REQUIRED_CREATE_WORKFLOW_SKILL
-                        );
-                    }
-                    if activates_required_modify_workflow_skill && !result.is_error {
-                        modify_workflow_skill_activated_this_turn = true;
-                        info!(
-                            "Main agent iteration {}/{}: required modify-workflow skill activated ({})",
-                            iteration + 1,
-                            state.config.max_tool_iterations,
-                            REQUIRED_MODIFY_WORKFLOW_SKILL
-                        );
-                    }
-
                     let result_preview = if result.content.len() > 10000 {
                         format!(
                             "{}...",
@@ -4177,6 +4125,20 @@ async fn load_messages_from_db(
     ))
 }
 
+fn latest_user_text_from_message(msg: &Message) -> String {
+    let text = text_from_message_content(&msg.content);
+    if let Some(inner) = parse_current_request_content(&text) {
+        return inner;
+    }
+    if let Some((_, _, inner)) = parse_wrapped_user_message(&text) {
+        return inner;
+    }
+    if let Some(rest) = text.strip_prefix("[scheduler]: ") {
+        return rest.to_string();
+    }
+    text
+}
+
 fn latest_user_text(messages: &[Message]) -> String {
     for m in messages.iter().rev() {
         if m.role != "user" {
@@ -5008,6 +4970,23 @@ fn build_persona_context_message(
     Some(body)
 }
 
+/// Capsule + prose for vault Standard Operating Procedures.
+fn sops_prompt_sections() -> (String, String) {
+    let caps = "- **SOPs (vault):** If `[persona_context]` lists any Tier 2 **SOP** (`id` + `vault_path`), or the task matches a pipeline, **read that vault file and follow it** before improvising; execute with `activate_skill` + `run_skill_script`\n".to_string();
+    let body = format!(
+        "## Standard Operating Procedures (SOPs)\n\
+         **Follow SOP when one applies.** Before procedural tool use, check `[persona_context]` for Tier 2 **SOPs** (`tier2.sops`: each entry has `vault_path` under ORIGIN). When a listed SOP matches the task, `read_file` or `search_vault` that path and execute its steps in order — do not substitute an ad-hoc script chain.\n\
+         **Workflow** means a **vault markdown SOP** (not removed YAML `run_workflow`).\n\
+         - **PZ post generation:** `{sop_path}` (also in Tier 2 when configured)\n\
+         - **Execution:** skills per SOP; **absolute paths** for `--sref`, `--cref`, outputs in persona cwd\n\
+         - **Cron:** `schedule_task` schedules only; the vault SOP defines execution when the job runs\n\
+         - **Memory:** `tier2.sops[]` = vault pointers (`id`, `vault_path`, optional `summary`); `tier1.workflow_principles` = compressed rules without replacing the SOP doc\n\
+         - **Not:** GitHub Actions `.github/workflows/`, ad-hoc `create-skill` unless requested\n",
+        sop_path = crate::sop_context_gate::SOP_VAULT_PATH
+    );
+    (caps, body)
+}
+
 fn build_system_prompt(
     _bot_username: &str,
     principles_content: &str,
@@ -5022,6 +5001,8 @@ fn build_system_prompt(
     workspace_data_root_display: &str,
     config_env_summary: &str,
     identity_tier1_memory: &str,
+    sops_caps_line: &str,
+    sops_body: &str,
 ) -> String {
     let caps = format!(
         r#"## Tool groups (names only; use tool schemas for parameters)
@@ -5034,7 +5015,7 @@ fn build_system_prompt(
 - **Media:** user images arrive as image blocks
 - **Cursor CLI:** cursor_agent, cursor_agent_send, list_cursor_agent_runs (use detach: true for long work)
 - **Skills:** `activate_skill` loads full `SKILL.md`; **`run_skill_script`** runs bundled skill scripts (prefer over bash); **new** skills → activate `create-skill` then **`build_skill`**; **existing** skill changes are runtime-gated to require **`modify-skill`** activation in the same turn
-- **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). **`register_tracked_job`** records an external id (e.g. ComfyUI `prompt_id`) so it appears in the same queue as shell jobs without blocking another background slot. Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
+{sops_caps_line}- **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). **`register_tracked_job`** records an external id (e.g. ComfyUI `prompt_id`) so it appears in the same queue as shell jobs without blocking another background slot. Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
 - **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, read_agent_history
 
 ## Conversation Memory
@@ -5045,6 +5026,7 @@ fn build_system_prompt(
 - **Long-term conversation recall**: Use `search_chat_history` when `[current_request]` requires past dialogue — not as a pre-flight on every turn. Search before saying "I don't remember" or asking the user to repeat something.
 - **Vault knowledge base**: Follow **# Principles** (AGENTS.md) for vault retrieval rules (`search_vault` vs file tools). The vault is a knowledge base, NOT conversation history.
 - **Skills directory**: {skills_dir_display}"#,
+        sops_caps_line = sops_caps_line,
         skills_dir_display = skills_dir_display
     );
     let mut prompt = format!(
@@ -5054,6 +5036,7 @@ fn build_system_prompt(
 
 ## Task scope (read first)
 - **Primary goal:** The `[current_request]` message at the end of the conversation is your task for this turn. Answer it directly.
+- **SOP first:** If `[persona_context]` includes Tier 2 SOPs (`**id** → vault path`) or this section names a vault SOP for the task, `read_file` that `ORIGIN/…` path and **follow it step-by-step** before improvising tools or bash.
 - **Background context:** `[persona_context]`, Tier 1 identity/facts in this system prompt, and `# Principles` (AGENTS.md) are reference material and constraints — not implicit todos.
 - **Recall tools:** Use `search_chat_history` or `search_vault` only when `[current_request]` requires historical context.
 
@@ -5067,7 +5050,7 @@ For serving files to users:
 - Never fabricate `/api/uploads/...` URLs in plain text; the platform materializes local paths at delivery (web upload URLs, Telegram workspace images).
 - Include the substantive explanation in the final message together with any attachment paths.
 
-When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. **Identity and Tier 1** (long-term facts, workflow principles) are compiled into the system prompt under **# Identity and long-term memory (Tier 1)**. **Tier 2**, bulletin focus, operator focus, and bookmarks are in the **[persona_context]** message at conversation start; Tier 3 appears there only when needed as fallback recent focus. Tier 2 is durable knowledge only (user terminology, known steps, preferences), not active project status. Bulletin is the operator snapshot of recent focus; your task is always `[current_request]`. Tier 3 is short-lived scratch context and should not duplicate bulletin status lines. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use read_tiered_memory/write_tiered_memory for explicit tier edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
+When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. **Identity and Tier 1** (long-term facts, workflow principles) are compiled into the system prompt under **# Identity and long-term memory (Tier 1)**. Tier 2 **`sops`** are vault pointers (`id`, `vault_path`, `summary`) — when an SOP in `[persona_context]` matches the task, read `vault_path` and follow it; do not improvise. There is no `known_steps` field (legacy lines migrate into `sops` or Tier 1 principles on load). **Tier 2**, bulletin focus, operator focus, and bookmarks are in **[persona_context]**; Tier 3 only when needed. Tier 2 holds terminology, **SOPs**, and preferences — not active project status. Bulletin is the operator snapshot of recent focus; your task is always `[current_request]`. Tier 3 is short-lived scratch context and should not duplicate bulletin status lines. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use read_tiered_memory/write_tiered_memory for explicit tier edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
 
 **Bulletin + memory sync:** Routine bulletin + Tier 3 hygiene persist automatically via post-delivery hooks. Use `update_bulletin_focus`/`write_tiered_memory` mainly for explicit user-requested edits. **Never** append `[bulletin_focus]` tags or bulletin snapshots to user-visible chat messages — the current bulletin is already in `[persona_context]`.
 
@@ -5076,12 +5059,7 @@ For skills:
 - **New skill:** activate `create-skill`, then use `build_skill` (or `write_file` at `skills/<name>/SKILL.md` only when creating a brand-new directory)
 - **Update / modify / change an existing skill:** activate `modify-skill` first in the same turn, read current `SKILL.md`, then `build_skill` or targeted file edits under `skills/<name>/`
 
-For authored workflows (deterministic step sequences in YAML under `workflows/`):
-- **List / read:** `list_workflows`, `read_workflow`
-- **Create:** activate `create-workflow`, then `write_workflow` (or `validate_workflow` first)
-- **Modify:** activate `modify-workflow` first in the same turn, then `read_workflow` + `write_workflow`
-- **Run:** `run_workflow` executes steps in fixed order (do not re-implement the same steps with ad-hoc bash)
-
+{sops_body}
 For scheduling:
 - Runtime enforces `schedule-job` activation before `schedule_task`/`update_scheduled_task`
 - Use 6-field cron format: sec min hour dom month dow (e.g., "0 */5 * * * *" for every 5 minutes)
@@ -5137,6 +5115,7 @@ The workspace (your working directory for file/bash/search tools) is persistent 
 Be concise and helpful. When executing commands or tools, show the relevant results to the user.
 "#,
         caps = caps,
+        sops_body = sops_body,
         persona_id = persona_id,
         skills_dir_display = skills_dir_display,
         timezone = timezone,
@@ -5808,58 +5787,38 @@ fn backtick_abs_image_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"`(/[^`]+?\.(?:png|jpg|jpeg|gif|webp|bmp))`").unwrap())
 }
 
-fn is_telegram_sendable_image_file(path: &Path) -> bool {
-    path.is_file()
-        && matches!(
-            path.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .as_deref(),
-            Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
-        )
+fn resolve_workspace_image_ref(
+    raw: &str,
+    workspace_root: &Path,
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+) -> Option<PathBuf> {
+    crate::final_delivery_media::resolve_workspace_artifact_path(
+        workspace_root,
+        chat_id,
+        persona_id,
+        raw,
+        crate::final_delivery_media::ArtifactResolveKind::ImageOnly,
+    )
 }
 
-fn path_under_workspace(candidate: &Path, workspace_root: &Path) -> Option<PathBuf> {
-    let cand = candidate.canonicalize().ok()?;
-    let root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    if !cand.starts_with(&root) || !is_telegram_sendable_image_file(&cand) {
-        return None;
-    }
-    Some(cand)
-}
-
-fn resolve_workspace_image_ref(raw: &str, workspace_root: &Path) -> Option<PathBuf> {
-    let t = raw
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
-    if t.is_empty()
-        || t.starts_with("http://")
-        || t.starts_with("https://")
-        || t.starts_with("data:")
-    {
-        return None;
-    }
-    let p = if t.starts_with('/') {
-        PathBuf::from(t)
-    } else {
-        let shared = workspace_root.join("shared").join(t);
-        if shared.exists() {
-            shared
-        } else {
-            workspace_root.join(t)
-        }
-    };
-    path_under_workspace(&p, workspace_root)
+/// Context for workspace-root auto-image delivery (markdown images and backtick paths).
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceAutoImageContext<'a> {
+    pub root: &'a Path,
+    pub chat_id: i64,
+    pub persona_id: i64,
 }
 
 /// Find workspace image files referenced in assistant text (markdown images and absolute paths
 /// in backticks), return them in document order (deduped) plus text with those markers removed.
 pub(crate) fn prepare_telegram_workspace_auto_images(
     text: &str,
-    workspace_root: &Path,
+    ctx: &WorkspaceAutoImageContext<'_>,
 ) -> (Vec<PathBuf>, String) {
+    let workspace_root = ctx.root;
+    let chat_id = Some(ctx.chat_id);
+    let persona_id = Some(ctx.persona_id);
     let md_re = markdown_image_regex();
     let bt_re = backtick_abs_image_regex();
 
@@ -5867,7 +5826,7 @@ pub(crate) fn prepare_telegram_workspace_auto_images(
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     let mut consider = |raw: &str| {
-        if let Some(p) = resolve_workspace_image_ref(raw, workspace_root) {
+        if let Some(p) = resolve_workspace_image_ref(raw, workspace_root, chat_id, persona_id) {
             if seen.insert(p.clone()) {
                 ordered.push(p);
             }
@@ -5899,7 +5858,9 @@ pub(crate) fn prepare_telegram_workspace_auto_images(
         let Some(inner) = caps.get(1) else {
             continue;
         };
-        if let Some(p) = resolve_workspace_image_ref(inner.as_str(), workspace_root) {
+        if let Some(p) =
+            resolve_workspace_image_ref(inner.as_str(), workspace_root, chat_id, persona_id)
+        {
             if sent.contains(&p) {
                 body = body.replace(full.as_str(), "");
             }
@@ -5912,7 +5873,9 @@ pub(crate) fn prepare_telegram_workspace_auto_images(
         let Some(inner) = caps.get(1) else {
             continue;
         };
-        if let Some(p) = resolve_workspace_image_ref(inner.as_str(), workspace_root) {
+        if let Some(p) =
+            resolve_workspace_image_ref(inner.as_str(), workspace_root, chat_id, persona_id)
+        {
             if sent.contains(&p) {
                 body = body.replace(full.as_str(), "");
             }
@@ -5987,7 +5950,7 @@ pub async fn send_response_result(
     chat_id: ChatId,
     text: &str,
     thread_id: Option<ThreadId>,
-    workspace_auto_images: Option<&Path>,
+    workspace_auto_images: Option<WorkspaceAutoImageContext<'_>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     send_response_result_impl(bot, chat_id, text, thread_id, false, workspace_auto_images).await
 }
@@ -5998,7 +5961,7 @@ pub async fn send_response_plain(
     chat_id: ChatId,
     text: &str,
     thread_id: Option<ThreadId>,
-    workspace_auto_images: Option<&Path>,
+    workspace_auto_images: Option<WorkspaceAutoImageContext<'_>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     send_response_result_impl(bot, chat_id, text, thread_id, true, workspace_auto_images).await
 }
@@ -6009,12 +5972,12 @@ async fn send_response_result_impl(
     text: &str,
     thread_id: Option<ThreadId>,
     plain_text: bool,
-    workspace_auto_images: Option<&Path>,
+    workspace_auto_images: Option<WorkspaceAutoImageContext<'_>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const MAX_LEN: usize = 4096;
 
     let (paths, body_text) = match workspace_auto_images {
-        Some(root) => prepare_telegram_workspace_auto_images(text, root),
+        Some(ctx) => prepare_telegram_workspace_auto_images(text, &ctx),
         None => (Vec::new(), text.to_string()),
     };
 
@@ -6093,7 +6056,7 @@ pub async fn send_response(
     chat_id: ChatId,
     text: &str,
     thread_id: Option<ThreadId>,
-    workspace_auto_images: Option<&Path>,
+    workspace_auto_images: Option<WorkspaceAutoImageContext<'_>>,
 ) {
     if let Err(e) = send_response_result(bot, chat_id, text, thread_id, workspace_auto_images).await
     {
@@ -6694,6 +6657,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("12345"));
         assert!(prompt.contains("**Shell:** bash"));
@@ -6718,6 +6683,8 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
+            "",
             "",
         );
         assert!(prompt.contains("# Principles"));
@@ -6799,6 +6766,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("# Principles"));
         assert!(!prompt.contains("# Operator memo"));
@@ -6823,6 +6792,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             tier1,
+            "",
+            "",
         );
         assert!(prompt.contains("# Identity and long-term memory (Tier 1)"));
         assert!(prompt.contains("Milla"));
@@ -6846,6 +6817,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("# Agent Skills"));
         assert!(prompt.contains("activate_skill"));
@@ -6868,6 +6841,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(!prompt.contains("# Agent Skills"));
     }
@@ -6888,6 +6863,8 @@ mod tests {
             "/home/user/tmp",
             "/home/user — bot loads `/home/user/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("Your workspace path is: /home/user/tmp/shared"));
     }
@@ -6907,6 +6884,8 @@ mod tests {
             "UTC",
             "/home/user/tmp",
             "/home/user — bot loads `/home/user/.env`",
+            "",
+            "",
             "",
         );
         assert!(prompt.contains("## Path discipline (strict)"));
@@ -6933,6 +6912,8 @@ mod tests {
             "/abs/workspace_data_root",
             "/abs — bot loads `/abs/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("## Repository layout and environment variables"));
         assert!(prompt.contains("/abs/workspace_data_root"));
@@ -6955,6 +6936,8 @@ mod tests {
             "./workspace",
             ". — bot loads `unit-test`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("Your workspace path is: ./workspace/shared"));
         assert!(prompt.contains("./workspace/skills"));
@@ -6975,6 +6958,8 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
+            "",
             "",
         );
         assert!(prompt.contains("persona_id is 1"));
@@ -7326,6 +7311,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("## Task scope (read first)"));
         assert!(prompt.contains("[current_request]"));
@@ -7347,6 +7334,8 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
+            "",
             "",
         );
         assert!(prompt.contains("user_message"));
@@ -7556,6 +7545,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("Test"));
@@ -7581,6 +7572,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("read_tiered_memory"));
         assert!(prompt.contains("write_tiered_memory"));
@@ -7602,6 +7595,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("export_chat"));
     }
@@ -7621,6 +7616,8 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
+            "",
             "",
         );
         assert!(prompt.contains("schedule_task"));
@@ -7642,6 +7639,8 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
+            "",
             "",
         );
         assert!(prompt.contains("update_bulletin_focus"));
@@ -7666,6 +7665,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             "",
+            "",
+            "",
         );
         assert!(prompt.contains("Time and timezone"));
         assert!(prompt.contains("US/Eastern"));
@@ -7686,6 +7687,8 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp/.env",
+            "",
+            "",
             "",
         );
         assert!(prompt.contains("For serving files to users:"));
@@ -7883,7 +7886,12 @@ mod tests {
         let img = img.canonicalize().unwrap();
 
         let text = format!("Hello\n\n![]({})\n\nBye", img.display());
-        let (paths, body) = prepare_telegram_workspace_auto_images(&text, &root);
+        let ctx = WorkspaceAutoImageContext {
+            root: &root,
+            chat_id: 1,
+            persona_id: 2,
+        };
+        let (paths, body) = prepare_telegram_workspace_auto_images(&text, &ctx);
         assert_eq!(paths, vec![img.clone()]);
         assert!(body.contains("Hello"));
         assert!(body.contains("Bye"));
@@ -7898,9 +7906,44 @@ mod tests {
         let root = root.canonicalize().unwrap();
 
         let text = "x ![](https://example.com/a.png) y";
-        let (paths, body) = prepare_telegram_workspace_auto_images(text, &root);
+        let ctx = WorkspaceAutoImageContext {
+            root: &root,
+            chat_id: 1,
+            persona_id: 2,
+        };
+        let (paths, body) = prepare_telegram_workspace_auto_images(text, &ctx);
         assert!(paths.is_empty());
         assert_eq!(body, text);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_prepare_telegram_workspace_auto_images_after_bare_normalize() {
+        let root = std::env::temp_dir().join(format!("tg_auto_img_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("shared").join("personas").join("9").join("3")).unwrap();
+        let img = root
+            .join("shared")
+            .join("personas")
+            .join("9")
+            .join("3")
+            .join("PZ-foo.png");
+        std::fs::write(&img, [137u8, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let raw = "Hello\n\nPZ-foo.png\n\nBye";
+        let normalized =
+            crate::final_delivery_media::normalize_assistant_artifact_references(&raw, &root, 9, 3);
+        let ctx = WorkspaceAutoImageContext {
+            root: &root,
+            chat_id: 9,
+            persona_id: 3,
+        };
+        let (paths, body) = prepare_telegram_workspace_auto_images(&normalized, &ctx);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with(std::path::Path::new("PZ-foo.png")));
+        assert!(body.contains("Hello"));
+        assert!(body.contains("Bye"));
+        assert!(!body.contains("PZ-foo.png"));
         let _ = std::fs::remove_dir_all(root);
     }
 

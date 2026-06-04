@@ -1,7 +1,7 @@
 //! Provider/model catalog for Web UI model selection and cost reference.
 //!
 //! **How models are chosen:** This is a **curated static list** in code (`PROVIDER_CATALOG`), keyed
-//! by `LLM_PROVIDER` from `.env` (with aliases like `gemini` → `google`). It is **not** fetched
+//! Provider and model are chosen in Web UI (`app_settings`); API keys stay in `.env`. Catalog is **not** fetched
 //! live from provider APIs. When your active `LLM_MODEL` is not in the list, the API still
 //! prepends it so you can keep using it (custom id or newer releases before we update the catalog).
 //!
@@ -47,8 +47,8 @@ pub const PROVIDER_CATALOG: &[CatalogProvider] = &[
         label: "OpenAI",
         default_base_url: "https://api.openai.com/v1",
         models: &[
+            catalog_model!("gpt-5.4", Some(1.75), Some(14.0), "high"),
             catalog_model!("gpt-5.2", Some(1.75), Some(14.0), "high"),
-            catalog_model!("gpt-5", Some(1.25), Some(10.0), "standard"),
             catalog_model!("gpt-5-mini", Some(0.25), Some(2.0), "low"),
         ],
     },
@@ -226,6 +226,7 @@ pub const PROVIDER_CATALOG: &[CatalogProvider] = &[
         label: "xAI",
         default_base_url: "https://api.x.ai/v1",
         models: &[
+            catalog_model!("grok-4.3", Some(1.25), Some(2.50), "standard"),
             catalog_model!("grok-4", Some(3.0), Some(15.0), "high"),
             catalog_model!("grok-3", Some(2.0), Some(10.0), "standard"),
         ],
@@ -267,13 +268,123 @@ pub const PROVIDER_CATALOG: &[CatalogProvider] = &[
 ];
 
 pub const APP_SETTING_LLM_MODEL: &str = "LLM_MODEL";
+pub const APP_SETTING_LLM_PROVIDER: &str = "LLM_PROVIDER";
 
-/// Normalize `.env` `LLM_PROVIDER` to a catalog entry id (`gemini` → `google`, etc.).
+/// First catalog provider that has an API key in `.env` (picker order).
+pub fn first_provider_with_api_key() -> Option<&'static str> {
+    PROVIDER_CATALOG
+        .iter()
+        .find(|p| p.id != "custom" && is_api_key_configured_for_provider(p.id))
+        .map(|p| p.id)
+}
+
+pub fn any_provider_api_key_configured() -> bool {
+    first_provider_with_api_key().is_some()
+}
+
+/// Env vars checked for API keys (first non-empty wins). Shown in Web UI as hints.
+pub fn provider_api_key_env_hints(provider_id: &str) -> Vec<String> {
+    provider_key_env_var_list(provider_id)
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+fn provider_key_env_var_list(provider_id: &str) -> Vec<&'static str> {
+    let p = resolve_catalog_provider_id(provider_id);
+    let keys: Vec<&'static str> = match p.as_str() {
+        "openai" => vec!["OPENAI_API_KEY"],
+        "xai" => vec!["XAI_API_KEY"],
+        "anthropic" => vec!["ANTHROPIC_API_KEY", "LLM_API_KEY"],
+        "google" => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "ollama" | "llama" | "llamacpp" => return vec![],
+        _ => vec!["LLM_API_KEY"],
+    };
+    keys
+}
+
+pub fn is_local_provider(provider_id: &str) -> bool {
+    matches!(
+        resolve_catalog_provider_id(provider_id).as_str(),
+        "ollama" | "llama" | "llamacpp"
+    )
+}
+
+fn env_key_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn first_non_empty_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    for key in keys {
+        if let Some(v) = env_key_non_empty(key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Resolve the API key for `provider_id` from process environment (after dotenv load).
+pub fn resolve_api_key_for_provider(provider_id: &str) -> String {
+    resolve_api_key_for_provider_with_config(provider_id, None)
+}
+
+/// Resolve API key from env; optional `Config` supplies fields loaded at startup (e.g. `openai_api_key`).
+pub fn resolve_api_key_for_provider_with_config(
+    provider_id: &str,
+    cfg: Option<&crate::config::Config>,
+) -> String {
+    if is_local_provider(provider_id) {
+        return String::new();
+    }
+    let p = resolve_catalog_provider_id(provider_id);
+    if let Some(c) = cfg {
+        match p.as_str() {
+            "openai" => {
+                if let Some(ref k) = c.openai_api_key {
+                    if !k.trim().is_empty() {
+                        return k.trim().to_string();
+                    }
+                }
+            }
+            "google" => {
+                if let Some(ref k) = c.gemini_api_key {
+                    if !k.trim().is_empty() {
+                        return k.trim().to_string();
+                    }
+                }
+            }
+            "anthropic" if c.llm_provider == "anthropic" => {
+                if !c.api_key.trim().is_empty() {
+                    return c.api_key.trim().to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    first_non_empty_keys(provider_key_env_var_list(provider_id).iter().copied()).unwrap_or_default()
+}
+
+pub fn is_api_key_configured_for_provider(provider_id: &str) -> bool {
+    is_local_provider(provider_id) || !resolve_api_key_for_provider(provider_id).is_empty()
+}
+
+/// Normalize `.env` `LLM_PROVIDER` to a catalog entry id (`gemini` → `google`, `grok` → `xai`, etc.).
 pub fn resolve_catalog_provider_id(provider: &str) -> String {
     match provider.trim().to_ascii_lowercase().as_str() {
         "gemini" => "google".to_string(),
+        "grok" => "xai".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Default OpenAI-compatible API base URL for a catalog provider, if defined.
+pub fn default_base_url_for_provider(provider: &str) -> Option<&'static str> {
+    find_provider(provider)
+        .map(|p| p.default_base_url)
+        .filter(|url| !url.is_empty())
 }
 
 pub fn find_provider(provider: &str) -> Option<&'static CatalogProvider> {
@@ -354,6 +465,43 @@ impl CatalogModelJson {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct ProviderCatalogJson {
+    pub id: String,
+    pub label: String,
+    pub api_key_configured: bool,
+    pub api_key_env_hints: Vec<String>,
+    pub models: Vec<CatalogModelJson>,
+}
+
+/// Curated providers that have an API key in `.env` (or are local) for the Web UI picker.
+pub fn providers_catalog_json(
+    active_provider: &str,
+    active_model: &str,
+) -> Vec<ProviderCatalogJson> {
+    PROVIDER_CATALOG
+        .iter()
+        .map(|p| ProviderCatalogJson {
+            id: p.id.to_string(),
+            label: p.label.to_string(),
+            api_key_configured: is_api_key_configured_for_provider(p.id),
+            api_key_env_hints: provider_api_key_env_hints(p.id)
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            models: catalog_models_json(
+                p.id,
+                if p.id.eq_ignore_ascii_case(active_provider) {
+                    active_model
+                } else {
+                    ""
+                },
+            ),
+        })
+        .filter(|p| p.api_key_configured)
+        .collect()
+}
+
 /// Curated models for `provider`, plus `active_model` when it is missing from the list.
 pub fn catalog_models_json(provider: &str, active_model: &str) -> Vec<CatalogModelJson> {
     let mut out = Vec::new();
@@ -399,6 +547,11 @@ mod tests {
         let models = catalog_models_json("google", "my-experimental-gemini-model");
         assert!(models.first().is_some_and(|m| m.from_active_config));
         assert!(models.iter().any(|m| m.id == "gemini-3-flash-preview"));
+    }
+
+    #[test]
+    fn grok_provider_alias_resolves_to_xai() {
+        assert_eq!(resolve_catalog_provider_id("grok"), "xai");
     }
 
     #[test]

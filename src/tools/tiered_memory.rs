@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
-use crate::memory::{MemoryManager, PersonaMemoryState};
+use crate::memory::{dedupe_sops, MemoryManager, PersonaMemoryState, SopPointer};
 
 use super::{
     auth_context_from_input, authorize_chat_persona_access, schema_object, Tool, ToolResult,
@@ -60,13 +60,18 @@ fn parse_tier_content(state: &PersonaMemoryState, tier: u8) -> String {
                     .iter()
                     .map(|v| format!("- Terminology|{}", v.trim())),
             );
-            lines.extend(
-                state
-                    .tier2
-                    .known_steps
-                    .iter()
-                    .map(|v| format!("- KnownStep|{}", v.trim())),
-            );
+            lines.extend(state.tier2.sops.iter().map(|sop| {
+                let id = if sop.id.trim().is_empty() {
+                    SopPointer::derive_id_from_vault_path(&sop.vault_path)
+                } else {
+                    sop.id.trim().to_string()
+                };
+                format!(
+                    "- SOP|{id}|{}|{}",
+                    sop.vault_path.trim(),
+                    sop.summary.trim()
+                )
+            }));
             lines.extend(
                 state
                     .tier2
@@ -81,9 +86,9 @@ fn parse_tier_content(state: &PersonaMemoryState, tier: u8) -> String {
     }
 }
 
-fn parse_tier2_knowledge_lines(content: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn parse_tier2_knowledge_lines(content: &str) -> (Vec<String>, Vec<SopPointer>, Vec<String>) {
     let mut terminology = Vec::new();
-    let mut known_steps = Vec::new();
+    let mut sops = Vec::new();
     let mut preferences = Vec::new();
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -94,28 +99,29 @@ fn parse_tier2_knowledge_lines(content: &str) -> (Vec<String>, Vec<String>, Vec<
             terminology.push(v.trim().to_string());
             continue;
         }
-        if let Some(v) = line.strip_prefix("- KnownStep|") {
-            known_steps.push(v.trim().to_string());
+        if let Some(sop) = SopPointer::from_legacy_line(line) {
+            sops.push(sop);
             continue;
         }
         if let Some(v) = line.strip_prefix("- Preference|") {
             preferences.push(v.trim().to_string());
             continue;
         }
-        // Backward compatibility: legacy project/task lines become known_steps.
         if let Some(v) = line.strip_prefix("- ProjectState|") {
-            known_steps.push(v.trim().to_string());
+            if let Some(sop) = SopPointer::from_legacy_line(v) {
+                sops.push(sop);
+            }
             continue;
         }
         if let Some(v) = line.strip_prefix("- TaskState|") {
-            known_steps.push(v.trim().to_string());
-            continue;
+            if let Some(sop) = SopPointer::from_legacy_line(v) {
+                sops.push(sop);
+            }
         }
-        known_steps.push(line.to_string());
     }
     (
         dedupe_lines(&terminology, 40),
-        dedupe_lines(&known_steps, 40),
+        dedupe_sops(sops),
         dedupe_lines(&preferences, 40),
     )
 }
@@ -190,10 +196,11 @@ fn apply_tier_write(state: &mut PersonaMemoryState, tier: u8, content: &str) {
             state.tier1.workflow_principles = workflow_principles;
         }
         2 => {
-            let (terminology, known_steps, preferences) = parse_tier2_knowledge_lines(content);
+            let (terminology, sops, preferences) = parse_tier2_knowledge_lines(content);
             state.tier2.user_terminology = terminology;
-            state.tier2.known_steps = known_steps;
+            state.tier2.sops = sops;
             state.tier2.preferences = preferences;
+            state.tier2.legacy_known_steps.clear();
         }
         3 => {
             state.tier3.recent_focus = normalize_tier3_recent_focus(content);
@@ -223,7 +230,7 @@ impl Tool for ReadTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_tiered_memory".into(),
-            description: "Read this persona's tiered memory from canonical memory_state.json (legacy MEMORY.md auto-migrates). Optional tier (1, 2, or 3) returns only that section. Tier 2 contains user terminology, known steps, and durable preferences.".into(),
+            description: "Read this persona's tiered memory from canonical memory_state.json (legacy MEMORY.md auto-migrates). Optional tier (1, 2, or 3) returns only that section. Tier 2 contains user terminology, SOPs (`tier2.sops` with ORIGIN vault paths), and durable preferences.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -315,7 +322,7 @@ impl Tool for WriteTieredMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_tiered_memory".into(),
-            description: "Write one tier of canonical memory_state.json. Tier 1 = long-term (only on explicit user ask); Tier 2 = user terminology + known steps + preferences; Tier 3 = short-lived scratch focus. Replaces only that tier's section.".into(),
+            description: "Write one tier of canonical memory_state.json. Tier 1 = long-term (only on explicit user ask); Tier 2 = terminology + SOPs + preferences. SOP line format: `- SOP|<id>|ORIGIN/path/to/doc.md|<summary>`. Tier 3 = short-lived scratch focus. Replaces only that tier's section.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -413,13 +420,17 @@ mod tests {
         state.identity.display_name = "Nova".into();
         state.tier1.stable_facts = vec!["- stable fact".into()];
         state.tier2.user_terminology = vec!["PZ = persona zero".into()];
-        state.tier2.known_steps = vec!["Approve base image, then hotify".into()];
+        state.tier2.sops.push(SopPointer {
+            id: "approve-hotify".into(),
+            vault_path: "ORIGIN/Operations/SOPs/Approve-Hotify.md".into(),
+            summary: "Approve base image, then hotify".into(),
+        });
         state.tier2.preferences = vec!["Prefer Bay Area weather context".into()];
         state.tier3.recent_focus = vec!["- recent".into()];
         assert!(parse_tier_content(&state, 1).contains("Identity|display_name=Nova"));
         let t2 = parse_tier_content(&state, 2);
         assert!(t2.contains("Terminology|PZ = persona zero"));
-        assert!(t2.contains("KnownStep|Approve base image, then hotify"));
+        assert!(t2.contains("SOP|approve-hotify|ORIGIN/Operations/SOPs/Approve-Hotify.md"));
         assert!(t2.contains("Preference|Prefer Bay Area weather context"));
         assert_eq!(parse_tier_content(&state, 3), "- recent");
     }
@@ -445,18 +456,14 @@ mod tests {
     fn test_parse_tier2_knowledge_lines_supports_new_and_legacy_formats() {
         let input = r#"
 - Terminology|PZ = Persona Zero
-- KnownStep|Approve base image before hotify
+- SOP|gate|ORIGIN/Operations/SOPs/Gate.md|Approve base image before hotify
 - Preference|Use V4 ref by default
-- ProjectState|id=legacy|status=active|updated=2026-04-01T02:00:00Z|summary=Old active project
-- freeform step note
 "#;
-        let (terminology, known_steps, preferences) = parse_tier2_knowledge_lines(input);
+        let (terminology, sops, preferences) = parse_tier2_knowledge_lines(input);
         assert_eq!(terminology.len(), 1);
         assert_eq!(preferences.len(), 1);
-        assert!(known_steps.iter().any(|s| s.contains("freeform step note")));
-        assert!(known_steps
-            .iter()
-            .any(|s| s.contains("ProjectState|id=legacy")));
+        assert_eq!(sops.len(), 1);
+        assert_eq!(sops[0].vault_path, "ORIGIN/Operations/SOPs/Gate.md");
     }
 
     #[test]
@@ -484,16 +491,15 @@ mod tests {
         let mut state = PersonaMemoryState::default();
         let content = "\
 - Terminology|IG = Instagram
-- KnownStep|Collect user approval before publishing
-- Preference|Avoid strap-slip prompts
-- freeform fallback line";
+- SOP|publish|ORIGIN/Operations/SOPs/Publish.md|Collect user approval before publishing
+- Preference|Avoid strap-slip prompts";
         apply_tier_write(&mut state, 2, content);
         assert_eq!(state.tier2.user_terminology.len(), 1);
         assert_eq!(state.tier2.preferences.len(), 1);
-        assert!(state
-            .tier2
-            .known_steps
-            .iter()
-            .any(|s| s.contains("freeform fallback line")));
+        assert_eq!(state.tier2.sops.len(), 1);
+        assert_eq!(
+            state.tier2.sops[0].vault_path,
+            "ORIGIN/Operations/SOPs/Publish.md"
+        );
     }
 }

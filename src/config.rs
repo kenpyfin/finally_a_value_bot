@@ -12,7 +12,7 @@ fn default_agent_display_name() -> String {
     String::new()
 }
 fn default_llm_provider() -> String {
-    "anthropic".into()
+    String::new()
 }
 fn default_api_key() -> String {
     String::new()
@@ -195,36 +195,8 @@ fn default_runtime_reliability_profile() -> String {
     "balanced".into()
 }
 
-fn default_workflow_auto_learn() -> bool {
-    true
-}
-
-fn default_workflow_min_success_repetitions() -> usize {
-    2
-}
-
-fn default_workflow_replay_strictness() -> String {
-    "adaptive".into()
-}
-
 fn default_project_auto_association_strictness() -> String {
     "balanced".into()
-}
-
-pub fn default_workflow_engine_enabled() -> bool {
-    true
-}
-
-pub fn default_workflow_definitions_dir() -> String {
-    "workflows".into()
-}
-
-pub fn default_workflow_allow_persona_scope() -> bool {
-    true
-}
-
-pub fn default_workflow_max_steps() -> usize {
-    50
 }
 
 fn default_orchestrator_enabled() -> bool {
@@ -313,11 +285,13 @@ fn is_local_web_host(host: &str) -> bool {
 /// Keys that configure LLM providers, models, and related limits. These must come from repo-root
 /// `.env` / process environment only — not from `app_settings` (Web UI persistence).
 ///
-/// Exception: [`crate::llm_catalog::APP_SETTING_LLM_MODEL`] may be stored in `app_settings` so the
-/// Web UI can pick a model while provider and API key stay in `.env`.
+/// Exception: [`crate::llm_catalog::APP_SETTING_LLM_MODEL`] and [`crate::llm_catalog::APP_SETTING_LLM_PROVIDER`]
+/// may be stored in `app_settings` so the Web UI can pick provider/model while API keys stay in `.env`.
 pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
     let u = key.trim().to_ascii_uppercase();
-    if u == crate::llm_catalog::APP_SETTING_LLM_MODEL {
+    if u == crate::llm_catalog::APP_SETTING_LLM_MODEL
+        || u == crate::llm_catalog::APP_SETTING_LLM_PROVIDER
+    {
         return false;
     }
     if u.starts_with("LLM_") {
@@ -326,6 +300,10 @@ pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
     matches!(
         u.as_str(),
         "OPENAI_API_KEY"
+            | "GEMINI_API_KEY"
+            | "GOOGLE_API_KEY"
+            | "ANTHROPIC_API_KEY"
+            | "XAI_API_KEY"
             | "MAX_TOKENS"
             | "MAX_TOOL_ITERATIONS"
             | "MAX_HISTORY_MESSAGES"
@@ -451,6 +429,9 @@ pub struct Config {
     pub workspace_dir: String,
     #[serde(default)]
     pub openai_api_key: Option<String>,
+    /// Google Gemini API key (`GEMINI_API_KEY` or `GOOGLE_API_KEY`). Used when `llm_provider` is google/gemini.
+    #[serde(default)]
+    pub gemini_api_key: Option<String>,
     #[serde(default = "default_timezone")]
     pub timezone: String,
     #[serde(default)]
@@ -660,30 +641,9 @@ pub struct Config {
     /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
     #[serde(default = "default_runtime_reliability_profile")]
     pub runtime_reliability_profile: String,
-    /// Enable auto-learning workflows from successful repeated runs.
-    #[serde(default = "default_workflow_auto_learn")]
-    pub workflow_auto_learn: bool,
-    /// Minimum repeated successful runs before workflow confidence is promoted.
-    #[serde(default = "default_workflow_min_success_repetitions")]
-    pub workflow_min_success_repetitions: usize,
-    /// Workflow replay mode: strict | adaptive | loose.
-    #[serde(default = "default_workflow_replay_strictness")]
-    pub workflow_replay_strictness: String,
     /// Project auto-linking mode: strict | balanced | loose.
     #[serde(default = "default_project_auto_association_strictness")]
     pub project_auto_association_strictness: String,
-    /// Enable authored deterministic workflow tools (list/read/write/validate/run_workflow).
-    #[serde(default = "default_workflow_engine_enabled")]
-    pub workflow_engine_enabled: bool,
-    /// Subdirectory under workspace data root for global workflow YAML files.
-    #[serde(default = "default_workflow_definitions_dir")]
-    pub workflow_definitions_dir: String,
-    /// Allow persona-scoped workflow overrides under shared/personas/{chat}/{persona}/workflows/.
-    #[serde(default = "default_workflow_allow_persona_scope")]
-    pub workflow_allow_persona_scope: bool,
-    /// Maximum steps per workflow execution.
-    #[serde(default = "default_workflow_max_steps")]
-    pub workflow_max_steps: usize,
 }
 
 impl Config {
@@ -914,9 +874,9 @@ impl Config {
             telegram_bot_token: Self::env("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
             bot_username: Self::env("BOT_USERNAME").unwrap_or_default(),
             agent_display_name: Self::env("AGENT_DISPLAY_NAME").unwrap_or_default(),
-            llm_provider: Self::env("LLM_PROVIDER").unwrap_or_else(default_llm_provider),
+            llm_provider: default_llm_provider(),
             api_key: Self::env("LLM_API_KEY").unwrap_or_else(default_api_key),
-            model: Self::env("LLM_MODEL").unwrap_or_default(),
+            model: default_model(),
             llm_base_url: Self::env("LLM_BASE_URL"),
             max_tokens: Self::env_u32("MAX_TOKENS", default_max_tokens()),
             max_tool_iterations: Self::env_usize(
@@ -941,6 +901,7 @@ impl Config {
             ),
             workspace_dir: Self::env("WORKSPACE_DIR").unwrap_or_else(default_workspace_dir),
             openai_api_key: Self::env("OPENAI_API_KEY"),
+            gemini_api_key: Self::env("GEMINI_API_KEY").or_else(|| Self::env("GOOGLE_API_KEY")),
             timezone: Self::env("TIMEZONE").unwrap_or_else(default_timezone),
             allowed_groups: Self::env_vec_i64("ALLOWED_GROUPS"),
             control_chat_ids: Self::env_vec_i64("CONTROL_CHAT_IDS"),
@@ -1141,61 +1102,140 @@ impl Config {
             ),
             runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
                 .unwrap_or_else(default_runtime_reliability_profile),
-            workflow_auto_learn: Self::env_bool(
-                "WORKFLOW_AUTO_LEARN",
-                default_workflow_auto_learn(),
-            ),
-            workflow_min_success_repetitions: Self::env_usize(
-                "WORKFLOW_MIN_SUCCESS_REPETITIONS",
-                default_workflow_min_success_repetitions(),
-            ),
-            workflow_replay_strictness: Self::env("WORKFLOW_REPLAY_STRICTNESS")
-                .unwrap_or_else(default_workflow_replay_strictness),
             project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
                 .unwrap_or_else(default_project_auto_association_strictness),
-            workflow_engine_enabled: Self::env_bool(
-                "WORKFLOW_ENGINE_ENABLED",
-                default_workflow_engine_enabled(),
-            ),
-            workflow_definitions_dir: Self::env("WORKFLOW_DEFINITIONS_DIR")
-                .unwrap_or_else(default_workflow_definitions_dir),
-            workflow_allow_persona_scope: Self::env_bool(
-                "WORKFLOW_ALLOW_PERSONA_SCOPE",
-                default_workflow_allow_persona_scope(),
-            ),
-            workflow_max_steps: Self::env_usize("WORKFLOW_MAX_STEPS", default_workflow_max_steps()),
         }
     }
 
-    /// If Web UI persisted `LLM_MODEL` in `app_settings`, apply it over `.env` / defaults.
-    pub fn merge_llm_model_from_app_settings(
+    /// Apply Web UI `LLM_PROVIDER` / `LLM_MODEL` from `app_settings` (sole source for provider/model).
+    pub fn merge_llm_selection_from_app_settings(
         &mut self,
         db: &crate::db::Database,
     ) -> Result<(), FinallyAValueBotError> {
         let settings = db.list_app_settings()?;
-        for s in settings {
+        let mut had_provider_setting = false;
+        let mut had_model_setting = false;
+        for s in &settings {
+            if s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
+            {
+                let v = s.value.trim();
+                if !v.is_empty() {
+                    self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(v);
+                    had_provider_setting = true;
+                }
+            }
+        }
+        for s in &settings {
             if s.key
                 .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
             {
                 let v = s.value.trim();
                 if !v.is_empty() {
                     self.model = v.to_string();
+                    had_model_setting = true;
                 }
                 break;
+            }
+        }
+
+        let mut persist_defaults = false;
+        if self.llm_provider.is_empty() {
+            if let Some(p) = crate::llm_catalog::first_provider_with_api_key() {
+                self.llm_provider = p.to_string();
+                persist_defaults = true;
+            } else {
+                return Err(FinallyAValueBotError::Config(
+                    "No LLM API keys in .env. Add provider keys (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY), then choose provider and model in Web UI → Settings → LLM.".into(),
+                ));
+            }
+        }
+        if self.model.is_empty() {
+            self.model = crate::llm_catalog::default_model_for_provider(&self.llm_provider).into();
+            persist_defaults = true;
+        }
+
+        self.sync_active_llm_provider_from_env()?;
+
+        if !crate::llm_catalog::is_local_provider(&self.llm_provider)
+            && crate::llm_catalog::resolve_api_key_for_provider_with_config(
+                &self.llm_provider,
+                Some(self),
+            )
+            .is_empty()
+        {
+            let hints =
+                crate::llm_catalog::provider_api_key_env_hints(&self.llm_provider).join(", ");
+            return Err(FinallyAValueBotError::Config(format!(
+                "No API key in .env for LLM provider {:?}. Set one of: {hints}",
+                self.llm_provider
+            )));
+        }
+
+        if persist_defaults || !had_provider_setting || !had_model_setting {
+            db.set_app_setting(
+                crate::llm_catalog::APP_SETTING_LLM_PROVIDER,
+                &self.llm_provider,
+            )?;
+            db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &self.model)?;
+        }
+        Ok(())
+    }
+
+    /// Backward-compatible alias.
+    pub fn merge_llm_model_from_app_settings(
+        &mut self,
+        db: &crate::db::Database,
+    ) -> Result<(), FinallyAValueBotError> {
+        self.merge_llm_selection_from_app_settings(db)
+    }
+
+    /// Apply API key and default base URL for the active `llm_provider` from environment / catalog.
+    pub fn sync_active_llm_provider_from_env(&mut self) -> Result<(), FinallyAValueBotError> {
+        self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(&self.llm_provider);
+        self.api_key = crate::llm_catalog::resolve_api_key_for_provider_with_config(
+            &self.llm_provider,
+            Some(self),
+        );
+        let base_empty = self
+            .llm_base_url
+            .as_ref()
+            .is_none_or(|u| u.trim().is_empty());
+        if base_empty {
+            if crate::llm_catalog::is_local_provider(&self.llm_provider) {
+                if self.llm_provider == "llama" || self.llm_provider == "llamacpp" {
+                    self.llm_base_url = Some("http://127.0.0.1:8080/v1".into());
+                } else if self.llm_provider == "ollama" {
+                    self.llm_base_url = Some("http://127.0.0.1:11434/v1".into());
+                }
+            } else if let Some(url) =
+                crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+            {
+                self.llm_base_url = Some(url.to_string());
             }
         }
         Ok(())
     }
 
+    /// Web UI provider switch: refresh credentials and catalog base URL for the new provider.
+    pub fn apply_llm_provider_switch(&mut self, provider_id: &str, model: &str) {
+        self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(provider_id);
+        self.model = model.trim().to_string();
+        self.api_key = crate::llm_catalog::resolve_api_key_for_provider_with_config(
+            &self.llm_provider,
+            Some(self),
+        );
+        self.llm_base_url = crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+            .map(|s| s.to_string());
+    }
+
     /// Apply post-deserialization normalization and validation.
     pub fn post_deserialize(&mut self) -> Result<(), FinallyAValueBotError> {
-        self.llm_provider = self.llm_provider.trim().to_lowercase();
+        self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(&self.llm_provider);
         self.safety_output_guard_mode = self.safety_output_guard_mode.trim().to_ascii_lowercase();
         self.safety_execution_mode = self.safety_execution_mode.trim().to_ascii_lowercase();
         self.runtime_reliability_profile =
             self.runtime_reliability_profile.trim().to_ascii_lowercase();
-        self.workflow_replay_strictness =
-            self.workflow_replay_strictness.trim().to_ascii_lowercase();
         self.project_auto_association_strictness = self
             .project_auto_association_strictness
             .trim()
@@ -1207,15 +1247,8 @@ impl Config {
             .filter(|v| !v.is_empty())
             .collect();
 
-        // Apply provider-specific default model if empty
-        if self.model.is_empty() {
-            self.model = match self.llm_provider.as_str() {
-                "anthropic" => "claude-sonnet-4-5-20250929".into(),
-                "ollama" => "llama3.2".into(),
-                "llama" | "llamacpp" => "local".into(),
-                "google" | "gemini" => "gemini-3-flash-preview".into(),
-                _ => "gpt-5.2".into(),
-            };
+        if !self.llm_provider.is_empty() && self.model.is_empty() {
+            self.model = crate::llm_catalog::default_model_for_provider(&self.llm_provider).into();
         }
 
         // Validate timezone
@@ -1232,6 +1265,12 @@ impl Config {
         if self.llm_base_url.is_none() && matches!(self.llm_provider.as_str(), "llama" | "llamacpp")
         {
             self.llm_base_url = Some("http://127.0.0.1:8080/v1".into());
+        }
+        if !self.llm_provider.is_empty() && self.llm_base_url.is_none() {
+            if let Some(url) = crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+            {
+                self.llm_base_url = Some(url.to_string());
+            }
         }
         if let Ok(dir) = std::env::var("FINALLY_A_VALUE_BOT_WORKSPACE_DIR") {
             let trimmed = dir.trim();
@@ -1357,22 +1396,16 @@ impl Config {
                 self.runtime_reliability_profile = "balanced".to_string();
             }
         }
-        if !["strict", "adaptive", "loose"].contains(&self.workflow_replay_strictness.as_str()) {
-            self.workflow_replay_strictness = default_workflow_replay_strictness();
-        }
-        if let Some(cmds) = &self.post_edit_validation_commands {
-            if cmds.trim().is_empty() {
-                self.post_edit_validation_commands = None;
-            }
-        }
         if !["strict", "balanced", "loose"]
             .contains(&self.project_auto_association_strictness.as_str())
         {
             self.project_auto_association_strictness =
                 default_project_auto_association_strictness();
         }
-        if self.workflow_min_success_repetitions == 0 {
-            self.workflow_min_success_repetitions = default_workflow_min_success_repetitions();
+        if let Some(cmds) = &self.post_edit_validation_commands {
+            if cmds.trim().is_empty() {
+                self.post_edit_validation_commands = None;
+            }
         }
         // Expand ~ in agent_browser_path if present
         if let Some(ref p) = self.agent_browser_path {
@@ -1414,11 +1447,13 @@ impl Config {
                 "At least one of telegram_bot_token or discord_bot_token must be set (unless web_enabled=true)".into(),
             ));
         }
-        if self.api_key.is_empty()
+        if !self.web_enabled
+            && !crate::llm_catalog::any_provider_api_key_configured()
             && !matches!(self.llm_provider.as_str(), "ollama" | "llama" | "llamacpp")
-            && !self.web_enabled
         {
-            return Err(FinallyAValueBotError::Config("api_key is required".into()));
+            return Err(FinallyAValueBotError::Config(
+                "At least one LLM API key is required in .env (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY). Provider and model are set in Web UI → Settings → LLM.".into(),
+            ));
         }
 
         Ok(())
@@ -1457,11 +1492,9 @@ impl Config {
             esc(&self.agent_display_name)
         ));
         lines.push("".into());
-        lines.push("# LLM".into());
-        lines.push(format!("LLM_PROVIDER={}", esc(&self.llm_provider)));
-        lines.push(format!("LLM_API_KEY={}", esc(&self.api_key)));
-        if !self.model.is_empty() {
-            lines.push(format!("LLM_MODEL={}", esc(&self.model)));
+        lines.push("# LLM (provider + model: Web UI → Settings → LLM; keys only in .env)".into());
+        if !self.api_key.is_empty() {
+            lines.push(format!("LLM_API_KEY={}", esc(&self.api_key)));
         }
         if let Some(ref u) = self.llm_base_url {
             if !u.is_empty() {
@@ -1485,22 +1518,6 @@ impl Config {
         lines.push(format!(
             "RUNTIME_RELIABILITY_PROFILE={}",
             esc(&self.runtime_reliability_profile)
-        ));
-        lines.push(format!(
-            "WORKFLOW_AUTO_LEARN={}",
-            if self.workflow_auto_learn {
-                "true"
-            } else {
-                "false"
-            }
-        ));
-        lines.push(format!(
-            "WORKFLOW_MIN_SUCCESS_REPETITIONS={}",
-            self.workflow_min_success_repetitions
-        ));
-        lines.push(format!(
-            "WORKFLOW_REPLAY_STRICTNESS={}",
-            esc(&self.workflow_replay_strictness)
         ));
         lines.push(format!(
             "PROJECT_AUTO_ASSOCIATION_STRICTNESS={}",
@@ -1659,6 +1676,7 @@ pub fn test_config() -> Config {
         max_document_size_mb: 100,
         workspace_dir: "./workspace".into(),
         openai_api_key: None,
+        gemini_api_key: None,
         timezone: "UTC".into(),
         allowed_groups: vec![],
         control_chat_ids: vec![],
@@ -1744,14 +1762,7 @@ pub fn test_config() -> Config {
         background_shell_auto_retry_max: default_background_shell_auto_retry_max(),
         background_shell_auto_agent_on_success: default_background_shell_auto_agent_on_success(),
         runtime_reliability_profile: default_runtime_reliability_profile(),
-        workflow_auto_learn: default_workflow_auto_learn(),
-        workflow_min_success_repetitions: default_workflow_min_success_repetitions(),
-        workflow_replay_strictness: default_workflow_replay_strictness(),
         project_auto_association_strictness: default_project_auto_association_strictness(),
-        workflow_engine_enabled: default_workflow_engine_enabled(),
-        workflow_definitions_dir: default_workflow_definitions_dir(),
-        workflow_allow_persona_scope: default_workflow_allow_persona_scope(),
-        workflow_max_steps: default_workflow_max_steps(),
     }
 }
 
@@ -1875,7 +1886,7 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         let err = config.post_deserialize().unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("api_key is required"));
+        assert!(msg.contains("At least one LLM API key"));
     }
 
     #[test]
@@ -1901,7 +1912,37 @@ mod tests {
             "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: openai\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.model, "gpt-5.2");
+        assert_eq!(config.model, "gpt-5.4");
+        assert_eq!(
+            config.llm_base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
+    fn test_post_deserialize_xai_default_model_and_base_url() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: xai\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.model, "grok-4.3");
+        assert_eq!(config.llm_base_url.as_deref(), Some("https://api.x.ai/v1"));
+    }
+
+    #[test]
+    fn test_post_deserialize_grok_normalizes_to_xai() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: grok\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.llm_provider, "xai");
+        assert_eq!(config.model, "grok-4.3");
+    }
+
+    #[test]
+    fn test_post_deserialize_openai_api_key_fallback() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: openai\nopenai_api_key: sk-openai-fallback\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.api_key, "sk-openai-fallback");
     }
 
     #[test]
@@ -1925,8 +1966,19 @@ mod tests {
     }
 
     #[test]
-    fn test_post_deserialize_empty_base_url_becomes_none() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_base_url: '  '\n";
+    fn test_post_deserialize_empty_base_url_fills_from_catalog_for_openai() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: openai\nllm_base_url: '  '\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(
+            config.llm_base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
+    fn test_post_deserialize_empty_base_url_stays_none_for_anthropic() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: anthropic\nllm_base_url: '  '\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert!(config.llm_base_url.is_none());

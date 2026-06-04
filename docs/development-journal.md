@@ -4,6 +4,76 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-03 — LLM provider/model Web UI only (removed from .env)
+
+- **Area:** config / web / main
+- **Summary:** `LLM_PROVIDER` and `LLM_MODEL` are no longer read from or written to `.env`. Startup merges selection from `app_settings` (or auto-picks first provider with a key and persists defaults). `.env` holds API keys only (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.). Config wizard CLI no longer prompts for provider/model.
+- **Key files / symbols:** `src/config.rs` (`merge_llm_selection_from_app_settings`, `save_env`), `src/main.rs`, `src/llm_catalog.rs` (`first_provider_with_api_key`), `.env.example`, `web/src/components/settings-llm.tsx`.
+
+### 2026-06-03 — Per-provider API keys (fix Gemini INVALID_ARGUMENT)
+
+- **Area:** config / llm_catalog
+- **Summary:** Stopped falling back to `LLM_API_KEY` for non-Anthropic providers. Google requires `GEMINI_API_KEY` or `GOOGLE_API_KEY` (`Config.gemini_api_key`). `LLM_API_KEY` / `ANTHROPIC_API_KEY` apply only to Anthropic.
+- **Key files / symbols:** `src/llm_catalog.rs` (`provider_key_env_var_list`, `llm_api_key_applies_to_provider`); `src/config.rs` (`gemini_api_key`).
+
+### 2026-06-03 — xAI Grok tool-call stop_reason fix
+
+- **Area:** llm / agent loop
+- **Summary:** xAI (and some OpenAI-compat gateways) return `finish_reason: "stop"` or `"completed"` while still populating `tool_calls`. `translate_oai_response` previously only mapped `tool_calls` → `tool_use`, so the agent loop treated tool turns as `end_turn` and dropped tool blocks. Now infers `tool_use` when response content includes `ToolUse` (same pattern as Gemini). Agent loop also forces `tool_use` when tool blocks are present regardless of stop reason.
+- **Key files / symbols:** `src/llm.rs` (`oai_stop_reason_from_content`, `translate_oai_response`, OpenAI stream path, `build_stream_response`); `src/channels/telegram.rs` (stop_reason override before end_turn branch).
+
+### 2026-06-03 — Web UI: switch LLM provider + model (keys in .env only)
+
+- **Area:** web / config / llm
+- **Summary:** Settings → LLM now has provider and model dropdowns. `LLM_PROVIDER` and `LLM_MODEL` persist in `app_settings`; API keys are read only from `.env` per provider (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GEMINI_API_KEY`, etc.). `GET/PATCH /api/llm` return all curated providers with key status; `LlmHandle::apply_selection` hot-swaps provider, model, base URL, and resolved key.
+- **Key files / symbols:** `src/llm_catalog.rs` (`APP_SETTING_LLM_PROVIDER`, `providers_catalog_json`, `resolve_api_key_for_provider`), `src/config.rs` (`merge_llm_selection_from_app_settings`, `apply_llm_provider_switch`), `src/llm.rs` (`apply_selection`), `src/web.rs`, `web/src/components/settings-llm.tsx`.
+- **Follow-ups:** Rebuild `web/dist` after deploy.
+
+### 2026-06-03 — Tier 2 memory: `sops[]` replaces `known_steps`
+
+- **Area:** memory / agent prompt
+- **Summary:** Restructured `tier2`: `known_steps` removed from persisted schema; new `sops[]` entries are `{ id, vault_path, summary }` with required `ORIGIN/…` paths. Legacy `known_steps` deserialize and migrate on `normalize`. Persona context renders **### SOPs (Tier 2)** with vault paths. `write_tiered_memory` Tier 2 format: `- SOP|id|vault_path|summary`.
+- **Key files / symbols:** `SopPointer`, `Tier2Memory::sops` in `src/memory.rs`; `src/tools/tiered_memory.rs`; persona 24 `memory_state.json`
+- **Follow-ups:** Bulk-migrate other personas on next read/write.
+
+### 2026-06-03 — Rollback YAML workflow engine → vault SOPs
+
+- **Area:** workflow / agent prompt / web / memory
+- **Summary:** Removed deterministic authored workflows entirely (`src/workflow_engine/`, `run_workflow` tools, `create-workflow`/`modify-workflow` builtin skills, Settings → Workflows UI, `WORKFLOW_*` config). **Workflow** now means vault markdown SOPs with memory pointers; hook steer via `sop_context_gate.rs`. Migrated PZ pipeline to `ORIGIN/Operations/SOPs/PZ-Post-Pipeline.md`; persona 24 memory updated.
+- **Rationale:** YAML executor caused pathing/identity drift and extra tool iterations; direct `run_skill_script` following a vault SOP was faster and more reliable (see agent history 20260603-200509 vs 194845).
+- **Key files / symbols:** `src/sop_context_gate.rs`, `sops_prompt_sections` in `src/channels/telegram.rs`; deleted `src/workflow_engine/`, `src/tools/workflow.rs`; `docs/sops.md`; `.cursor/rules/sops.mdc`
+- **Follow-ups:** Mine new SOP into Mem-Palace; tune `SOP_PHRASES` if steer is too broad.
+
+### 2026-06-03 — Harden OpenAI and xAI (Grok) on OpenAI-compatible Chat Completions
+
+- **Area:** LLM / config / doctor
+- **Summary:** OpenAI and xAI use the shared `OpenAiProvider` (`/chat/completions`). `Config::post_deserialize` now normalizes `grok` → `xai`, fills `llm_base_url` and default model from `llm_catalog`, and falls back `LLM_API_KEY` from `OPENAI_API_KEY` (openai) or `XAI_API_KEY` (xai). `OpenAiProvider` resolves base URL via catalog; GPT-5/o-series and Grok reasoning models send `max_completion_tokens` (with one-shot 400 retry). Catalog adds `grok-4.3`, `gpt-5.4`. Doctor warns when `LLM_PROVIDER=xai` still points at the OpenAI default host.
+- **Key files / symbols:** `src/llm_catalog.rs` (`resolve_catalog_provider_id`, `default_base_url_for_provider`), `src/config.rs` (`post_deserialize`), `src/llm.rs` (`oai_resolve_base_url`, `build_oai_chat_request_body`, `OpenAiProvider`), `src/doctor.rs` (`check_llm_provider_base_url`); presets in `src/config_wizard.rs`, `src/setup.rs`.
+- **Follow-ups:** Native OpenAI/xAI Responses API deferred; live model list fetching not implemented.
+
+### 2026-06-03 — PZ post pipeline YAML fix + deprecate learned workflows
+
+- **Area:** workflow engine / config / docs
+- **Summary:** Rewrote `workspace/workflows/pz-post-pipeline.workflow.yaml` to valid schema (`type: script` / `bash` / `deliver`) using allowed skills `image-generator` and `pz-hotify`. Added semantic validation in `lint_workflow_yaml_raw` / `validate_tool_input` (reject `args` on tool steps, empty tool `input`). Removed SQLite learned-workflow runtime surface: `WORKFLOW_AUTO_LEARN` config, dead DB APIs (`get_best_workflow_for_intent`, `upsert_workflow_learning`, `log_workflow_execution`), `AgentEvent::WorkflowSelected`. Docs/rules now point to authored workflows only (`docs/deterministic-workflows.md`; `docs/workflow.md` is a deprecation stub).
+- **Key files / symbols:** `src/workflow_engine/schema.rs`, `workspace/workflows/pz-post-pipeline.workflow.yaml`, `src/config.rs`, `src/db.rs`, `builtin_skills/create-workflow/SKILL.md`, `.cursor/rules/authored-workflows.mdc`
+- **Follow-ups:** Optional `pz-post-pipeline-publish` workflow for post-approval scheduling; drop legacy `workflows` DB tables in a future migration.
+
+### 2026-06-03 — Authored workflows in system prompt (catalog + tool groups)
+
+- **Area:** agent prompt / tools
+- **Summary:** When `workflow_engine_enabled`, `build_system_prompt` now injects a **Tool groups** line for workflow tools, a prose block (run/create/modify), and a live **Workflows on disk** list from `WorkflowCatalog::list_entries`. Question-intent tool filter also exposes `list_workflows`, `read_workflow`, `validate_workflow`.
+- **Rationale:** Model often confused authored YAML workflows with Tier 1 “workflow principles” or SQLite learned workflows; it had no workflow ids unless it called `list_workflows`.
+- **Key files / symbols:** `authored_workflows_prompt_sections`, `build_system_prompt` in `src/channels/telegram.rs`; `definitions_filtered` in `src/tools/mod.rs`
+- **Follow-ups:** Optional `AGENTS.md` routing line per persona; Phase 2 scheduler `[workflow:id]`.
+
+### 2026-06-03 — Cross-channel image delivery normalization
+
+- **Area:** channels / delivery / web
+- **Summary:** Added `src/final_delivery_media.rs` with persona-aware `resolve_workspace_artifact_path` (searches `shared/personas/{chat}/{persona}/`, `runtime/groups/…`, and unique basename under persona tree) and `normalize_assistant_artifact_references` (bare image filename lines → `![basename](abs_path)`). `deliver_agent_final_to_contact` normalizes before store/deliver; web runs normalize then `materialize_response_file_links`. Telegram `prepare_telegram_workspace_auto_images` takes `WorkspaceAutoImageContext { root, chat_id, persona_id }` for scoped resolution and `send_photo` before text.
+- **Rationale:** Assistants often emit bare basenames (e.g. `PZ-….png`) while artifacts live under persona cwd; prior delivery only detected markdown images and `shared/<file>`, so Telegram and web showed text only.
+- **Key files / symbols:** `src/final_delivery_media.rs`; `src/channel.rs` (`normalize_final_for_delivery`, `deliver_agent_final_to_contact`); `src/channels/telegram.rs` (`WorkspaceAutoImageContext`, `prepare_telegram_workspace_auto_images`); `src/web.rs` (normalize + materialize order, `resolve_response_local_file_path`).
+- **Follow-ups:** Materialize at store time when a contact has web bindings but the run was Telegram-only, if cross-channel history should always show `/api/uploads/…` inline images.
+
 ### 2026-06-02 — Pre-delivery PDQE gate + remove main-agent `send_message`
 
 - **Area:** agent loop / channels / delivery / evaluators
@@ -19,6 +89,12 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Rationale:** Operators need repeatable step sequences without probabilistic tool ordering; skills teach authoring while tools validate, persist, and execute.
 - **Key files / symbols:** `src/workflow_engine/` (`execute_workflow`, `WorkflowCatalog`), `src/tools/workflow.rs`, `src/workflow_activation_gate.rs`, `src/hook_runtime.rs` (`builtin_turn_skill_gate` workflow signals), `src/channels/telegram.rs` (registration + turn gates + system prompt), `builtin_skills/create-workflow/`, `builtin_skills/modify-workflow/`, `docs/deterministic-workflows.md`, `workspace/workflows/echo-demo.workflow.yaml`
 - **Follow-ups:** Phase 2: `agent`/`when`/`foreach` steps; scheduler `[workflow:id]` unattended path; web cockpit list/run.
+
+### 2026-06-02 — Web Settings: edit authored workflows
+
+- **Area:** web / workflow engine
+- **Summary:** Settings dialog adds a **Workflows** tab: list global/persona YAML workflows, edit in a textarea, validate, save, delete. REST: `GET/POST /api/workflows`, `GET/DELETE /api/workflows/:id`, `POST /api/workflows/validate`.
+- **Key files / symbols:** `src/web.rs` (`api_workflows_*`, `workflow_catalog`), `src/workflow_engine/catalog.rs` (`delete`), `web/src/components/settings-workflows.tsx`, `web/src/main.tsx`
 
 ### 2026-06-02 — Post-delivery quality evaluation (PDQE) + Perplexity evaluators
 

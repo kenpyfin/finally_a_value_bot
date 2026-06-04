@@ -42,7 +42,7 @@ Before the loop starts, the system builds everything the LLM needs to know.
 The system prompt includes **## Task scope (read first)**: `[current_request]` is the primary goal; `[persona_context]` and Tier 1 are background reference only unless the current ask needs them.
 
 
-**Learned workflows (SQLite, post-run only):** The shared agent path does **not** append a `# Learned Workflow Hint` from the DB at run start. Tool-using runs may still update `workflows` and promote recurring successes into tiered memory `workflow_principles`. See [`docs/workflow.md`](workflow.md).
+**Vault SOPs:** Operating procedures in ORIGIN markdown; agent executes via skills. YAML `run_workflow` engine and SQLite learned workflows were removed; see [`docs/sops.md`](sops.md) and [`docs/workflow.md`](workflow.md).
 
 ### 1.2 Conversation History
 

@@ -319,20 +319,6 @@ pub async fn run_hooks_for_event_async(
                     ));
                     break;
                 }
-                if signal_bool(input, "requires_create_workflow_skill") {
-                    out.blocked_reason = Some(format!(
-                        "skill_required: {}",
-                        crate::workflow_activation_gate::create_workflow_required_error_message()
-                    ));
-                    break;
-                }
-                if signal_bool(input, "requires_modify_workflow_skill") {
-                    out.blocked_reason = Some(format!(
-                        "skill_required: {}",
-                        crate::workflow_activation_gate::modify_workflow_required_error_message()
-                    ));
-                    break;
-                }
             }
             "builtin_deferred_commitment_guard" => {
                 if input

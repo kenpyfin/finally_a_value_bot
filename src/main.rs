@@ -112,7 +112,7 @@ fn print_version() {
 }
 
 async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(c) => c,
         Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config error: {e}");
@@ -124,20 +124,25 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
+    let runtime_data_dir = config.runtime_data_dir();
+    let db = match db::Database::new(&runtime_data_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Database init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = config.merge_llm_selection_from_app_settings(&db) {
+        eprintln!("LLM config error: {e}");
+        std::process::exit(1);
+    }
     let provider = finally_a_value_bot::llm::create_provider(&config);
     let messages = vec![Message {
         role: "user".into(),
         content: MessageContent::Text("Reply with exactly: OK".into()),
     }];
     let tools_arg = if with_tools {
-        let runtime_data_dir = config.runtime_data_dir();
-        let db = match db::Database::new(&runtime_data_dir) {
-            Ok(d) => std::sync::Arc::new(d),
-            Err(e) => {
-                eprintln!("Database init failed (needed for --with-tools): {e}");
-                std::process::exit(1);
-            }
-        };
+        let db = std::sync::Arc::new(db);
         let token = if config.telegram_bot_token.is_empty() {
             "dummy"
         } else {
@@ -419,7 +424,7 @@ fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
 }
 
 fn is_llm_ready(config: &Config) -> bool {
-    !config.api_key.is_empty()
+    finally_a_value_bot::llm_catalog::any_provider_api_key_configured()
         || matches!(
             config.llm_provider.as_str(),
             "ollama" | "llama" | "llamacpp"
@@ -475,7 +480,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(c) => c,
         Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config missing/invalid: {e}");
@@ -513,6 +518,12 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
+
+    config.merge_llm_selection_from_app_settings(&db)?;
+    info!(
+        "LLM selection: provider={} model={}",
+        config.llm_provider, config.model
+    );
 
     match finally_a_value_bot::persona_shared_migrate::maybe_run(&config, &db) {
         Ok(stats) => {

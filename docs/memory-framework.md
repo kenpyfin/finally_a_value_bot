@@ -60,9 +60,12 @@ Legacy `MEMORY.md` is read for migration compatibility and converted into canoni
 - `user_terminology` (`string[]`)
   - Meaning: durable terms/aliases and user-specific language conventions.
   - Behavior: trimmed, empties removed, deduped case-insensitively, truncated to 40.
-- `known_steps` (`string[]`)
-  - Meaning: reusable procedural steps that solve recurring user goals.
-  - Behavior: trimmed, empties removed, deduped case-insensitively, truncated to 40.
+- `sops` (`object[]`) — replaces legacy `known_steps`
+  - Each entry:
+    - `id` (`string`) — short handle (e.g. `pz-post-pipeline`)
+    - `vault_path` (`string`) — required; must start with `ORIGIN/` (e.g. `ORIGIN/Operations/SOPs/PZ-Post-Pipeline.md`)
+    - `summary` (`string`) — optional one-line hint; full procedure is always read from `vault_path`
+  - Behavior: deduped by `vault_path`, max 20 entries. Legacy `known_steps` strings migrate on load into `sops` (when they contain an ORIGIN path) or Tier 1 `workflow_principles`.
 - `preferences` (`string[]`)
   - Meaning: durable operating preferences and defaults.
   - Behavior: trimmed, empties removed, deduped case-insensitively, truncated to 40.
@@ -175,14 +178,15 @@ Per-event fields:
     ]
   },
   "tier2": {
-    "active_projects": [
+    "user_terminology": [],
+    "sops": [
       {
-        "id": "memory-doc-spec",
-        "status": "active",
-        "summary": "Expand memory JSON documentation",
-        "updated_at": "2026-05-08T16:00:00Z"
+        "id": "example-sop",
+        "vault_path": "ORIGIN/Operations/SOPs/Example.md",
+        "summary": "Optional one-line hint"
       }
-    ]
+    ],
+    "preferences": []
   },
   "tier3": {
     "recent_focus": [

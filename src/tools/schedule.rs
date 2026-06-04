@@ -215,7 +215,7 @@ impl Tool for ScheduleTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "schedule_task".into(),
-            description: "Create a new scheduled task (cron or one-time). This is not the same as learned workflows (intent hints in the DB): cron schedules live in `scheduled_tasks` only. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used. To change an existing task, use `update_scheduled_task`.".into(),
+            description: "Create a new scheduled task (cron or one-time). Cron schedules live in `scheduled_tasks` only — not authored YAML workflows. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used. To change an existing task, use `update_scheduled_task`.".into(),
             input_schema: schema_object(
                 json!({
                     "chat_id": {
@@ -537,7 +537,7 @@ impl Tool for CancelTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "cancel_scheduled_task".into(),
-            description: "Cancel a scheduled task permanently (marks cancelled; not related to learned workflows).".into(),
+            description: "Cancel a scheduled task permanently (marks cancelled).".into(),
             input_schema: schema_object(
                 json!({
                     "task_id": {
@@ -605,7 +605,7 @@ impl Tool for UpdateScheduledTaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "update_scheduled_task".into(),
-            description: "Update an existing scheduled task by id: optional status (paused/active/cancelled), persona_id, prompt, and/or schedule (schedule_type + schedule_value with optional timezone). Same preflight rules as `schedule_task`. Not related to learned workflows. Activate the `schedule-job` skill before changing schedule fields.".into(),
+            description: "Update an existing scheduled task by id: optional status (paused/active/cancelled), persona_id, prompt, and/or schedule (schedule_type + schedule_value with optional timezone). Same preflight rules as `schedule_task`. Activate the `schedule-job` skill before changing schedule fields.".into(),
             input_schema: schema_object(
                 json!({
                     "task_id": {

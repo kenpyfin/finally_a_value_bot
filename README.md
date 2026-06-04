@@ -53,7 +53,7 @@ finally-a-value-bot help        # all commands
 **Minimum configuration**
 
 - **Channel:** at least one of **Telegram** (`TELEGRAM_BOT_TOKEN` + `BOT_USERNAME`) or **Discord** (`DISCORD_BOT_TOKEN`).
-- **LLM:** `LLM_PROVIDER` and `LLM_API_KEY` — except for local providers (`ollama`, `llama`, `llamacpp`) where the API key may be omitted.
+- **LLM:** at least one provider API key in `.env` (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`); choose provider and model in **Web UI → Settings → LLM**. Local providers (`ollama`, `llama`, `llamacpp`) may omit API keys.
 
 See [.env.example](.env.example) for the full list (web UI, scheduler, vault, safety, etc.).
 

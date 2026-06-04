@@ -2101,9 +2101,10 @@ function App() {
                     <Dialog.Content style={{ maxWidth: 920 }}>
                       <Dialog.Title>Web UI configuration</Dialog.Title>
                       <Dialog.Description size="2" mb="3">
-                        Set <code className="text-xs">LLM_PROVIDER</code> and <code className="text-xs">LLM_API_KEY</code> in repo-root{' '}
-                        <code className="text-xs">.env</code>, then pick a model under the LLM tab (saved in the app; applies without editing{' '}
-                        <code className="text-xs">.env</code>). Changing provider or API key in <code className="text-xs">.env</code> requires a process restart.
+                        Put LLM API keys in repo-root <code className="text-xs">.env</code> (e.g.{' '}
+                        <code className="text-xs">ANTHROPIC_API_KEY</code>, <code className="text-xs">OPENAI_API_KEY</code>).
+                        Choose provider and model under the LLM tab (saved in the app, not in <code className="text-xs">.env</code>).
+                        Restart the process after changing API keys in <code className="text-xs">.env</code>.
                       </Dialog.Description>
                       {settingsError ? (
                         <Callout.Root color="red" size="1" variant="soft" className="mb-2">

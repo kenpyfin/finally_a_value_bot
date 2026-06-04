@@ -235,18 +235,41 @@ impl LlmHandle {
             .unwrap_or_else(|_| String::new())
     }
 
-    /// Update active model, rebuild provider, and return the new model id.
-    pub fn set_model(&self, model: String) -> Result<String, String> {
+    pub fn current_provider(&self) -> String {
+        self.base_config
+            .read()
+            .map(|c| c.llm_provider.clone())
+            .unwrap_or_else(|_| String::new())
+    }
+
+    /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
+    pub fn apply_selection(
+        &self,
+        provider: String,
+        model: String,
+    ) -> Result<(String, String), String> {
         let model = model.trim().to_string();
         if model.is_empty() {
             return Err("model cannot be empty".into());
+        }
+        let provider_id = crate::llm_catalog::resolve_catalog_provider_id(&provider);
+        if provider_id.is_empty() {
+            return Err("provider cannot be empty".into());
+        }
+        if !crate::llm_catalog::is_local_provider(&provider_id)
+            && crate::llm_catalog::resolve_api_key_for_provider(&provider_id).is_empty()
+        {
+            let hints = crate::llm_catalog::provider_api_key_env_hints(&provider_id).join(", ");
+            return Err(format!(
+                "No API key in environment for provider {provider_id}. Set one of: {hints}"
+            ));
         }
         let mut cfg = self
             .base_config
             .read()
             .map_err(|_| "config lock poisoned".to_string())?
             .clone();
-        cfg.model = model.clone();
+        cfg.apply_llm_provider_switch(&provider_id, &model);
         let new_provider = Arc::from(create_provider(&cfg));
         *self
             .model
@@ -260,7 +283,13 @@ impl LlmHandle {
             .provider
             .write()
             .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
-        Ok(model)
+        Ok((provider_id, model))
+    }
+
+    /// Update active model for the current provider, rebuild client, return the new model id.
+    pub fn set_model(&self, model: String) -> Result<String, String> {
+        let provider = self.current_provider();
+        self.apply_selection(provider, model).map(|(_, m)| m)
     }
 }
 
@@ -711,11 +740,24 @@ fn normalize_stop_reason(reason: Option<String>) -> Option<String> {
         Some("max_tokens") | Some("length") => Some("max_tokens".into()),
         Some("end_turn") => Some("end_turn".into()),
         Some(r) if r.eq_ignore_ascii_case("stop") => Some("end_turn".into()),
+        Some(r) if r.eq_ignore_ascii_case("completed") => Some("end_turn".into()),
         Some("clarification") | Some("ask_user") | Some("needs_clarification") => {
             Some("ask_clarification".into())
         }
         Some(other) => Some(other.to_string()),
     }
+}
+
+/// OpenAI-compatible APIs (notably xAI Grok) may return `finish_reason: "stop"` / `"completed"`
+/// while still populating `tool_calls`. Prefer tool content over finish_reason.
+fn oai_stop_reason_from_content(
+    finish_reason: Option<&str>,
+    has_tool_calls: bool,
+) -> Option<String> {
+    if has_tool_calls {
+        return Some("tool_use".into());
+    }
+    normalize_stop_reason(finish_reason.map(str::to_string))
 }
 
 fn parse_tool_input(input_json: &str) -> serde_json::Value {
@@ -756,9 +798,18 @@ fn build_stream_response(
         });
     }
 
+    let has_tool_calls = content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+    let stop_reason = if has_tool_calls {
+        Some("tool_use".into())
+    } else {
+        normalize_stop_reason(stop_reason)
+    };
+
     MessagesResponse {
         content,
-        stop_reason: normalize_stop_reason(stop_reason),
+        stop_reason,
         usage,
     }
 }
@@ -893,6 +944,61 @@ impl LlmProvider for AnthropicProvider {
 // OpenAI-compatible provider  (OpenAI, OpenRouter, DeepSeek, Groq, Ollama …)
 // ---------------------------------------------------------------------------
 
+fn oai_resolve_base_url(config: &Config) -> String {
+    if let Some(ref url) = config.llm_base_url {
+        let t = url.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    crate::llm_catalog::default_base_url_for_provider(&config.llm_provider)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+}
+
+/// GPT-5 / o-series and some Grok reasoning models reject `max_tokens` on Chat Completions.
+fn oai_uses_max_completion_tokens(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("gpt-5")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("grok-4.20")
+        || m.contains("-reasoning")
+}
+
+fn oai_error_wants_max_completion_tokens(body: &str) -> bool {
+    body.contains("max_completion_tokens")
+}
+
+fn build_oai_chat_request_body(
+    model: &str,
+    max_tokens: u32,
+    oai_messages: &[serde_json::Value],
+    tools: Option<&[ToolDefinition]>,
+    stream: bool,
+    use_max_completion_tokens: bool,
+) -> serde_json::Value {
+    let mut body = json!({
+        "model": model,
+        "messages": oai_messages,
+    });
+    if use_max_completion_tokens {
+        body["max_completion_tokens"] = json!(max_tokens);
+    } else {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if stream {
+        body["stream"] = json!(true);
+    }
+    if let Some(tool_defs) = tools {
+        if !tool_defs.is_empty() {
+            body["tools"] = json!(translate_tools_to_oai(tool_defs));
+        }
+    }
+    body
+}
+
 pub struct OpenAiProvider {
     http: reqwest::Client,
     api_key: String,
@@ -903,10 +1009,7 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: &Config) -> Self {
-        let base = config
-            .llm_base_url
-            .as_deref()
-            .unwrap_or("https://api.openai.com/v1");
+        let base = oai_resolve_base_url(config);
         let chat_url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
         OpenAiProvider {
@@ -1009,23 +1112,22 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let oai_messages = translate_messages_to_oai(system, &messages);
-
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": oai_messages,
-        });
-
-        if let Some(ref tool_defs) = tools {
-            if !tool_defs.is_empty() {
-                body["tools"] = json!(translate_tools_to_oai(tool_defs));
-            }
-        }
-
+        let tool_slice = tools.as_deref();
+        let mut use_max_completion_tokens = oai_uses_max_completion_tokens(&self.model);
+        let mut token_field_retried = false;
         let mut retries = 0u32;
         let max_retries = 3;
 
         loop {
+            let body = build_oai_chat_request_body(
+                &self.model,
+                self.max_tokens,
+                &oai_messages,
+                tool_slice,
+                false,
+                use_max_completion_tokens,
+            );
+
             let mut req = self
                 .http
                 .post(&self.chat_url)
@@ -1083,6 +1185,14 @@ impl LlmProvider for OpenAiProvider {
             }
 
             let text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 400
+                && !token_field_retried
+                && oai_error_wants_max_completion_tokens(&text)
+            {
+                token_field_retried = true;
+                use_max_completion_tokens = true;
+                continue;
+            }
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
                 let msg = format_oai_error(status, &err.error, &text);
                 return Err(FinallyAValueBotError::LlmApi(msg));
@@ -1101,24 +1211,22 @@ impl LlmProvider for OpenAiProvider {
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let oai_messages = translate_messages_to_oai(system, &messages);
-
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": oai_messages,
-            "stream": true,
-        });
-
-        if let Some(ref tool_defs) = tools {
-            if !tool_defs.is_empty() {
-                body["tools"] = json!(translate_tools_to_oai(tool_defs));
-            }
-        }
-
+        let tool_slice = tools.as_deref();
+        let mut use_max_completion_tokens = oai_uses_max_completion_tokens(&self.model);
+        let mut token_field_retried = false;
         let mut retries = 0u32;
         let max_retries = 3;
 
         let response = loop {
+            let body = build_oai_chat_request_body(
+                &self.model,
+                self.max_tokens,
+                &oai_messages,
+                tool_slice,
+                true,
+                use_max_completion_tokens,
+            );
+
             let mut req = self
                 .http
                 .post(&self.chat_url)
@@ -1169,6 +1277,14 @@ impl LlmProvider for OpenAiProvider {
             }
 
             let text = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 400
+                && !token_field_retried
+                && oai_error_wants_max_completion_tokens(&text)
+            {
+                token_field_retried = true;
+                use_max_completion_tokens = true;
+                continue;
+            }
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
                 let msg = format_oai_error(status, &err.error, &text);
                 return Err(FinallyAValueBotError::LlmApi(msg));
@@ -1237,9 +1353,13 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
+        let has_tool_calls = content
+            .iter()
+            .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+
         Ok(MessagesResponse {
             content,
-            stop_reason: normalize_stop_reason(stop_reason),
+            stop_reason: oai_stop_reason_from_content(stop_reason.as_deref(), has_tool_calls),
             usage,
         })
     }
@@ -2174,11 +2294,11 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
         });
     }
 
-    let stop_reason = match choice.finish_reason.as_deref() {
-        Some("tool_calls") => Some("tool_use".into()),
-        Some("length") => Some("max_tokens".into()),
-        _ => Some("end_turn".into()),
-    };
+    let has_tool_calls = content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+
+    let stop_reason = oai_stop_reason_from_content(choice.finish_reason.as_deref(), has_tool_calls);
 
     let usage = oai.usage.map(|u| Usage {
         input_tokens: u.prompt_tokens,
@@ -2196,6 +2316,26 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_oai_uses_max_completion_tokens() {
+        assert!(oai_uses_max_completion_tokens("gpt-5.4"));
+        assert!(oai_uses_max_completion_tokens("o3-mini"));
+        assert!(oai_uses_max_completion_tokens("grok-4.20-0309-reasoning"));
+        assert!(!oai_uses_max_completion_tokens("gpt-4o"));
+        assert!(!oai_uses_max_completion_tokens("grok-4.3"));
+    }
+
+    #[test]
+    fn test_build_oai_chat_request_body_token_fields() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let legacy = build_oai_chat_request_body("gpt-4o", 100, &msgs, None, false, false);
+        assert!(legacy.get("max_tokens").is_some());
+        assert!(legacy.get("max_completion_tokens").is_none());
+        let modern = build_oai_chat_request_body("gpt-5.2", 100, &msgs, None, false, true);
+        assert!(modern.get("max_completion_tokens").is_some());
+        assert!(modern.get("max_tokens").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // translate_messages_to_oai
@@ -2577,6 +2717,58 @@ mod tests {
             ResponseContentBlock::ToolUse { name, .. } => assert_eq!(name, "read_file"),
             _ => panic!("Expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn test_translate_oai_response_xai_stop_with_tool_calls() {
+        let oai = OaiResponse {
+            choices: vec![OaiChoice {
+                message: OaiMessage {
+                    content: None,
+                    tool_calls: Some(vec![OaiToolCall {
+                        id: "call_abc".into(),
+                        function: OaiFunction {
+                            name: "bash".into(),
+                            arguments: r#"{"command":"ls"}"#.into(),
+                            thought_signature: None,
+                        },
+                        thought_signature: None,
+                    }]),
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+        let resp = translate_oai_response(oai);
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        assert!(resp.content.iter().any(|b| matches!(
+            b,
+            ResponseContentBlock::ToolUse { name, .. } if name == "bash"
+        )));
+    }
+
+    #[test]
+    fn test_translate_oai_response_xai_completed_with_tool_calls() {
+        let oai = OaiResponse {
+            choices: vec![OaiChoice {
+                message: OaiMessage {
+                    content: None,
+                    tool_calls: Some(vec![OaiToolCall {
+                        id: "call_xyz".into(),
+                        function: OaiFunction {
+                            name: "read_file".into(),
+                            arguments: "{}".into(),
+                            thought_signature: None,
+                        },
+                        thought_signature: None,
+                    }]),
+                },
+                finish_reason: Some("completed".into()),
+            }],
+            usage: None,
+        };
+        let resp = translate_oai_response(oai);
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
     }
 
     #[test]
