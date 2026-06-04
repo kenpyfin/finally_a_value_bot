@@ -4,6 +4,14 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-04 — Web image delivery: repair fabricated `-bot-` upload URLs
+
+- **Area:** web / delivery / final_delivery_media
+- **Summary:** When the assistant emits `/api/uploads/.../YYYYMMDD-HHMMSS-bot-<artifact>` URLs that were never persisted (or points at a missing `-bot-` copy path), `materialize_response_file_links` now strips delivery-copy and hash prefixes and resolves the persona artifact (e.g. `PZ-20260608-PARK-HOTIFY-MEDIUM.png`) before re-uploading. Thread markdown renderers include explicit `img` styling.
+- **Rationale:** Influencer_PZ_3 (persona 24) runs showed repeated “can't see the image” — LLM-invented upload URLs 404'd because fallback only matched exact basenames, not canonical artifact names under `shared/personas/997894126/24/`.
+- **Key files / symbols:** `artifact_basename_fallback_candidates` in `src/final_delivery_media.rs`; `resolve_response_local_file_path` in `src/web.rs`; `web/src/components/thread-pane.tsx`, `message-markdown.tsx`.
+- **Follow-ups:** Rebuild `web/dist` after deploy; existing stored chat rows with broken URLs stay broken until the user asks for a resend (materialization runs on new replies only).
+
 ### 2026-06-03 — LLM provider/model Web UI only (removed from .env)
 
 - **Area:** config / web / main

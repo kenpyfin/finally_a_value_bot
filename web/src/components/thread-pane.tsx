@@ -291,6 +291,14 @@ export const ThreadPane = React.memo(function ThreadPane({
   const MarkdownText = makeMarkdownText({
     remarkPlugins: [remarkGfm],
     components: {
+      img: ({ alt, className, ...props }) => (
+        <img
+          {...props}
+          alt={alt ?? ''}
+          className={['my-2 max-h-[70vh] max-w-full rounded-lg', className].filter(Boolean).join(' ')}
+          loading="lazy"
+        />
+      ),
       a: (props) => {
         const mergedRel = [props.rel, 'noopener', 'noreferrer'].filter(Boolean).join(' ')
         return <a {...props} target="_blank" rel={mergedRel} />

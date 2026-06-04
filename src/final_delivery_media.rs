@@ -20,6 +20,38 @@ fn trim_artifact_ref(raw: &str) -> &str {
         .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>')
 }
 
+fn web_delivery_copy_basename_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\d{8}-\d{6}-bot-(.+)$").unwrap())
+}
+
+fn hash_prefixed_upload_basename_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^[0-9a-f]{16}-(.+)$").unwrap())
+}
+
+/// Basename variants to try when a delivery URL or `-bot-` copy path does not exist on disk.
+pub fn artifact_basename_fallback_candidates(basename: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        if !value.is_empty() && !out.iter().any(|existing| existing == &value) {
+            out.push(value);
+        }
+    };
+    push(basename.to_string());
+    if let Some(caps) = web_delivery_copy_basename_regex().captures(basename) {
+        if let Some(rest) = caps.get(1) {
+            push(rest.as_str().to_string());
+        }
+    }
+    if let Some(caps) = hash_prefixed_upload_basename_regex().captures(basename) {
+        if let Some(rest) = caps.get(1) {
+            push(rest.as_str().to_string());
+        }
+    }
+    out
+}
+
 pub fn is_deliverable_image_extension(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -314,5 +346,21 @@ mod tests {
         let out = normalize_assistant_artifact_references(&input, &root, 1, 2);
         assert_eq!(out, input);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_basename_fallback_candidates_strips_delivery_copy_prefix() {
+        let candidates = artifact_basename_fallback_candidates(
+            "20260604-045735-bot-PZ-20260608-PARK-HOTIFY-MEDIUM.png",
+        );
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[1], "PZ-20260608-PARK-HOTIFY-MEDIUM.png");
+    }
+
+    #[test]
+    fn artifact_basename_fallback_candidates_strips_hash_prefix() {
+        let candidates =
+            artifact_basename_fallback_candidates("78bc936e4388a4ae-PZ-20260603-EMBARCADERO.png");
+        assert!(candidates.contains(&"PZ-20260603-EMBARCADERO.png".to_string()));
     }
 }

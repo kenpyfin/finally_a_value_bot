@@ -36,6 +36,15 @@ export function MessageMarkdown({ content }: MessageMarkdownProps) {
             }
             return <code className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[12px]">{children}</code>
           },
+          img: ({ alt, src, ...props }) => (
+            <img
+              {...props}
+              src={src}
+              alt={alt ?? ''}
+              className="my-2 max-h-[70vh] max-w-full rounded-lg"
+              loading="lazy"
+            />
+          ),
           pre: ({ children }) => <pre className="my-2 overflow-x-auto">{children}</pre>,
           blockquote: ({ children }) => (
             <blockquote className="my-2 border-l-4 border-teal-300 bg-teal-50/40 py-1 pl-3 text-slate-700">

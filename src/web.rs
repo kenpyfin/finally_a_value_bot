@@ -2061,13 +2061,35 @@ fn resolve_response_local_file_path(
     if trimmed.starts_with('#') || trimmed.starts_with("mailto:") {
         return None;
     }
-    crate::final_delivery_media::resolve_workspace_artifact_path(
-        &state.app_state.config.workspace_root_absolute(),
+    let workspace_root = state.app_state.config.workspace_root_absolute();
+    let kind = crate::final_delivery_media::ArtifactResolveKind::AnyFile;
+    if let Some(path) = crate::final_delivery_media::resolve_workspace_artifact_path(
+        &workspace_root,
         Some(chat_id),
         Some(persona_id),
         trimmed,
-        crate::final_delivery_media::ArtifactResolveKind::AnyFile,
-    )
+        kind,
+    ) {
+        return Some(path);
+    }
+    let basename = std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    for candidate in crate::final_delivery_media::artifact_basename_fallback_candidates(basename) {
+        if candidate == basename {
+            continue;
+        }
+        if let Some(path) = crate::final_delivery_media::resolve_workspace_artifact_path(
+            &workspace_root,
+            Some(chat_id),
+            Some(persona_id),
+            &candidate,
+            kind,
+        ) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn upload_rel_url_exists(state: &WebState, rel_url: &str) -> bool {
@@ -5481,6 +5503,38 @@ mod tests {
         assert!(output.contains("/api/uploads/web/997894126/"));
         assert_ne!(input, output);
 
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_repairs_fabricated_bot_copy_upload_url() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = 997894126_i64;
+        let persona_id = 24_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let persona_dir = workspace_root
+            .join("shared")
+            .join("personas")
+            .join(chat_id.to_string())
+            .join(persona_id.to_string());
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        std::fs::write(
+            persona_dir.join("PZ-20260608-PARK-HOTIFY-MEDIUM.png"),
+            [137u8, 80, 78, 71, 13, 10, 26, 10],
+        )
+        .unwrap();
+
+        let input = "![preview](/api/uploads/web/997894126/24/20260604-045735-bot-PZ-20260608-PARK-HOTIFY-MEDIUM.png)";
+        let output = materialize_response_file_links(&web_state, chat_id, persona_id, input)
+            .await
+            .unwrap();
+        assert_ne!(input, output);
         let urls = extract_upload_urls_from_text(&output);
         assert_eq!(urls.len(), 1);
         assert!(upload_rel_url_exists(&web_state, &urls[0]));
