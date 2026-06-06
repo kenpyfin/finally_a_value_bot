@@ -144,8 +144,22 @@ pub async fn deliver_and_store_bot_message(
     }
 }
 
-/// Store the bot message once under canonical_chat_id and deliver to all bound channels (Telegram, Discord, web).
-/// Used for unified contact sync: the same reply appears on every linked channel.
+/// Controls which external bindings receive an outbound message (web history always stored).
+#[derive(Debug, Clone, Copy, Default)]
+pub enum DeliveryScope {
+    /// Deliver to every bound channel for this contact (scheduler, web-initiated, background jobs).
+    #[default]
+    ContactWide,
+    /// Reply only on the platform + bot instance that received the inbound message.
+    PlatformInstance {
+        channel_type: &'static str,
+        bot_instance_id: i64,
+    },
+    /// Persist for web/history only; no Telegram/Discord/WhatsApp send.
+    StoreOnly,
+}
+
+/// Store the bot message once under canonical_chat_id and deliver per [`DeliveryScope`].
 pub async fn deliver_to_contact(
     db: Arc<Database>,
     telegram_bots: &HashMap<i64, Bot>,
@@ -155,6 +169,7 @@ pub async fn deliver_to_contact(
     persona_id: i64,
     text: &str,
     workspace_root: Option<PathBuf>,
+    scope: DeliveryScope,
 ) -> Result<(), String> {
     let text = strip_embedded_bulletin_focus(text);
     let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
@@ -190,7 +205,19 @@ pub async fn deliver_to_contact(
     }
 
     let mut delivered_targets: HashSet<(String, String)> = HashSet::new();
+    if matches!(scope, DeliveryScope::StoreOnly) {
+        return Ok(());
+    }
     for b in &bindings {
+        if let DeliveryScope::PlatformInstance {
+            channel_type,
+            bot_instance_id,
+        } = scope
+        {
+            if b.channel_type != channel_type || b.bot_instance_id != bot_instance_id {
+                continue;
+            }
+        }
         if let Some((mode, policy_persona_id)) = policy_by_instance.get(&b.bot_instance_id) {
             if *mode == crate::db::ChannelPersonaMode::Single
                 && policy_persona_id.is_some()
@@ -205,9 +232,12 @@ pub async fn deliver_to_contact(
         }
         match b.channel_type.as_str() {
             "telegram" => {
-                let tg_bot = telegram_bots
-                    .get(&b.bot_instance_id)
-                    .or_else(|| telegram_bots.get(&crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY));
+                let tg_bot = match scope {
+                    DeliveryScope::PlatformInstance { .. } => telegram_bots.get(&b.bot_instance_id),
+                    _ => telegram_bots
+                        .get(&b.bot_instance_id)
+                        .or_else(|| telegram_bots.get(&crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY)),
+                };
                 if let Some(bot) = tg_bot {
                     if let Ok(chat_id) = b.channel_handle.parse::<i64>() {
                         let auto_images =
@@ -234,9 +264,12 @@ pub async fn deliver_to_contact(
                 }
             }
             "discord" => {
-                let http = discord_http
-                    .get(&b.bot_instance_id)
-                    .or_else(|| discord_http.get(&crate::db::BOT_INSTANCE_DISCORD_PRIMARY));
+                let http = match scope {
+                    DeliveryScope::PlatformInstance { .. } => discord_http.get(&b.bot_instance_id),
+                    _ => discord_http
+                        .get(&b.bot_instance_id)
+                        .or_else(|| discord_http.get(&crate::db::BOT_INSTANCE_DISCORD_PRIMARY)),
+                };
                 if let Some(http) = http {
                     if let Ok(channel_id_u64) = b.channel_handle.parse::<u64>() {
                         let channel_id = serenity::model::id::ChannelId::new(channel_id_u64);
@@ -297,6 +330,7 @@ pub async fn deliver_agent_final_to_contact(
     persona_id: i64,
     raw_final: &str,
     workspace_root: Option<PathBuf>,
+    scope: DeliveryScope,
 ) -> Result<AgentFinalDeliveryOutcome, String> {
     let cleaned = normalize_final_for_delivery(
         raw_final,
@@ -318,6 +352,7 @@ pub async fn deliver_agent_final_to_contact(
                 persona_id,
                 &cleaned,
                 workspace_root,
+                scope,
             )
             .await?;
             Ok(AgentFinalDeliveryOutcome {
@@ -340,6 +375,7 @@ pub async fn deliver_agent_final_to_contact(
                 persona_id,
                 &suffix,
                 workspace_root,
+                scope,
             )
             .await?;
             Ok(AgentFinalDeliveryOutcome {

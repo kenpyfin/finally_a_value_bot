@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::warn;
 
-use crate::channel::deliver_to_contact;
+use crate::channel::{deliver_to_contact, DeliveryScope};
 use crate::db::call_blocking;
 use crate::telegram::{AgentEvent, AppState};
 
@@ -248,6 +248,7 @@ pub fn spawn_shared_heartbeat(
                             persona_id,
                             &format!("Background update: {}", message),
                             Some(state.config.workspace_root_absolute()),
+                            DeliveryScope::ContactWide,
                         )
                         .await;
                         last_user_notify = Instant::now();
@@ -290,6 +291,7 @@ pub fn spawn_shared_heartbeat(
                             persona_id,
                             &format!("Background update: {}", message),
                             Some(state.config.workspace_root_absolute()),
+                            DeliveryScope::ContactWide,
                         )
                         .await;
                         last_user_notify = Instant::now();

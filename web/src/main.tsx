@@ -500,6 +500,7 @@ function App() {
   const [newBotLabel, setNewBotLabel] = useState('')
   const [newBotToken, setNewBotToken] = useState('')
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
+  const [integrationsNotice, setIntegrationsNotice] = useState<string | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [mobileChatHeaderCollapsed, setMobileChatHeaderCollapsed] = useState(false)
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState<boolean>(readDesktopSidebarOpen)
@@ -1472,9 +1473,10 @@ function App() {
       return
     }
     setSettingsError('')
+    setIntegrationsNotice(null)
     setBotFormBusy(true)
     try {
-      await api('/api/channel_bot_instances', {
+      const data = await api<{ message?: string }>('/api/channel_bot_instances', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1485,7 +1487,11 @@ function App() {
       })
       setNewBotLabel('')
       setNewBotToken('')
+      setIntegrationsNotice(data.message ?? 'Bot instance created. Restart the gateway to activate dispatchers.')
       await loadBotInstances()
+      if (chatId != null) {
+        await loadBindings(chatId)
+      }
     } catch (e) {
       setSettingsError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1513,23 +1519,28 @@ function App() {
     personaId?: number,
   ): Promise<void> {
     if (chatId == null) return
-    if (mode === 'all') {
-      await api('/api/channel_persona_policy', {
-        method: 'DELETE',
-        body: JSON.stringify({ chat_id: chatId, bot_instance_id: botInstanceId }),
-      })
-    } else {
-      await api('/api/channel_persona_policy', {
-        method: 'POST',
-        body: JSON.stringify({
-          chat_id: chatId,
-          bot_instance_id: botInstanceId,
-          mode: 'single',
-          persona_id: personaId,
-        }),
-      })
+    setSettingsError('')
+    try {
+      if (mode === 'all') {
+        await api('/api/channel_persona_policy', {
+          method: 'DELETE',
+          body: JSON.stringify({ chat_id: chatId, bot_instance_id: botInstanceId }),
+        })
+      } else {
+        await api('/api/channel_persona_policy', {
+          method: 'POST',
+          body: JSON.stringify({
+            chat_id: chatId,
+            bot_instance_id: botInstanceId,
+            mode: 'single',
+            persona_id: personaId,
+          }),
+        })
+      }
+      await loadBindings(chatId)
+    } catch (e) {
+      setSettingsError(e instanceof Error ? e.message : String(e))
     }
-    await loadBindings(chatId)
   }
 
   async function loadQueueDiagnostics(cid: number | null = chatId): Promise<void> {
@@ -2195,8 +2206,13 @@ function App() {
                       >
                         <Text size="2" weight="bold" className="mb-1">Bot integrations</Text>
                         <Text size="1" color="gray" className="mb-2 block">
-                          Additional Telegram or Discord bots beyond env-seeded instances. Tokens are stored in the database; primary instances from config may be read-only here.
+                          Additional Telegram or Discord bots beyond env-seeded instances. Tokens are stored in the database; primary instances from config may be read-only here. Restart the gateway after adding a bot.
                         </Text>
+                        {integrationsNotice ? (
+                          <Callout.Root color="green" size="1" variant="soft" className="mb-2">
+                            <Callout.Text>{integrationsNotice}</Callout.Text>
+                          </Callout.Root>
+                        ) : null}
                         <div className="mb-3 space-y-1">
                           {botInstances.length === 0 ? (
                             <Text size="1" color="gray">No instances loaded (check auth).</Text>
@@ -2282,23 +2298,40 @@ function App() {
                       >
                         <Text size="2" weight="bold">External channel persona mode</Text>
                         <Text size="1" color="gray" className="mb-2 block">
-                          Per Telegram/Discord/WhatsApp bot instance: allow all personas or lock to one. Web chat is not listed here — use the persona selector in the chat UI.
+                          Every Telegram/Discord bot integration appears here immediately. Handles auto-link from existing chats on the same contact when you add a bot under Integrations (restart required). Web chat uses the persona selector in the main UI.
                         </Text>
                         <div className="space-y-2">
                           {bindings.length === 0 ? (
-                            <Text size="1" color="gray">No channel bindings found for this contact.</Text>
+                            <Text size="1" color="gray">No bot integrations configured. Add bots under the Integrations tab.</Text>
                           ) : bindings.map((b) => {
                             const currentMode = b.persona_mode === 'single' ? 'single' : 'all'
                             const currentPersonaId = b.persona_id ?? activePersonaId ?? personas[0]?.id ?? null
+                            const platform = b.platform ?? b.channel_type
+                            const handleLabel = b.linked && b.channel_handle
+                              ? b.channel_handle
+                              : 'pending link'
+                            const otherAllOnPlatform = bindings.some(
+                              (other) =>
+                                other.bot_instance_id !== b.bot_instance_id &&
+                                (other.platform ?? other.channel_type) === platform &&
+                                other.persona_mode !== 'single',
+                            )
+                            const allPersonasDisabled = otherAllOnPlatform && currentMode !== 'all'
                             return (
-                              <Flex key={`${b.bot_instance_id}:${b.channel_type}:${b.channel_handle}`} gap="2" align="center" wrap="wrap">
-                                <Text size="1" className="min-w-[200px]">
-                                  {b.channel_type} (bot #{b.bot_instance_id}): {b.channel_handle}
+                              <Flex key={`${b.bot_instance_id}:${b.channel_type}:${b.channel_handle ?? 'pending'}`} gap="2" align="center" wrap="wrap">
+                                <Text size="1" className="min-w-[220px]">
+                                  {b.label ? `${b.label} — ` : ''}{platform} (bot #{b.bot_instance_id}): {handleLabel}
                                 </Text>
                                 <Select.Root
                                   value={currentMode}
                                   onValueChange={(mode) => {
                                     if (mode === 'all') {
+                                      if (allPersonasDisabled) {
+                                        setSettingsError(
+                                          `Only one ${platform} bot can use all personas for this contact. Lock the other bot to a single persona first.`,
+                                        )
+                                        return
+                                      }
                                       void updateChannelPersonaPolicy(b.bot_instance_id, 'all')
                                     } else if (currentPersonaId != null) {
                                       void updateChannelPersonaPolicy(b.bot_instance_id, 'single', currentPersonaId)
@@ -2307,7 +2340,9 @@ function App() {
                                 >
                                   <Select.Trigger className="w-[140px]" />
                                   <Select.Content>
-                                    <Select.Item value="all">All personas</Select.Item>
+                                    <Select.Item value="all" disabled={allPersonasDisabled}>
+                                      All personas
+                                    </Select.Item>
                                     <Select.Item value="single">Single persona</Select.Item>
                                   </Select.Content>
                                 </Select.Root>

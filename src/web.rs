@@ -23,7 +23,7 @@ use crate::background_jobs::{
     await_handoff_startup_ack, handoff_trigger_for_db, is_background_handoff_response,
     try_enqueue_background_handoff, HandoffEnqueueOutcome,
 };
-use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact};
+use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact, DeliveryScope};
 use crate::chat_queue::{QueueEnqueueMeta, QueueRemoveOutcome, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
@@ -1919,6 +1919,7 @@ async fn send_and_store_response_with_events(
             persona_id,
             &resp,
             Some(state.app_state.config.workspace_root_absolute()),
+            DeliveryScope::ContactWide,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1971,6 +1972,7 @@ async fn send_and_store_response_with_events(
             is_scheduled_task: false,
             is_background_job: false,
             run_key: run_key.map(|s| s.to_string()),
+            reply_bot_instance_id: None,
         },
         None,
         image_data,
@@ -2027,6 +2029,7 @@ async fn send_and_store_response_with_events(
             persona_id,
             &response,
             Some(state.app_state.config.workspace_root_absolute()),
+            DeliveryScope::ContactWide,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -4452,38 +4455,27 @@ async fn api_contacts_bindings(
 
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
-    let bindings = call_blocking(state.app_state.db.clone(), move |db| {
-        db.list_bindings_for_contact(chat_id)
+    let rows = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_contact_channel_integration_rows(chat_id)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let policies = call_blocking(state.app_state.db.clone(), move |db| {
-        db.list_channel_persona_policies(chat_id)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mut policy_by_instance: HashMap<i64, (String, Option<i64>)> = HashMap::new();
-    for p in policies {
-        let mode = match p.mode {
-            ChannelPersonaMode::All => "all",
-            ChannelPersonaMode::Single => "single",
-        };
-        policy_by_instance.insert(p.bot_instance_id, (mode.to_string(), p.persona_id));
-    }
 
-    let items: Vec<serde_json::Value> = bindings
+    let items: Vec<serde_json::Value> = rows
         .into_iter()
-        .filter(|b| b.channel_type != "web")
-        .map(|b| {
-            let (mode, persona_id) = policy_by_instance
-                .get(&b.bot_instance_id)
-                .cloned()
-                .unwrap_or_else(|| ("all".to_string(), None));
+        .map(|r| {
+            let (persona_mode, persona_id) = match r.persona_mode {
+                ChannelPersonaMode::All => ("all", None),
+                ChannelPersonaMode::Single => ("single", r.persona_id),
+            };
             json!({
-                "bot_instance_id": b.bot_instance_id,
-                "channel_type": b.channel_type,
-                "channel_handle": b.channel_handle,
-                "persona_mode": mode,
+                "bot_instance_id": r.bot_instance_id,
+                "platform": r.platform,
+                "label": r.label,
+                "channel_type": r.platform,
+                "channel_handle": r.channel_handle,
+                "linked": r.linked,
+                "persona_mode": persona_mode,
                 "persona_id": persona_id
             })
         })
@@ -4842,16 +4834,26 @@ async fn api_channel_bot_instances_post(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let platform = body.platform;
+    let platform_for_provision = platform.clone();
     let label = body.label;
     let token = body.token;
-    let id = call_blocking(state.app_state.db.clone(), move |db| {
+    let db = state.app_state.db.clone();
+    let id = call_blocking(db.clone(), move |db| {
         db.create_channel_bot_instance(&platform, &label, &token)
     })
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok(Json(
-        json!({ "ok": true, "id": id, "message": "Bot instance created. Restart the process to run dispatchers for new instances." }),
-    ))
+    let linked = call_blocking(db, move |db| {
+        db.provision_bindings_for_instance(&platform_for_provision, id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "bindings_provisioned": linked,
+        "message": "Bot instance created. Restart the process to run dispatchers for new instances. Existing contacts were auto-linked where possible."
+    })))
 }
 
 async fn api_channel_bot_instances_patch(

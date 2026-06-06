@@ -9,7 +9,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 
 use crate::background_jobs::{try_enqueue_background_handoff, HandoffEnqueueOutcome};
-use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact};
+use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact, DeliveryScope};
 use crate::config::Config;
 use crate::db::{call_blocking, BackgroundJob};
 use crate::job_heartbeat::{spawn_shared_heartbeat, HeartbeatSignal, JobType};
@@ -390,6 +390,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
         persona_id,
         &ack,
         Some(state.config.workspace_root_absolute()),
+        DeliveryScope::ContactWide,
     )
     .await
     {
@@ -649,6 +650,7 @@ async fn deliver_shell_notification(
         persona_id,
         text,
         Some(state.config.workspace_root_absolute()),
+        DeliveryScope::ContactWide,
     )
     .await
 }
@@ -763,6 +765,7 @@ pub async fn finalize_shell_job(
         persona_id,
         &delivery_text,
         Some(state.config.workspace_root_absolute()),
+        DeliveryScope::ContactWide,
     )
     .await
     {

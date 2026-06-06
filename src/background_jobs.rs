@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
-use crate::channel::deliver_agent_final_to_contact;
+use crate::channel::{deliver_agent_final_to_contact, DeliveryScope};
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::db::call_blocking;
 use crate::job_heartbeat::{
@@ -305,6 +305,7 @@ pub fn spawn_background_job(
                 is_scheduled_task: false,
                 is_background_job: true,
                 run_key: Some(job_id.clone()),
+                reply_bot_instance_id: None,
             },
             Some(&prompt),
             None,
@@ -409,6 +410,7 @@ pub fn spawn_background_job(
                     persona_id,
                     &final_text,
                     Some(state.config.workspace_root_absolute()),
+                    DeliveryScope::ContactWide,
                 )
                 .await
                 {
@@ -455,6 +457,7 @@ pub fn spawn_background_job(
                     persona_id,
                     &fallback,
                     Some(state.config.workspace_root_absolute()),
+                    DeliveryScope::ContactWide,
                 )
                 .await;
 

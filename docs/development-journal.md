@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-04 — Multi-bot Telegram/Discord: Channels tab, auto-link, scoped delivery
+
+- **Area:** DB / channels / web API / web UI
+- **Summary:** Settings → **Channels** lists every `channel_bot_instances` row for telegram/discord immediately (`list_contact_channel_integration_rows`, `GET /api/contacts/bindings`) with `linked` + optional handle. New bots auto-provision sibling `channel_bindings` on create and at startup (`provision_bindings_for_instance`, `provision_all_missing_sibling_bindings`). Extra instance ids are `>= 4`; migration moves misplaced rows off reserved ids 2–3. Outbound replies use `DeliveryScope::PlatformInstance` from inbound telegram/discord/whatsapp handlers (web/scheduler still `ContactWide`); messages always stored for web history. At most one bot per platform per contact may use effective “all personas” (`validate_all_persona_slot`). Telegram startup logs/`getMe` per instance; `telegram_enabled` when any DB telegram token exists.
+- **Key files / symbols:** `src/db.rs` (`ContactChannelIntegrationRow`, `migrate_misplaced_channel_bot_instance_ids`); `src/channel.rs` (`DeliveryScope`); `src/channels/telegram.rs` (`reply_bot_instance_id`, dispatcher logs); `src/web.rs` (`api_contacts_bindings`, `api_channel_bot_instances_post`); `web/src/main.tsx`, `web/src/types.ts`.
+- **Follow-ups:** Rebuild `web/dist`; restart gateway after adding integrations; per-bot `@username` for group mentions still uses `BOT_USERNAME` from env (primary only).
+
 ### 2026-06-04 — Web image delivery: repair fabricated `-bot-` upload URLs
 
 - **Area:** web / delivery / final_delivery_media

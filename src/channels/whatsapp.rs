@@ -10,7 +10,7 @@ use base64::Engine;
 use serde::Deserialize;
 use tracing::{error, info};
 
-use crate::channel::deliver_agent_final_to_contact;
+use crate::channel::{deliver_agent_final_to_contact, DeliveryScope};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
@@ -557,6 +557,9 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 is_scheduled_task: false,
                                 is_background_job: false,
                                 run_key: None,
+                                reply_bot_instance_id: Some(
+                                    crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
+                                ),
                             },
                             None,
                             image_data,
@@ -579,6 +582,10 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                     persona_id,
                                     &agent_out.response,
                                     Some(app_state.config.workspace_root_absolute()),
+                                    DeliveryScope::PlatformInstance {
+                                        channel_type: "whatsapp",
+                                        bot_instance_id: crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
+                                    },
                                 )
                                 .await;
 

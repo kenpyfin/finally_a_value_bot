@@ -11,7 +11,7 @@ use crate::background_jobs::{
     await_handoff_startup_ack, is_background_handoff_response, try_enqueue_background_handoff,
     HandoffEnqueueOutcome,
 };
-use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact};
+use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact, DeliveryScope};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::{call_blocking, ScheduledTask};
 use crate::error::FinallyAValueBotError;
@@ -442,6 +442,7 @@ async fn run_scheduled_agent_and_finalize(
             is_scheduled_task: true,
             is_background_job: false,
             run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
+            reply_bot_instance_id: None,
         },
         Some(&prompt),
         None,
@@ -479,6 +480,7 @@ async fn run_scheduled_agent_and_finalize(
                 persona_id,
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
+                DeliveryScope::ContactWide,
             )
             .await
             .is_ok();
@@ -537,6 +539,7 @@ async fn run_scheduled_agent_and_finalize(
                 persona_id,
                 &response_text,
                 Some(state.config.workspace_root_absolute()),
+                DeliveryScope::ContactWide,
             )
             .await
             {
@@ -617,6 +620,7 @@ async fn run_scheduled_agent_and_finalize(
                 persona_id,
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
+                DeliveryScope::ContactWide,
             )
             .await
             .is_ok();

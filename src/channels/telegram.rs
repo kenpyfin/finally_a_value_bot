@@ -302,6 +302,8 @@ pub struct AgentRequestContext<'a> {
     pub is_scheduled_task: bool,
     pub is_background_job: bool,
     pub run_key: Option<String>,
+    /// When set, outbound delivery is scoped to this bot instance on `caller_channel`.
+    pub reply_bot_instance_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,7 +368,11 @@ pub async fn run_bot(
     skills: SkillManager,
     mcp_manager: crate::mcp::McpManager,
 ) -> anyhow::Result<()> {
-    let telegram_enabled = !config.telegram_bot_token.trim().is_empty();
+    let telegram_enabled = !config.telegram_bot_token.trim().is_empty()
+        || db
+            .list_channel_bot_instances_by_platform("telegram")
+            .map(|rows| rows.iter().any(|r| !r.token.trim().is_empty()))
+            .unwrap_or(false);
 
     let mut telegram_bots_map: HashMap<i64, Bot> = HashMap::new();
     let mut telegram_token_owner: HashMap<String, i64> = HashMap::new();
@@ -384,7 +390,19 @@ pub async fn run_bot(
             continue;
         }
         telegram_token_owner.insert(token.to_string(), row.id);
-        telegram_bots_map.insert(row.id, Bot::new(token));
+        let bot = Bot::new(token);
+        match bot.get_me().await {
+            Ok(me) => info!(
+                "Telegram bot instance {} ready (@{})",
+                row.id,
+                me.user.username.as_deref().unwrap_or("?")
+            ),
+            Err(e) => warn!(
+                "Telegram bot instance {} getMe failed: {} (dispatcher will still start)",
+                row.id, e
+            ),
+        }
+        telegram_bots_map.insert(row.id, bot);
     }
     if telegram_bots_map.is_empty() && telegram_enabled {
         telegram_bots_map.insert(
@@ -589,10 +607,16 @@ pub async fn run_bot(
 
     if telegram_enabled {
         const TELEGRAM_RETRY_DELAY_SECS: u64 = 10;
+        info!(
+            "Starting {} Telegram dispatcher(s): {:?}",
+            state.telegram_bots.len(),
+            state.telegram_bots.keys().collect::<Vec<_>>()
+        );
         for (inst_id, bot) in state.telegram_bots.iter() {
             let bot = bot.clone();
             let inst_id = *inst_id;
             let state_clone = state.clone();
+            info!("Telegram dispatcher starting for instance {inst_id}");
             tokio::spawn(async move {
                 loop {
                     let bot_clone = bot.clone();
@@ -1424,6 +1448,7 @@ async fn handle_message(
     // Queue agent work per (canonical chat, persona) so different personas can run in parallel.
     let state_spawn = state.clone();
     let bot_spawn = bot.clone();
+    let telegram_bot_instance_id_spawn = telegram_bot_instance_id;
     let chat_id_spawn = msg.chat.id;
     let thread_id_spawn = msg.thread_id;
     let runtime_chat_type_owned = runtime_chat_type.to_string();
@@ -1509,6 +1534,7 @@ async fn handle_message(
                 is_scheduled_task: false,
                 is_background_job: false,
                 run_key: None,
+                reply_bot_instance_id: Some(telegram_bot_instance_id_spawn),
             },
             None,
             image_data,
@@ -1554,7 +1580,11 @@ async fn handle_message(
                     to_send.len()
                 );
                 let ws_root = state_spawn.config.workspace_root_absolute();
-                let delivered = match crate::channel::deliver_agent_final_to_contact(
+                let delivery_scope = crate::channel::DeliveryScope::PlatformInstance {
+                    channel_type: "telegram",
+                    bot_instance_id: telegram_bot_instance_id_spawn,
+                };
+                if let Err(e) = crate::channel::deliver_agent_final_to_contact(
                     state_spawn.db.clone(),
                     state_spawn.telegram_bots.as_ref(),
                     state_spawn.discord_http.as_ref(),
@@ -1563,54 +1593,25 @@ async fn handle_message(
                     persona_id,
                     &to_send,
                     Some(ws_root.clone()),
+                    delivery_scope,
                 )
                 .await
                 {
-                    Ok(outcome) if !outcome.response_for_client.is_empty() => {
-                        if outcome.response_for_client != to_send {
-                            let auto_ctx = WorkspaceAutoImageContext {
-                                root: ws_root.as_path(),
-                                chat_id: canonical_chat_id_spawn,
-                                persona_id,
-                            };
-                            send_response(
-                                &bot_spawn,
-                                chat_id_spawn,
-                                &outcome.response_for_client,
-                                thread_id_spawn,
-                                Some(auto_ctx),
-                            )
-                            .await;
-                        }
-                        true
-                    }
-                    Ok(_) => {
-                        tracing::info!(
-                            target: "channel",
-                            chat_id = canonical_chat_id_spawn,
-                            "Skipping agent final delivery as redundant"
-                        );
-                        false
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Telegram only");
-                        let auto_ctx = WorkspaceAutoImageContext {
-                            root: ws_root.as_path(),
-                            chat_id: canonical_chat_id_spawn,
-                            persona_id,
-                        };
-                        send_response(
-                            &bot_spawn,
-                            chat_id_spawn,
-                            &to_send,
-                            thread_id_spawn,
-                            Some(auto_ctx),
-                        )
-                        .await;
-                        true
-                    }
-                };
-                let _delivered = delivered;
+                    tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Telegram only");
+                    let auto_ctx = WorkspaceAutoImageContext {
+                        root: ws_root.as_path(),
+                        chat_id: canonical_chat_id_spawn,
+                        persona_id,
+                    };
+                    send_response(
+                        &bot_spawn,
+                        chat_id_spawn,
+                        &to_send,
+                        thread_id_spawn,
+                        Some(auto_ctx),
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 error!("Error processing message: {}", e);

@@ -353,6 +353,7 @@ impl EventHandler for Handler {
         );
 
         let app_state = self.app_state.clone();
+        let discord_bot_instance_id = self.discord_bot_instance_id;
         let chat_queue = app_state.chat_queue.clone();
         let channel_id_for_send = msg.channel_id;
         let is_guild = msg.guild_id.is_some();
@@ -382,6 +383,7 @@ impl EventHandler for Handler {
                         is_scheduled_task: false,
                         is_background_job: false,
                         run_key: None,
+                        reply_bot_instance_id: Some(discord_bot_instance_id),
                     },
                     None,
                     image_data,
@@ -398,7 +400,11 @@ impl EventHandler for Handler {
                             agent_out.response.clone()
                         };
                         if !to_send.is_empty() {
-                            let delivered = match crate::channel::deliver_agent_final_to_contact(
+                            let delivery_scope = crate::channel::DeliveryScope::PlatformInstance {
+                                channel_type: "discord",
+                                bot_instance_id: discord_bot_instance_id,
+                            };
+                            if let Err(e) = crate::channel::deliver_agent_final_to_contact(
                                 app_state.db.clone(),
                                 app_state.telegram_bots.as_ref(),
                                 app_state.discord_http.as_ref(),
@@ -407,18 +413,14 @@ impl EventHandler for Handler {
                                 persona_id,
                                 &to_send,
                                 Some(app_state.config.workspace_root_absolute()),
+                                delivery_scope,
                             )
                             .await
                             {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Discord only");
-                                    send_discord_response_to_http(&http, channel_id_for_send, &to_send)
-                                        .await;
-                                    true
-                                }
-                            };
-                            let _delivered = delivered;
+                                tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Discord only");
+                                send_discord_response_to_http(&http, channel_id_for_send, &to_send)
+                                    .await;
+                            }
                         }
                     }
                     Err(e) => {

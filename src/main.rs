@@ -538,6 +538,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     db.sync_channel_bot_instances_from_config(&config)?;
+    match db.provision_all_missing_sibling_bindings() {
+        Ok(n) if n > 0 => {
+            info!("Auto-provisioned {n} sibling channel binding(s) for bot instances")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Sibling channel binding provisioning skipped: {}", e),
+    }
 
     // Seed onboarding task for fresh installations
     if is_llm_ready(&config) && has_any_realtime_channel(&config) {

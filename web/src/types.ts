@@ -20,7 +20,11 @@ export type Persona = {
 export type ChannelBinding = {
   bot_instance_id: number
   channel_type: string
-  channel_handle: string
+  /** Telegram chat id or Discord channel id; null when not linked yet. */
+  channel_handle: string | null
+  platform?: string
+  label?: string
+  linked?: boolean
   persona_mode?: 'all' | 'single'
   persona_id?: number | null
 }
