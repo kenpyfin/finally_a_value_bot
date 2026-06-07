@@ -4,6 +4,20 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-07 — Web UI mobile polish (operator cockpit)
+
+- **Area:** web UI (`web/`)
+- **Summary:** Expanded session cockpit on small screens uses a fixed scrollable panel with backdrop dismiss instead of overlapping the thread; status strip uses a 2-column grid with hidden separators; controls stack full-width on mobile. Added `viewport-fit=cover`, safe-area padding on header/drawer/composer/dialogs, user bubble right alignment, and tighter tool-card/bookmark overflow handling. Cockpit stays visible when header collapses on scroll if the panel is open (`cockpitExpanded`).
+- **Key files / symbols:** `web/index.html`; `web/src/styles.css` (mobile `@media`, `.mc-app-header-bar`, `.rt-DialogContent`); `web/src/components/cockpit-bar.tsx` (`onExpandedChange`, mobile overlay); `web/src/main.tsx` (`cockpitExpanded`, drawer safe-area).
+- **Follow-ups:** Rebuild `web/dist` for deploy; smoke expanded cockpit + settings dialogs on a phone or narrow viewport.
+
+### 2026-06-07 — Web UI craft polish (operator cockpit)
+
+- **Area:** web UI (`web/`)
+- **Summary:** Unified light/dark styling on `--mc-*` semantic tokens (`--mc-text-*`, `--mc-surface-*`, `--mc-border-strong`); removed decorative body gradients and heavy message/dock shadows; differentiated desktop user vs assistant bubbles; added `prefers-reduced-motion` for thinking dots; refactored expanded `CockpitBar` (signal row, two-column controls, collapsible bulletin); flattened sidebar persona list with SVG icon controls and grouped accent theme picker; removed unused `chat-timeline`, `message-markdown`, `lib/ui.ts`.
+- **Key files / symbols:** `web/src/styles.css`; `web/src/components/cockpit-bar.tsx`, `session-sidebar.tsx`, `initial-run-prompt-view.tsx`, `settings-llm.tsx`; `web/src/main.tsx`.
+- **Follow-ups:** Rebuild `web/dist` for deploy; smoke expanded cockpit + theme menu in both appearances.
+
 ### 2026-06-04 — Multi-bot Telegram/Discord: Channels tab, auto-link, scoped delivery
 
 - **Area:** DB / channels / web API / web UI

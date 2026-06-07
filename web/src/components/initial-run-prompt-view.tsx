@@ -51,7 +51,7 @@ function formatMessageContent(content: unknown): string {
 export function messageSectionLabel(body: string, role: string): string | null {
   if (role !== 'user') return null
   if (body.includes('[persona_context]')) {
-    return 'persona context — Tier 2/3, operator focus, bookmarks'
+    return 'persona context - Tier 2/3, operator focus, bookmarks'
   }
   if (body.includes('[system_runtime_context]')) {
     return 'runtime context (date/time)'
@@ -103,9 +103,7 @@ type Props = {
 /**
  * Renders the first-turn LLM snapshot: system, tools, and messages as one formatted transcript.
  */
-export function InitialRunPromptView({ jsonText, appearance }: Props) {
-  const isDark = appearance === 'dark'
-
+export function InitialRunPromptView({ jsonText }: Props) {
   const parsed = useMemo((): InitialLlmRequestV1 | null => {
     try {
       const v = JSON.parse(jsonText) as unknown
@@ -126,14 +124,10 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
   )
 
   const panel =
-    isDark
-      ? 'rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/80'
-      : 'rounded-md border border-slate-200 bg-white'
+    'rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-surface-elevated)]'
 
   const preBody =
-    isDark
-      ? 'whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-slate-100'
-      : 'whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-slate-800'
+    'whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-[color:var(--mc-text-primary)]'
 
   if (!parsed || typeof parsed !== 'object') {
     return (
@@ -175,11 +169,7 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
               {tools.map((name) => (
                 <code
                   key={name}
-                  className={
-                    isDark
-                      ? 'rounded border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-[11px] text-slate-200'
-                      : 'rounded border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] text-slate-800'
-                  }
+                  className="rounded border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-[11px] text-[color:var(--mc-text-primary)]"
                 >
                   {name}
                 </code>
@@ -187,7 +177,7 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
             </Flex>
           ) : (
             <Text size="2" color="gray" className={`block ${panel} p-3`}>
-              None — conversational turn (no tools on first call).
+              None - conversational turn (no tools on first call).
             </Text>
           )}
         </section>
@@ -205,7 +195,7 @@ export function InitialRunPromptView({ jsonText, appearance }: Props) {
             </Text>
             {!hasPersonaContext && messageCount > 0 ? (
               <Text size="1" color="amber">
-                No <code className="text-xs">[persona_context]</code> block in this snapshot — memory
+                No <code className="text-xs">[persona_context]</code> block in this snapshot - memory
                 / memo / bookmarks were empty or removed before the LLM call (e.g. token trim).
               </Text>
             ) : null}

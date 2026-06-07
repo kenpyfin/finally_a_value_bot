@@ -503,6 +503,7 @@ function App() {
   const [integrationsNotice, setIntegrationsNotice] = useState<string | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [mobileChatHeaderCollapsed, setMobileChatHeaderCollapsed] = useState(false)
+  const [cockpitExpanded, setCockpitExpanded] = useState(false)
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState<boolean>(readDesktopSidebarOpen)
   const [desktopSidebarWidth, setDesktopSidebarWidth] = useState<number>(readDesktopSidebarWidth)
   const [desktopSidebarResizing, setDesktopSidebarResizing] = useState(false)
@@ -1928,12 +1929,7 @@ function App() {
             />
             <div
               id="mobile-session-sidebar-panel"
-              className={
-                appearance === 'dark'
-                  ? 'relative z-[101] flex h-full min-h-0 w-[min(320px,100vw)] max-w-[90vw] flex-col border-r border-[color:var(--mc-border-soft)] shadow-xl'
-                  : 'relative z-[101] flex h-full min-h-0 w-[min(320px,100vw)] max-w-[90vw] flex-col border-r border-slate-200 bg-white shadow-xl'
-              }
-              style={appearance === 'dark' ? { background: 'var(--mc-bg-sidebar)' } : undefined}
+              className="relative z-[101] flex h-full min-h-0 w-[min(320px,100vw)] max-w-[90vw] flex-col border-r border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] pt-[env(safe-area-inset-top,0px)] pl-[env(safe-area-inset-left,0px)]"
             >
               <SessionSidebar
                 appearance={appearance}
@@ -1996,18 +1992,18 @@ function App() {
             className={
               appearance === 'dark'
                 ? 'flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-[var(--mc-bg-panel)]'
-                : 'flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-white/95'
+                : 'flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-[color:var(--mc-surface-elevated)]/95'
             }
           >
             <header
               className={
                 appearance === 'dark'
                   ? 'sticky top-0 z-30 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)]/95 backdrop-blur-sm md:top-0'
-                  : 'sticky top-0 z-30 border-b border-slate-200 bg-white/92 backdrop-blur-sm md:top-0'
+                  : 'sticky top-0 z-30 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-surface-elevated)]/92 backdrop-blur-sm md:top-0'
               }
             >
               <div
-                className={`px-3 transition-[padding] duration-200 max-md:ease-out md:px-4 md:py-3 ${
+                className={`mc-app-header-bar px-3 transition-[padding] duration-200 max-md:ease-out md:px-4 md:py-3 ${
                   mobileChatHeaderCollapsed ? 'max-md:py-1.5' : 'max-md:py-2'
                 }`}
               >
@@ -2320,7 +2316,7 @@ function App() {
                             return (
                               <Flex key={`${b.bot_instance_id}:${b.channel_type}:${b.channel_handle ?? 'pending'}`} gap="2" align="center" wrap="wrap">
                                 <Text size="1" className="min-w-[220px]">
-                                  {b.label ? `${b.label} — ` : ''}{platform} (bot #{b.bot_instance_id}): {handleLabel}
+                                  {b.label ? `${b.label} ' ` : ''}{platform} (bot #{b.bot_instance_id}): {handleLabel}
                                 </Text>
                                 <Select.Root
                                   value={currentMode}
@@ -2403,7 +2399,7 @@ function App() {
                           <>
                             <table className="hidden w-full border-collapse text-left text-sm md:table">
                               <thead>
-                                <tr className={appearance === 'dark' ? 'text-slate-400' : 'text-slate-600'}>
+                                <tr className={appearance === 'dark' ? 'text-[color:var(--mc-text-muted)]' : 'text-[color:var(--mc-text-muted)]'}>
                                   <th className="p-1 pr-2">#</th>
                                   <th className="p-1 pr-2">State</th>
                                   <th className="p-1 pr-2">Persona</th>
@@ -2424,9 +2420,9 @@ function App() {
                                       <td className="p-1 pr-2">{it.state}</td>
                                       <td className="p-1 pr-2">{it.persona_name}</td>
                                       <td className="p-1 pr-2">{it.source}</td>
-                                      <td className="p-1 max-w-[280px] break-words" title={it.label}>{it.label || '—'}</td>
-                                      <td className="p-1 pr-2 font-mono text-xs">{it.project_id ?? '—'}</td>
-                                      <td className="p-1 pr-2 font-mono text-xs">{it.workflow_id ?? '—'}</td>
+                                      <td className="p-1 max-w-[280px] break-words" title={it.label}>{it.label || '-'}</td>
+                                      <td className="p-1 pr-2 font-mono text-xs">{it.project_id ?? '-'}</td>
+                                      <td className="p-1 pr-2 font-mono text-xs">{it.workflow_id ?? '-'}</td>
                                       <td className="p-1 text-right">
                                         <Button
                                           size="1"
@@ -2455,7 +2451,7 @@ function App() {
                                     className={
                                       appearance === 'dark'
                                         ? 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
-                                        : 'rounded-lg border border-slate-200 p-3 text-sm'
+                                        : 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
                                     }
                                   >
                                     <Flex justify="between" align="start" gap="2" mb="2">
@@ -2478,10 +2474,10 @@ function App() {
                                       {it.persona_name} · {it.source}
                                     </Text>
                                     <Text size="1" className="break-words">
-                                      {it.label || '—'}
+                                      {it.label || '-'}
                                     </Text>
                                     <Text size="1" color="gray" className="mt-1 block font-mono">
-                                      project {it.project_id ?? '—'} · workflow {it.workflow_id ?? '—'}
+                                      project {it.project_id ?? '-'} · workflow {it.workflow_id ?? '-'}
                                     </Text>
                                   </div>
                                 )
@@ -2503,7 +2499,7 @@ function App() {
                           <>
                             <table className="hidden w-full border-collapse text-left text-sm md:table">
                               <thead>
-                                <tr className={appearance === 'dark' ? 'text-slate-400' : 'text-slate-600'}>
+                                <tr className={appearance === 'dark' ? 'text-[color:var(--mc-text-muted)]' : 'text-[color:var(--mc-text-muted)]'}>
                                   <th className="p-1 pr-2">Status</th>
                                   <th className="p-1 pr-2">Kind</th>
                                   <th className="p-1 pr-2">ID</th>
@@ -2522,8 +2518,8 @@ function App() {
                                       <td className="p-1 pr-2">{job.status}</td>
                                       <td className="p-1 pr-2 text-xs">{job.job_kind === 'shell' ? 'shell' : 'agent'}</td>
                                       <td className="p-1 pr-2 font-mono text-xs">{job.id}</td>
-                                      <td className="p-1 pr-2 max-w-[260px] break-words" title={job.label || job.prompt}>{job.label || job.prompt || '—'}</td>
-                                      <td className="p-1 pr-2 text-xs">{updatedAt ? new Date(updatedAt).toLocaleString() : '—'}</td>
+                                      <td className="p-1 pr-2 max-w-[260px] break-words" title={job.label || job.prompt}>{job.label || job.prompt || '-'}</td>
+                                      <td className="p-1 pr-2 text-xs">{updatedAt ? new Date(updatedAt).toLocaleString() : '-'}</td>
                                       <td className="p-1 text-right">
                                         {isActive ? (
                                           <Button
@@ -2536,7 +2532,7 @@ function App() {
                                             {isStopping ? 'Stopping...' : 'Stop'}
                                           </Button>
                                         ) : (
-                                          <Text size="1" color="gray">—</Text>
+                                          <Text size="1" color="gray">'</Text>
                                         )}
                                       </td>
                                     </tr>
@@ -2555,7 +2551,7 @@ function App() {
                                     className={
                                       appearance === 'dark'
                                         ? 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
-                                        : 'rounded-lg border border-slate-200 p-3 text-sm'
+                                        : 'rounded-lg border border-[color:var(--mc-border-soft)] p-3 text-sm'
                                     }
                                   >
                                     <Flex justify="between" align="start" gap="2" mb="2">
@@ -2578,10 +2574,10 @@ function App() {
                                       {job.id}
                                     </Text>
                                     <Text size="1" className="break-words">
-                                      {job.prompt || '—'}
+                                      {job.prompt || '-'}
                                     </Text>
                                     <Text size="1" color="gray" className="mt-1 block">
-                                      {updatedAt ? new Date(updatedAt).toLocaleString() : '—'}
+                                      {updatedAt ? new Date(updatedAt).toLocaleString() : '-'}
                                     </Text>
                                   </div>
                                 )
@@ -2659,7 +2655,7 @@ function App() {
                                   ))}
                                 </Select.Content>
                               </Select.Root>
-                              <Text size="1" color="gray">{t.schedule_type} · {t.next_run ?? '—'}</Text>
+                              <Text size="1" color="gray">{t.schedule_type} · {t.next_run ?? '-'}</Text>
                               <Text size="1" color={
                                 t.status === 'active' || t.status === 'running' ? 'green' :
                                   t.status === 'paused' ? 'orange' :
@@ -2781,13 +2777,13 @@ function App() {
                             <Text size="2" color="gray" className="block">Schedule</Text>
                             <Text size="2" className="block break-all">{scheduleDetailTask.schedule_value}</Text>
                             <Text size="2" color="gray" className="block">Next run</Text>
-                            <Text size="2" className="block break-all">{scheduleDetailTask.next_run ?? '—'}</Text>
+                            <Text size="2" className="block break-all">{scheduleDetailTask.next_run ?? '-'}</Text>
                             <Text size="2" color="gray" className="block">Last run</Text>
-                            <Text size="2" className="block break-all">{scheduleDetailTask.last_run ?? '—'}</Text>
+                            <Text size="2" className="block break-all">{scheduleDetailTask.last_run ?? '-'}</Text>
                             <Text size="2" color="gray" className="block">Status</Text>
                             <Text size="2" className="block">{scheduleDetailTask.status}</Text>
                             <Text size="2" color="gray" className="block">Created</Text>
-                            <Text size="2" className="block break-all">{scheduleDetailTask.created_at ?? '—'}</Text>
+                            <Text size="2" className="block break-all">{scheduleDetailTask.created_at ?? '-'}</Text>
                           </div>
                           <Text size="2" weight="bold" mb="1">Prompt</Text>
                           <textarea
@@ -2796,8 +2792,8 @@ function App() {
                             spellCheck={false}
                             disabled={scheduleDetailTask.status === 'cancelled'}
                             className={appearance === 'dark'
-                              ? 'min-h-[160px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-slate-100'
-                              : 'min-h-[160px] w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-xs text-slate-900'}
+                              ? 'min-h-[160px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-[color:var(--mc-text-primary)]'
+                              : 'min-h-[160px] w-full rounded-md border border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] p-3 font-mono text-xs text-[color:var(--mc-text-primary)]'}
                           />
                           <Text size="2" weight="bold" mb="1" mt="3">Schedule</Text>
                           <Flex gap="2" align="center" wrap="wrap" mb="2">
@@ -2820,8 +2816,8 @@ function App() {
                               disabled={scheduleDetailTask.status === 'cancelled'}
                               placeholder={scheduleDetailScheduleType === 'cron' ? '0 9 * * * *' : '2099-12-31T23:59:59+00:00'}
                               className={appearance === 'dark'
-                                ? 'min-w-[200px] flex-1 rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 font-mono text-xs text-slate-100'
-                                : 'min-w-[200px] flex-1 rounded-md border border-slate-300 bg-white px-2 py-1 font-mono text-xs text-slate-900'}
+                                ? 'min-w-[200px] flex-1 rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 font-mono text-xs text-[color:var(--mc-text-primary)]'
+                                : 'min-w-[200px] flex-1 rounded-md border border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] px-2 py-1 font-mono text-xs text-[color:var(--mc-text-primary)]'}
                             />
                           </Flex>
                           <Flex justify="end" gap="2" mt="3" wrap="wrap">
@@ -2913,8 +2909,8 @@ function App() {
                         onChange={(e) => setAgentsMdContent(e.target.value)}
                         spellCheck={false}
                         className={appearance === 'dark'
-                          ? 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-slate-100'
-                          : 'h-[420px] w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-xs text-slate-900'}
+                          ? 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-[color:var(--mc-text-primary)]'
+                          : 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] p-3 font-mono text-xs text-[color:var(--mc-text-primary)]'}
                       />
                       <Flex justify="between" align="center" mt="3" wrap="wrap" gap="2">
                         <Text size="1" color="gray">
@@ -2975,7 +2971,7 @@ function App() {
                           </Flex>
                           <div className={appearance === 'dark'
                             ? 'max-h-[min(440px,65vh)] overflow-auto rounded-md border border-[color:var(--mc-border-soft)]'
-                            : 'max-h-[min(440px,65vh)] overflow-auto rounded-md border border-slate-300'
+                            : 'max-h-[min(440px,65vh)] overflow-auto rounded-md border border-[color:var(--mc-border-strong)]'
                           }>
                             {artifactsBusy ? (
                               <Text size="2" color="gray" className="block p-2">Loading artifacts...</Text>
@@ -3013,7 +3009,7 @@ function App() {
                         </div>
                         <div className={appearance === 'dark'
                           ? 'min-h-[200px] min-w-0 w-full flex-[2] rounded-md border border-[color:var(--mc-border-soft)] p-2 md:min-w-[320px]'
-                          : 'min-h-[200px] min-w-0 w-full flex-[2] rounded-md border border-slate-300 p-2 md:min-w-[320px]'
+                          : 'min-h-[200px] min-w-0 w-full flex-[2] rounded-md border border-[color:var(--mc-border-strong)] p-2 md:min-w-[320px]'
                         }>
                           {selectedArtifact == null ? (
                             <Text size="2" color="gray">Select an artifact to preview.</Text>
@@ -3128,8 +3124,8 @@ function App() {
                         onChange={(e) => setMemoryContent(e.target.value)}
                         spellCheck={false}
                         className={appearance === 'dark'
-                          ? 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-slate-100'
-                          : 'h-[420px] w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-xs text-slate-900'}
+                          ? 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 font-mono text-xs text-[color:var(--mc-text-primary)]'
+                          : 'h-[420px] w-full rounded-md border border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] p-3 font-mono text-xs text-[color:var(--mc-text-primary)]'}
                       />
 
                       <Flex justify="between" align="center" mt="3" wrap="wrap" gap="2">
@@ -3232,7 +3228,7 @@ function App() {
                                   className={
                                     appearance === 'dark'
                                       ? 'mb-3 max-h-32 overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-2'
-                                      : 'mb-3 max-h-32 overflow-auto rounded-md border border-slate-300 bg-slate-50 p-2'
+                                      : 'mb-3 max-h-32 overflow-auto rounded-md border border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-main)] p-2'
                                   }
                                 >
                                   <AgentHistoryMarkdownBody markdown={agentHistoryParsed.runHeader} />
@@ -3280,7 +3276,7 @@ function App() {
                                     className={
                                       appearance === 'dark'
                                         ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
-                                        : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
+                                        : 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] p-3'
                                     }
                                   >
                                     <AgentHistoryMarkdownBody
@@ -3295,7 +3291,7 @@ function App() {
                                   className={
                                     appearance === 'dark'
                                       ? 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3'
-                                      : 'max-h-[420px] overflow-auto rounded-md border border-slate-300 bg-white p-3'
+                                      : 'max-h-[420px] overflow-auto rounded-md border border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] p-3'
                                   }
                                 >
                                   <AgentHistoryMarkdownBody markdown={agentHistoryRaw} />
@@ -3352,7 +3348,7 @@ function App() {
             >
               <div
                 className={`pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2 transition-all duration-200 max-md:ease-out ${
-                  mobileChatHeaderCollapsed
+                  mobileChatHeaderCollapsed && !cockpitExpanded
                     ? 'max-md:-translate-y-2 max-md:opacity-0'
                     : 'max-md:translate-y-0 max-md:opacity-100'
                 }`}
@@ -3374,6 +3370,7 @@ function App() {
                     operatorMemoServer={bulletinOperatorMemo}
                     reloadBulletin={reloadPersonaBulletin}
                     onBulletinStatus={(msg) => setStatusText(msg)}
+                    onExpandedChange={setCockpitExpanded}
                     floating
                   />
                 </div>

@@ -123,7 +123,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
     <Flex direction="column" gap="3">
       <Text size="1" color="gray">
         Put API keys in repo-root <code className="text-xs">.env</code> only (never in this UI).
-        Provider and model are configured here and saved in the app database — not in{' '}
+        Provider and model are configured here and saved in the app database - not in{' '}
         <code className="text-xs">.env</code>. Lists are curated in code, not live from provider
         APIs; use custom model id for newer releases.
       </Text>
@@ -209,7 +209,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
           </Text>
           {useCustom ? (
             <Text size="1" color="gray">
-              Custom model — check your provider&apos;s pricing page.
+              Custom model - check your provider&apos;s pricing page.
             </Text>
           ) : selectedCatalog ? (
             <Flex direction="column" gap="1">
@@ -244,7 +244,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
           </span>
           {llm.provider_source === 'app_settings' && llm.model_source === 'app_settings'
             ? ' (saved in app)'
-            : ' (auto-selected — save to confirm)'}
+            : ' (auto-selected - save to confirm)'}
         </Text>
       </Flex>
 
