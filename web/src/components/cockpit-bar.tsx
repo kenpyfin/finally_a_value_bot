@@ -167,8 +167,7 @@ export function CockpitBar({
     setMemoBusy(true)
     setMemoError('')
     try {
-      const payload =
-        memoDraftTrimmed.length === 0 ? null : memoDraft
+      const payload = memoDraftTrimmed.length === 0 ? '' : memoDraft
       await api(`/api/personas/${activePersonaId}/bulletin`, {
         method: 'PATCH',
         body: JSON.stringify({ operator_memo: payload }),
@@ -427,34 +426,22 @@ export function CockpitBar({
               </>
             )}
           </div>
-          <div className="grid gap-3 md:grid-cols-2">
-            <div className="hidden flex-col gap-2 md:flex">
-              {queueError ? (
-                <Text size="1" color="red" className="leading-snug">
-                  Queue error: {queueError}
-                </Text>
-              ) : null}
-              {needsRestart ? (
-                <Text size="1" color="orange" className="leading-snug">
-                  Restart the process after changing API keys or runtime settings in .env.
-                </Text>
-              ) : !queueError ? (
-                <Text size="1" color="gray" className="leading-snug">
-                  Session signals update on poll. Open the queue for run details.
-                </Text>
-              ) : null}
-            </div>
-            {queueError ? (
-              <Text size="1" color="red" className="leading-snug md:hidden">
-                Queue error: {queueError}
-              </Text>
-            ) : null}
-            {needsRestart ? (
-              <Text size="1" color="orange" className="leading-snug md:hidden">
-                Restart the process after changing API keys or runtime settings in .env.
-              </Text>
-            ) : null}
+          {queueError ? (
+            <Text size="1" color="red" className="leading-snug">
+              Queue error: {queueError}
+            </Text>
+          ) : null}
+          {needsRestart ? (
+            <Text size="1" color="orange" className="leading-snug">
+              Restart the process after changing API keys or runtime settings in .env.
+            </Text>
+          ) : !queueError ? (
+            <Text size="1" color="gray" className="leading-snug">
+              Session signals update on poll. Open the queue for run details.
+            </Text>
+          ) : null}
 
+          <div className="space-y-3">
             <div className={`${controlsPanelClass} space-y-4`}>
               <div>
                 <Text size="1" weight="medium">
@@ -550,7 +537,7 @@ export function CockpitBar({
                           try {
                             await api(`/api/personas/${activePersonaId}/bulletin`, {
                               method: 'PATCH',
-                              body: JSON.stringify({ operator_memo: null }),
+                              body: JSON.stringify({ operator_memo: '' }),
                             })
                             await reloadBulletin()
                             onBulletinStatus?.('Operator memo cleared')
@@ -573,10 +560,8 @@ export function CockpitBar({
                 ) : null}
               </div>
             </div>
-          </div>
 
-          <div className="space-y-2">
-            <div>
+            <div className={controlsPanelClass}>
               <Flex justify="between" align="center" gap="2">
                 <Text size="1" weight="medium">
                   Bulletin
@@ -595,7 +580,7 @@ export function CockpitBar({
               <div className="mt-1 whitespace-pre-wrap text-xs text-[color:var(--gray-11)]">{bulletinPreview}</div>
             </div>
 
-            <div>
+            <div className={controlsPanelClass}>
               <Text size="1" weight="medium">
                 Bookmarks
               </Text>

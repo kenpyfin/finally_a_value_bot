@@ -2789,13 +2789,25 @@ struct HooksQuery {
     persona_id: Option<i64>,
 }
 
+/// PATCH tri-state: absent = unchanged, JSON `null` = clear, value = set.
+/// Plain `Option<Option<T>>` treats JSON `null` as absent; this wrapper maps it to `Some(None)`.
+fn deserialize_patch_field<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct PersonaPolicyPatchBody {
     /// `null` => default allow-all. `[]` => explicit allow-none.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
     allowed_hook_ids: Option<Option<Vec<i64>>>,
     /// `null` => default allow-all. `[]` => explicit allow-none.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
     allowed_skill_names: Option<Option<Vec<String>>>,
 }
 
@@ -2809,11 +2821,14 @@ struct PersonaBookmarkUpsertBody {
 struct PersonaBulletinPatchBody {
     /// `null` clears override (server defaults). Omitted = leave unchanged.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
     recent_history_min_user: Option<Option<i64>>,
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
     recent_history_min_assistant: Option<Option<i64>>,
     /// `null` clears memo. Omitted = leave unchanged.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
     operator_memo: Option<Option<String>>,
 }
 
