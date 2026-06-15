@@ -230,6 +230,8 @@ export type ThreadPaneProps = {
   draftText: string
   /** If true, avoid resetting thread runtime while new assistant text is streaming in. */
   isStreaming?: boolean
+  /** If true, show a loading indicator while initial chat history is being fetched. */
+  historyLoading?: boolean
   onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
@@ -282,6 +284,7 @@ export const ThreadPane = React.memo(function ThreadPane({
   runtimeKey,
   draftText,
   isStreaming = false,
+  historyLoading = false,
   onDraftTextChange,
   bookmarkedMessageIds,
   onToggleBookmark,
@@ -441,6 +444,16 @@ export const ThreadPane = React.memo(function ThreadPane({
           className="h-full min-h-0 min-w-0"
         >
           <div className="mc-thread-shell flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+            {historyLoading && initialMessages.length === 0 ? (
+              <div className="mc-history-loading">
+                <div className="mc-history-loading-indicator">
+                  <div className="mc-assistant-placeholder-dot" />
+                  <div className="mc-assistant-placeholder-dot" />
+                  <div className="mc-assistant-placeholder-dot" />
+                </div>
+                <span className="mc-history-loading-text">Loading conversation...</span>
+              </div>
+            ) : (
             <Thread.Viewport ref={bindThreadViewport} className="aui-thread-viewport mc-thread-viewport">
               <ThreadWelcome />
               <Thread.Messages
@@ -451,6 +464,7 @@ export const ThreadPane = React.memo(function ThreadPane({
               />
               <Thread.FollowupSuggestions />
             </Thread.Viewport>
+            )}
             <div
               className="mc-thread-composer-dock"
               onFocusCapture={() =>

@@ -428,6 +428,7 @@ function App() {
   const [historyVisibleLimit, setHistoryVisibleLimit] = useState<number>(HISTORY_PAGE_SIZE)
   const [historyHasMore, setHistoryHasMore] = useState<boolean>(false)
   const [historyLoadingMore, setHistoryLoadingMore] = useState<boolean>(false)
+  const [historyLoading, setHistoryLoading] = useState<boolean>(true)
   const [error, setError] = useState<string>('')
   const [statusText, setStatusText] = useState<string>('Idle')
   const [replayNotice, setReplayNotice] = useState<string>('')
@@ -730,17 +731,22 @@ function App() {
 
   async function switchPersona(personaName: string): Promise<void> {
     if (chatId == null) return
-    await api('/api/personas/switch', {
-      method: 'POST',
-      body: JSON.stringify({ chat_id: chatId, persona_name: personaName }),
-    })
-    const p = personas.find((x) => x.name === personaName)
-    if (p) writeStoredPersonaId(p.id)
-    await loadPersonas(chatId)
-    resetHistoryPagination()
-    await loadHistory(chatId, p?.id ?? undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
-    if (p) markPersonaRead(p.id)
-    if (p) await loadPersonaBulletin(p.id)
+    setHistoryLoading(true)
+    try {
+      await api('/api/personas/switch', {
+        method: 'POST',
+        body: JSON.stringify({ chat_id: chatId, persona_name: personaName }),
+      })
+      const p = personas.find((x) => x.name === personaName)
+      if (p) writeStoredPersonaId(p.id)
+      await loadPersonas(chatId)
+      resetHistoryPagination()
+      await loadHistory(chatId, p?.id ?? undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
+      if (p) markPersonaRead(p.id)
+      if (p) await loadPersonaBulletin(p.id)
+    } finally {
+      setHistoryLoading(false)
+    }
   }
 
   async function loadHistory(
@@ -1295,6 +1301,7 @@ function App() {
     ; (async () => {
       try {
         setError('')
+        setHistoryLoading(true)
         void loadSettings()
         const data = await api<{ chat_id?: number; persona_id?: number }>('/api/chat')
         const cid = typeof data.chat_id === 'number' ? data.chat_id : null
@@ -1318,6 +1325,8 @@ function App() {
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setHistoryLoading(false)
       }
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3442,6 +3451,7 @@ function App() {
                     initialMessages={historySeed}
                     runtimeKey={runtimeKey}
                     isStreaming={pendingRunsForActivePersona.length > 0}
+                    historyLoading={historyLoading}
                     draftText={activeDraftText}
                     onDraftTextChange={handleDraftTextChange}
                     bookmarkedMessageIds={bookmarkedMessageIds}
