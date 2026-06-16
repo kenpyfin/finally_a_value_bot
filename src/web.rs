@@ -35,7 +35,8 @@ use crate::hook_executor::validate_command_payload;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext, AppState,
+    archive_conversation, process_with_agent, process_with_agent_with_events, AgentEvent,
+    AgentRequestContext, AppState,
 };
 use std::time::SystemTime;
 
@@ -314,6 +315,8 @@ struct HistoryQuery {
     persona_id: Option<i64>,
     limit: Option<usize>,
     day: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +325,8 @@ struct SendRequest {
     persona_id: Option<i64>,
     sender_name: Option<String>,
     message: String,
+    #[serde(default)]
+    session_id: Option<String>,
     #[serde(default)]
     attachments: Vec<SendAttachmentRequest>,
 }
@@ -641,7 +646,14 @@ async fn api_history(
     let cid2 = chat_id;
     let pid = persona_id;
 
-    let messages = if let Some(ref day) = requested_day {
+    let messages = if let Some(ref sid) = query.session_id {
+        let session_id = sid.clone();
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_all_messages_for_session(&session_id)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else if let Some(ref day) = requested_day {
         let (from_date, to_date) = day_range(day);
         call_blocking(state.app_state.db.clone(), move |db| {
             db.get_messages_for_date_range(
@@ -1920,6 +1932,7 @@ async fn send_and_store_response_with_events(
             &resp,
             Some(state.app_state.config.workspace_root_absolute()),
             DeliveryScope::ContactWide,
+            None,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1951,6 +1964,7 @@ async fn send_and_store_response_with_events(
         id: uuid::Uuid::new_v4().to_string(),
         chat_id,
         persona_id,
+        session_id: body.session_id.clone(),
         sender_name: sender_name.clone(),
         content: text,
         is_from_bot: false,
@@ -1973,6 +1987,7 @@ async fn send_and_store_response_with_events(
             is_background_job: false,
             run_key: run_key.map(|s| s.to_string()),
             reply_bot_instance_id: None,
+            session_id: body.session_id.clone(),
         },
         None,
         image_data,
@@ -2030,6 +2045,7 @@ async fn send_and_store_response_with_events(
             &response,
             Some(state.app_state.config.workspace_root_absolute()),
             DeliveryScope::ContactWide,
+            body.session_id.clone(),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -2846,6 +2862,299 @@ fn normalize_persona_scope_ids(ids: &[i64]) -> Vec<i64> {
     out.dedup();
     out
 }
+
+// --- Chat Sessions ---
+
+#[derive(Debug, Deserialize)]
+struct ChatSessionsListQuery {
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+    #[serde(default)]
+    include_archived: Option<bool>,
+}
+
+async fn api_chat_sessions_list(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<ChatSessionsListQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = query.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let include_archived = query.include_archived.unwrap_or(false);
+    let sessions = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_chat_sessions(chat_id, persona_id, include_archived)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let items: Vec<serde_json::Value> = sessions
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "chat_id": s.chat_id,
+                "persona_id": s.persona_id,
+                "title": s.title,
+                "intent": s.intent,
+                "status": s.status,
+                "created_at": s.created_at,
+                "last_active_at": s.last_active_at,
+                "archived_at": s.archived_at,
+                "ttl_hours": s.ttl_hours,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "sessions": items })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChatSessionRequest {
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+    intent: String,
+    #[serde(default)]
+    ttl_hours: Option<i64>,
+}
+
+async fn api_chat_sessions_create(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<CreateChatSessionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    let intent = body.intent.trim().to_string();
+    if intent.is_empty() || intent.len() > 500 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "intent must be 1-500 characters".into(),
+        ));
+    }
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let title = intent.chars().take(60).collect::<String>();
+    let ttl_hours = body.ttl_hours.unwrap_or(72).max(0);
+
+    let sid = session_id.clone();
+    let t = title.clone();
+    let i = intent.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.create_chat_session(&sid, chat_id, persona_id, &t, &i, ttl_hours)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Run bootstrap agent turn: search vault/skills and produce compact context
+    let bootstrap_prompt = format!(
+        concat!(
+            "You are bootstrapping a new focused session. The user's intent is:\n\n",
+            "\"{}\"\n\n",
+            "Search the vault (using search_vault or mempalace search) for notes relevant to this intent. ",
+            "Also list which skills from the workspace are relevant.\n\n",
+            "Return ONLY a compact JSON object (no markdown fences) with this structure:\n",
+            "{{\"relevant_notes\": [\"note title or path\", ...], ",
+            "\"selected_skills\": [\"skill_name\", ...], ",
+            "\"key_context\": \"2-3 sentence summary of relevant background knowledge\"}}\n\n",
+            "If nothing relevant is found, return the JSON with empty arrays and a brief note in key_context. ",
+            "Do NOT ask the user anything. Do NOT include explanation outside the JSON."
+        ),
+        intent
+    );
+
+    let bootstrap_sid = session_id.clone();
+    let bootstrap_result = process_with_agent(
+        &state.app_state,
+        AgentRequestContext {
+            caller_channel: "web",
+            chat_id,
+            chat_type: "private",
+            persona_id,
+            is_scheduled_task: false,
+            is_background_job: false,
+            run_key: None,
+            reply_bot_instance_id: None,
+            session_id: Some(session_id.clone()),
+        },
+        Some(&bootstrap_prompt),
+        None,
+    )
+    .await;
+
+    let mut bootstrap_summary = String::new();
+    if let Ok(response) = bootstrap_result {
+        let trimmed = response.trim().to_string();
+        // Store as bootstrap_context_json
+        let ctx_sid = bootstrap_sid.clone();
+        let ctx_json = trimmed.clone();
+        let _ = call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_bootstrap_context(&ctx_sid, &ctx_json)
+        })
+        .await;
+
+        // Store the bootstrap response as an assistant message in the session
+        let bot_msg = crate::db::StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            persona_id,
+            session_id: Some(bootstrap_sid.clone()),
+            sender_name: state.app_state.config.bot_username.clone(),
+            content: format!("Session ready. Context loaded for: {}", intent),
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let _ = call_blocking(state.app_state.db.clone(), move |db| {
+            db.store_message(&bot_msg)
+        })
+        .await;
+        bootstrap_summary = trimmed;
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_id": session_id,
+        "title": title,
+        "chat_id": chat_id,
+        "persona_id": persona_id,
+        "bootstrap_context": bootstrap_summary,
+    })))
+}
+
+async fn api_chat_sessions_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let session = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_chat_session(&session_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match session {
+        Some(s) => Ok(Json(serde_json::json!({
+            "id": s.id,
+            "chat_id": s.chat_id,
+            "persona_id": s.persona_id,
+            "title": s.title,
+            "intent": s.intent,
+            "status": s.status,
+            "created_at": s.created_at,
+            "last_active_at": s.last_active_at,
+            "archived_at": s.archived_at,
+            "ttl_hours": s.ttl_hours,
+            "bootstrap_context_json": s.bootstrap_context_json,
+        }))),
+        None => Err((StatusCode::NOT_FOUND, "session not found".into())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchChatSessionRequest {
+    title: Option<String>,
+    status: Option<String>,
+    ttl_hours: Option<i64>,
+}
+
+async fn api_chat_sessions_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<PatchChatSessionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    if let Some(ref title) = body.title {
+        let sid = session_id.clone();
+        let t = title.clone();
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_title(&sid, &t)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    if let Some(ref status) = body.status {
+        match status.as_str() {
+            "archived" => {
+                let sid = session_id.clone();
+                call_blocking(state.app_state.db.clone(), move |db| {
+                    db.archive_chat_session(&sid)
+                })
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+            "active" => {
+                let sid = session_id.clone();
+                call_blocking(state.app_state.db.clone(), move |db| {
+                    db.reopen_chat_session(&sid)
+                })
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "status must be 'active' or 'archived'".into(),
+                ));
+            }
+        }
+    }
+
+    if let Some(ttl) = body.ttl_hours {
+        let sid = session_id.clone();
+        let ttl_val = ttl.max(0);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_ttl(&sid, ttl_val)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn api_chat_sessions_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_chat_session(&session_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(Json(serde_json::json!({ "ok": true })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "session not found".into()))
+    }
+}
+
+// --- end Chat Sessions ---
 
 async fn api_skills_get(
     headers: HeaderMap,
@@ -5381,6 +5690,16 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/personas/switch", post(api_personas_switch))
         .route("/api/personas/create", post(api_personas_create))
         .route("/api/personas/delete", post(api_personas_delete))
+        .route(
+            "/api/chat_sessions",
+            get(api_chat_sessions_list).post(api_chat_sessions_create),
+        )
+        .route(
+            "/api/chat_sessions/:session_id",
+            get(api_chat_sessions_get)
+                .patch(api_chat_sessions_patch)
+                .delete(api_chat_sessions_delete),
+        )
         .route("/api/skills", get(api_skills_get))
         .route("/api/hooks", get(api_hooks_get).post(api_hooks_post))
         .route("/api/hooks/:id", delete(api_hooks_delete))

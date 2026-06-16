@@ -391,6 +391,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
         &ack,
         Some(state.config.workspace_root_absolute()),
         DeliveryScope::ContactWide,
+        None,
     )
     .await
     {
@@ -651,6 +652,7 @@ async fn deliver_shell_notification(
         text,
         Some(state.config.workspace_root_absolute()),
         DeliveryScope::ContactWide,
+        None,
     )
     .await
 }
@@ -766,6 +768,7 @@ pub async fn finalize_shell_job(
         &delivery_text,
         Some(state.config.workspace_root_absolute()),
         DeliveryScope::ContactWide,
+        None,
     )
     .await
     {

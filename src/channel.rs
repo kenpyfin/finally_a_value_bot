@@ -88,6 +88,7 @@ pub async fn deliver_and_store_bot_message(
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
             persona_id,
+            session_id: None,
             sender_name: bot_username.to_string(),
             content: text.to_string(),
             is_from_bot: true,
@@ -109,6 +110,7 @@ pub async fn deliver_and_store_bot_message(
             id: uuid::Uuid::new_v4().to_string(),
             chat_id,
             persona_id,
+            session_id: None,
             sender_name: bot_username.to_string(),
             content: text.to_string(),
             is_from_bot: true,
@@ -170,6 +172,7 @@ pub async fn deliver_to_contact(
     text: &str,
     workspace_root: Option<PathBuf>,
     scope: DeliveryScope,
+    session_id: Option<String>,
 ) -> Result<(), String> {
     let text = strip_embedded_bulletin_focus(text);
     let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
@@ -177,6 +180,7 @@ pub async fn deliver_to_contact(
         id: uuid::Uuid::new_v4().to_string(),
         chat_id: canonical_chat_id,
         persona_id,
+        session_id,
         sender_name: bot_username.to_string(),
         content: text.to_string(),
         is_from_bot: true,
@@ -331,6 +335,7 @@ pub async fn deliver_agent_final_to_contact(
     raw_final: &str,
     workspace_root: Option<PathBuf>,
     scope: DeliveryScope,
+    session_id: Option<String>,
 ) -> Result<AgentFinalDeliveryOutcome, String> {
     let cleaned = normalize_final_for_delivery(
         raw_final,
@@ -353,6 +358,7 @@ pub async fn deliver_agent_final_to_contact(
                 &cleaned,
                 workspace_root,
                 scope,
+                session_id,
             )
             .await?;
             Ok(AgentFinalDeliveryOutcome {
@@ -376,6 +382,7 @@ pub async fn deliver_agent_final_to_contact(
                 &suffix,
                 workspace_root,
                 scope,
+                session_id,
             )
             .await?;
             Ok(AgentFinalDeliveryOutcome {

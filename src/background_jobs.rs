@@ -306,6 +306,7 @@ pub fn spawn_background_job(
                 is_background_job: true,
                 run_key: Some(job_id.clone()),
                 reply_bot_instance_id: None,
+                session_id: None,
             },
             Some(&prompt),
             None,
@@ -411,6 +412,7 @@ pub fn spawn_background_job(
                     &final_text,
                     Some(state.config.workspace_root_absolute()),
                     DeliveryScope::ContactWide,
+                    None,
                 )
                 .await
                 {
@@ -458,6 +460,7 @@ pub fn spawn_background_job(
                     &fallback,
                     Some(state.config.workspace_root_absolute()),
                     DeliveryScope::ContactWide,
+                    None,
                 )
                 .await;
 

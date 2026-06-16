@@ -320,6 +320,7 @@ impl EventHandler for Handler {
             id: msg.id.get().to_string(),
             chat_id: canonical_chat_id,
             persona_id,
+            session_id: None,
             sender_name: sender_name.clone(),
             content: text.clone(),
             is_from_bot: false,
@@ -384,6 +385,7 @@ impl EventHandler for Handler {
                         is_background_job: false,
                         run_key: None,
                         reply_bot_instance_id: Some(discord_bot_instance_id),
+                        session_id: None,
                     },
                     None,
                     image_data,
@@ -414,6 +416,7 @@ impl EventHandler for Handler {
                                 &to_send,
                                 Some(app_state.config.workspace_root_absolute()),
                                 delivery_scope,
+                                None,
                             )
                             .await
                             {

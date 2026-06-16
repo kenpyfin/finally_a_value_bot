@@ -29,6 +29,7 @@ import { SettingsHooksSkillsPanel } from './components/settings-hooks-skills'
 import { SettingsRuntimePanel } from './components/settings-runtime'
 import { InitialRunPromptView } from './components/initial-run-prompt-view'
 import { SessionSidebar } from './components/session-sidebar'
+import { SessionPicker } from './components/session-picker'
 import { ThreadPane } from './components/thread-pane'
 import { useDocumentVisible } from './hooks/use-document-visible'
 import { useOpsPoll } from './hooks/use-ops-poll'
@@ -48,6 +49,7 @@ import {
   type BackendMessage,
   type BotInstanceRow,
   type ChannelBinding,
+  type ChatSession,
   type InstallationStatus,
   type Persona,
   type PersonaBulletinFocus,
@@ -440,6 +442,10 @@ function App() {
   const [bulletinHistorySuffix, setBulletinHistorySuffix] = useState<PersonaBulletinHistorySuffix | null>(null)
   const [bulletinOperatorMemo, setBulletinOperatorMemo] = useState<string | null>(null)
   const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([])
+  const activeSessionIdRef = useRef<string | null>(null)
+  activeSessionIdRef.current = activeSessionId
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
   const [schedulesDialogOpen, setSchedulesDialogOpen] = useState<boolean>(false)
   const [schedulesShowArchived, setSchedulesShowArchived] = useState(false)
@@ -732,6 +738,7 @@ function App() {
   async function switchPersona(personaName: string): Promise<void> {
     if (chatId == null) return
     setHistoryLoading(true)
+    setActiveSessionId(null)
     try {
       await api('/api/personas/switch', {
         method: 'POST',
@@ -740,6 +747,7 @@ function App() {
       const p = personas.find((x) => x.name === personaName)
       if (p) writeStoredPersonaId(p.id)
       await loadPersonas(chatId)
+      void loadSessions(chatId, p?.id)
       resetHistoryPagination()
       await loadHistory(chatId, p?.id ?? undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
       if (p) markPersonaRead(p.id)
@@ -749,11 +757,84 @@ function App() {
     }
   }
 
+  async function loadSessions(cid?: number | null, personaId?: number | null): Promise<void> {
+    const c = cid ?? chatId
+    const p = personaId ?? activePersonaId
+    if (c == null || p == null) return
+    try {
+      const data = await api<{ sessions?: ChatSession[] }>(
+        `/api/chat_sessions?chat_id=${c}&persona_id=${p}&include_archived=true`,
+      )
+      setChatSessions(Array.isArray(data.sessions) ? data.sessions : [])
+    } catch {
+      setChatSessions([])
+    }
+  }
+
+  async function handleSelectSession(sessionId: string | null): Promise<void> {
+    setActiveSessionId(sessionId)
+    resetHistoryPagination()
+    await loadHistory(chatId, activePersonaId ?? undefined, null, {
+      force: true,
+      limitOverride: HISTORY_PAGE_SIZE,
+      sessionId,
+    })
+  }
+
+  async function handleCreateSession(intent: string): Promise<void> {
+    if (chatId == null || activePersonaId == null) return
+    const data = await api<{ session?: ChatSession }>('/api/chat_sessions', {
+      method: 'POST',
+      body: JSON.stringify({ chat_id: chatId, persona_id: activePersonaId, intent }),
+    })
+    if (data.session) {
+      await loadSessions()
+      setActiveSessionId(data.session.id)
+      resetHistoryPagination()
+      await loadHistory(chatId, activePersonaId, null, {
+        force: true,
+        limitOverride: HISTORY_PAGE_SIZE,
+        sessionId: data.session.id,
+      })
+    }
+  }
+
+  async function handleArchiveSession(sessionId: string): Promise<void> {
+    await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'archived' }),
+    })
+    if (activeSessionId === sessionId) {
+      setActiveSessionId(null)
+      resetHistoryPagination()
+      await loadHistory(chatId, activePersonaId ?? undefined, null, {
+        force: true,
+        limitOverride: HISTORY_PAGE_SIZE,
+        sessionId: null,
+      })
+    }
+    await loadSessions()
+  }
+
+  async function handleDeleteSession(sessionId: string): Promise<void> {
+    await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+    if (activeSessionId === sessionId) {
+      setActiveSessionId(null)
+      resetHistoryPagination()
+      await loadHistory(chatId, activePersonaId ?? undefined, null, {
+        force: true,
+        limitOverride: HISTORY_PAGE_SIZE,
+        sessionId: null,
+      })
+    }
+    await loadSessions()
+  }
+
   async function loadHistory(
     cid: number | null = chatId,
     personaId?: number | null,
     day?: string | null,
-    opts?: { force?: boolean; limitOverride?: number },
+    opts?: { force?: boolean; limitOverride?: number; sessionId?: string | null },
   ): Promise<void> {
     if (cid == null) return
     const pid =
@@ -769,10 +850,11 @@ function App() {
       return
     }
     const query = new URLSearchParams({ chat_id: String(cid), persona_id: String(pid) })
+    const sid = opts?.sessionId !== undefined ? opts.sessionId : activeSessionIdRef.current
+    if (sid) query.set('session_id', sid)
     if (day) query.set('day', day)
     else {
       const visibleLimit = opts?.limitOverride ?? historyVisibleLimitRef.current
-      // Ask for one extra message so we can infer whether older history exists.
       query.set('limit', String(visibleLimit + 1))
     }
     const data = await api<{ messages?: BackendMessage[] }>(`/api/history?${query.toString()}`)
@@ -997,6 +1079,7 @@ function App() {
           }
           if (chatId != null) sendBody.chat_id = chatId
           if (activePersonaId != null && activePersonaId > 0) sendBody.persona_id = activePersonaId
+          if (activeSessionIdRef.current) (sendBody as Record<string, unknown>).session_id = activeSessionIdRef.current
           if (attachments.length > 0) sendBody.attachments = attachments
           const sendResponse = await api<{ run_id?: string }>('/api/send_stream', {
             method: 'POST',
@@ -1313,6 +1396,7 @@ function App() {
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
           void invalidateOps(cid)
+          void loadSessions(cid, chosen?.id ?? pid)
           resetHistoryPagination()
           await loadHistory(cid, chosen?.id ?? pid, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
           if (chosen?.id != null) {
@@ -3385,6 +3469,19 @@ function App() {
                 </div>
               </div>
               <div className="mx-auto w-full max-w-5xl px-2 pt-10 md:px-3 md:pt-14">
+                {activePersonaId != null && (
+                  <div className="mb-1">
+                    <SessionPicker
+                      sessions={chatSessions}
+                      activeSessionId={activeSessionId}
+                      onSelectSession={(sid) => void handleSelectSession(sid)}
+                      onCreateSession={handleCreateSession}
+                      onArchiveSession={handleArchiveSession}
+                      onDeleteSession={handleDeleteSession}
+                      loading={historyLoading}
+                    />
+                  </div>
+                )}
                 {installationStatus != null &&
                 !onboardingDismissed &&
                 (!installationStatus.llm_ready || !installationStatus.channel_ready) ? (

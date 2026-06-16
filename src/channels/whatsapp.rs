@@ -511,6 +511,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     id: message.id.clone(),
                     chat_id,
                     persona_id,
+                    session_id: None,
                     sender_name: sender_name.clone(),
                     content: text.clone(),
                     is_from_bot: false,
@@ -560,6 +561,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 reply_bot_instance_id: Some(
                                     crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
                                 ),
+                                session_id: None,
                             },
                             None,
                             image_data,
@@ -586,6 +588,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                         channel_type: "whatsapp",
                                         bot_instance_id: crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
                                     },
+                                    None,
                                 )
                                 .await;
 

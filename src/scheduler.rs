@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::background_jobs::{
     await_handoff_startup_ack, is_background_handoff_response, try_enqueue_background_handoff,
@@ -46,6 +46,27 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
     let task_timeout_secs = state.config.scheduler_task_timeout_secs;
     let stale_reclaim_secs = state.config.scheduler_stale_running_reclaim_secs as i64;
     let poll_interval_secs = state.config.scheduler_poll_interval_secs.max(1);
+
+    // Session TTL sweep (every 15 minutes)
+    let db_for_ttl = state.db.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+            match call_blocking(db_for_ttl.clone(), |db| db.get_expired_chat_sessions()).await {
+                Ok(expired) => {
+                    for session in expired {
+                        let id = session.id.clone();
+                        let _ = call_blocking(db_for_ttl.clone(), move |db| {
+                            db.archive_chat_session(&id)
+                        })
+                        .await;
+                        info!("Session TTL: auto-archived session {}", session.id);
+                    }
+                }
+                Err(e) => warn!("Session TTL sweep error: {e}"),
+            }
+        }
+    });
 
     tokio::spawn(async move {
         info!(
@@ -443,6 +464,7 @@ async fn run_scheduled_agent_and_finalize(
             is_background_job: false,
             run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
             reply_bot_instance_id: None,
+            session_id: None,
         },
         Some(&prompt),
         None,
@@ -481,6 +503,7 @@ async fn run_scheduled_agent_and_finalize(
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
                 DeliveryScope::ContactWide,
+                None,
             )
             .await
             .is_ok();
@@ -540,6 +563,7 @@ async fn run_scheduled_agent_and_finalize(
                 &response_text,
                 Some(state.config.workspace_root_absolute()),
                 DeliveryScope::ContactWide,
+                None,
             )
             .await
             {
@@ -621,6 +645,7 @@ async fn run_scheduled_agent_and_finalize(
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
                 DeliveryScope::ContactWide,
+                None,
             )
             .await
             .is_ok();

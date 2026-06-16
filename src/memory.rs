@@ -475,7 +475,7 @@ impl PersonaMemoryState {
         self.workflow_memory.intents = by_intent.into_values().collect();
         self.workflow_memory
             .intents
-            .sort_by(|a, b| b.support_count.cmp(&a.support_count));
+            .sort_by_key(|a| std::cmp::Reverse(a.support_count));
     }
 }
 

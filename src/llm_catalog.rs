@@ -356,10 +356,8 @@ pub fn resolve_api_key_for_provider_with_config(
                     }
                 }
             }
-            "anthropic" if c.llm_provider == "anthropic" => {
-                if !c.api_key.trim().is_empty() {
-                    return c.api_key.trim().to_string();
-                }
+            "anthropic" if c.llm_provider == "anthropic" && !c.api_key.trim().is_empty() => {
+                return c.api_key.trim().to_string();
             }
             _ => {}
         }

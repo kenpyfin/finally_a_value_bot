@@ -256,3 +256,16 @@ export type QueueDiagnosticsResponse = {
   lanes?: QueueLane[]
   background_by_chat?: Record<string, BackgroundJobItem[]>
 }
+
+export type ChatSession = {
+  id: string
+  chat_id: number
+  persona_id: number
+  title: string
+  intent: string
+  status: 'active' | 'archived'
+  created_at: string
+  last_active_at: string
+  archived_at?: string | null
+  ttl_hours: number
+}

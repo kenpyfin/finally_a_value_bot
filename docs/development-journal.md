@@ -4,6 +4,14 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-16 — Focused chat sessions (web-only, per persona)
+
+- **Area:** DB / agent loop / web API / web UI / scheduler
+- **Summary:** Per-persona **focused sessions** let the web operator spin up intent-scoped sub-threads without polluting main chat history. New `chat_sessions` table (title, intent, status, TTL, `bootstrap_context_json`) plus `messages.session_id` (nullable; legacy rows stay `NULL` = main chat). Web send/history pass `session_id`; Telegram/Discord/WhatsApp/scheduler/background jobs always use `session_id: None`. On create, a bootstrap agent turn searches vault/skills and stores compact JSON context; each run injects `[session_context]` into the prompt and loads session-scoped history. Sessions skip `trim_to_recent_balanced` and use a 40k (vs 12k) token budget. Scheduler runs a 15-minute TTL sweep that auto-archives expired active sessions (`ttl_hours` default 72; `0` = no expiry). Web UI adds `SessionPicker` (main chat vs active/archived sessions, create/archive/delete).
+- **Key files / symbols:** `ChatSession`, `migrate_chat_sessions_schema`, CRUD + `get_all_messages_for_session` / `get_expired_chat_sessions` in `src/db.rs`; `AgentRequestContext::session_id`, session history/context/token paths in `src/channels/telegram.rs`; `session_id` on `deliver_to_contact` / `deliver_agent_final_to_contact` in `src/channel.rs`; `GET/POST /api/chat_sessions`, `GET/PATCH/DELETE /api/chat_sessions/:session_id`, bootstrap in `api_chat_sessions_create` in `src/web.rs`; TTL sweep in `src/scheduler.rs`; `web/src/components/session-picker.tsx`, `web/src/main.tsx`, `web/src/types.ts` (`ChatSession`).
+- **Rationale:** Long-running or exploratory work (refactors, research threads) was mixing into the persona’s main timeline and getting trimmed away; isolated sessions keep main chat lean while allowing full session history and richer bootstrap context for focused tasks.
+- **Follow-ups:** Rebuild `web/dist` for deploy; fix `handleCreateSession` — API returns `session_id` but UI checks `data.session` so post-create switch may not run; revert accidental `f#` typo in `TEST.md`; consider whether Telegram/Discord should ever bind inbound messages to a session; smoke bootstrap + archive/TTL + main-chat regression.
+
 ### 2026-06-07 — Web UI mobile polish (operator cockpit)
 
 - **Area:** web UI (`web/`)

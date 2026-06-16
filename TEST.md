@@ -1,4 +1,4 @@
-# FinallyAValueBot Testing Guide
+f# FinallyAValueBot Testing Guide
 
 This document describes how to test every feature of FinallyAValueBot. It includes both automated tests (unit/integration) and manual black-box functional tests organized by user stories.
 

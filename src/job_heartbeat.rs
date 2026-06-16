@@ -249,6 +249,7 @@ pub fn spawn_shared_heartbeat(
                             &format!("Background update: {}", message),
                             Some(state.config.workspace_root_absolute()),
                             DeliveryScope::ContactWide,
+                            None,
                         )
                         .await;
                         last_user_notify = Instant::now();
@@ -292,6 +293,7 @@ pub fn spawn_shared_heartbeat(
                             &format!("Background update: {}", message),
                             Some(state.config.workspace_root_absolute()),
                             DeliveryScope::ContactWide,
+                            None,
                         )
                         .await;
                         last_user_notify = Instant::now();

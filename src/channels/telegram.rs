@@ -304,6 +304,8 @@ pub struct AgentRequestContext<'a> {
     pub run_key: Option<String>,
     /// When set, outbound delivery is scoped to this bot instance on `caller_channel`.
     pub reply_bot_instance_id: Option<i64>,
+    /// When set, scopes this run to a focused session (web-UI only).
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1375,6 +1377,7 @@ async fn handle_message(
             id: msg.id.0.to_string(),
             chat_id: canonical_chat_id,
             persona_id,
+            session_id: None,
             sender_name,
             content: stored_content,
             is_from_bot: false,
@@ -1418,6 +1421,7 @@ async fn handle_message(
         id: msg.id.0.to_string(),
         chat_id: canonical_chat_id,
         persona_id,
+        session_id: None,
         sender_name: sender_name.clone(),
         content: stored_content,
         is_from_bot: false,
@@ -1535,6 +1539,7 @@ async fn handle_message(
                 is_background_job: false,
                 run_key: None,
                 reply_bot_instance_id: Some(telegram_bot_instance_id_spawn),
+                session_id: None,
             },
             None,
             image_data,
@@ -1594,6 +1599,7 @@ async fn handle_message(
                     &to_send,
                     Some(ws_root.clone()),
                     delivery_scope,
+                    None,
                 )
                 .await
                 {
@@ -1994,6 +2000,14 @@ pub async fn process_with_agent_with_events(
     // Background-job runs are detached and do not consume foreground chat context while running.
     let mut messages = if context.is_background_job {
         Vec::new()
+    } else if let Some(ref sid) = context.session_id {
+        // Session mode: load full session history
+        let session_id = sid.clone();
+        let history = call_blocking(state.db.clone(), move |db| {
+            db.get_all_messages_for_session(&session_id)
+        })
+        .await?;
+        history_to_claude_messages(&history, &state.config.bot_username, false)
     } else {
         load_messages_from_db(
             state,
@@ -2041,8 +2055,10 @@ pub async fn process_with_agent_with_events(
         }
     }
 
-    // Keep smallest suffix with at least N user and N assistant messages (see config / persona overrides).
-    messages = trim_to_recent_balanced(messages, min_user_suffix, min_asst_suffix);
+    // Sessions retain full history; main chat trims to balanced suffix.
+    if context.session_id.is_none() {
+        messages = trim_to_recent_balanced(messages, min_user_suffix, min_asst_suffix);
+    }
 
     let (history_messages, current_request) = split_trailing_user_request(messages);
     let Some(current_request) = current_request else {
@@ -2092,6 +2108,34 @@ pub async fn process_with_agent_with_events(
             content: MessageContent::Text(ctx),
         });
     }
+    // Inject session context when running inside a focused session
+    if let Some(ref sid) = context.session_id {
+        let sid_for_touch = sid.clone();
+        let _ = call_blocking(state.db.clone(), move |db| {
+            db.update_chat_session_last_active(&sid_for_touch)
+        })
+        .await;
+        let session_ctx = call_blocking(state.db.clone(), {
+            let sid = sid.clone();
+            move |db| db.get_chat_session(&sid)
+        })
+        .await?;
+        if let Some(session) = session_ctx {
+            let mut block = format!(
+                "[session_context id=\"{}\" intent=\"{}\" created=\"{}\"]\n",
+                session.id, session.intent, session.created_at
+            );
+            if let Some(ref bootstrap_json) = session.bootstrap_context_json {
+                block.push_str(bootstrap_json);
+                block.push('\n');
+            }
+            block.push_str("[/session_context]");
+            prepended.push(Message {
+                role: "user".into(),
+                content: MessageContent::Text(block),
+            });
+        }
+    }
     prepended.extend(history_messages);
     prepended.push(build_current_request_from_message(current_request.clone()));
     if let Some(steer) =
@@ -2129,11 +2173,16 @@ pub async fn process_with_agent_with_events(
 
     // Token-aware trimming: drop oldest messages only while over budget and only if the
     // remainder still has at least the same minimum user/assistant counts as `trim_to_recent_balanced`.
+    let token_budget = if context.session_id.is_some() {
+        40_000
+    } else {
+        12_000
+    };
     trim_to_token_budget(
         &mut messages,
         &system_prompt,
         &tool_defs,
-        12_000,
+        token_budget,
         min_user_suffix,
         min_asst_suffix,
         protected_message_count,
@@ -6430,6 +6479,7 @@ mod tests {
             id: id.into(),
             chat_id: 100,
             persona_id: 1,
+            session_id: None,
             sender_name: sender.into(),
             content: content.into(),
             is_from_bot: is_bot,

@@ -28,10 +28,26 @@ pub struct StoredMessage {
     pub id: String,
     pub chat_id: i64,
     pub persona_id: i64,
+    pub session_id: Option<String>,
     pub sender_name: String,
     pub content: String,
     pub is_from_bot: bool,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatSession {
+    pub id: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub title: String,
+    pub intent: String,
+    pub status: String,
+    pub created_at: String,
+    pub last_active_at: String,
+    pub archived_at: Option<String>,
+    pub ttl_hours: i64,
+    pub bootstrap_context_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -654,6 +670,7 @@ impl Database {
         Self::migrate_personas_prompt_context(&conn)?;
         Self::migrate_hook_policy_schema(&conn)?;
         Self::ensure_builtin_hook_definitions(&conn)?;
+        Self::migrate_chat_sessions_schema(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -1232,6 +1249,36 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_chat_sessions_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chat_sessions (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                intent TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                last_active_at TEXT NOT NULL,
+                archived_at TEXT,
+                ttl_hours INTEGER NOT NULL DEFAULT 72,
+                bootstrap_context_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_persona
+                ON chat_sessions(chat_id, persona_id, status);
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_last_active
+                ON chat_sessions(last_active_at DESC);",
+        )?;
+        if !Self::column_exists(conn, "messages", "session_id")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN session_id TEXT", [])?;
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session
+                    ON messages(session_id, timestamp ASC);",
+            )?;
+        }
+        Ok(())
+    }
+
     fn migrate_background_jobs_lease_schema(
         conn: &Connection,
     ) -> Result<(), FinallyAValueBotError> {
@@ -1403,12 +1450,13 @@ impl Database {
     pub fn store_message(&self, msg: &StoredMessage) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 msg.id,
                 msg.chat_id,
                 msg.persona_id,
+                msg.session_id,
                 msg.sender_name,
                 msg.content,
                 msg.is_from_bot as i32,
@@ -1469,7 +1517,7 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
              ORDER BY timestamp DESC
@@ -1482,10 +1530,11 @@ impl Database {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
                     persona_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    content: row.get(4)?,
-                    is_from_bot: row.get::<_, i32>(5)? != 0,
-                    timestamp: row.get(6)?,
+                    session_id: row.get(3)?,
+                    sender_name: row.get(4)?,
+                    content: row.get(5)?,
+                    is_from_bot: row.get::<_, i32>(6)? != 0,
+                    timestamp: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1503,7 +1552,7 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
              ORDER BY timestamp ASC",
@@ -1514,10 +1563,11 @@ impl Database {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
                     persona_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    content: row.get(4)?,
-                    is_from_bot: row.get::<_, i32>(5)? != 0,
-                    timestamp: row.get(6)?,
+                    session_id: row.get(3)?,
+                    sender_name: row.get(4)?,
+                    content: row.get(5)?,
+                    is_from_bot: row.get::<_, i32>(6)? != 0,
+                    timestamp: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1534,7 +1584,7 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
                AND (?3 IS NULL OR timestamp >= ?3)
@@ -1550,10 +1600,11 @@ impl Database {
                         id: row.get(0)?,
                         chat_id: row.get(1)?,
                         persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
+                        session_id: row.get(3)?,
+                        sender_name: row.get(4)?,
+                        content: row.get(5)?,
+                        is_from_bot: row.get::<_, i32>(6)? != 0,
+                        timestamp: row.get(7)?,
                     })
                 },
             )?
@@ -2643,7 +2694,7 @@ impl Database {
 
         let mut messages = if let Some(ts) = last_bot_ts {
             let mut stmt = conn.prepare(
-                "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+                "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
                  FROM messages
                  WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3
                  ORDER BY timestamp DESC
@@ -2655,17 +2706,18 @@ impl Database {
                         id: row.get(0)?,
                         chat_id: row.get(1)?,
                         persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
+                        session_id: row.get(3)?,
+                        sender_name: row.get(4)?,
+                        content: row.get(5)?,
+                        is_from_bot: row.get::<_, i32>(6)? != 0,
+                        timestamp: row.get(7)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+                "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
                  FROM messages
                  WHERE chat_id = ?1 AND persona_id = ?2
                  ORDER BY timestamp DESC
@@ -2677,10 +2729,11 @@ impl Database {
                         id: row.get(0)?,
                         chat_id: row.get(1)?,
                         persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
+                        session_id: row.get(3)?,
+                        sender_name: row.get(4)?,
+                        content: row.get(5)?,
+                        is_from_bot: row.get::<_, i32>(6)? != 0,
+                        timestamp: row.get(7)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3815,7 +3868,7 @@ impl Database {
     ) -> Result<Option<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3
              LIMIT 1",
@@ -3825,10 +3878,11 @@ impl Database {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
                     persona_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    content: row.get(4)?,
-                    is_from_bot: row.get::<_, i64>(5)? != 0,
-                    timestamp: row.get(6)?,
+                    session_id: row.get(3)?,
+                    sender_name: row.get(4)?,
+                    content: row.get(5)?,
+                    is_from_bot: row.get::<_, i64>(6)? != 0,
+                    timestamp: row.get(7)?,
                 })
             },
         );
@@ -5006,7 +5060,7 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp > ?3 AND is_from_bot = 0
              ORDER BY timestamp ASC",
@@ -5017,10 +5071,11 @@ impl Database {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
                     persona_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    content: row.get(4)?,
-                    is_from_bot: row.get::<_, i32>(5)? != 0,
-                    timestamp: row.get(6)?,
+                    session_id: row.get(3)?,
+                    sender_name: row.get(4)?,
+                    content: row.get(5)?,
+                    is_from_bot: row.get::<_, i32>(6)? != 0,
+                    timestamp: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -5335,7 +5390,7 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.chat_id, m.persona_id, m.sender_name, m.content, m.is_from_bot, m.timestamp
+            "SELECT m.id, m.chat_id, m.persona_id, m.session_id, m.sender_name, m.content, m.is_from_bot, m.timestamp
              FROM messages_fts
              JOIN messages m ON m.rowid = messages_fts.rowid
              WHERE messages_fts MATCH ?1
@@ -5354,15 +5409,247 @@ impl Database {
                         id: row.get(0)?,
                         chat_id: row.get(1)?,
                         persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
+                        session_id: row.get(3)?,
+                        sender_name: row.get(4)?,
+                        content: row.get(5)?,
+                        is_from_bot: row.get::<_, i32>(6)? != 0,
+                        timestamp: row.get(7)?,
                     })
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
+    }
+
+    // --- Chat Sessions ---
+
+    pub fn create_chat_session(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        title: &str,
+        intent: &str,
+        ttl_hours: i64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO chat_sessions (id, chat_id, persona_id, title, intent, status, created_at, last_active_at, ttl_hours)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)",
+            params![id, chat_id, persona_id, title, intent, now, ttl_hours],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_chat_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ChatSession>, FinallyAValueBotError> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().unwrap();
+        let result = conn
+            .query_row(
+                "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+                 FROM chat_sessions WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(ChatSession {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        persona_id: row.get(2)?,
+                        title: row.get(3)?,
+                        intent: row.get(4)?,
+                        status: row.get(5)?,
+                        created_at: row.get(6)?,
+                        last_active_at: row.get(7)?,
+                        archived_at: row.get(8)?,
+                        ttl_hours: row.get(9)?,
+                        bootstrap_context_json: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn list_chat_sessions(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        include_archived: bool,
+    ) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let query = if include_archived {
+            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+             FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY last_active_at DESC"
+        } else {
+            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+             FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2 AND status = 'active'
+             ORDER BY last_active_at DESC"
+        };
+        let mut stmt = conn.prepare(query)?;
+        let sessions = stmt
+            .query_map(params![chat_id, persona_id], |row| {
+                Ok(ChatSession {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    intent: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_active_at: row.get(7)?,
+                    archived_at: row.get(8)?,
+                    ttl_hours: row.get(9)?,
+                    bootstrap_context_json: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(sessions)
+    }
+
+    pub fn update_chat_session_last_active(
+        &self,
+        session_id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE chat_sessions SET last_active_at = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_chat_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE chat_sessions SET title = ?1 WHERE id = ?2",
+            params![title, session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn update_chat_session_ttl(
+        &self,
+        session_id: &str,
+        ttl_hours: i64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_sessions SET ttl_hours = ?1 WHERE id = ?2",
+            params![ttl_hours, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_chat_session_bootstrap_context(
+        &self,
+        session_id: &str,
+        bootstrap_context_json: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_sessions SET bootstrap_context_json = ?1 WHERE id = ?2",
+            params![bootstrap_context_json, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE chat_sessions SET status = 'archived', archived_at = ?1 WHERE id = ?2 AND status = 'active'",
+            params![now, session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn reopen_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE chat_sessions SET status = 'active', archived_at = NULL, last_active_at = ?1 WHERE id = ?2 AND status = 'archived'",
+            params![now, session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn delete_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let rows = conn.execute(
+            "DELETE FROM chat_sessions WHERE id = ?1",
+            params![session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn get_all_messages_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+             FROM messages
+             WHERE session_id = ?1
+             ORDER BY timestamp ASC",
+        )?;
+        let messages = stmt
+            .query_map(params![session_id], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    session_id: row.get(3)?,
+                    sender_name: row.get(4)?,
+                    content: row.get(5)?,
+                    is_from_bot: row.get::<_, i32>(6)? != 0,
+                    timestamp: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
+    pub fn get_expired_chat_sessions(&self) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+             FROM chat_sessions
+             WHERE status = 'active'
+               AND ttl_hours > 0
+               AND datetime(last_active_at, '+' || ttl_hours || ' hours') < datetime('now')",
+        )?;
+        let sessions = stmt
+            .query_map([], |row| {
+                Ok(ChatSession {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    intent: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_active_at: row.get(7)?,
+                    archived_at: row.get(8)?,
+                    ttl_hours: row.get(9)?,
+                    bootstrap_context_json: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(sessions)
     }
 }
 
@@ -5416,6 +5703,7 @@ mod tests {
             id: "msg1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
@@ -5440,6 +5728,7 @@ mod tests {
             id: "msg1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "original".into(),
             is_from_bot: false,
@@ -5452,6 +5741,7 @@ mod tests {
             id: "msg1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "updated".into(),
             is_from_bot: false,
@@ -5506,6 +5796,7 @@ mod tests {
             id: "m1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "hi".into(),
             is_from_bot: false,
@@ -5518,6 +5809,7 @@ mod tests {
             id: "m2".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bot".into(),
             content: "hello!".into(),
             is_from_bot: true,
@@ -5530,6 +5822,7 @@ mod tests {
             id: "m3".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "how are you?".into(),
             is_from_bot: false,
@@ -5542,6 +5835,7 @@ mod tests {
             id: "m4".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bob".into(),
             content: "me too".into(),
             is_from_bot: false,
@@ -5906,6 +6200,7 @@ mod tests {
             id: "m1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "old msg".into(),
             is_from_bot: false,
@@ -5918,6 +6213,7 @@ mod tests {
             id: "m2".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bot".into(),
             content: "response".into(),
             is_from_bot: true,
@@ -5930,6 +6226,7 @@ mod tests {
             id: "m3".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "new msg 1".into(),
             is_from_bot: false,
@@ -5941,6 +6238,7 @@ mod tests {
             id: "m4".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bob".into(),
             content: "new msg 2".into(),
             is_from_bot: false,
@@ -5953,6 +6251,7 @@ mod tests {
             id: "m5".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bot".into(),
             content: "bot again".into(),
             is_from_bot: true,
@@ -6030,6 +6329,7 @@ mod tests {
             id: "m-bookmark-1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "bookmark me".into(),
             is_from_bot: false,

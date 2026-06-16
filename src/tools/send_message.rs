@@ -610,6 +610,7 @@ impl Tool for SendMessageTool {
                         id: uuid::Uuid::new_v4().to_string(),
                         chat_id,
                         persona_id: pid,
+                        session_id: None,
                         sender_name: self.bot_username.clone(),
                         content,
                         is_from_bot: true,
