@@ -97,6 +97,7 @@ export type LlmProviderOption = {
   label: string
   api_key_configured: boolean
   api_key_env_hints: string[]
+  default_base_url?: string | null
   models: LlmCatalogModel[]
 }
 
@@ -108,10 +109,32 @@ export type LlmConfigResponse = {
   model?: string
   model_in_catalog?: boolean
   model_source?: 'app_settings' | 'default'
+  is_local_provider?: boolean
+  base_url?: string | null
+  default_base_url?: string | null
+  base_url_source?: 'app_settings' | 'default' | 'n/a'
   catalog?: LlmCatalogModel[]
   providers?: LlmProviderOption[]
   cost_reference_note?: string
   custom_model_allowed?: boolean
+}
+
+export type MultimodelConfigResponse = {
+  ok?: boolean
+  enabled?: boolean
+  tier1_base_url?: string
+  tier1_model?: string
+  tier2_base_url?: string
+  tier2_model?: string
+  strategy_provider?: string
+  strategy_model?: string
+  description?: string
+  defaults?: {
+    tier1_base_url?: string
+    tier1_model?: string
+    tier2_base_url?: string
+    tier2_model?: string
+  }
 }
 
 /** Redacted row from `GET /api/channel_bot_instances`. */

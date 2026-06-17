@@ -463,6 +463,11 @@ pub async fn run_bot(
     config.tool_output_debug = tool_output_debug;
     let runtime_toggles = crate::runtime_toggles::RuntimeToggles::new(tool_output_debug);
     let llm = crate::llm::LlmHandle::new(&config);
+    if let Ok(mm_cfg) = crate::multimodel::load_from_db(&db) {
+        if let Err(e) = llm.apply_multimodel_config(mm_cfg) {
+            warn!("Failed to apply multi-model config: {e}");
+        }
+    }
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
         Arc::new(std::sync::OnceLock::new());
     let env_redactor = Arc::new(EnvSecretRedactor::discover(&config));
@@ -2158,6 +2163,7 @@ pub async fn process_with_agent_with_events(
     let intent = classify_user_intent(&latest_user_text, has_image_input);
     let is_conversational = matches!(intent, UserIntent::Conversational);
     let mut run_tool_names: Vec<String> = Vec::new();
+    let mut last_iteration_tools: Vec<String> = Vec::new();
     let tool_defs = match intent {
         UserIntent::Conversational => Vec::new(),
         UserIntent::Question => state.tools.definitions_filtered(true),
@@ -2406,10 +2412,20 @@ pub async fn process_with_agent_with_events(
         })
         .await;
 
+        let route_ctx = crate::multimodel::RouteContext {
+            iteration,
+            is_conversational,
+            last_iteration_tools: &last_iteration_tools,
+            max_iterations: state.config.max_tool_iterations,
+            force_strategy: false,
+        };
+        let model_tier = state.llm.resolve_route(route_ctx);
+
         info!(
-            "Main agent iteration {}/{}: sending LLM request ({} messages in context)",
+            "Main agent iteration {}/{}: model_tier={}, sending LLM request ({} messages in context)",
             iteration + 1,
             state.config.max_tool_iterations,
+            model_tier.label(),
             messages.len()
         );
 
@@ -2424,9 +2440,12 @@ pub async fn process_with_agent_with_events(
             match await_with_cancel(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                    state
-                        .llm
-                        .send_message(&system_prompt, llm_messages, tool_defs),
+                    state.llm.send_message_for_tier(
+                        model_tier,
+                        &system_prompt,
+                        llm_messages,
+                        tool_defs,
+                    ),
                 ),
                 cancel.as_ref(),
             )
@@ -3280,6 +3299,8 @@ pub async fn process_with_agent_with_events(
                 });
             }
 
+            last_iteration_tools = executed_tool_names.clone();
+
             let used_legacy_edit = executed_tool_names
                 .iter()
                 .any(|name| matches!(name.as_str(), "write_file" | "edit_file"));
@@ -3438,9 +3459,12 @@ pub async fn process_with_agent_with_events(
                         let final_response = match await_with_cancel(
                             tokio::time::timeout(
                                 std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                                state
-                                    .llm
-                                    .send_message(&system_prompt, messages.clone(), None),
+                                state.llm.send_message_for_tier(
+                                    crate::multimodel::ModelTier::Strategy,
+                                    &system_prompt,
+                                    messages.clone(),
+                                    None,
+                                ),
                             ),
                             cancel.as_ref(),
                         )

@@ -4,6 +4,14 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-17 — Multi-model routing (local llama.cpp + strategy API)
+
+- **Area:** llm / agent loop / web API / web UI
+- **Summary:** Three-tier model routing for privacy/cost: **Tier 1 (technical)** and **Tier 2 (knowledge)** use configurable local llama.cpp OpenAI-compatible servers; **Tier 3 (strategy)** uses the existing Settings → LLM provider/model (e.g. Anthropic Claude). Heuristic routing in the shared agent loop: iteration 0 and final synthesis always strategy; chained tool rounds route to local tiers when all tools in the previous iteration are technical (`bash`, file edits, grep, …) or knowledge (`search_vault`, `read_tiered_memory`, …). Disabled by default — unchanged behavior when off. Web UI **Settings → Multi-model** configures tier base URLs/models, enable toggle, and per-tier connection test. Hot-reloads via `app_settings` without gateway restart.
+- **Key files / symbols:** `MultimodelConfig`, `resolve_route`, `ModelTier` in `src/multimodel.rs`; `LlmHandle::send_message_for_tier`, `apply_multimodel_config` in `src/llm.rs`; agent loop routing + `last_iteration_tools` in `src/channels/telegram.rs`; `GET/PATCH /api/multimodel`, `POST /api/multimodel/test` in `src/web.rs`; `web/src/components/settings-multimodel.tsx`.
+- **Rationale:** RTX 5060 Ti 16GB can run Qwen-Coder + Mistral-Nemo locally for tool-heavy iterations while reserving API spend for planning and final answers; routing is automatic so operators do not pick models per message.
+- **Follow-ups:** Run two llama.cpp instances (ports 8080/8081) with the GGUF models loaded; set Settings → LLM to Anthropic + `claude-sonnet-4-5` (or preferred strategy model); rebuild `web/dist`; tune tool classification lists if new tools need tier hints; consider exposing active tier in run timeline / cockpit.
+
 ### 2026-06-16 — Focused chat sessions (web-only, per persona)
 
 - **Area:** DB / agent loop / web API / web UI / scheduler

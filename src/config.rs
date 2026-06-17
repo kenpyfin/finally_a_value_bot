@@ -285,12 +285,13 @@ fn is_local_web_host(host: &str) -> bool {
 /// Keys that configure LLM providers, models, and related limits. These must come from repo-root
 /// `.env` / process environment only — not from `app_settings` (Web UI persistence).
 ///
-/// Exception: [`crate::llm_catalog::APP_SETTING_LLM_MODEL`] and [`crate::llm_catalog::APP_SETTING_LLM_PROVIDER`]
-/// may be stored in `app_settings` so the Web UI can pick provider/model while API keys stay in `.env`.
+/// Exception: [`crate::llm_catalog::APP_SETTING_LLM_MODEL`], [`crate::llm_catalog::APP_SETTING_LLM_PROVIDER`],
+/// and [`crate::llm_catalog::APP_SETTING_LLM_BASE_URL`] (local servers only) may be stored in `app_settings`.
 pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
     let u = key.trim().to_ascii_uppercase();
     if u == crate::llm_catalog::APP_SETTING_LLM_MODEL
         || u == crate::llm_catalog::APP_SETTING_LLM_PROVIDER
+        || u == crate::llm_catalog::APP_SETTING_LLM_BASE_URL
     {
         return false;
     }
@@ -1107,30 +1108,31 @@ impl Config {
         }
     }
 
-    /// Apply Web UI `LLM_PROVIDER` / `LLM_MODEL` from `app_settings` (sole source for provider/model).
+    /// Apply Web UI `LLM_PROVIDER` / `LLM_MODEL` / local `LLM_BASE_URL` from `app_settings`.
     pub fn merge_llm_selection_from_app_settings(
         &mut self,
         db: &crate::db::Database,
     ) -> Result<(), FinallyAValueBotError> {
-        let settings = db.list_app_settings()?;
+        let settings: Vec<(String, String)> = db
+            .list_app_settings()?
+            .into_iter()
+            .map(|s| (s.key, s.value))
+            .collect();
         let mut had_provider_setting = false;
         let mut had_model_setting = false;
-        for s in &settings {
-            if s.key
-                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
-            {
-                let v = s.value.trim();
+        let mut had_base_url_setting = false;
+        for (key, value) in &settings {
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER) {
+                let v = value.trim();
                 if !v.is_empty() {
                     self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(v);
                     had_provider_setting = true;
                 }
             }
         }
-        for s in &settings {
-            if s.key
-                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
-            {
-                let v = s.value.trim();
+        for (key, value) in &settings {
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL) {
+                let v = value.trim();
                 if !v.is_empty() {
                     self.model = v.to_string();
                     had_model_setting = true;
@@ -1157,6 +1159,19 @@ impl Config {
 
         self.sync_active_llm_provider_from_env()?;
 
+        if crate::llm_catalog::is_local_provider(&self.llm_provider) {
+            if let Some(url) =
+                crate::llm_catalog::local_base_url_from_app_settings(&settings, &self.llm_provider)
+            {
+                self.llm_base_url = Some(url);
+                had_base_url_setting = true;
+            } else {
+                let url = crate::llm_catalog::effective_local_base_url(&self.llm_provider, None);
+                self.llm_base_url = Some(url.clone());
+                persist_defaults = true;
+            }
+        }
+
         if !crate::llm_catalog::is_local_provider(&self.llm_provider)
             && crate::llm_catalog::resolve_api_key_for_provider_with_config(
                 &self.llm_provider,
@@ -1179,6 +1194,13 @@ impl Config {
             )?;
             db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &self.model)?;
         }
+        if crate::llm_catalog::is_local_provider(&self.llm_provider)
+            && (persist_defaults || !had_base_url_setting)
+        {
+            if let Some(ref url) = self.llm_base_url {
+                db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, url)?;
+            }
+        }
         Ok(())
     }
 
@@ -1197,19 +1219,16 @@ impl Config {
             &self.llm_provider,
             Some(self),
         );
+        if crate::llm_catalog::is_local_provider(&self.llm_provider) {
+            // Local server URL is owned by Web UI `app_settings`, not `.env` LLM_BASE_URL.
+            return Ok(());
+        }
         let base_empty = self
             .llm_base_url
             .as_ref()
             .is_none_or(|u| u.trim().is_empty());
         if base_empty {
-            if crate::llm_catalog::is_local_provider(&self.llm_provider) {
-                if self.llm_provider == "llama" || self.llm_provider == "llamacpp" {
-                    self.llm_base_url = Some("http://127.0.0.1:8080/v1".into());
-                } else if self.llm_provider == "ollama" {
-                    self.llm_base_url = Some("http://127.0.0.1:11434/v1".into());
-                }
-            } else if let Some(url) =
-                crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+            if let Some(url) = crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
             {
                 self.llm_base_url = Some(url.to_string());
             }
@@ -1217,16 +1236,29 @@ impl Config {
         Ok(())
     }
 
-    /// Web UI provider switch: refresh credentials and catalog base URL for the new provider.
-    pub fn apply_llm_provider_switch(&mut self, provider_id: &str, model: &str) {
+    /// Web UI provider switch: refresh credentials and base URL for the new provider.
+    pub fn apply_llm_provider_switch(
+        &mut self,
+        provider_id: &str,
+        model: &str,
+        local_base_url: Option<&str>,
+    ) {
         self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(provider_id);
         self.model = model.trim().to_string();
         self.api_key = crate::llm_catalog::resolve_api_key_for_provider_with_config(
             &self.llm_provider,
             Some(self),
         );
-        self.llm_base_url = crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
-            .map(|s| s.to_string());
+        if crate::llm_catalog::is_local_provider(&self.llm_provider) {
+            self.llm_base_url = Some(crate::llm_catalog::effective_local_base_url(
+                &self.llm_provider,
+                local_base_url,
+            ));
+        } else {
+            self.llm_base_url =
+                crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+                    .map(|s| s.to_string());
+        }
     }
 
     /// Apply post-deserialization normalization and validation.

@@ -4819,6 +4819,8 @@ struct LlmModelPatchRequest {
     provider: Option<String>,
     #[serde(default)]
     custom: bool,
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4883,22 +4885,36 @@ async fn api_llm_get(
         crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
     let preset = crate::llm_catalog::find_provider(&provider_id);
     let current_model = state.app_state.llm.current_model();
-    let (model_source, provider_source) = call_blocking(state.app_state.db.clone(), |db| {
-        let settings = db.list_app_settings()?;
-        let model_source = settings.iter().any(|s| {
-            s.key
-                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
-                && !s.value.trim().is_empty()
-        });
-        let provider_source = settings.iter().any(|s| {
-            s.key
-                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
-                && !s.value.trim().is_empty()
-        });
-        Ok((model_source, provider_source))
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (model_source, provider_source, base_url_source) =
+        call_blocking(state.app_state.db.clone(), |db| {
+            let settings = db.list_app_settings()?;
+            let model_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
+                    && !s.value.trim().is_empty()
+            });
+            let provider_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
+                    && !s.value.trim().is_empty()
+            });
+            let base_url_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_BASE_URL)
+                    && !s.value.trim().is_empty()
+            });
+            Ok((model_source, provider_source, base_url_source))
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let is_local = crate::llm_catalog::is_local_provider(&provider_id);
+    let default_base_url = if is_local {
+        crate::llm_catalog::default_base_url_for_provider(&provider_id).map(|s| s.to_string())
+    } else {
+        None
+    };
+    let base_url = state.app_state.llm.current_base_url();
 
     let catalog_models = crate::llm_catalog::catalog_models_json(&provider_id, &current_model);
     let catalog: Vec<serde_json::Value> = catalog_models
@@ -4927,6 +4943,14 @@ async fn api_llm_get(
         "model": current_model,
         "model_in_catalog": in_catalog,
         "model_source": if model_source { "app_settings" } else { "default" },
+        "is_local_provider": is_local,
+        "base_url": base_url,
+        "default_base_url": default_base_url,
+        "base_url_source": if is_local {
+            if base_url_source { "app_settings" } else { "default" }
+        } else {
+            "n/a"
+        },
         "catalog": catalog,
         "providers": providers,
         "catalog_source": "static_curated",
@@ -4965,9 +4989,27 @@ async fn api_llm_patch(
     let (provider_saved, model_saved) = state
         .app_state
         .llm
-        .apply_selection(provider_id.clone(), model.clone())
+        .apply_selection(
+            provider_id.clone(),
+            model.clone(),
+            if crate::llm_catalog::is_local_provider(&provider_id) {
+                Some(
+                    body.base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .ok_or((
+                            StatusCode::BAD_REQUEST,
+                            "base_url is required for Ollama and llama.cpp providers".into(),
+                        ))?
+                        .to_string(),
+                )
+            } else {
+                None
+            },
+        )
         .map_err(|e| {
-            if e.contains("No API key") {
+            if e.contains("No API key") || e.contains("base_url") {
                 (StatusCode::BAD_REQUEST, e)
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -4976,9 +5018,22 @@ async fn api_llm_patch(
 
     let provider_db = provider_saved.clone();
     let model_db = model_saved.clone();
+    let base_url_db = if crate::llm_catalog::is_local_provider(&provider_saved) {
+        state
+            .app_state
+            .llm
+            .current_base_url()
+            .map(|url| crate::llm_catalog::normalize_local_base_url(&url, &provider_saved))
+    } else {
+        None
+    };
+    let base_url_response = base_url_db.clone();
     call_blocking(state.app_state.db.clone(), move |db| {
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_PROVIDER, &provider_db)?;
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_db)?;
+        if let Some(ref url) = base_url_db {
+            db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, url)?;
+        }
         Ok(())
     })
     .await
@@ -4990,10 +5045,153 @@ async fn api_llm_patch(
             "id": provider_saved,
         },
         "model": model_saved,
+        "base_url": base_url_response,
         "provider_source": "app_settings",
         "model_source": "app_settings",
+        "base_url_source": if base_url_response.is_some() {
+            "app_settings"
+        } else {
+            "n/a"
+        },
         "message": "Provider and model updated. New agent runs use this selection immediately.",
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MultimodelTestRequest {
+    tier: String,
+    base_url: String,
+    model: String,
+}
+
+async fn api_multimodel_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let cfg = state.app_state.llm.multimodel_config();
+    let strategy_provider =
+        crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
+    let strategy_model = state.app_state.llm.current_model();
+    Ok(Json(json!({
+        "ok": true,
+        "enabled": cfg.enabled,
+        "tier1_base_url": cfg.tier1_base_url,
+        "tier1_model": cfg.tier1_model,
+        "tier2_base_url": cfg.tier2_base_url,
+        "tier2_model": cfg.tier2_model,
+        "strategy_provider": strategy_provider,
+        "strategy_model": strategy_model,
+        "description": "Tier 1 (technical) and Tier 2 (knowledge) use local llama.cpp OpenAI-compatible servers. Tier 3 (strategy) uses the provider/model from Settings → LLM.",
+        "defaults": {
+            "tier1_base_url": crate::multimodel::DEFAULT_TIER1_BASE_URL,
+            "tier1_model": crate::multimodel::DEFAULT_TIER1_MODEL,
+            "tier2_base_url": crate::multimodel::DEFAULT_TIER2_BASE_URL,
+            "tier2_model": crate::multimodel::DEFAULT_TIER2_MODEL,
+        },
+    })))
+}
+
+async fn api_multimodel_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<crate::multimodel::MultimodelPatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let mut cfg = state.app_state.llm.multimodel_config();
+    if let Some(enabled) = body.enabled {
+        cfg.enabled = enabled;
+    }
+    if let Some(ref url) = body.tier1_base_url {
+        cfg.tier1_base_url = url.trim().to_string();
+    }
+    if let Some(ref model) = body.tier1_model {
+        cfg.tier1_model = model.trim().to_string();
+    }
+    if let Some(ref url) = body.tier2_base_url {
+        cfg.tier2_base_url = url.trim().to_string();
+    }
+    if let Some(ref model) = body.tier2_model {
+        cfg.tier2_model = model.trim().to_string();
+    }
+    cfg = cfg.normalize();
+    call_blocking(state.app_state.db.clone(), {
+        let cfg_db = cfg.clone();
+        move |db| crate::multimodel::persist_to_db(db, &cfg_db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .app_state
+        .llm
+        .apply_multimodel_config(cfg.clone())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "enabled": cfg.enabled,
+        "tier1_base_url": cfg.tier1_base_url,
+        "tier1_model": cfg.tier1_model,
+        "tier2_base_url": cfg.tier2_base_url,
+        "tier2_model": cfg.tier2_model,
+        "message": if cfg.enabled {
+            "Multi-model routing enabled. New agent runs route tool iterations to local tiers when appropriate."
+        } else {
+            "Multi-model routing disabled. All iterations use the main LLM."
+        },
+    })))
+}
+
+async fn api_multimodel_test_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<MultimodelTestRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let tier = match body.tier.trim().to_ascii_lowercase().as_str() {
+        "technical" | "tier1" | "1" => crate::multimodel::ModelTier::Technical,
+        "knowledge" | "tier2" | "2" => crate::multimodel::ModelTier::Knowledge,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown tier {:?}. Use technical or knowledge.", other),
+            ))
+        }
+    };
+    let model = body.model.trim();
+    let base_url_raw = body.base_url.trim();
+    if model.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "model is required".into()));
+    }
+    if base_url_raw.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "base_url is required".into()));
+    }
+    let (label, fallback_base) = match tier {
+        crate::multimodel::ModelTier::Technical => {
+            ("technical", crate::multimodel::DEFAULT_TIER1_BASE_URL)
+        }
+        crate::multimodel::ModelTier::Knowledge => {
+            ("knowledge", crate::multimodel::DEFAULT_TIER2_BASE_URL)
+        }
+        crate::multimodel::ModelTier::Strategy => unreachable!("strategy tier not testable here"),
+    };
+    let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, fallback_base);
+    let base = state.app_state.config.clone();
+    let mut test_cfg = base;
+    test_cfg.llm_provider = "llama".into();
+    test_cfg.api_key = String::new();
+    test_cfg.model = model.to_string();
+    test_cfg.llm_base_url = Some(base_url.clone());
+    match crate::llm::test_model(&test_cfg, model).await {
+        Ok(()) => Ok(Json(json!({
+            "ok": true,
+            "tier": label,
+            "model": model,
+            "base_url": base_url,
+            "message": format!("{label} tier reachable at {base_url}."),
+        }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
 }
 
 async fn api_settings_get(
@@ -5639,6 +5837,11 @@ fn build_router(web_state: WebState) -> Router {
             get(api_settings_get).patch(api_settings_patch),
         )
         .route("/api/llm", get(api_llm_get).patch(api_llm_patch))
+        .route(
+            "/api/multimodel",
+            get(api_multimodel_get).patch(api_multimodel_patch),
+        )
+        .route("/api/multimodel/test", post(api_multimodel_test_post))
         .route(
             "/api/runtime",
             get(api_runtime_get).patch(api_runtime_patch),

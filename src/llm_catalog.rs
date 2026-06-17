@@ -103,7 +103,11 @@ pub const PROVIDER_CATALOG: &[CatalogProvider] = &[
         id: "llama",
         label: "Llama.cpp (local)",
         default_base_url: "http://127.0.0.1:8080/v1",
-        models: &[catalog_model!("local", None, None, "free")],
+        models: &[
+            catalog_model!("qwen2.5-coder-14b-instruct", None, None, "free"),
+            catalog_model!("mistral-nemo-12b-instruct", None, None, "free"),
+            catalog_model!("local", None, None, "free"),
+        ],
     },
     CatalogProvider {
         id: "google",
@@ -269,6 +273,38 @@ pub const PROVIDER_CATALOG: &[CatalogProvider] = &[
 
 pub const APP_SETTING_LLM_MODEL: &str = "LLM_MODEL";
 pub const APP_SETTING_LLM_PROVIDER: &str = "LLM_PROVIDER";
+/// Local provider (Ollama / llama.cpp) OpenAI-compatible base URL — Web UI only, not `.env`.
+pub const APP_SETTING_LLM_BASE_URL: &str = "LLM_BASE_URL";
+
+pub fn normalize_local_base_url(raw: &str, provider_id: &str) -> String {
+    let fallback = default_base_url_for_provider(provider_id).unwrap_or("http://127.0.0.1:8080/v1");
+    crate::multimodel::normalize_base_url_for_provider(raw, fallback)
+}
+
+pub fn local_base_url_from_app_settings(
+    settings: &[(String, String)],
+    provider_id: &str,
+) -> Option<String> {
+    if !is_local_provider(provider_id) {
+        return None;
+    }
+    settings
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(APP_SETTING_LLM_BASE_URL))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| normalize_local_base_url(&v, provider_id))
+}
+
+pub fn effective_local_base_url(provider_id: &str, app_settings_url: Option<&str>) -> String {
+    let provider_id = resolve_catalog_provider_id(provider_id);
+    if let Some(url) = app_settings_url.map(str::trim).filter(|u| !u.is_empty()) {
+        return normalize_local_base_url(url, &provider_id);
+    }
+    default_base_url_for_provider(&provider_id)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "http://127.0.0.1:8080/v1".into())
+}
 
 /// First catalog provider that has an API key in `.env` (picker order).
 pub fn first_provider_with_api_key() -> Option<&'static str> {
@@ -469,6 +505,8 @@ pub struct ProviderCatalogJson {
     pub label: String,
     pub api_key_configured: bool,
     pub api_key_env_hints: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_base_url: Option<String>,
     pub models: Vec<CatalogModelJson>,
 }
 
@@ -487,6 +525,11 @@ pub fn providers_catalog_json(
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            default_base_url: if is_local_provider(p.id) {
+                default_base_url_for_provider(p.id).map(|s| s.to_string())
+            } else {
+                None
+            },
             models: catalog_models_json(
                 p.id,
                 if p.id.eq_ignore_ascii_case(active_provider) {
@@ -564,5 +607,21 @@ mod tests {
             "claude-sonnet-4-5-20250929",
             false
         ));
+    }
+
+    #[test]
+    fn normalize_local_base_url_appends_v1() {
+        assert_eq!(
+            normalize_local_base_url("http://127.0.0.1:11434", "ollama"),
+            "http://127.0.0.1:11434/v1"
+        );
+    }
+
+    #[test]
+    fn effective_local_base_url_prefers_app_settings() {
+        assert_eq!(
+            effective_local_base_url("ollama", Some("http://10.0.0.5:11434")),
+            "http://10.0.0.5:11434/v1"
+        );
     }
 }

@@ -185,6 +185,23 @@ pub fn create_provider(config: &Config) -> Box<dyn LlmProvider> {
     }
 }
 
+/// OpenAI-compatible client for local llama.cpp / Ollama tiers (multi-model routing).
+pub fn create_openai_compatible_provider(
+    base_config: &Config,
+    base_url: &str,
+    model: &str,
+) -> Box<dyn LlmProvider> {
+    let mut cfg = base_config.clone();
+    cfg.llm_provider = "llama".into();
+    cfg.api_key = String::new();
+    cfg.model = model.trim().to_string();
+    cfg.llm_base_url = Some(crate::multimodel::normalize_base_url_for_provider(
+        base_url,
+        crate::multimodel::DEFAULT_TIER1_BASE_URL,
+    ));
+    Box::new(OpenAiProvider::new(&cfg))
+}
+
 /// Sidecar LLM for PTE / PDQE (Perplexity Sonar via OpenAI-compatible API). Never used for the main agent loop.
 pub fn create_evaluator_provider(
     config: &Config,
@@ -213,6 +230,7 @@ pub struct LlmHandle {
     model: std::sync::RwLock<String>,
     provider: std::sync::RwLock<Arc<dyn LlmProvider>>,
     base_config: std::sync::RwLock<Config>,
+    multimodel: std::sync::RwLock<Option<crate::multimodel::MultimodelRuntime>>,
 }
 
 impl LlmHandle {
@@ -225,7 +243,97 @@ impl LlmHandle {
             model: std::sync::RwLock::new(config.model.clone()),
             base_config: std::sync::RwLock::new(config.clone()),
             provider: std::sync::RwLock::new(provider),
+            multimodel: std::sync::RwLock::new(None),
         })
+    }
+
+    pub fn multimodel_config(&self) -> crate::multimodel::MultimodelConfig {
+        self.multimodel
+            .read()
+            .ok()
+            .and_then(|mm| mm.as_ref().map(|m| m.config.clone()))
+            .unwrap_or_default()
+    }
+
+    pub fn apply_multimodel_config(
+        &self,
+        config: crate::multimodel::MultimodelConfig,
+    ) -> Result<(), String> {
+        let base = self
+            .base_config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .clone();
+        let runtime = if config.enabled {
+            Some(crate::multimodel::MultimodelRuntime::new(
+                &base,
+                config.clone(),
+            ))
+        } else {
+            None
+        };
+        *self
+            .multimodel
+            .write()
+            .map_err(|_| "multimodel lock poisoned".to_string())? = runtime;
+        Ok(())
+    }
+
+    pub fn resolve_route(
+        &self,
+        ctx: crate::multimodel::RouteContext<'_>,
+    ) -> crate::multimodel::ModelTier {
+        let cfg = self.multimodel_config();
+        crate::multimodel::resolve_route(&cfg, &ctx)
+    }
+
+    fn provider_for_tier(
+        &self,
+        tier: crate::multimodel::ModelTier,
+    ) -> Result<Arc<dyn LlmProvider>, FinallyAValueBotError> {
+        let strategy = self
+            .provider
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
+            .clone();
+        let mm = self
+            .multimodel
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("multimodel lock poisoned".into()))?;
+        Ok(if let Some(ref runtime) = *mm {
+            if runtime.config.enabled {
+                runtime.provider_for_tier(tier, &strategy)
+            } else {
+                strategy
+            }
+        } else {
+            strategy
+        })
+    }
+
+    pub async fn send_message_for_tier(
+        &self,
+        tier: crate::multimodel::ModelTier,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let provider = self.provider_for_tier(tier)?;
+        provider.send_message(system, messages, tools).await
+    }
+
+    pub async fn send_message_for_route(
+        &self,
+        ctx: crate::multimodel::RouteContext<'_>,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<(crate::multimodel::ModelTier, MessagesResponse), FinallyAValueBotError> {
+        let tier = self.resolve_route(ctx);
+        let response = self
+            .send_message_for_tier(tier, system, messages, tools)
+            .await?;
+        Ok((tier, response))
     }
 
     pub fn current_model(&self) -> String {
@@ -242,11 +350,19 @@ impl LlmHandle {
             .unwrap_or_else(|_| String::new())
     }
 
+    pub fn current_base_url(&self) -> Option<String> {
+        self.base_config
+            .read()
+            .ok()
+            .and_then(|c| c.llm_base_url.clone())
+    }
+
     /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
     pub fn apply_selection(
         &self,
         provider: String,
         model: String,
+        local_base_url: Option<String>,
     ) -> Result<(String, String), String> {
         let model = model.trim().to_string();
         if model.is_empty() {
@@ -264,12 +380,23 @@ impl LlmHandle {
                 "No API key in environment for provider {provider_id}. Set one of: {hints}"
             ));
         }
+        if crate::llm_catalog::is_local_provider(&provider_id)
+            && local_base_url
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        {
+            return Err(
+                "base_url is required when provider is Ollama or llama.cpp (configure in Settings → LLM)."
+                    .into(),
+            );
+        }
         let mut cfg = self
             .base_config
             .read()
             .map_err(|_| "config lock poisoned".to_string())?
             .clone();
-        cfg.apply_llm_provider_switch(&provider_id, &model);
+        cfg.apply_llm_provider_switch(&provider_id, &model, local_base_url.as_deref());
         let new_provider = Arc::from(create_provider(&cfg));
         *self
             .model
@@ -283,13 +410,24 @@ impl LlmHandle {
             .provider
             .write()
             .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
+        if let Ok(mm) = self.multimodel.read() {
+            if let Some(ref runtime) = *mm {
+                let _ = self.apply_multimodel_config(runtime.config.clone());
+            }
+        }
         Ok((provider_id, model))
     }
 
     /// Update active model for the current provider, rebuild client, return the new model id.
     pub fn set_model(&self, model: String) -> Result<String, String> {
         let provider = self.current_provider();
-        self.apply_selection(provider, model).map(|(_, m)| m)
+        let base_url = if crate::llm_catalog::is_local_provider(&provider) {
+            self.current_base_url()
+        } else {
+            None
+        };
+        self.apply_selection(provider, model, base_url)
+            .map(|(_, m)| m)
     }
 }
 

@@ -26,6 +26,7 @@ pub mod llm_catalog;
 pub mod logging;
 pub mod mcp;
 pub mod memory;
+pub mod multimodel;
 pub mod persona;
 pub mod persona_shared_migrate;
 pub mod post_tool_evaluator;

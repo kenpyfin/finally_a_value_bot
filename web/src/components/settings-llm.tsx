@@ -15,6 +15,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
   const [selectedModel, setSelectedModel] = useState('')
   const [customModel, setCustomModel] = useState('')
   const [useCustom, setUseCustom] = useState(false)
+  const [serverUrl, setServerUrl] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
 
@@ -43,6 +44,19 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
         setCustomModel(current)
         setSelectedModel(catalog[0]?.id || '')
       }
+      const activeIsLocal =
+        providerId === 'ollama' || providerId === 'llama' || providerId === 'llamacpp'
+      if (activeIsLocal) {
+        const entry = data.providers?.find((p) => p.id === providerId)
+        setServerUrl(
+          data.base_url?.trim() ||
+            entry?.default_base_url?.trim() ||
+            data.default_base_url?.trim() ||
+            '',
+        )
+      } else {
+        setServerUrl('')
+      }
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       setLlm(null)
@@ -62,6 +76,11 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
 
   const catalogForProvider = activeProviderEntry?.models ?? llm?.catalog ?? []
 
+  const isLocalProvider =
+    selectedProvider === 'ollama' ||
+    selectedProvider === 'llama' ||
+    selectedProvider === 'llamacpp'
+
   function onProviderChange(nextProvider: string) {
     setSelectedProvider(nextProvider)
     setSaveNotice(null)
@@ -69,6 +88,13 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
     const firstModel = entry?.models?.[0]?.id ?? ''
     if (!useCustom) {
       setSelectedModel(firstModel)
+    }
+    const local =
+      nextProvider === 'ollama' || nextProvider === 'llama' || nextProvider === 'llamacpp'
+    if (local) {
+      setServerUrl(entry?.default_base_url?.trim() || '')
+    } else {
+      setServerUrl('')
     }
   }
 
@@ -83,13 +109,22 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
       onError('Pick a model or enter a custom model id.')
       return
     }
+    if (isLocalProvider && !serverUrl.trim()) {
+      onError('Enter the local server URL (OpenAI-compatible /v1 base).')
+      return
+    }
     setSaving(true)
     setSaveNotice(null)
     try {
       const res = await api<{ ok?: boolean; message?: string; model?: string }>('/api/llm', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider, model, custom: useCustom }),
+        body: JSON.stringify({
+          provider,
+          model,
+          custom: useCustom,
+          ...(isLocalProvider ? { base_url: serverUrl.trim() } : {}),
+        }),
       })
       setSaveNotice(res.message ?? 'Saved.')
       await load()
@@ -154,13 +189,40 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
               </Select.Content>
             </Select.Root>
             {activeProviderEntry ? (
-              <Text size="1" color="green">
-                API key found in .env ({activeProviderEntry.api_key_env_hints.join(' or ')})
-              </Text>
+              isLocalProvider ? (
+                <Text size="1" color="green">
+                  Local provider — no API key required.
+                </Text>
+              ) : (
+                <Text size="1" color="green">
+                  API key found in .env ({activeProviderEntry.api_key_env_hints.join(' or ')})
+                </Text>
+              )
             ) : null}
           </>
         )}
       </Flex>
+
+      {isLocalProvider ? (
+        <Flex direction="column" gap="2">
+          <Text size="2" weight="medium">
+            Server URL
+          </Text>
+          <TextField.Root
+            placeholder={
+              selectedProvider === 'ollama'
+                ? 'http://127.0.0.1:11434/v1'
+                : 'http://127.0.0.1:8080/v1'
+            }
+            value={serverUrl}
+            onChange={(e) => setServerUrl(e.target.value)}
+          />
+          <Text size="1" color="gray">
+            OpenAI-compatible API base (include <code className="text-xs">/v1</code>). Saved in the
+            app database — not read from <code className="text-xs">.env</code>.
+          </Text>
+        </Flex>
+      ) : null}
 
       <Flex direction="column" gap="2">
         <Text size="2" weight="medium">
@@ -241,6 +303,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
           Active:{' '}
           <span className="font-mono">
             {llm.provider?.label ?? llm.provider?.id} / {llm.model}
+            {llm.is_local_provider && llm.base_url ? ` @ ${llm.base_url}` : ''}
           </span>
           {llm.provider_source === 'app_settings' && llm.model_source === 'app_settings'
             ? ' (saved in app)'
