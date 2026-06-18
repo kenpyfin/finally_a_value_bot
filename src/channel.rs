@@ -82,6 +82,7 @@ pub async fn deliver_and_store_bot_message(
     workspace_root: Option<PathBuf>,
 ) -> Result<(), String> {
     let text = strip_embedded_bulletin_focus(text);
+    let text = crate::agent_turn_context::strip_stored_dialogue_markup(&text);
     let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
     if is_web_chat(db.clone(), chat_id).await {
         let msg = StoredMessage {
@@ -175,6 +176,7 @@ pub async fn deliver_to_contact(
     session_id: Option<String>,
 ) -> Result<(), String> {
     let text = strip_embedded_bulletin_focus(text);
+    let text = crate::agent_turn_context::strip_stored_dialogue_markup(&text);
     let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
     let msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -316,7 +318,9 @@ fn normalize_final_for_delivery(
     canonical_chat_id: i64,
     persona_id: i64,
 ) -> String {
-    let cleaned = strip_embedded_bulletin_focus(raw_final);
+    let cleaned = crate::agent_turn_context::strip_stored_dialogue_markup(
+        &strip_embedded_bulletin_focus(raw_final),
+    );
     match workspace_root {
         Some(root) => {
             normalize_assistant_artifact_references(&cleaned, root, canonical_chat_id, persona_id)

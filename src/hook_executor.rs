@@ -334,8 +334,6 @@ pub async fn execute_prompt_hook(
         llm_config.model = model.to_string();
     } else if !config.hook_prompt_model.trim().is_empty() {
         llm_config.model = config.hook_prompt_model.trim().to_string();
-    } else if !config.tool_skill_agent_model.trim().is_empty() {
-        llm_config.model = config.tool_skill_agent_model.trim().to_string();
     } else if !config.orchestrator_model.trim().is_empty() {
         llm_config.model = config.orchestrator_model.trim().to_string();
     }

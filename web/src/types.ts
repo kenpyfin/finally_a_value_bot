@@ -126,15 +126,18 @@ export type MultimodelConfigResponse = {
   tier1_model?: string
   tier2_base_url?: string
   tier2_model?: string
+  tier1_tools_ok?: boolean
+  tier2_tools_ok?: boolean
   strategy_provider?: string
   strategy_model?: string
   description?: string
-  defaults?: {
-    tier1_base_url?: string
-    tier1_model?: string
-    tier2_base_url?: string
-    tier2_model?: string
-  }
+}
+
+export type AgentHistoryOptimizeResponse = {
+  ok?: boolean
+  job_id?: string
+  filename?: string
+  message?: string
 }
 
 /** Redacted row from `GET /api/channel_bot_instances`. */

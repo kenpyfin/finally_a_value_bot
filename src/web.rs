@@ -686,7 +686,7 @@ async fn api_history(
         .map(|m| HistoryItem {
             id: m.id,
             sender_name: m.sender_name,
-            content: m.content,
+            content: crate::agent_turn_context::strip_stored_dialogue_markup(&m.content),
             is_from_bot: m.is_from_bot,
             timestamp: m.timestamp,
         })
@@ -4201,6 +4201,84 @@ async fn api_persona_agent_history_latest(
         }
     }
 }
+
+async fn api_persona_agent_history_optimize(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMemoryPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let mm = state.app_state.llm.multimodel_config();
+    if mm.tier2_base_url.trim().is_empty() || mm.tier2_model.trim().is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Tier 2 (Knowledge) base URL and model must be configured in Settings → Multi-model."
+                .into(),
+        ));
+    }
+
+    let data_dir = state.app_state.config.runtime_data_dir();
+    let history = match crate::agent_history::read_latest_agent_history(&data_dir, chat_id, pid) {
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no agent history for this persona".into(),
+            ))
+        }
+        Ok(Some(r)) => r,
+        Err(crate::agent_history::ReadLatestAgentHistoryError::FileTooLarge(_)) => {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "agent history file too large".into(),
+            ))
+        }
+        Err(crate::agent_history::ReadLatestAgentHistoryError::Io(e)) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    };
+
+    let app_state = state.app_state.clone();
+    match crate::run_optimizer::try_enqueue_run_optimize(
+        app_state,
+        chat_id,
+        pid,
+        history.filename.clone(),
+        history.content,
+    )
+    .await
+    {
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::Queued { job_id } => Ok(Json(json!({
+            "ok": true,
+            "job_id": job_id,
+            "filename": history.filename,
+            "message": "Queued. Track progress in Background jobs.",
+        }))),
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::BlockedAlreadyRunning => Err((
+            StatusCode::CONFLICT,
+            "another background job is already active for this chat".into(),
+        )),
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::ActiveLookupFailed(e) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::DbCreateFailed(e) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+    }
+}
+
 async fn api_personas_create(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -5080,15 +5158,11 @@ async fn api_multimodel_get(
         "tier1_model": cfg.tier1_model,
         "tier2_base_url": cfg.tier2_base_url,
         "tier2_model": cfg.tier2_model,
+        "tier1_tools_ok": cfg.tier1_tools_ok,
+        "tier2_tools_ok": cfg.tier2_tools_ok,
         "strategy_provider": strategy_provider,
         "strategy_model": strategy_model,
         "description": "Tier 1 (technical) and Tier 2 (knowledge) use local llama.cpp OpenAI-compatible servers. Tier 3 (strategy) uses the provider/model from Settings → LLM.",
-        "defaults": {
-            "tier1_base_url": crate::multimodel::DEFAULT_TIER1_BASE_URL,
-            "tier1_model": crate::multimodel::DEFAULT_TIER1_MODEL,
-            "tier2_base_url": crate::multimodel::DEFAULT_TIER2_BASE_URL,
-            "tier2_model": crate::multimodel::DEFAULT_TIER2_MODEL,
-        },
     })))
 }
 
@@ -5098,7 +5172,8 @@ async fn api_multimodel_patch(
     Json(body): Json<crate::multimodel::MultimodelPatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let mut cfg = state.app_state.llm.multimodel_config();
+    let old = state.app_state.llm.multimodel_config();
+    let mut cfg = old.clone();
     if let Some(enabled) = body.enabled {
         cfg.enabled = enabled;
     }
@@ -5114,7 +5189,40 @@ async fn api_multimodel_patch(
     if let Some(ref model) = body.tier2_model {
         cfg.tier2_model = model.trim().to_string();
     }
+    let tier1_changed = body.tier1_base_url.is_some() || body.tier1_model.is_some();
+    let tier2_changed = body.tier2_base_url.is_some() || body.tier2_model.is_some();
+    if tier1_changed
+        && (old.tier1_base_url != cfg.tier1_base_url || old.tier1_model != cfg.tier1_model)
+    {
+        cfg.tier1_tools_ok = false;
+    }
+    if tier2_changed
+        && (old.tier2_base_url != cfg.tier2_base_url || old.tier2_model != cfg.tier2_model)
+    {
+        cfg.tier2_tools_ok = false;
+    }
     cfg = cfg.normalize();
+    if cfg.enabled && !cfg.tier1_configured() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Tier 1 (Technical) base URL and model are required to enable multi-model routing."
+                .into(),
+        ));
+    }
+    if cfg.enabled && !cfg.tier2_configured() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Tier 2 (Knowledge) base URL and model are required to enable multi-model routing."
+                .into(),
+        ));
+    }
+    if cfg.enabled && (!cfg.tier1_tools_ok || !cfg.tier2_tools_ok) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Run the tool-calling test for both Tier 1 (technical) and Tier 2 (knowledge) before enabling multi-model routing."
+                .into(),
+        ));
+    }
     call_blocking(state.app_state.db.clone(), {
         let cfg_db = cfg.clone();
         move |db| crate::multimodel::persist_to_db(db, &cfg_db)
@@ -5167,12 +5275,8 @@ async fn api_multimodel_test_post(
         return Err((StatusCode::BAD_REQUEST, "base_url is required".into()));
     }
     let (label, fallback_base) = match tier {
-        crate::multimodel::ModelTier::Technical => {
-            ("technical", crate::multimodel::DEFAULT_TIER1_BASE_URL)
-        }
-        crate::multimodel::ModelTier::Knowledge => {
-            ("knowledge", crate::multimodel::DEFAULT_TIER2_BASE_URL)
-        }
+        crate::multimodel::ModelTier::Technical => ("technical", ""),
+        crate::multimodel::ModelTier::Knowledge => ("knowledge", ""),
         crate::multimodel::ModelTier::Strategy => unreachable!("strategy tier not testable here"),
     };
     let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, fallback_base);
@@ -5183,14 +5287,36 @@ async fn api_multimodel_test_post(
     test_cfg.model = model.to_string();
     test_cfg.llm_base_url = Some(base_url.clone());
     match crate::llm::test_model(&test_cfg, model).await {
-        Ok(()) => Ok(Json(json!({
-            "ok": true,
-            "tier": label,
-            "model": model,
-            "base_url": base_url,
-            "message": format!("{label} tier reachable at {base_url}."),
-        }))),
-        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+        Ok(()) => {}
+        Err(e) => return Err((StatusCode::BAD_GATEWAY, e)),
+    }
+    match crate::llm::test_multimodel_tools(&test_cfg, model, tier).await {
+        Ok(()) => {
+            call_blocking(state.app_state.db.clone(), move |db| {
+                crate::multimodel::persist_tier_tools_ok(db, tier, true)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if let Ok(cfg) = call_blocking(state.app_state.db.clone(), |db| {
+                crate::multimodel::load_from_db(db)
+            })
+            .await
+            {
+                let _ = state.app_state.llm.apply_multimodel_config(cfg);
+            }
+            Ok(Json(json!({
+                "ok": true,
+                "tier": label,
+                "model": model,
+                "base_url": base_url,
+                "tools_ok": true,
+                "message": format!("{label} tier reachable and tool-calling verified at {base_url}."),
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Server reachable but tool-calling probe failed: {e}"),
+        )),
     }
 }
 
@@ -5933,6 +6059,10 @@ fn build_router(web_state: WebState) -> Router {
         .route(
             "/api/personas/:persona_id/agent_history/latest",
             get(api_persona_agent_history_latest),
+        )
+        .route(
+            "/api/personas/:persona_id/agent_history/latest/optimize",
+            post(api_persona_agent_history_optimize),
         )
         .route(
             "/api/workspace/agents_md",

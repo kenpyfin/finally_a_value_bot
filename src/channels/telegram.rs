@@ -37,7 +37,6 @@ use crate::post_tool_evaluator::{evaluate_completion, PteAction};
 use crate::safety_redaction::EnvSecretRedactor;
 use crate::skills::SkillManager;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
-use crate::tool_skill_agent::{evaluate_tool_use, TsaDecision};
 use crate::tools::{ToolAuthContext, ToolRegistry};
 
 /// Escape XML special characters in user-supplied content to prevent prompt injection.
@@ -2164,6 +2163,7 @@ pub async fn process_with_agent_with_events(
     let is_conversational = matches!(intent, UserIntent::Conversational);
     let mut run_tool_names: Vec<String> = Vec::new();
     let mut last_iteration_tools: Vec<String> = Vec::new();
+    let mut local_tier_error_streak: u32 = 0;
     let tool_defs = match intent {
         UserIntent::Conversational => Vec::new(),
         UserIntent::Question => state.tools.definitions_filtered(true),
@@ -2223,8 +2223,24 @@ pub async fn process_with_agent_with_events(
     const DEFERRED_COMMITMENT_MAX_NUDGES: usize = 2;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
-    let initial_llm_snapshot_json =
-        format_initial_llm_snapshot_json(&system_prompt, &messages, &tool_names_list);
+    let multimodel_run_summary = state.llm.multimodel_run_summary();
+    let iter0_route_ctx = crate::multimodel::RouteContext {
+        iteration: 0,
+        is_conversational,
+        last_iteration_tools: &[],
+        max_iterations: state.config.max_tool_iterations,
+        force_strategy: false,
+        local_tier_error_streak: 0,
+    };
+    let iter0_tier = state.llm.resolve_route(iter0_route_ctx);
+    let iter0_tier_snap = state.llm.tier_endpoint_snapshot(iter0_tier);
+    let routing_v1 = multimodel_run_summary.routing_v1_json(&iter0_tier_snap);
+    let initial_llm_snapshot_json = format_initial_llm_snapshot_json(
+        &system_prompt,
+        &messages,
+        &tool_names_list,
+        Some(&routing_v1),
+    );
     info!(
         "Main agent loop starting: chat_id={}, persona_id={}, channel={}, max_iterations={}, tools=[{}], messages_in_context={}, system_prompt_len={}",
         chat_id,
@@ -2285,6 +2301,7 @@ pub async fn process_with_agent_with_events(
                 stop_reason: stop_reason_owned.clone(),
                 total_duration_ms: run_start.elapsed().as_millis(),
                 initial_llm_snapshot: Some(initial_llm_snapshot_json.clone()),
+                multimodel_summary: multimodel_run_summary.clone(),
             };
             let basename = write_agent_history_run(
                 &state.config.runtime_data_dir(),
@@ -2378,6 +2395,7 @@ pub async fn process_with_agent_with_events(
                     &user_msg_preview,
                     run_start,
                     &initial_llm_snapshot_json,
+                    &multimodel_run_summary,
                 )
                 .await?
                 {
@@ -2418,8 +2436,12 @@ pub async fn process_with_agent_with_events(
             last_iteration_tools: &last_iteration_tools,
             max_iterations: state.config.max_tool_iterations,
             force_strategy: false,
+            local_tier_error_streak,
         };
         let model_tier = state.llm.resolve_route(route_ctx);
+        let tier_snap = state.llm.tier_endpoint_snapshot(model_tier);
+        let (tier_label, tier_provider, tier_model, tier_endpoint) =
+            IterationRecord::tier_fields_from_snapshot(&tier_snap);
 
         info!(
             "Main agent iteration {}/{}: model_tier={}, sending LLM request ({} messages in context)",
@@ -2492,6 +2514,7 @@ pub async fn process_with_agent_with_events(
                         &user_msg_preview,
                         run_start,
                         &initial_llm_snapshot_json,
+                        &multimodel_run_summary,
                     )
                     .await?
                     {
@@ -2527,6 +2550,7 @@ pub async fn process_with_agent_with_events(
                         &user_msg_preview,
                         run_start,
                         &initial_llm_snapshot_json,
+                        &multimodel_run_summary,
                     )
                     .await?
                     {
@@ -2537,10 +2561,21 @@ pub async fn process_with_agent_with_events(
             }
         };
 
-        let provider_stop = response.stop_reason.as_deref().unwrap_or("end_turn");
+        let provider_stop = response
+            .stop_reason
+            .as_deref()
+            .unwrap_or("end_turn")
+            .to_string();
 
-        // Extract any assistant text from this response
-        let assistant_text: String = response
+        let mut response = response;
+        let mut model_tier = model_tier;
+        let mut tier_label = tier_label;
+        let mut tier_provider = tier_provider;
+        let mut tier_model = tier_model;
+        let mut tier_endpoint = tier_endpoint;
+
+        let tools_offered = !tool_defs.is_empty();
+        let mut assistant_text: String = response
             .content
             .iter()
             .filter_map(|block| match block {
@@ -2550,8 +2585,8 @@ pub async fn process_with_agent_with_events(
             .collect::<Vec<_>>()
             .join("");
 
-        let stop_reason = effective_stop_reason(provider_stop, &assistant_text, &messages);
-        let stop_reason = if response
+        let stop_reason = effective_stop_reason(&provider_stop, &assistant_text, &messages);
+        let mut stop_reason = if response
             .content
             .iter()
             .any(|block| matches!(block, ResponseContentBlock::ToolUse { .. }))
@@ -2560,6 +2595,103 @@ pub async fn process_with_agent_with_events(
         } else {
             stop_reason
         };
+
+        let has_tool_use = stop_reason == "tool_use";
+        if should_fallback_local_tier_to_strategy(
+            model_tier,
+            tools_offered,
+            &last_iteration_tools,
+            &stop_reason,
+            has_tool_use,
+            is_conversational,
+            &assistant_text,
+        ) {
+            let from_tier = model_tier.label();
+            info!(
+                "tier_tool_fallback: {}→strategy (no tool_calls after tool results)",
+                from_tier
+            );
+            let _ = call_blocking(state.db.clone(), {
+                let run_key = run_key.clone();
+                let detail = format!(
+                    r#"{{"from_tier":"{}","reason":"no_tool_calls_after_tool_results"}}"#,
+                    from_tier
+                );
+                move |db| {
+                    db.append_run_timeline_event(
+                        &run_key,
+                        chat_id,
+                        persona_id,
+                        "tier_tool_fallback",
+                        Some(&detail),
+                    )
+                }
+            })
+            .await;
+            let llm_messages = messages.clone();
+            let fallback_tools = if tool_defs.is_empty() {
+                None
+            } else {
+                Some(tool_defs.clone())
+            };
+            match await_with_cancel(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
+                    state.llm.send_message_for_tier(
+                        crate::multimodel::ModelTier::Strategy,
+                        &system_prompt,
+                        llm_messages,
+                        fallback_tools,
+                    ),
+                ),
+                cancel.as_ref(),
+            )
+            .await
+            {
+                Ok(Ok(Ok(fallback_response))) => {
+                    response = fallback_response;
+                    model_tier = crate::multimodel::ModelTier::Strategy;
+                    let fallback_snap = state.llm.tier_endpoint_snapshot(model_tier);
+                    (tier_label, tier_provider, tier_model, tier_endpoint) =
+                        IterationRecord::tier_fields_from_snapshot(&fallback_snap);
+                    assistant_text = response
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ResponseContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let fallback_stop = response
+                        .stop_reason
+                        .as_deref()
+                        .unwrap_or("end_turn")
+                        .to_string();
+                    stop_reason = effective_stop_reason(&fallback_stop, &assistant_text, &messages);
+                    stop_reason = if response
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ResponseContentBlock::ToolUse { .. }))
+                    {
+                        "tool_use".to_string()
+                    } else {
+                        stop_reason
+                    };
+                }
+                Ok(Ok(Err(e))) => {
+                    info!("tier_tool_fallback: strategy retry failed: {}", e);
+                }
+                Ok(Err(_)) => {
+                    info!("tier_tool_fallback: strategy retry timed out");
+                }
+                Err(()) => {
+                    info!("tier_tool_fallback: strategy retry cancelled");
+                }
+            }
+        }
+
+        let stop_reason = stop_reason;
 
         let assistant_text_preview = if assistant_text.len() > 10000 {
             format!(
@@ -2590,6 +2722,10 @@ pub async fn process_with_agent_with_events(
                 assistant_text_preview: assistant_text_preview.clone(),
                 tool_calls: Vec::new(),
                 hook_events: Vec::new(),
+                model_tier: tier_label.clone(),
+                provider: tier_provider.clone(),
+                model: tier_model.clone(),
+                endpoint: tier_endpoint.clone(),
             });
 
             messages.push(Message {
@@ -2918,146 +3054,79 @@ pub async fn process_with_agent_with_events(
                         && requested_skill_name
                             .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_MODIFY_SKILL))
                             .unwrap_or(false);
-                    // TSA: allow or deny before execution
-                    let tsa_deny = if state.config.tool_skill_agent_enabled {
-                        info!(
-                            "Main agent iteration {}/{}: TSA evaluating tool={}",
-                            iteration + 1,
-                            state.config.max_tool_iterations,
-                            name
-                        );
-                        let tsa_start = std::time::Instant::now();
-                        match evaluate_tool_use(
-                            &state.config,
-                            state.env_redactor.as_ref(),
-                            name,
-                            &hook_input_for_exec,
-                            &messages,
-                            Some(&tool_auth),
-                        )
-                        .await
-                        {
-                            Ok(tsa_result) if tsa_result.decision == TsaDecision::Deny => {
-                                let mut msg = format!("[Tool use denied] {}", tsa_result.reason);
-                                if let Some(ref sug) = tsa_result.suggestion {
-                                    msg.push_str(&format!(" {}", sug));
-                                }
-                                info!(
-                                    "Main agent iteration {}/{}: TSA DENIED tool={} in {}ms, reason=\"{}\"",
-                                    iteration + 1,
-                                    state.config.max_tool_iterations,
-                                    name,
-                                    tsa_start.elapsed().as_millis(),
-                                    tsa_result.reason
-                                );
-                                Some(
-                                    crate::tools::ToolResult::error(msg)
-                                        .with_error_type("tsa_deny"),
-                                )
-                            }
-                            Ok(tsa_result) => {
-                                info!(
-                                    "Main agent iteration {}/{}: TSA ALLOWED tool={} in {}ms, reason=\"{}\"",
-                                    iteration + 1,
-                                    state.config.max_tool_iterations,
-                                    name,
-                                    tsa_start.elapsed().as_millis(),
-                                    tsa_result.reason
-                                );
-                                None
-                            }
-                            Err(e) => {
-                                info!(
-                                    "Main agent iteration {}/{}: TSA evaluation FAILED for tool={} in {}ms, allowing: {}",
-                                    iteration + 1,
-                                    state.config.max_tool_iterations,
-                                    name,
-                                    tsa_start.elapsed().as_millis(),
-                                    e
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let mut result = if let Some(deny_result) = tsa_deny {
-                        deny_result
-                    } else {
-                        match await_with_cancel(
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
-                                state.tools.execute_with_auth(
-                                    name,
-                                    hook_input_for_exec.clone(),
-                                    &tool_auth,
-                                ),
+                    let mut result = match await_with_cancel(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
+                            state.tools.execute_with_auth(
+                                name,
+                                hook_input_for_exec.clone(),
+                                &tool_auth,
                             ),
-                            cancel.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(tool_result)) => tool_result,
-                            Ok(Err(_)) => {
-                                info!(
-                                    "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
-                                    iteration + 1,
-                                    state.config.max_tool_iterations,
-                                    name,
-                                    TOOL_EXECUTION_TIMEOUT_SECS
-                                );
-                                iteration_timed_out = true;
-                                let error_content = format!(
+                        ),
+                        cancel.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tool_result)) => tool_result,
+                        Ok(Err(_)) => {
+                            info!(
+                                "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
+                                iteration + 1,
+                                state.config.max_tool_iterations,
+                                name,
+                                TOOL_EXECUTION_TIMEOUT_SECS
+                            );
+                            iteration_timed_out = true;
+                            let error_content = format!(
                                 "Tool execution timed out after {}s. The tool took too long to complete. This may indicate a network issue or the service is slow. Please try again later or break the request into smaller steps.",
                                 TOOL_EXECUTION_TIMEOUT_SECS
                             );
-                                let error_bytes = error_content.len();
-                                crate::tools::ToolResult {
-                                    content: error_content,
-                                    is_error: true,
-                                    duration_ms: Some(started.elapsed().as_millis()),
-                                    status_code: Some(1),
-                                    bytes: error_bytes,
-                                    error_type: Some("timeout".into()),
-                                }
+                            let error_bytes = error_content.len();
+                            crate::tools::ToolResult {
+                                content: error_content,
+                                is_error: true,
+                                duration_ms: Some(started.elapsed().as_millis()),
+                                status_code: Some(1),
+                                bytes: error_bytes,
+                                error_type: Some("timeout".into()),
                             }
-                            Err(()) => {
-                                info!(
-                                    "Main agent iteration {}/{}: tool={} interrupted by cancel request",
-                                    iteration + 1,
-                                    state.config.max_tool_iterations,
-                                    name
-                                );
-                                if let Some(r) = try_finish_agent_turn(
-                                    state,
-                                    &context,
-                                    event_tx,
-                                    &run_key,
-                                    chat_id,
-                                    persona_id,
-                                    "cancelled",
-                                    "Run cancelled.".to_string(),
-                                    &system_prompt,
-                                    &mut messages,
-                                    protected_message_count,
-                                    &mut pdqe_retries,
-                                    &mut history_iterations,
-                                    &principles_content,
-                                    is_conversational,
-                                    &run_tool_names,
-                                    &mut agent_history_basename,
-                                    iteration > 0,
-                                    &user_msg_preview,
-                                    run_start,
-                                    &initial_llm_snapshot_json,
-                                )
-                                .await?
-                                {
-                                    return Ok(r);
-                                }
-                                continue 'agent_loop;
+                        }
+                        Err(()) => {
+                            info!(
+                                "Main agent iteration {}/{}: tool={} interrupted by cancel request",
+                                iteration + 1,
+                                state.config.max_tool_iterations,
+                                name
+                            );
+                            if let Some(r) = try_finish_agent_turn(
+                                state,
+                                &context,
+                                event_tx,
+                                &run_key,
+                                chat_id,
+                                persona_id,
+                                "cancelled",
+                                "Run cancelled.".to_string(),
+                                &system_prompt,
+                                &mut messages,
+                                protected_message_count,
+                                &mut pdqe_retries,
+                                &mut history_iterations,
+                                &principles_content,
+                                is_conversational,
+                                &run_tool_names,
+                                &mut agent_history_basename,
+                                iteration > 0,
+                                &user_msg_preview,
+                                run_start,
+                                &initial_llm_snapshot_json,
+                                &multimodel_run_summary,
+                            )
+                            .await?
+                            {
+                                return Ok(r);
                             }
+                            continue 'agent_loop;
                         }
                     };
                     if state.config.post_edit_validation_enabled
@@ -3283,7 +3352,22 @@ pub async fn process_with_agent_with_events(
                 assistant_text_preview: assistant_text_preview.clone(),
                 tool_calls: history_tool_calls,
                 hook_events: history_hook_events.clone(),
+                model_tier: tier_label.clone(),
+                provider: tier_provider.clone(),
+                model: tier_model.clone(),
+                endpoint: tier_endpoint.clone(),
             });
+
+            let iteration_all_tool_errors = !tool_results.is_empty()
+                && tool_results.iter().all(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult {
+                            is_error: Some(true),
+                            ..
+                        }
+                    )
+                });
 
             messages.push(Message {
                 role: "user".into(),
@@ -3300,6 +3384,22 @@ pub async fn process_with_agent_with_events(
             }
 
             last_iteration_tools = executed_tool_names.clone();
+
+            if matches!(
+                model_tier,
+                crate::multimodel::ModelTier::Technical | crate::multimodel::ModelTier::Knowledge
+            ) && iteration_all_tool_errors
+            {
+                local_tier_error_streak = local_tier_error_streak.saturating_add(1);
+                info!(
+                    "local_tier_error_streak={} after {:?} on {}",
+                    local_tier_error_streak,
+                    executed_tool_names,
+                    model_tier.label()
+                );
+            } else if !iteration_all_tool_errors {
+                local_tier_error_streak = 0;
+            }
 
             let used_legacy_edit = executed_tool_names
                 .iter()
@@ -3511,6 +3611,7 @@ pub async fn process_with_agent_with_events(
                                     &user_msg_preview,
                                     run_start,
                                     &initial_llm_snapshot_json,
+                                    &multimodel_run_summary,
                                 )
                                 .await?
                                 {
@@ -3546,6 +3647,7 @@ pub async fn process_with_agent_with_events(
                                     &user_msg_preview,
                                     run_start,
                                     &initial_llm_snapshot_json,
+                                    &multimodel_run_summary,
                                 )
                                 .await?
                                 {
@@ -3572,6 +3674,14 @@ pub async fn process_with_agent_with_events(
                             synth_start.elapsed().as_millis(),
                             text.len()
                         );
+
+                        let pte_snap = state
+                            .llm
+                            .tier_endpoint_snapshot(crate::multimodel::ModelTier::Strategy);
+                        if let Some(last) = history_iterations.last_mut() {
+                            last.hook_events
+                                .push(format!("PTE synthesis: {}", pte_snap.format_tier_line()));
+                        }
 
                         messages.push(Message {
                             role: "assistant".into(),
@@ -3736,6 +3846,10 @@ pub async fn process_with_agent_with_events(
             assistant_text_preview: assistant_text_preview.clone(),
             tool_calls: Vec::new(),
             hook_events: Vec::new(),
+            model_tier: tier_label.clone(),
+            provider: tier_provider.clone(),
+            model: tier_model.clone(),
+            endpoint: tier_endpoint.clone(),
         });
 
         messages.push(Message {
@@ -3783,6 +3897,7 @@ pub async fn process_with_agent_with_events(
         &user_msg_preview,
         run_start,
         &initial_llm_snapshot_json,
+        &multimodel_run_summary,
     )
     .await?
     {
@@ -3821,6 +3936,7 @@ async fn try_finish_agent_turn(
     user_msg_preview: &str,
     run_start: std::time::Instant,
     initial_llm_snapshot_json: &str,
+    multimodel_summary: &crate::multimodel::MultimodelRunSummary,
 ) -> anyhow::Result<Option<AgentProcessResult>> {
     let mut final_text = response;
     match finish_turn_with_quality_gate(
@@ -3845,6 +3961,7 @@ async fn try_finish_agent_turn(
         user_msg_preview,
         run_start,
         initial_llm_snapshot_json,
+        multimodel_summary,
     )
     .await?
     {
@@ -3875,6 +3992,7 @@ async fn finish_turn_with_quality_gate(
     user_msg_preview: &str,
     run_start: std::time::Instant,
     initial_llm_snapshot_json: &str,
+    multimodel_summary: &crate::multimodel::MultimodelRunSummary,
 ) -> anyhow::Result<FinishTurnOutcome> {
     let (hook_summary, should_run_focus_sync) = run_post_delivery_hooks_before_gate(
         state,
@@ -4065,6 +4183,7 @@ async fn finish_turn_with_quality_gate(
         stop_reason: stop_reason_owned.clone(),
         total_duration_ms: run_start.elapsed().as_millis(),
         initial_llm_snapshot: Some(initial_llm_snapshot_json.to_string()),
+        multimodel_summary: multimodel_summary.clone(),
     };
     *agent_history_basename = write_agent_history_run(
         &state.config.runtime_data_dir(),
@@ -4515,6 +4634,77 @@ fn assistant_text_references_incomplete_work(text: &str) -> bool {
     static RUN_ID_RE: OnceLock<Regex> = OnceLock::new();
     let re = RUN_ID_RE.get_or_init(|| Regex::new(r"#\d{1,6}\b").expect("run id regex"));
     re.is_match(text)
+}
+
+/// True when assistant text claims actions (uploads, writes, publishes) not backed by tool use
+/// in the same turn — used to avoid strategy fallback on legitimate bash summaries.
+fn assistant_text_claims_unbacked_actions(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    const ACTION_PHRASES: &[&str] = &[
+        "generated",
+        "uploaded",
+        "vault updated",
+        "published",
+        "created the file",
+        "i have created",
+        "i've created",
+        "successfully uploaded",
+        "here is the link",
+        "here's the link",
+        "wrote to disk",
+        "saved to disk",
+    ];
+    if ACTION_PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    static IMG_MD_RE: OnceLock<Regex> = OnceLock::new();
+    let img_re = IMG_MD_RE
+        .get_or_init(|| Regex::new(r"!\[[^\]]*\]\([^)]+\)").expect("markdown image regex"));
+    if img_re.is_match(text) {
+        return true;
+    }
+    if lower.contains("http")
+        && (lower.contains(".png")
+            || lower.contains(".jpg")
+            || lower.contains(".jpeg")
+            || lower.contains("upload"))
+    {
+        return true;
+    }
+    false
+}
+
+fn should_fallback_local_tier_to_strategy(
+    model_tier: crate::multimodel::ModelTier,
+    tools_offered: bool,
+    last_iteration_tools: &[String],
+    stop_reason: &str,
+    has_tool_use: bool,
+    is_conversational: bool,
+    assistant_text: &str,
+) -> bool {
+    if has_tool_use {
+        return false;
+    }
+    if !matches!(
+        model_tier,
+        crate::multimodel::ModelTier::Technical | crate::multimodel::ModelTier::Knowledge
+    ) {
+        return false;
+    }
+    if !tools_offered || last_iteration_tools.is_empty() {
+        return false;
+    }
+    if stop_reason != "end_turn" && stop_reason != "max_tokens" {
+        return false;
+    }
+    if is_conversational {
+        return false;
+    }
+    assistant_text_claims_unbacked_actions(assistant_text)
 }
 
 fn should_reject_premature_end_turn(assistant_text: &str, messages: &[Message]) -> bool {
@@ -8105,6 +8295,48 @@ mod tests {
         assert!(!should_reject_premature_end_turn(
             "The file is missing. Re-run generation when ready.",
             &messages
+        ));
+    }
+
+    #[test]
+    fn test_assistant_text_claims_unbacked_actions_detects_hallucinated_uploads() {
+        assert!(assistant_text_claims_unbacked_actions(
+            "I uploaded HOTIFY-V5.png to the server. ![v5](https://cdn.example.com/HOTIFY-V5.png)"
+        ));
+        assert!(!assistant_text_claims_unbacked_actions(
+            "Here are the files from the listing:\nfoo.txt\nbar.txt"
+        ));
+    }
+
+    #[test]
+    fn test_should_fallback_local_tier_to_strategy() {
+        let last_tools = vec!["bash".into()];
+        assert!(should_fallback_local_tier_to_strategy(
+            crate::multimodel::ModelTier::Technical,
+            true,
+            &last_tools,
+            "end_turn",
+            false,
+            false,
+            "Generated and uploaded HOTIFY-V5.png",
+        ));
+        assert!(!should_fallback_local_tier_to_strategy(
+            crate::multimodel::ModelTier::Technical,
+            true,
+            &last_tools,
+            "end_turn",
+            false,
+            false,
+            "Files in the directory: a.txt, b.txt",
+        ));
+        assert!(!should_fallback_local_tier_to_strategy(
+            crate::multimodel::ModelTier::Strategy,
+            true,
+            &last_tools,
+            "end_turn",
+            false,
+            false,
+            "Uploaded file.png",
         ));
     }
 

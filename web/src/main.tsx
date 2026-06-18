@@ -42,10 +42,17 @@ import {
   type SendAttachmentRef,
 } from './lib/attachments'
 import { historiesEqual, mapBackendHistory } from './lib/history-sync'
-import { parseAgentHistoryMarkdown, splitAgentHistoryRaw, type ParsedAgentHistory } from './parse-agent-history'
+import {
+  formatTierBadgeLabel,
+  parseAgentHistoryMarkdown,
+  splitAgentHistoryRaw,
+  type ParsedAgentHistory,
+  type TierRouteInfo,
+} from './parse-agent-history'
 import {
   OPERATOR_MEMO_MAX_CHARS,
   type ArtifactItem,
+  type AgentHistoryOptimizeResponse,
   type BackgroundJobItem,
   type BackendMessage,
   type BotInstanceRow,
@@ -422,6 +429,29 @@ function AgentHistoryMarkdownBody({ markdown }: { markdown: string }) {
   )
 }
 
+function tierBadgeClass(tier: string): string {
+  switch (tier) {
+    case 'technical':
+      return 'border-[color:var(--mc-accent-primary)]/35 bg-[color:var(--mc-accent-primary)]/10 text-[color:var(--mc-accent-primary)]'
+    case 'knowledge':
+      return 'border-[color:var(--mc-accent-secondary)]/35 bg-[color:var(--mc-accent-secondary)]/10 text-[color:var(--mc-text-secondary)]'
+    case 'strategy':
+    default:
+      return 'border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] text-[color:var(--mc-text-primary)]'
+  }
+}
+
+function AgentHistoryTierBadge({ tier }: { tier: TierRouteInfo }) {
+  return (
+    <span
+      className={`inline-flex max-w-full items-center rounded-md border px-2 py-0.5 font-mono text-[11px] leading-snug ${tierBadgeClass(tier.tier)}`}
+      title={`${tier.provider} · ${tier.endpoint}`}
+    >
+      {formatTierBadgeLabel(tier)}
+    </span>
+  )
+}
+
 function App() {
   const [appearance, setAppearance] = useState<Appearance>(readAppearance())
   const [uiTheme, setUiTheme] = useState<UiTheme>(readUiTheme())
@@ -475,6 +505,7 @@ function App() {
   const [agentHistoryFilename, setAgentHistoryFilename] = useState('')
   const [agentHistoryMtimeMs, setAgentHistoryMtimeMs] = useState<number | null>(null)
   const [agentHistoryIterationIdx, setAgentHistoryIterationIdx] = useState(0)
+  const [agentHistoryOptimizeBusy, setAgentHistoryOptimizeBusy] = useState(false)
   const [newSchedulePrompt, setNewSchedulePrompt] = useState('')
   const [newScheduleType, setNewScheduleType] = useState<'cron' | 'once'>('cron')
   const [newScheduleValue, setNewScheduleValue] = useState('0 9 * * *')
@@ -1045,6 +1076,29 @@ function App() {
       setAgentHistoryMtimeMs(null)
     } finally {
       setAgentHistoryBusy(false)
+    }
+  }
+
+  async function optimizeAgentHistoryLatest(pid: number): Promise<void> {
+    setAgentHistoryOptimizeBusy(true)
+    setAgentHistoryError('')
+    try {
+      const data = await api<AgentHistoryOptimizeResponse>(
+        `/api/personas/${pid}/agent_history/latest/optimize`,
+        { method: 'POST' },
+      )
+      const jobId = typeof data.job_id === 'string' ? data.job_id : ''
+      const msg =
+        typeof data.message === 'string' && data.message.trim()
+          ? data.message.trim()
+          : 'Learn & optimize queued.'
+      setReplayNotice(jobId ? `${msg} (job ${jobId})` : msg)
+      if (chatId != null) void invalidateOps(chatId)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setAgentHistoryError(msg)
+    } finally {
+      setAgentHistoryOptimizeBusy(false)
     }
   }
 
@@ -2614,7 +2668,13 @@ function App() {
                                   return (
                                     <tr key={job.id} className="border-t border-[color:var(--gray-6)] align-top">
                                       <td className="p-1 pr-2">{job.status}</td>
-                                      <td className="p-1 pr-2 text-xs">{job.job_kind === 'shell' ? 'shell' : 'agent'}</td>
+                                      <td className="p-1 pr-2 text-xs">
+                                        {job.job_kind === 'shell'
+                                          ? 'shell'
+                                          : job.job_kind === 'run_optimize'
+                                            ? 'optimize'
+                                            : 'agent'}
+                                      </td>
                                       <td className="p-1 pr-2 font-mono text-xs">{job.id}</td>
                                       <td className="p-1 pr-2 max-w-[260px] break-words" title={job.label || job.prompt}>{job.label || job.prompt || '-'}</td>
                                       <td className="p-1 pr-2 text-xs">{updatedAt ? new Date(updatedAt).toLocaleString() : '-'}</td>
@@ -2654,7 +2714,12 @@ function App() {
                                   >
                                     <Flex justify="between" align="start" gap="2" mb="2">
                                       <Text size="2" weight="bold">
-                                        {job.status} · {job.job_kind === 'shell' ? 'shell' : 'agent'}
+                                        {job.status} ·{' '}
+                                        {job.job_kind === 'shell'
+                                          ? 'shell'
+                                          : job.job_kind === 'run_optimize'
+                                            ? 'optimize'
+                                            : 'agent'}
                                       </Text>
                                       {isActive ? (
                                         <Button
@@ -3336,10 +3401,19 @@ function App() {
                               {agentHistoryParsed.iterations.length > 0 ? (
                                 <>
                                   <Flex justify="between" align="center" mb="2" wrap="wrap" gap="2">
-                                    <Text size="2">
-                                      Iteration {agentHistoryIterationIdx + 1} of{' '}
-                                      {agentHistoryParsed.iterations.length}
-                                    </Text>
+                                    <Flex direction="column" gap="1">
+                                      <Text size="2">
+                                        Iteration {agentHistoryIterationIdx + 1} of{' '}
+                                        {agentHistoryParsed.iterations.length}
+                                      </Text>
+                                      {agentHistoryParsed.iterations[agentHistoryIterationIdx]?.tier ? (
+                                        <AgentHistoryTierBadge
+                                          tier={
+                                            agentHistoryParsed.iterations[agentHistoryIterationIdx]!.tier!
+                                          }
+                                        />
+                                      ) : null}
+                                    </Flex>
                                     <Flex gap="2">
                                       <Button
                                         size="1"
@@ -3415,7 +3489,25 @@ function App() {
                         </Tabs.Root>
                       ) : null}
 
-                      <Flex justify="end" mt="3" gap="2">
+                      <Flex justify="end" mt="3" gap="2" wrap="wrap">
+                        <Button
+                          size="1"
+                          variant="soft"
+                          color="teal"
+                          onClick={() => {
+                            if (activePersonaId != null) {
+                              void optimizeAgentHistoryLatest(activePersonaId)
+                            }
+                          }}
+                          disabled={
+                            agentHistoryBusy
+                            || agentHistoryOptimizeBusy
+                            || activePersonaId == null
+                            || !agentHistoryFilename
+                          }
+                        >
+                          {agentHistoryOptimizeBusy ? 'Queuing…' : 'Learn & optimize'}
+                        </Button>
                         <Button
                           size="1"
                           variant="soft"

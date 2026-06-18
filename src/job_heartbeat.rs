@@ -13,6 +13,7 @@ pub enum JobType {
     ManualBackground,
     Scheduled,
     ShellBackground,
+    RunOptimize,
 }
 
 impl JobType {
@@ -21,11 +22,15 @@ impl JobType {
             JobType::ManualBackground => "manual_background",
             JobType::Scheduled => "scheduled",
             JobType::ShellBackground => "shell_background",
+            JobType::RunOptimize => "run_optimize",
         }
     }
 
     fn notify_user_periodically(self) -> bool {
-        matches!(self, JobType::ManualBackground | JobType::ShellBackground)
+        matches!(
+            self,
+            JobType::ManualBackground | JobType::ShellBackground | JobType::RunOptimize
+        )
     }
 }
 

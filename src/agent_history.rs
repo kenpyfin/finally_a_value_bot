@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::claude::{ContentBlock, Message, MessageContent};
+use crate::multimodel::{MultimodelRunSummary, TierEndpointSnapshot};
 
 /// Max UTF-8 bytes for the JSON blob appended under [`SNAPSHOT_SECTION_START`] in run markdown.
 pub const MAX_INITIAL_LLM_SNAPSHOT_BYTES: usize = 800 * 1024;
@@ -19,6 +20,15 @@ pub const QUALITY_EVAL_SECTION_START: &str = "\n## Post-delivery quality evaluat
 
 /// Max bytes read for a single agent history file (web UI / API).
 pub const MAX_AGENT_HISTORY_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Trace markdown only (no initial LLM snapshot suffix) for optimizer input.
+pub fn split_trace_for_optimize(content: &str) -> String {
+    let idx = content.find(SNAPSHOT_SECTION_START);
+    match idx {
+        Some(i) => content[..i].trim_end().to_string(),
+        None => content.trim_end().to_string(),
+    }
+}
 
 /// Basename must be `YYYYMMDD-HHMMSS.md` (same as `write_agent_history_run`).
 pub fn is_valid_agent_history_filename(name: &str) -> bool {
@@ -141,6 +151,23 @@ pub struct IterationRecord {
     pub assistant_text_preview: String,
     pub tool_calls: Vec<ToolCallRecord>,
     pub hook_events: Vec<String>,
+    pub model_tier: String,
+    pub provider: String,
+    pub model: String,
+    pub endpoint: String,
+}
+
+impl IterationRecord {
+    pub fn tier_fields_from_snapshot(
+        snap: &TierEndpointSnapshot,
+    ) -> (String, String, String, String) {
+        (
+            snap.tier.label().to_string(),
+            snap.provider.clone(),
+            snap.model.clone(),
+            snap.endpoint.clone(),
+        )
+    }
 }
 
 pub struct AgentRunRecord {
@@ -153,6 +180,7 @@ pub struct AgentRunRecord {
     pub total_duration_ms: u128,
     /// JSON (pretty) of `system_prompt`, `tool_names_first_turn`, and `messages` as sent on the first LLM call.
     pub initial_llm_snapshot: Option<String>,
+    pub multimodel_summary: MultimodelRunSummary,
 }
 
 fn history_dir(data_dir: &str, chat_id: i64, persona_id: i64) -> PathBuf {
@@ -181,12 +209,20 @@ impl AgentRunRecord {
             self.stop_reason,
             self.total_duration_ms,
         ));
+        md.push_str(&self.multimodel_summary.format_markdown_block());
 
         for iter in &self.iterations {
             md.push_str(&format!(
                 "\n## Iteration {}\nStop: {}\n",
                 iter.iteration, iter.stop_reason
             ));
+
+            if !iter.model_tier.is_empty() {
+                md.push_str(&format!(
+                    "Model tier: {} | provider: {} | model: {} | endpoint: {}\n",
+                    iter.model_tier, iter.provider, iter.model, iter.endpoint
+                ));
+            }
 
             if !iter.tool_calls.is_empty() {
                 for tc in &iter.tool_calls {
@@ -271,14 +307,18 @@ pub fn format_initial_llm_snapshot_json(
     system_prompt: &str,
     messages: &[Message],
     tool_names: &[String],
+    routing_v1: Option<&serde_json::Value>,
 ) -> String {
     let messages_json: Vec<serde_json::Value> = messages.iter().map(snap_message).collect();
-    let root = json!({
+    let mut root = json!({
         "schema": "initial_llm_request_v1",
         "system_prompt": system_prompt,
         "tool_names_first_turn": tool_names,
         "messages": messages_json,
     });
+    if let Some(routing) = routing_v1 {
+        root["routing_v1"] = routing.clone();
+    }
     let mut s = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
     if s.len() > MAX_INITIAL_LLM_SNAPSHOT_BYTES {
         let mut end = MAX_INITIAL_LLM_SNAPSHOT_BYTES.saturating_sub(120);
@@ -391,7 +431,68 @@ pub fn truncate_preview(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multimodel::{ModelTier, MultimodelRunSummary, TierEndpointSnapshot};
     use chrono::TimeZone;
+
+    fn sample_multimodel_summary() -> MultimodelRunSummary {
+        MultimodelRunSummary {
+            enabled: true,
+            strategy_provider: "google".into(),
+            strategy_model: "gemini-test".into(),
+            strategy_endpoint: "https://generativelanguage.googleapis.com/v1beta".into(),
+            tier1_model: "qwen-test".into(),
+            tier1_endpoint: "http://127.0.0.1:8080/v1".into(),
+            tier2_model: "mistral-test".into(),
+            tier2_endpoint: "http://127.0.0.1:8081/v1".into(),
+        }
+    }
+
+    #[test]
+    fn to_markdown_includes_multimodel_tier_lines() {
+        let record = AgentRunRecord {
+            timestamp: Utc.with_ymd_and_hms(2026, 6, 17, 12, 0, 0).unwrap(),
+            channel: "web".into(),
+            user_message_preview: "hello".into(),
+            iterations: vec![IterationRecord {
+                iteration: 1,
+                stop_reason: "tool_use".into(),
+                assistant_text_preview: String::new(),
+                tool_calls: vec![],
+                hook_events: vec![],
+                model_tier: "technical".into(),
+                provider: "llama".into(),
+                model: "qwen-test".into(),
+                endpoint: "http://127.0.0.1:8080/v1".into(),
+            }],
+            total_iterations: 1,
+            stop_reason: "end_turn".into(),
+            total_duration_ms: 42,
+            initial_llm_snapshot: None,
+            multimodel_summary: sample_multimodel_summary(),
+        };
+        let md = record.to_markdown();
+        assert!(md.contains("Multi-model: enabled"));
+        assert!(md.contains("Tier 1 (technical): qwen-test @ http://127.0.0.1:8080/v1"));
+        assert!(md.contains(
+            "Model tier: technical | provider: llama | model: qwen-test | endpoint: http://127.0.0.1:8080/v1"
+        ));
+    }
+
+    #[test]
+    fn format_initial_llm_snapshot_includes_routing_v1() {
+        let snap = TierEndpointSnapshot {
+            tier: ModelTier::Strategy,
+            provider: "google".into(),
+            model: "gemini-test".into(),
+            endpoint: "https://example.com/v1".into(),
+        };
+        let summary = sample_multimodel_summary();
+        let routing = summary.routing_v1_json(&snap);
+        let json = format_initial_llm_snapshot_json("sys", &[], &[], Some(&routing));
+        assert!(json.contains("\"routing_v1\""));
+        assert!(json.contains("\"multimodel_enabled\": true"));
+        assert!(json.contains("\"iter0\""));
+    }
 
     #[test]
     fn append_pdqe_step_adds_section_and_entries() {
@@ -408,6 +509,16 @@ mod tests {
             stop_reason: "end_turn".into(),
             total_duration_ms: 1,
             initial_llm_snapshot: None,
+            multimodel_summary: MultimodelRunSummary {
+                enabled: false,
+                strategy_provider: "google".into(),
+                strategy_model: "gemini".into(),
+                strategy_endpoint: "https://example.com/v1".into(),
+                tier1_model: String::new(),
+                tier1_endpoint: String::new(),
+                tier2_model: String::new(),
+                tier2_endpoint: String::new(),
+            },
         };
         let basename = write_agent_history_run(data_dir, chat_id, persona_id, &record).unwrap();
         append_pdqe_step_to_agent_history(

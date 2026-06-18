@@ -16,6 +16,40 @@ use crate::claude::{
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
 
+const LLM_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
+const LLM_HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Settings / persona connection probes (not full agent turns).
+const LLM_PROBE_TIMEOUT_SECS: u64 = 15;
+const LLM_TEST_MAX_TOKENS: u32 = 8;
+
+fn build_llm_http_client(request_timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            LLM_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .timeout(request_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn default_llm_http_client() -> reqwest::Client {
+    build_llm_http_client(std::time::Duration::from_secs(
+        LLM_HTTP_REQUEST_TIMEOUT_SECS,
+    ))
+}
+
+fn probe_llm_http_client() -> reqwest::Client {
+    build_llm_http_client(std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS))
+}
+
+fn llm_error_body_preview(body: &str, max_len: usize) -> String {
+    if body.len() <= max_len {
+        body.to_string()
+    } else {
+        format!("{}...", &body[..max_len])
+    }
+}
+
 /// Remove orphaned `ToolResult` blocks whose `tool_use_id` does not match any
 /// `ToolUse` block in the conversation.  This can happen after session
 /// compaction splits a tool_use / tool_result pair.
@@ -149,6 +183,20 @@ impl SseEventParser {
 // Provider trait
 // ---------------------------------------------------------------------------
 
+/// Per-request options for LLM calls (local OpenAI-compat tiers use `tool_choice`).
+#[derive(Debug, Clone, Default)]
+pub struct LlmSendOptions {
+    /// OpenAI `tool_choice`: `"required"`, `"auto"`, `"none"`, or a function name.
+    pub tool_choice: Option<String>,
+}
+
+impl LlmSendOptions {
+    pub fn with_tool_choice(mut self, choice: impl Into<String>) -> Self {
+        self.tool_choice = Some(choice.into());
+        self
+    }
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn send_message(
@@ -157,6 +205,17 @@ pub trait LlmProvider: Send + Sync {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError>;
+
+    async fn send_message_with_options(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: LlmSendOptions,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let _ = options;
+        self.send_message(system, messages, tools).await
+    }
 
     async fn send_message_stream(
         &self,
@@ -230,6 +289,7 @@ pub struct LlmHandle {
     model: std::sync::RwLock<String>,
     provider: std::sync::RwLock<Arc<dyn LlmProvider>>,
     base_config: std::sync::RwLock<Config>,
+    multimodel_config: std::sync::RwLock<crate::multimodel::MultimodelConfig>,
     multimodel: std::sync::RwLock<Option<crate::multimodel::MultimodelRuntime>>,
 }
 
@@ -243,15 +303,18 @@ impl LlmHandle {
             model: std::sync::RwLock::new(config.model.clone()),
             base_config: std::sync::RwLock::new(config.clone()),
             provider: std::sync::RwLock::new(provider),
+            multimodel_config: std::sync::RwLock::new(
+                crate::multimodel::MultimodelConfig::default(),
+            ),
             multimodel: std::sync::RwLock::new(None),
         })
     }
 
     pub fn multimodel_config(&self) -> crate::multimodel::MultimodelConfig {
-        self.multimodel
+        self.multimodel_config
             .read()
             .ok()
-            .and_then(|mm| mm.as_ref().map(|m| m.config.clone()))
+            .map(|cfg| cfg.clone())
             .unwrap_or_default()
     }
 
@@ -259,12 +322,17 @@ impl LlmHandle {
         &self,
         config: crate::multimodel::MultimodelConfig,
     ) -> Result<(), String> {
+        let config = config.normalize();
+        *self
+            .multimodel_config
+            .write()
+            .map_err(|_| "multimodel config lock poisoned".to_string())? = config.clone();
         let base = self
             .base_config
             .read()
             .map_err(|_| "config lock poisoned".to_string())?
             .clone();
-        let runtime = if config.enabled {
+        let runtime = if config.ready_for_routing() {
             Some(crate::multimodel::MultimodelRuntime::new(
                 &base,
                 config.clone(),
@@ -301,7 +369,7 @@ impl LlmHandle {
             .read()
             .map_err(|_| FinallyAValueBotError::LlmApi("multimodel lock poisoned".into()))?;
         Ok(if let Some(ref runtime) = *mm {
-            if runtime.config.enabled {
+            if runtime.config.ready_for_routing() {
                 runtime.provider_for_tier(tier, &strategy)
             } else {
                 strategy
@@ -319,7 +387,13 @@ impl LlmHandle {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let provider = self.provider_for_tier(tier)?;
-        provider.send_message(system, messages, tools).await
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+        let options = LlmSendOptions {
+            tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+        };
+        provider
+            .send_message_with_options(system, messages, tools, options)
+            .await
     }
 
     pub async fn send_message_for_route(
@@ -355,6 +429,70 @@ impl LlmHandle {
             .read()
             .ok()
             .and_then(|c| c.llm_base_url.clone())
+    }
+
+    fn strategy_endpoint(&self) -> String {
+        if let Some(url) = self.current_base_url() {
+            let t = url.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+        let provider = self.current_provider();
+        crate::llm_catalog::default_base_url_for_provider(&provider)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+    }
+
+    fn strategy_tier_snapshot(&self) -> crate::multimodel::TierEndpointSnapshot {
+        crate::multimodel::TierEndpointSnapshot {
+            tier: crate::multimodel::ModelTier::Strategy,
+            provider: self.current_provider(),
+            model: self.current_model(),
+            endpoint: self.strategy_endpoint(),
+        }
+    }
+
+    /// Resolved provider/model/endpoint for a tier (for agent history and debugging).
+    pub fn tier_endpoint_snapshot(
+        &self,
+        tier: crate::multimodel::ModelTier,
+    ) -> crate::multimodel::TierEndpointSnapshot {
+        let mm_cfg = self.multimodel_config();
+        if !mm_cfg.enabled || tier == crate::multimodel::ModelTier::Strategy {
+            return self.strategy_tier_snapshot();
+        }
+        match tier {
+            crate::multimodel::ModelTier::Technical => crate::multimodel::TierEndpointSnapshot {
+                tier,
+                provider: "llama".into(),
+                model: mm_cfg.tier1_model.clone(),
+                endpoint: mm_cfg.tier1_base_url.clone(),
+            },
+            crate::multimodel::ModelTier::Knowledge => crate::multimodel::TierEndpointSnapshot {
+                tier,
+                provider: "llama".into(),
+                model: mm_cfg.tier2_model.clone(),
+                endpoint: mm_cfg.tier2_base_url.clone(),
+            },
+            crate::multimodel::ModelTier::Strategy => self.strategy_tier_snapshot(),
+        }
+    }
+
+    /// Run-level routing summary for agent history (captured once per run).
+    pub fn multimodel_run_summary(&self) -> crate::multimodel::MultimodelRunSummary {
+        let mm_cfg = self.multimodel_config();
+        let strategy = self.strategy_tier_snapshot();
+        crate::multimodel::MultimodelRunSummary {
+            enabled: mm_cfg.enabled,
+            strategy_provider: strategy.provider,
+            strategy_model: strategy.model,
+            strategy_endpoint: strategy.endpoint,
+            tier1_model: mm_cfg.tier1_model,
+            tier1_endpoint: mm_cfg.tier1_base_url,
+            tier2_model: mm_cfg.tier2_model,
+            tier2_endpoint: mm_cfg.tier2_base_url,
+        }
     }
 
     /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
@@ -410,11 +548,10 @@ impl LlmHandle {
             .provider
             .write()
             .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
-        if let Ok(mm) = self.multimodel.read() {
-            if let Some(ref runtime) = *mm {
-                let _ = self.apply_multimodel_config(runtime.config.clone());
-            }
-        }
+        // Clone multimodel config before apply — holding a read guard across
+        // apply_multimodel_config would deadlock (it needs a write lock).
+        let mm_cfg = self.multimodel_config();
+        let _ = self.apply_multimodel_config(mm_cfg);
         Ok((provider_id, model))
     }
 
@@ -465,19 +602,159 @@ impl LlmProvider for LlmHandle {
     }
 }
 
+/// Lightweight reachability check for OpenAI-compatible local servers (llama.cpp, Ollama).
+async fn probe_openai_compatible_server(base_url: &str, model: &str) -> Result<(), String> {
+    let base = base_url.trim().trim_end_matches('/');
+    let models_url = format!("{base}/models");
+    let client = probe_llm_http_client();
+    let resp = client
+        .get(&models_url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach server at {base_url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Server at {base_url} returned HTTP {status}. Response: {}",
+            llm_error_body_preview(&body, 200)
+        ));
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
+            if !data.is_empty() && !model.trim().is_empty() {
+                let found = data.iter().any(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .is_some_and(|id| id == model.trim())
+                });
+                if !found {
+                    let listed: Vec<&str> = data
+                        .iter()
+                        .filter_map(|e| e.get("id").and_then(|id| id.as_str()))
+                        .take(8)
+                        .collect();
+                    return Err(format!(
+                        "Server reachable at {base_url}, but model {:?} was not listed in /models. Loaded models: {}",
+                        model,
+                        listed.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Test that a model override is reachable with the current provider/config.
 /// Returns Ok(()) on success, or an error string suitable for showing to the user.
 pub async fn test_model(config: &Config, model_override: &str) -> Result<(), String> {
+    let model = model_override.trim();
+    if model.is_empty() {
+        return Err("model is required".into());
+    }
+
+    if crate::llm_catalog::is_local_provider(&config.llm_provider) {
+        let base_url = config
+            .llm_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| "base_url is required for local providers".to_string())?;
+        return match tokio::time::timeout(
+            std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS),
+            probe_openai_compatible_server(base_url, model),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(format!(
+                "Connection test timed out after {LLM_PROBE_TIMEOUT_SECS}s (is the server running at {base_url}?)"
+            )),
+        };
+    }
+
     let mut test_config = config.clone();
-    test_config.model = model_override.to_string();
+    test_config.model = model.to_string();
+    test_config.max_tokens = LLM_TEST_MAX_TOKENS.min(test_config.max_tokens);
     let provider = create_provider(&test_config);
     let messages = vec![Message {
         role: "user".into(),
         content: MessageContent::Text("Hi".into()),
     }];
-    match provider.send_message("Test.", messages, None).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.to_string()),
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS),
+        provider.send_message("Test.", messages, None),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "Connection test timed out after {LLM_PROBE_TIMEOUT_SECS}s (server did not respond in time)"
+        )),
+    }
+}
+
+/// Probe tool-calling on a local OpenAI-compatible tier (llama.cpp).
+pub async fn test_multimodel_tools(
+    config: &Config,
+    model: &str,
+    tier: crate::multimodel::ModelTier,
+) -> Result<(), String> {
+    let mut test_config = config.clone();
+    test_config.model = model.to_string();
+    test_config.max_tokens = 256;
+    let base_url = config
+        .llm_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| "base_url is required for local providers".to_string())?;
+    let provider = create_openai_compatible_provider(&test_config, base_url, model);
+    let tools = vec![ToolDefinition {
+        name: "add".into(),
+        description: "Add two integers".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "integer" },
+                "b": { "type": "integer" }
+            },
+            "required": ["a", "b"]
+        }),
+    }];
+    let messages = vec![Message {
+        role: "user".into(),
+        content: MessageContent::Text("Use add to compute 2+3. You must call the tool.".into()),
+    }];
+    let has_tools = true;
+    let options = LlmSendOptions {
+        tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+    };
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS.saturating_mul(4)),
+        provider.send_message_with_options("Test.", messages, Some(tools), options),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Tool-calling probe timed out after {}s",
+            LLM_PROBE_TIMEOUT_SECS.saturating_mul(4)
+        )
+    })?
+    .map_err(|e| e.to_string())?;
+    let has_tool_use = response
+        .content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+    if has_tool_use {
+        Ok(())
+    } else {
+        Err("Model responded without tool_calls (tool-calling not verified)".into())
     }
 }
 
@@ -496,7 +773,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(config: &Config) -> Self {
         AnthropicProvider {
-            http: reqwest::Client::new(),
+            http: default_llm_http_client(),
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -1114,6 +1391,7 @@ fn build_oai_chat_request_body(
     max_tokens: u32,
     oai_messages: &[serde_json::Value],
     tools: Option<&[ToolDefinition]>,
+    tool_choice: Option<&str>,
     stream: bool,
     use_max_completion_tokens: bool,
 ) -> serde_json::Value {
@@ -1132,6 +1410,9 @@ fn build_oai_chat_request_body(
     if let Some(tool_defs) = tools {
         if !tool_defs.is_empty() {
             body["tools"] = json!(translate_tools_to_oai(tool_defs));
+            if let Some(choice) = tool_choice {
+                body["tool_choice"] = json!(choice);
+            }
         }
     }
     body
@@ -1151,7 +1432,7 @@ impl OpenAiProvider {
         let chat_url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
         OpenAiProvider {
-            http: reqwest::Client::new(),
+            http: default_llm_http_client(),
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -1249,8 +1530,20 @@ impl LlmProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        self.send_message_with_options(system, messages, tools, LlmSendOptions::default())
+            .await
+    }
+
+    async fn send_message_with_options(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: LlmSendOptions,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let oai_messages = translate_messages_to_oai(system, &messages);
         let tool_slice = tools.as_deref();
+        let tool_choice = options.tool_choice.as_deref();
         let mut use_max_completion_tokens = oai_uses_max_completion_tokens(&self.model);
         let mut token_field_retried = false;
         let mut retries = 0u32;
@@ -1262,6 +1555,7 @@ impl LlmProvider for OpenAiProvider {
                 self.max_tokens,
                 &oai_messages,
                 tool_slice,
+                tool_choice,
                 false,
                 use_max_completion_tokens,
             );
@@ -1361,6 +1655,7 @@ impl LlmProvider for OpenAiProvider {
                 self.max_tokens,
                 &oai_messages,
                 tool_slice,
+                None,
                 true,
                 use_max_completion_tokens,
             );
@@ -1517,7 +1812,7 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(config: &Config) -> Self {
         GeminiProvider {
-            http: reqwest::Client::new(),
+            http: default_llm_http_client(),
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -2402,11 +2697,27 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
     };
 
     let mut content = Vec::new();
+    let tool_calls_from_api = choice.message.tool_calls.is_some();
 
-    if let Some(text) = choice.message.content {
-        if !text.is_empty() {
-            content.push(ResponseContentBlock::Text { text });
+    let mut text_content = choice.message.content.unwrap_or_default();
+
+    if !tool_calls_from_api {
+        let markup_tools = parse_embedded_tool_calls_from_content(&text_content);
+        if !markup_tools.is_empty() {
+            text_content = strip_tools_markup_from_content(&text_content);
+            for (idx, (name, input)) in markup_tools.into_iter().enumerate() {
+                content.push(ResponseContentBlock::ToolUse {
+                    id: format!("embedded_tool_{idx}_{}", Uuid::new_v4()),
+                    name,
+                    input,
+                    thought_signature: None,
+                });
+            }
         }
+    }
+
+    if !text_content.is_empty() {
+        content.push(ResponseContentBlock::Text { text: text_content });
     }
 
     if let Some(tool_calls) = choice.message.tool_calls {
@@ -2450,6 +2761,48 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
     }
 }
 
+/// Qwen-Coder via llama.cpp may return `<tools>{ "name": "...", "arguments": {...} }</tools>` in content.
+fn parse_embedded_tool_calls_from_content(text: &str) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    const OPEN: &str = "<tools>";
+    const CLOSE: &str = "</tools>";
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(close_idx) = after_open.find(CLOSE) else {
+            break;
+        };
+        let inner = after_open[..close_idx].trim();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(inner) {
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                let input = v.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                out.push((name.to_string(), input));
+            } else if let Some(arr) = v.as_array() {
+                for item in arr {
+                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        let input = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                        out.push((name.to_string(), input));
+                    }
+                }
+            }
+        }
+        rest = &after_open[close_idx + CLOSE.len()..];
+    }
+    out
+}
+
+fn strip_tools_markup_from_content(text: &str) -> String {
+    let mut out = text.to_string();
+    while let Some(start) = out.find("<tools>") {
+        let Some(rel_end) = out[start..].find("</tools>") else {
+            break;
+        };
+        let end = start + rel_end + "</tools>".len();
+        out.replace_range(start..end, "");
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2467,12 +2820,47 @@ mod tests {
     #[test]
     fn test_build_oai_chat_request_body_token_fields() {
         let msgs = vec![json!({"role": "user", "content": "hi"})];
-        let legacy = build_oai_chat_request_body("gpt-4o", 100, &msgs, None, false, false);
+        let legacy = build_oai_chat_request_body("gpt-4o", 100, &msgs, None, None, false, false);
         assert!(legacy.get("max_tokens").is_some());
         assert!(legacy.get("max_completion_tokens").is_none());
-        let modern = build_oai_chat_request_body("gpt-5.2", 100, &msgs, None, false, true);
+        let modern = build_oai_chat_request_body("gpt-5.2", 100, &msgs, None, None, false, true);
         assert!(modern.get("max_completion_tokens").is_some());
         assert!(modern.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_build_oai_chat_request_body_tool_choice() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let tools = vec![ToolDefinition {
+            name: "add".into(),
+            description: "add".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let body = build_oai_chat_request_body(
+            "qwen",
+            100,
+            &msgs,
+            Some(&tools),
+            Some("required"),
+            false,
+            false,
+        );
+        assert_eq!(body["tool_choice"], json!("required"));
+        assert!(body.get("tools").is_some());
+    }
+
+    #[test]
+    fn test_parse_embedded_tool_calls_from_qwen_markup() {
+        let raw = r#"<tools>
+{
+  "name": "add",
+  "arguments": { "a": 2, "b": 3 }
+}
+</tools>"#;
+        let parsed = parse_embedded_tool_calls_from_content(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "add");
+        assert_eq!(parsed[0].1["a"], 2);
     }
 
     // -----------------------------------------------------------------------

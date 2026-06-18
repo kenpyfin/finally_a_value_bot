@@ -3913,6 +3913,24 @@ impl Database {
         Ok(())
     }
 
+    pub fn create_background_run_optimize_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        history_filename: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let label = "Learn & optimize";
+        conn.execute(
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage, job_kind, label)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 'run_optimize', ?5, ?5, 'pending', 'run_optimize', ?6)",
+            params![id, chat_id, persona_id, history_filename, now, label],
+        )?;
+        Ok(())
+    }
+
     pub fn create_background_shell_job(
         &self,
         id: &str,

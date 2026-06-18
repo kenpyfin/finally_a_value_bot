@@ -84,11 +84,25 @@ impl Tool for ReadFileTool {
             return ToolResult::error(msg);
         }
 
+        if is_likely_binary_media_path(&resolved_path) {
+            return ToolResult::error(format!(
+                "Cannot read binary/image file as text: {path}. To show this file to the user, put it in your final assistant message as a markdown image link with the absolute local path (e.g. ![caption]({resolved_path_str})) — do not use read_file on images."
+            ));
+        }
+
         info!("Reading file: {}", resolved_path.display());
 
         let content = match tokio::fs::read_to_string(&resolved_path).await {
             Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to read file: {e}")),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("UTF-8") || msg.contains("utf-8") {
+                    return ToolResult::error(format!(
+                        "Failed to read file: {msg}. This path is likely a binary/image file — use a markdown image link with the absolute path in your final message instead of read_file."
+                    ));
+                }
+                return ToolResult::error(format!("Failed to read file: {msg}"));
+            }
         };
 
         let lines: Vec<&str> = content.lines().collect();
@@ -136,6 +150,36 @@ impl Tool for ReadFileTool {
 
         ToolResult::success(selected.join("\n"))
     }
+}
+
+fn is_likely_binary_media_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "ico"
+                    | "pdf"
+                    | "zip"
+                    | "gz"
+                    | "tar"
+                    | "mp4"
+                    | "mov"
+                    | "mp3"
+                    | "wav"
+                    | "woff"
+                    | "woff2"
+                    | "ttf"
+                    | "otf"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -205,6 +249,24 @@ mod tests {
         assert!(result.content.contains("4"));
         assert!(result.content.contains("6"));
         assert!(!result.content.contains("\t1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_rejects_png() {
+        let dir = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_rf_png_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("image.png");
+        std::fs::write(&file, [137u8, 80, 78, 71]).unwrap();
+
+        let tool = ReadFileTool::new(dir.to_str().unwrap());
+        let result = tool.execute(json!({"path": "image.png"})).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("binary/image"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

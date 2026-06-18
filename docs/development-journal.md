@@ -4,13 +4,85 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-18 — Remove TSA (Tool and Skill Agent) gatekeeper
+
+- **Area:** agent loop / config
+- **Summary:** Removed the legacy TSA layer that ran an extra LLM call before every tool execution, redacted/truncated conversation context (including emails), and could deny tool use. Deleted `src/tool_skill_agent.rs`; dropped `TOOL_SKILL_AGENT_ENABLED` / `TOOL_SKILL_AGENT_MODEL` config. Tools now execute directly after hooks, as in the orchestrator-first flow.
+- **Key files / symbols:** `src/channels/telegram.rs` (removed `evaluate_tool_use` block); `src/config.rs`, `src/config_wizard.rs`, `src/hook_executor.rs`, `.env.example`.
+- **Rationale:** Operator feedback — TSA redaction/truncation was mangling emails and blocking normal tool chains; feature was already default-off and superseded by orchestrator routing.
+- **Follow-ups:** Remove stale TSA mentions from `ARCHITECTURE.md` when that doc is next edited.
+
+### 2026-06-18 — Remove bash/glob listing-only routing gate
+
+- **Area:** multimodel routing
+- **Summary:** Removed `last_tools_are_listing_only` from `resolve_route`. After `bash` or `glob`, the next iteration routes to **Tier 1 (technical)** again instead of forcing strategy — `bash`/`glob` are too common and the gate effectively disabled local LLM use. Safety nets unchanged: `local_tier_error_streak`, strategy tool fallback, `read_file` binary guard, `tool_choice`, probe gate.
+- **Key files / symbols:** `resolve_route` in `src/multimodel.rs`; `docs/multimodel-local-tiers.md`.
+- **Rationale:** Operator feedback; multi-model should route to local tiers for typical shell/file discovery chains.
+- **Follow-ups:** `./reload.sh` on deploy hosts.
+
+### 2026-06-18 — Multi-model local tiers operator guide
+
+- **Area:** docs / multimodel / operations
+- **Summary:** Added [`docs/multimodel-local-tiers.md`](multimodel-local-tiers.md) — canonical guide for consistent local tool calling across installs: wire vs behavioral consistency, three-tier architecture, fresh-install checklist, reference llama.cpp setup (`--jinja`, `tool_choice` curl probes), `tools_ok` gate, agent-loop safety nets, troubleshooting, and cross-machine deployment. Linked from `DEVELOP.md` related documentation table.
+- **Key files / symbols:** `docs/multimodel-local-tiers.md`; `tool_choice_for_tier`, `persist_tier_tools_ok`, `resolve_route` in `src/multimodel.rs`; Settings → Multi-model UI.
+- **Rationale:** Operator knowledge was split across journal entries and ad-hoc probes; new hosts need one checklist without archaeology.
+- **Follow-ups:** Optional reference `docker compose` for llama tiers; auto-probe on startup; tier-restricted tool lists (listed as roadmap in doc).
+
+### 2026-06-18 — Local tier tool calling (Qwen `tool_choice`, probe, strategy fallback)
+
+- **Area:** multimodel / llm / agent loop / web settings
+- **Summary:** Qwen2.5-Coder on llama.cpp returns `<tools>{...}</tools>` in `content` instead of `tool_calls` unless the request includes `tool_choice: "required"`. Bot now sends tier-appropriate `tool_choice` for local OpenAI-compat tiers (Tier 1 `required`, Tier 2 `auto`) via `LlmSendOptions` and `build_oai_chat_request_body`. Defense-in-depth: `parse_embedded_tool_calls_from_content` promotes Qwen markup to `ToolUse` blocks. Settings → Multi-model **Test** runs a tool probe and persists `MULTIMODEL_TIER1_TOOLS_OK` / `MULTIMODEL_TIER2_TOOLS_OK`; routing to local tiers is gated until verified. Agent loop retries once on strategy when a local tier returns `end_turn` without tools after tool results and text claims unbacked actions (PZ hallucinated upload URLs).
+- **Key files / symbols:** `tool_choice_for_tier`, `persist_tier_tools_ok`, `tier1_routable` in `src/multimodel.rs`; `LlmSendOptions`, `test_multimodel_tools`, `parse_embedded_tool_calls_from_content` in `src/llm.rs`; `should_fallback_local_tier_to_strategy`, `assistant_text_claims_unbacked_actions` in `src/channels/telegram.rs`; `POST /api/multimodel/test` in `src/web.rs`; `settings-multimodel.tsx`.
+- **Rationale:** Live probe on `10.0.1.217:8080` confirmed server OK; missing `tool_choice` was the PZ failure mode. Probe + route gate prevent silent routing to models that cannot call tools; strategy fallback is a safety net for regressions.
+- **Follow-ups:** Re-run tier tests after llama.cpp upgrades; rebuild `web/dist` on deploy.
+
+### 2026-06-18 — LLM settings save hang + fast local server connection tests
+
+- **Area:** llm / web API / Settings → LLM / Settings → Multi-model
+- **Summary:** Saving LLM provider (e.g. llama.cpp) could hang forever: `apply_selection` held a read lock on `multimodel_config` while calling `apply_multimodel_config`, which needs a write lock on the same `RwLock` (self-deadlock). Fixed by cloning config via `multimodel_config()` before re-applying. Multi-model / persona connection tests no longer run a full chat completion against local servers with unbounded HTTP waits — local providers use `GET /v1/models` with 5s connect + 15s overall timeout; cloud probes use a minimal chat with the same cap. All LLM HTTP clients now set connect/request timeouts.
+- **Key files / symbols:** `LlmHandle::apply_selection`, `test_model`, `probe_openai_compatible_server`, `build_llm_http_client` in `src/llm.rs`; `POST /api/multimodel/test` unchanged but benefits from `test_model`.
+- **Rationale:** Settings save must never block on multimodel lock ordering; connection tests should fail fast when llama.cpp is down or slow to load.
+- **Follow-ups:** Rebuild/restart gateway after deploy.
+
+### 2026-06-18 — Multi-model tier settings: no defaults, persist when disabled
+
+- **Area:** multimodel config / web UI / LlmHandle
+- **Summary:** Tier 1 and Tier 2 URL/model fields start empty (placeholders only) instead of pre-filled defaults. Saved values persist in `app_settings` and survive toggling multi-model off. `LlmHandle` now keeps `multimodel_config` separately from the optional runtime so GET/PATCH still return stored tier URLs when routing is disabled. Enabling routing requires both tiers configured; `normalize()` trims and appends `/v1` but does not inject default models/URLs.
+- **Key files / symbols:** `MultimodelConfig::normalize`, `tier1_configured`, `ready_for_routing` in `src/multimodel.rs`; `multimodel_config` field + `apply_multimodel_config` in `src/llm.rs`; `GET/PATCH /api/multimodel` in `src/web.rs`; `web/src/components/settings-multimodel.tsx`.
+- **Rationale:** Operators should explicitly configure local servers; disabling routing must not wipe or mask previously entered endpoints.
+- **Follow-ups:** Rebuild `web/dist` on deploy.
+
+### 2026-06-17 — Strip internal dialogue XML from chat delivery
+
+- **Area:** agent turn context / channel delivery / web history API
+- **Summary:** Internal LLM history wrappers (`<assistant_message context="prior_turn" at="...">`) were leaking into operator chat when the model echoed them. New `strip_stored_dialogue_markup` in `src/agent_turn_context.rs` unwraps echoed assistant/user XML (including persona-prefixed lines) and unescapes entities. Applied on bot message delivery (`deliver_and_store_bot_message`, `deliver_to_contact`, `normalize_final_for_delivery` in `src/channel.rs`) and when serving `/api/history` in `src/web.rs` so existing DB rows render cleanly.
+- **Key files / symbols:** `strip_stored_dialogue_markup`, `parse_wrapped_assistant_message` in `src/agent_turn_context.rs`; delivery hooks in `src/channel.rs`; history mapping in `src/web.rs`.
+- **Rationale:** Wrappers are prompt-only scaffolding for the model; they must never appear in user-visible chat.
+- **Follow-ups:** None.
+
+### 2026-06-17 — Learn & optimize from Last agent run (Tier 2 background job)
+
+- **Area:** run optimizer / web API / web UI / background jobs
+- **Summary:** **Learn & optimize** button in the Last agent run dialog enqueues a background job (`job_kind: run_optimize`) that analyzes the latest saved run markdown with **local Tier 2 (Knowledge)** llama and updates persona memory via a restricted tool loop (`read_tiered_memory`, `write_tiered_memory`, `update_bulletin_focus`). Uses saved Tier 2 URL/model from Settings → Multi-model as-is (no default URL changes). Progress in Background jobs panel; completion message delivered to chat.
+- **Key files / symbols:** `src/run_optimizer.rs` (`try_enqueue_run_optimize`, `run_optimizer_from_history`, `build_optimize_user_message`); `split_trace_for_optimize` in `src/agent_history.rs`; `create_background_run_optimize_job` in `src/db.rs`; `JobType::RunOptimize` in `src/job_heartbeat.rs`; `POST /api/personas/:persona_id/agent_history/latest/optimize` in `src/web.rs`; button in `web/src/main.tsx`.
+- **Rationale:** Operators can turn a finished run trace into durable efficiency learnings without a full agent turn or cloud API cost; manual trigger keeps memory writes intentional.
+- **Follow-ups:** Optional filename picker for non-latest runs; extract shared restricted tool loop with persona focus sync.
+
+### 2026-06-17 — Agent run history: multi-model tier tracing
+
+- **Area:** agent history / agent loop / web UI
+- **Summary:** Persisted agent run markdown and the web **Last agent run** dialog now record **per-iteration tier routing**: tier name, provider, resolved model, and endpoint. Run header includes a multi-model summary block (enabled/disabled + tier1/2/strategy endpoints). First-turn LLM snapshot JSON adds optional `routing_v1` (iter0 tier + tier config). PTE final synthesis appends a hook line on the iteration with strategy-tier endpoint info.
+- **Key files / symbols:** `TierEndpointSnapshot`, `MultimodelRunSummary`, `format_tier_line` in `src/multimodel.rs`; `LlmHandle::tier_endpoint_snapshot`, `multimodel_run_summary` in `src/llm.rs`; `IterationRecord` tier fields + `AgentRunRecord::multimodel_summary` + `format_initial_llm_snapshot_json(..., routing_v1)` in `src/agent_history.rs`; population in `src/channels/telegram.rs`; `parseTierLine`, `formatTierBadgeLabel`, `AgentHistoryTierBadge` in `web/src/parse-agent-history.ts` + `web/src/main.tsx`.
+- **Rationale:** Runtime logs showed `model_tier=` but saved history and the cockpit debug dialog did not — operators could not verify local vs strategy routing after a run without reading log files.
+- **Follow-ups:** Rebuild `web/dist` on deploy hosts without `npm` in PATH (`node ./node_modules/vite/bin/vite.js build`); optional run-timeline SSE event for active tier during live runs.
+
 ### 2026-06-17 — Multi-model routing (local llama.cpp + strategy API)
 
 - **Area:** llm / agent loop / web API / web UI
 - **Summary:** Three-tier model routing for privacy/cost: **Tier 1 (technical)** and **Tier 2 (knowledge)** use configurable local llama.cpp OpenAI-compatible servers; **Tier 3 (strategy)** uses the existing Settings → LLM provider/model (e.g. Anthropic Claude). Heuristic routing in the shared agent loop: iteration 0 and final synthesis always strategy; chained tool rounds route to local tiers when all tools in the previous iteration are technical (`bash`, file edits, grep, …) or knowledge (`search_vault`, `read_tiered_memory`, …). Disabled by default — unchanged behavior when off. Web UI **Settings → Multi-model** configures tier base URLs/models, enable toggle, and per-tier connection test. Hot-reloads via `app_settings` without gateway restart.
 - **Key files / symbols:** `MultimodelConfig`, `resolve_route`, `ModelTier` in `src/multimodel.rs`; `LlmHandle::send_message_for_tier`, `apply_multimodel_config` in `src/llm.rs`; agent loop routing + `last_iteration_tools` in `src/channels/telegram.rs`; `GET/PATCH /api/multimodel`, `POST /api/multimodel/test` in `src/web.rs`; `web/src/components/settings-multimodel.tsx`.
 - **Rationale:** RTX 5060 Ti 16GB can run Qwen-Coder + Mistral-Nemo locally for tool-heavy iterations while reserving API spend for planning and final answers; routing is automatic so operators do not pick models per message.
-- **Follow-ups:** Run two llama.cpp instances (ports 8080/8081) with the GGUF models loaded; set Settings → LLM to Anthropic + `claude-sonnet-4-5` (or preferred strategy model); rebuild `web/dist`; tune tool classification lists if new tools need tier hints; consider exposing active tier in run timeline / cockpit.
+- **Follow-ups:** Run two llama.cpp instances (ports 8080/8081) with the GGUF models loaded; set Settings → LLM to Anthropic + `claude-sonnet-4-5` (or preferred strategy model); rebuild `web/dist`; tune tool classification lists if new tools need tier hints.
 
 ### 2026-06-16 — Focused chat sessions (web-only, per persona)
 

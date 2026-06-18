@@ -487,8 +487,6 @@ fn default_config() -> Config {
         vault: None,
         orchestrator_enabled: true,
         orchestrator_model: String::new(),
-        tool_skill_agent_enabled: true,
-        tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
         response_quality_evaluator_enabled: false,

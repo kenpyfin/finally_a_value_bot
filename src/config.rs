@@ -207,14 +207,6 @@ fn default_orchestrator_model() -> String {
     String::new()
 }
 
-fn default_tool_skill_agent_enabled() -> bool {
-    false
-}
-
-fn default_tool_skill_agent_model() -> String {
-    String::new()
-}
-
 fn default_post_tool_evaluator_enabled() -> bool {
     false
 }
@@ -313,8 +305,6 @@ pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
             | "MAX_DOCUMENT_SIZE_MB"
             | "ORCHESTRATOR_MODEL"
             | "ORCHESTRATOR_ENABLED"
-            | "TOOL_SKILL_AGENT_MODEL"
-            | "TOOL_SKILL_AGENT_ENABLED"
             | "POST_TOOL_EVALUATOR_MODEL"
             | "POST_TOOL_EVALUATOR_ENABLED"
             | "SHOW_THINKING"
@@ -529,12 +519,6 @@ pub struct Config {
     /// Optional model override for orchestrator (e.g. faster/cheaper). If empty, use main model.
     #[serde(default = "default_orchestrator_model")]
     pub orchestrator_model: String,
-    /// [Legacy] When true and orchestrator disabled, gate tool use via TSA. Default false; orchestrator-first flow does not use TSA.
-    #[serde(default = "default_tool_skill_agent_enabled")]
-    pub tool_skill_agent_enabled: bool,
-    /// Optional model for TSA (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
-    #[serde(default = "default_tool_skill_agent_model")]
-    pub tool_skill_agent_model: String,
     /// Post-Tool Evaluator (PTE): evaluate task completion after each tool iteration. Default false.
     #[serde(default = "default_post_tool_evaluator_enabled")]
     pub post_tool_evaluator_enabled: bool,
@@ -987,11 +971,6 @@ impl Config {
                 default_orchestrator_enabled(),
             ),
             orchestrator_model: Self::env("ORCHESTRATOR_MODEL").unwrap_or_default(),
-            tool_skill_agent_enabled: Self::env_bool(
-                "TOOL_SKILL_AGENT_ENABLED",
-                default_tool_skill_agent_enabled(),
-            ),
-            tool_skill_agent_model: Self::env("TOOL_SKILL_AGENT_MODEL").unwrap_or_default(),
             post_tool_evaluator_enabled: Self::env_bool(
                 "POST_TOOL_EVALUATOR_ENABLED",
                 default_post_tool_evaluator_enabled(),
@@ -1754,8 +1733,6 @@ pub fn test_config() -> Config {
         vault: None,
         orchestrator_enabled: true,
         orchestrator_model: String::new(),
-        tool_skill_agent_enabled: true,
-        tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
         response_quality_evaluator_enabled: false,

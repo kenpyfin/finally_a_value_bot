@@ -43,7 +43,7 @@ fn text_from_message_content(content: &MessageContent) -> String {
 
 fn parse_wrapped_user_message(text: &str) -> Option<(String, Option<String>, String)> {
     let text = text.trim();
-    const PREFIX: &str = "<user_message ";
+    const PREFIX: &str = "<user_message";
     const SUFFIX: &str = "</user_message>";
     if !text.starts_with(PREFIX) || !text.ends_with(SUFFIX) {
         return None;
@@ -55,6 +55,69 @@ fn parse_wrapped_user_message(text: &str) -> Option<(String, Option<String>, Str
     let sender = extract_xml_attr(attrs, "sender")?;
     let at = extract_xml_attr(attrs, "at");
     Some((sender, at, content))
+}
+
+fn parse_wrapped_assistant_message(text: &str) -> Option<String> {
+    let text = text.trim();
+    const PREFIX: &str = "<assistant_message";
+    const SUFFIX: &str = "</assistant_message>";
+    if !text.starts_with(PREFIX) {
+        return None;
+    }
+    let tag_body = if text.ends_with(SUFFIX) {
+        &text[PREFIX.len()..text.len() - SUFFIX.len()]
+    } else {
+        &text[PREFIX.len()..]
+    };
+    let tag_body = tag_body.trim_start();
+    let close = tag_body.find('>')?;
+    let mut content = tag_body[close + 1..].to_string();
+    if let Some(suffix_pos) = content.rfind(SUFFIX) {
+        content.truncate(suffix_pos);
+    }
+    Some(unescape_xml_entities(content.trim()))
+}
+
+fn unescape_xml_entities(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Remove LLM-history XML wrappers accidentally echoed into user-visible chat text.
+pub fn strip_stored_dialogue_markup(text: &str) -> String {
+    let mut t = text.trim().to_string();
+    for _ in 0..3 {
+        if let Some(inner) = parse_wrapped_assistant_message(&t) {
+            return inner;
+        }
+        if let Some((_, _, inner)) = parse_wrapped_user_message(&t) {
+            return unescape_xml_entities(inner.trim());
+        }
+        if let Some(next) = strip_one_leading_persona_bracket(&t) {
+            if next == t {
+                return t;
+            }
+            t = next;
+            continue;
+        }
+        return t;
+    }
+    t
+}
+
+fn strip_one_leading_persona_bracket(text: &str) -> Option<String> {
+    let rest = text.trim_start();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let close = rest.find(']')?;
+    let token = &rest[1..close];
+    if token.is_empty() || token.len() > 64 || token.contains('\n') {
+        return None;
+    }
+    Some(rest[close + 1..].trim_start().to_string())
 }
 
 fn extract_xml_attr(attrs: &str, name: &str) -> Option<String> {
@@ -241,5 +304,16 @@ mod tests {
         assert!(!is_short_reply_request(
             "please regenerate the image with the blue background"
         ));
+    }
+
+    #[test]
+    fn strip_stored_dialogue_markup_unwraps_assistant_echo() {
+        let raw = "<assistant_message context=\"prior_turn\" at=\"2026-06-17T22:58:05.123456789+00:00\">Hello &amp; welcome</assistant_message>";
+        assert_eq!(strip_stored_dialogue_markup(raw), "Hello & welcome");
+    }
+
+    #[test]
+    fn strip_stored_dialogue_markup_leaves_normal_text() {
+        assert_eq!(strip_stored_dialogue_markup("plain reply"), "plain reply");
     }
 }

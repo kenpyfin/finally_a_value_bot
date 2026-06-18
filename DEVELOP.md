@@ -83,12 +83,13 @@ The bot redacts **only literal values** loaded from **env-like files** on disk a
 - **Restart the bot** after changing any env-like file so the catalog refreshes.
 - Secrets not stored in env-like files are **not** redacted (inline chat secrets, generated tokens, etc.).
 
-Redaction runs on tool results, logs, hook/TSA/PTE prompts, scheduler delivery, final assistant output safeguards, and background-shell output.
+Redaction runs on tool results, logs, hook/PTE prompts, scheduler delivery, final assistant output safeguards, and background-shell output.
 
 ### Related documentation
 
 | Topic | Doc |
 | --- | --- |
+| Multi-model local tiers (llama.cpp, tool probe, cross-install setup) | [`docs/multimodel-local-tiers.md`](docs/multimodel-local-tiers.md) |
 | Vault SOPs (workflows as procedure context) | [`docs/sops.md`](docs/sops.md) |
 | Deprecated SQLite learned workflows | [`docs/workflow.md`](docs/workflow.md) |
 | Runtime parity / deferred agent-runtime items | [`docs/runtime-gap-analysis.md`](docs/runtime-gap-analysis.md) |
