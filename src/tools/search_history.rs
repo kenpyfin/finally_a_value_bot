@@ -26,10 +26,10 @@ impl Tool for SearchHistoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "search_chat_history".into(),
-            description: "Search past messages in this chat using full-text search. Use this to recall past conversations, facts, or context the user mentioned previously. Always use this before saying \"I don't remember\" or asking the user to repeat something.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "search_chat_history",
+            "Search past messages in this chat using full-text search. Use this to recall past conversations, facts, or context the user mentioned previously. Always use this before saying \"I don't remember\" or asking the user to repeat something.",
+            schema_object(
                 json!({
                     "query": {
                         "type": "string",
@@ -54,7 +54,7 @@ impl Tool for SearchHistoryTool {
                 }),
                 &["query", "chat_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

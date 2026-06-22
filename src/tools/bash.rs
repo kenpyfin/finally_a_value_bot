@@ -86,10 +86,10 @@ impl Tool for BashTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "bash".into(),
-            description: "Execute a bash command and return the output. Use for running shell commands, scripts, or system operations. Do not use recursive `grep -r` or unbounded `find` over large trees — use the `glob` and `grep` tools instead (shell recursive search is blocked unless you prefix CONFIRM_EXECUTE).".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "bash",
+            "Execute a bash command and return the output. Use for running shell commands, scripts, or system operations. Do not use recursive `grep -r` or unbounded `find` over large trees — use the `glob` and `grep` tools instead (shell recursive search is blocked unless you prefix CONFIRM_EXECUTE).",
+            schema_object(
                 json!({
                     "command": {
                         "type": "string",
@@ -102,7 +102,7 @@ impl Tool for BashTool {
                 }),
                 &["command"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

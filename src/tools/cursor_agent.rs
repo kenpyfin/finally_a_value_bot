@@ -289,10 +289,10 @@ impl Tool for CursorAgentTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "cursor_agent".into(),
-            description: "Run the Cursor CLI agent (cursor-agent) with a prompt. Use for research, code generation, or analysis that benefits from Cursor's native agent. For long tasks, prefer detach: true to run in background via tmux and avoid request timeouts. Optional: timeout_secs, model override. Working directory is the shared tool workspace.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "cursor_agent",
+            "Run the Cursor CLI agent (cursor-agent) with a prompt. Use for research, code generation, or analysis that benefits from Cursor's native agent. For long tasks, prefer detach: true to run in background via tmux and avoid request timeouts. Optional: timeout_secs, model override. Working directory is the shared tool workspace.",
+            schema_object(
                 json!({
                     "prompt": {
                         "type": "string",
@@ -313,7 +313,7 @@ impl Tool for CursorAgentTool {
                 }),
                 &["prompt"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -516,10 +516,10 @@ impl Tool for ListCursorAgentRunsTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "list_cursor_agent_runs".into(),
-            description: "List recent cursor-agent runs to monitor project status. By default returns runs for the current chat; use this to see last run outcome, success/failure, and output preview. For post-mortems on a finished run, use read_agent_history (iterations and tool traces) or read_file on output_path when present; if the tmux session is still alive, tmux capture-pane via bash can show scrollback.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "list_cursor_agent_runs",
+            "List recent cursor-agent runs to monitor project status. By default returns runs for the current chat; use this to see last run outcome, success/failure, and output preview. For post-mortems on a finished run, use read_agent_history (iterations and tool traces) or read_file on output_path when present; if the tmux session is still alive, tmux capture-pane via bash can show scrollback.",
+            schema_object(
                 json!({
                     "limit": {
                         "type": "integer",
@@ -532,7 +532,7 @@ impl Tool for ListCursorAgentRunsTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -652,10 +652,10 @@ impl Tool for CursorAgentSendTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "cursor_agent_send".into(),
-            description: "Send keys to a running cursor-agent tmux session (from a run with detach: true). Use to redirect the agent mid-task (e.g. 'Focus on the API first').".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "cursor_agent_send",
+            "Send keys to a running cursor-agent tmux session (from a run with detach: true). Use to redirect the agent mid-task (e.g. 'Focus on the API first').",
+            schema_object(
                 json!({
                     "tmux_session": {
                         "type": "string",
@@ -668,7 +668,7 @@ impl Tool for CursorAgentSendTool {
                 }),
                 &["tmux_session", "keys"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -737,10 +737,10 @@ impl Tool for BuildSkillTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "build_skill".into(),
-            description: "Create or update a FinallyAValueBot skill by running cursor-agent. For new skills activate `create-skill` first; for changes to an existing skill activate `modify-skill` first (enforced when the skill folder already exists). Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "build_skill",
+            "Create or update a FinallyAValueBot skill by running cursor-agent. For new skills activate `create-skill` first; for changes to an existing skill activate `modify-skill` first (enforced when the skill folder already exists). Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.",
+            schema_object(
                 json!({
                     "name": {
                         "type": "string",
@@ -757,7 +757,7 @@ impl Tool for BuildSkillTool {
                 }),
                 &["name", "description", "instructions"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

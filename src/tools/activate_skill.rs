@@ -51,10 +51,10 @@ impl Tool for ActivateSkillTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "activate_skill".into(),
-            description: "Activate an agent skill to load its full instructions. Use this when you see a relevant skill in the available skills list and need its detailed instructions to complete a task. The catalog excludes skills for other platforms only; declared deps are not required locally (API/remote skills).".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "activate_skill",
+            "Activate an agent skill to load its full instructions. Use this when you see a relevant skill in the available skills list and need its detailed instructions to complete a task. The catalog excludes skills for other platforms only; declared deps are not required locally (API/remote skills).",
+            schema_object(
                 json!({
                     "skill_name": {
                         "type": "string",
@@ -63,7 +63,7 @@ impl Tool for ActivateSkillTool {
                 }),
                 &["skill_name"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

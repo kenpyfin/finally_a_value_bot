@@ -26,10 +26,10 @@ impl Tool for GrepTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "grep".into(),
-            description: "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers. Prefer a narrow `path` and `glob` filter (e.g. path `shared/`, glob `*.md`) — avoid searching all of `shared/` without a glob.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "grep",
+            "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers. Prefer a narrow `path` and `glob` filter (e.g. path `shared/`, glob `*.md`) — avoid searching all of `shared/` without a glob.",
+            schema_object(
                 json!({
                     "pattern": {
                         "type": "string",
@@ -46,7 +46,7 @@ impl Tool for GrepTool {
                 }),
                 &["pattern"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

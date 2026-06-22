@@ -28,18 +28,17 @@ impl Tool for ReadMemoryStateTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_memory_state".into(),
-            description: "Read canonical per-persona memory_state.json (single source of truth)."
-                .into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "read_memory_state",
+            "Read canonical per-persona memory_state.json (single source of truth).",
+            schema_object(
                 json!({
                     "chat_id": {"type": "integer", "description": "Chat ID (defaults from auth context)"},
                     "persona_id": {"type": "integer", "description": "Persona ID (defaults from auth context)"}
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
@@ -91,11 +90,10 @@ impl Tool for ValidateMemoryStateTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "validate_memory_state".into(),
-            description: "Validate candidate memory_state JSON against schema and invariants."
-                .into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "validate_memory_state",
+            "Validate candidate memory_state JSON against schema and invariants.",
+            schema_object(
                 json!({
                     "chat_id": {"type": "integer", "description": "Chat ID (defaults from auth context)"},
                     "persona_id": {"type": "integer", "description": "Persona ID (defaults from auth context)"},
@@ -103,7 +101,7 @@ impl Tool for ValidateMemoryStateTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
@@ -168,10 +166,10 @@ impl Tool for WriteMemoryStateTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "write_memory_state".into(),
-            description: "Write canonical memory_state.json with validation and optional revision conflict guard.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "write_memory_state",
+            "Write canonical memory_state.json with validation and optional revision conflict guard.",
+            schema_object(
                 json!({
                     "chat_id": {"type": "integer", "description": "Chat ID (defaults from auth context)"},
                     "persona_id": {"type": "integer", "description": "Persona ID (defaults from auth context)"},
@@ -180,7 +178,7 @@ impl Tool for WriteMemoryStateTool {
                 }),
                 &["content"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
@@ -263,10 +261,10 @@ impl Tool for PatchMemoryStateTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "patch_memory_state".into(),
-            description: "Apply a JSON object patch to canonical memory state (deep-merge for objects, replace scalars/arrays).".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "patch_memory_state",
+            "Apply a JSON object patch to canonical memory state (deep-merge for objects, replace scalars/arrays).",
+            schema_object(
                 json!({
                     "chat_id": {"type": "integer", "description": "Chat ID (defaults from auth context)"},
                     "persona_id": {"type": "integer", "description": "Persona ID (defaults from auth context)"},
@@ -275,7 +273,7 @@ impl Tool for PatchMemoryStateTool {
                 }),
                 &["patch"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: Value) -> ToolResult {

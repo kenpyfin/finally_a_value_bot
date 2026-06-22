@@ -36,10 +36,10 @@ impl Tool for RegisterTrackedJobTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "register_tracked_job".into(),
-            description: "Record an external long-running job id (e.g. ComfyUI prompt_id) in the bot's background_jobs table so it appears in the queue/cockpit. Use immediately after submitting to an external API whose id should match what you tell the user. Does not start tmux or block spawn_background_command.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "register_tracked_job",
+            "Record an external long-running job id (e.g. ComfyUI prompt_id) in the bot's background_jobs table so it appears in the queue/cockpit. Use immediately after submitting to an external API whose id should match what you tell the user. Does not start tmux or block spawn_background_command.",
+            schema_object(
                 json!({
                     "external_id": {
                         "type": "string",
@@ -60,7 +60,7 @@ impl Tool for RegisterTrackedJobTool {
                 }),
                 &["external_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

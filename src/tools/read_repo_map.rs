@@ -137,10 +137,10 @@ impl Tool for ReadRepoMapTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_repo_map".into(),
-            description: "Build a lightweight repository map with source files and top-level symbol signatures.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "read_repo_map",
+            "Build a lightweight repository map with source files and top-level symbol signatures.",
+            schema_object(
                 json!({
                     "path": {
                         "type": "string",
@@ -161,7 +161,7 @@ impl Tool for ReadRepoMapTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

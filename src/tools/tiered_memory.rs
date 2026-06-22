@@ -228,10 +228,10 @@ impl Tool for ReadTieredMemoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_tiered_memory".into(),
-            description: "Read this persona's tiered memory from canonical memory_state.json (legacy MEMORY.md auto-migrates). Optional tier (1, 2, or 3) returns only that section. Tier 2 contains user terminology, SOPs (`tier2.sops` with ORIGIN vault paths), and durable preferences.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "read_tiered_memory",
+            "Read this persona's tiered memory from canonical memory_state.json (legacy MEMORY.md auto-migrates). Optional tier (1, 2, or 3) returns only that section. Tier 2 contains user terminology, SOPs (`tier2.sops` with ORIGIN vault paths), and durable preferences.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -248,7 +248,7 @@ impl Tool for ReadTieredMemoryTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -320,10 +320,10 @@ impl Tool for WriteTieredMemoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "write_tiered_memory".into(),
-            description: "Write one tier of canonical memory_state.json. Tier 1 = long-term (only on explicit user ask); Tier 2 = terminology + SOPs + preferences. SOP line format: `- SOP|<id>|ORIGIN/path/to/doc.md|<summary>`. Tier 3 = short-lived scratch focus. Replaces only that tier's section.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "write_tiered_memory",
+            "Write one tier of canonical memory_state.json. Tier 1 = long-term (only on explicit user ask); Tier 2 = terminology + SOPs + preferences. SOP line format: `- SOP|<id>|ORIGIN/path/to/doc.md|<summary>`. Tier 3 = short-lived scratch focus. Replaces only that tier's section.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -345,7 +345,7 @@ impl Tool for WriteTieredMemoryTool {
                 }),
                 &["tier", "content"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

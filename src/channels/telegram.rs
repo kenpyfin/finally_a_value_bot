@@ -292,6 +292,13 @@ const PERSONA_SWITCH_CALLBACK_PREFIX: &str = "persona:switch:";
 /// times out and the work should be retried as a background job.
 pub const BACKGROUND_JOB_HANDOFF_PREFIX: &str = "##BACKGROUND_JOB_HANDOFF##";
 
+const EXECUTE_PREAMBLE: &str = "[EXECUTION PHASE]\n\
+You are continuing tool execution for a task already planned. You MUST call tools \
+directly — do not describe commands in code blocks, do not ask for confirmation, \
+do not re-explain or re-plan. Use bash, run_skill_script, or other tools NOW. \
+If you encounter an unexpected error you cannot resolve, respond with [ESCALATE] \
+and a one-line explanation.\n\n";
+
 #[derive(Debug, Clone)]
 pub struct AgentRequestContext<'a> {
     pub caller_channel: &'a str,
@@ -2164,6 +2171,19 @@ pub async fn process_with_agent_with_events(
     let mut run_tool_names: Vec<String> = Vec::new();
     let mut last_iteration_tools: Vec<String> = Vec::new();
     let mut local_tier_error_streak: u32 = 0;
+    let mm_cfg_for_phase_check = state.llm.multimodel_config();
+    let use_phases = !is_conversational
+        && matches!(intent, UserIntent::Task)
+        && mm_cfg_for_phase_check.ready_for_routing();
+    let mut current_phase = crate::multimodel::AgentPhase::Plan;
+    info!(
+        "Phase routing: use_phases={}, intent={:?}, mm_enabled={}, local_routable={}, local_tools_ok={}",
+        use_phases,
+        intent,
+        mm_cfg_for_phase_check.enabled,
+        mm_cfg_for_phase_check.local_routable(),
+        mm_cfg_for_phase_check.local_tools_ok
+    );
     let tool_defs = match intent {
         UserIntent::Conversational => Vec::new(),
         UserIntent::Question => state.tools.definitions_filtered(true),
@@ -2430,15 +2450,19 @@ pub async fn process_with_agent_with_events(
         })
         .await;
 
-        let route_ctx = crate::multimodel::RouteContext {
-            iteration,
-            is_conversational,
-            last_iteration_tools: &last_iteration_tools,
-            max_iterations: state.config.max_tool_iterations,
-            force_strategy: false,
-            local_tier_error_streak,
+        let model_tier = if use_phases {
+            current_phase.model_tier()
+        } else {
+            let route_ctx = crate::multimodel::RouteContext {
+                iteration,
+                is_conversational,
+                last_iteration_tools: &last_iteration_tools,
+                max_iterations: state.config.max_tool_iterations,
+                force_strategy: false,
+                local_tier_error_streak,
+            };
+            state.llm.resolve_route(route_ctx)
         };
-        let model_tier = state.llm.resolve_route(route_ctx);
         let tier_snap = state.llm.tier_endpoint_snapshot(model_tier);
         let (tier_label, tier_provider, tier_model, tier_endpoint) =
             IterationRecord::tier_fields_from_snapshot(&tier_snap);
@@ -2452,6 +2476,12 @@ pub async fn process_with_agent_with_events(
         );
 
         let llm_start = std::time::Instant::now();
+        let effective_system =
+            if use_phases && current_phase == crate::multimodel::AgentPhase::Execute {
+                format!("{EXECUTE_PREAMBLE}{system_prompt}")
+            } else {
+                system_prompt.clone()
+            };
         let response = {
             let llm_messages = messages.clone();
             let tool_defs = if tool_defs.is_empty() {
@@ -2464,7 +2494,7 @@ pub async fn process_with_agent_with_events(
                     std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
                     state.llm.send_message_for_tier(
                         model_tier,
-                        &system_prompt,
+                        &effective_system,
                         llm_messages,
                         tool_defs,
                     ),
@@ -2597,6 +2627,7 @@ pub async fn process_with_agent_with_events(
         };
 
         let has_tool_use = stop_reason == "tool_use";
+        let mut local_fallback_this_iter = false;
         if should_fallback_local_tier_to_strategy(
             model_tier,
             tools_offered,
@@ -2606,6 +2637,7 @@ pub async fn process_with_agent_with_events(
             is_conversational,
             &assistant_text,
         ) {
+            local_fallback_this_iter = true;
             let from_tier = model_tier.label();
             info!(
                 "tier_tool_fallback: {}→strategy (no tool_calls after tool results)",
@@ -2651,6 +2683,13 @@ pub async fn process_with_agent_with_events(
                 Ok(Ok(Ok(fallback_response))) => {
                     response = fallback_response;
                     model_tier = crate::multimodel::ModelTier::Strategy;
+                    if use_phases {
+                        local_tier_error_streak = local_tier_error_streak.saturating_add(1);
+                        info!(
+                            "tier_tool_fallback incremented local_error_streak={}",
+                            local_tier_error_streak
+                        );
+                    }
                     let fallback_snap = state.llm.tier_endpoint_snapshot(model_tier);
                     (tier_label, tier_provider, tier_model, tier_endpoint) =
                         IterationRecord::tier_fields_from_snapshot(&fallback_snap);
@@ -2711,6 +2750,20 @@ pub async fn process_with_agent_with_events(
             assistant_text.len(),
             assistant_text_preview.replace('\n', "\\n")
         );
+
+        if use_phases
+            && current_phase == crate::multimodel::AgentPhase::Execute
+            && (stop_reason == "end_turn" || stop_reason == "max_tokens")
+            && assistant_text.contains("[ESCALATE]")
+        {
+            info!("Phase: execute → synthesize (local escalated via text)");
+            current_phase = crate::multimodel::AgentPhase::Synthesize;
+            messages.push(Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(assistant_text.clone()),
+            });
+            continue;
+        }
 
         if stop_reason == "end_turn"
             || stop_reason == "max_tokens"
@@ -3385,11 +3438,7 @@ pub async fn process_with_agent_with_events(
 
             last_iteration_tools = executed_tool_names.clone();
 
-            if matches!(
-                model_tier,
-                crate::multimodel::ModelTier::Technical | crate::multimodel::ModelTier::Knowledge
-            ) && iteration_all_tool_errors
-            {
+            if model_tier.is_local() && iteration_all_tool_errors {
                 local_tier_error_streak = local_tier_error_streak.saturating_add(1);
                 info!(
                     "local_tier_error_streak={} after {:?} on {}",
@@ -3397,8 +3446,41 @@ pub async fn process_with_agent_with_events(
                     executed_tool_names,
                     model_tier.label()
                 );
-            } else if !iteration_all_tool_errors {
+            } else if !iteration_all_tool_errors && !local_fallback_this_iter {
                 local_tier_error_streak = 0;
+            }
+
+            if use_phases {
+                let has_mutation = executed_tool_names
+                    .iter()
+                    .any(|t| crate::multimodel::is_mutation_tool(t));
+                info!(
+                    "advance_phase input: current={}, iteration={}, tools={:?}, has_mutation={}",
+                    current_phase.label(),
+                    iteration,
+                    executed_tool_names,
+                    has_mutation
+                );
+                let (next_phase, transition) = crate::multimodel::advance_phase(
+                    &state.llm.multimodel_config(),
+                    current_phase,
+                    iteration,
+                    state.config.max_tool_iterations,
+                    is_conversational,
+                    &executed_tool_names,
+                    "tool_use",
+                    &assistant_text,
+                    local_tier_error_streak,
+                );
+                if next_phase != current_phase {
+                    info!(
+                        "Phase: {} → {} ({:?})",
+                        current_phase.label(),
+                        next_phase.label(),
+                        transition
+                    );
+                }
+                current_phase = next_phase;
             }
 
             let used_legacy_edit = executed_tool_names
@@ -4674,6 +4756,18 @@ fn assistant_text_claims_unbacked_actions(text: &str) -> bool {
     {
         return true;
     }
+    if text.contains("```") && lower.contains("confirm") {
+        return true;
+    }
+    if (text.contains("```bash") || text.contains("```python") || text.contains("```shell"))
+        && (lower.contains("here is the command")
+            || lower.contains("here's the command")
+            || lower.contains("i will now proceed")
+            || lower.contains("please confirm")
+            || lower.contains("ready for this"))
+    {
+        return true;
+    }
     false
 }
 
@@ -4689,10 +4783,7 @@ fn should_fallback_local_tier_to_strategy(
     if has_tool_use {
         return false;
     }
-    if !matches!(
-        model_tier,
-        crate::multimodel::ModelTier::Technical | crate::multimodel::ModelTier::Knowledge
-    ) {
+    if !model_tier.is_local() {
         return false;
     }
     if !tools_offered || last_iteration_tools.is_empty() {
@@ -8312,7 +8403,7 @@ mod tests {
     fn test_should_fallback_local_tier_to_strategy() {
         let last_tools = vec!["bash".into()];
         assert!(should_fallback_local_tier_to_strategy(
-            crate::multimodel::ModelTier::Technical,
+            crate::multimodel::ModelTier::Local,
             true,
             &last_tools,
             "end_turn",
@@ -8321,7 +8412,7 @@ mod tests {
             "Generated and uploaded HOTIFY-V5.png",
         ));
         assert!(!should_fallback_local_tier_to_strategy(
-            crate::multimodel::ModelTier::Technical,
+            crate::multimodel::ModelTier::Local,
             true,
             &last_tools,
             "end_turn",

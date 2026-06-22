@@ -147,9 +147,9 @@ impl Tool for BrowserTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "browser".into(),
-            description: "Browser automation via the agent-browser CLI (npm package). Use this tool with a command string (e.g. open, snapshot, click, fill). Do not run agent-browser in the shell — use this tool only. Browser state (cookies, localStorage, login sessions) persists across calls.\n\n\
+        ToolDefinition::new(
+            "browser",
+            "Browser automation via the agent-browser CLI (npm package). Use this tool with a command string (e.g. open, snapshot, click, fill). Do not run agent-browser in the shell — use this tool only. Browser state (cookies, localStorage, login sessions) persists across calls.\n\n\
                 Public search sites and trade directories are often protected by Cloudflare/CAPTCHA. Prefer web_search + web_fetch for discovery/extraction and use browser when interaction is truly required.\n\
                 If stderr says profile was ignored because a daemon is already running, the current daemon session is reused until restarted.\n\n\
                 ## Basic workflow\n\
@@ -176,8 +176,8 @@ impl Tool for BrowserTool {
                 **Network**: network route <url> [--abort|--body <json>], network requests\n\
                 **Wait**: wait <sel|ms|--text|--url|--load|--fn>\n\
                 **Auth state**: state save <path>, state load <path>\n\
-                **Semantic find**: find role/text/label/placeholder <value> <action> [input]".into(),
-            input_schema: schema_object(
+                **Semantic find**: find role/text/label/placeholder <value> <action> [input]",
+            schema_object(
                 json!({
                     "command": {
                         "type": "string",
@@ -190,7 +190,7 @@ impl Tool for BrowserTool {
                 }),
                 &["command"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

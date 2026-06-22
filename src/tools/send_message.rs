@@ -452,10 +452,10 @@ impl Tool for SendMessageTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "send_message".into(),
-            description: "Send a message mid-conversation. Supports text for all channels, and attachments for Telegram/Discord/WhatsApp/web via attachment_path. For attachments, use an absolute local file path so the tool can find the file reliably.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "send_message",
+            "Send a message mid-conversation. Supports text for all channels, and attachments for Telegram/Discord/WhatsApp/web via attachment_path. For attachments, use an absolute local file path so the tool can find the file reliably.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -480,7 +480,7 @@ impl Tool for SendMessageTool {
                 }),
                 &["chat_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

@@ -48,10 +48,10 @@ impl Tool for GlobTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "glob".into(),
-            description: "Find files matching a glob pattern. Returns matching file paths.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "glob",
+            "Find files matching a glob pattern. Returns matching file paths.",
+            schema_object(
                 json!({
                     "pattern": {
                         "type": "string",
@@ -64,7 +64,7 @@ impl Tool for GlobTool {
                 }),
                 &["pattern"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

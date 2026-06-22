@@ -115,14 +115,14 @@ impl Tool for WebSearchTool {
         } else {
             " For reliable search, set TAVILY_API_KEY (Tavily) or SEARXNG_URL (SearXNG)."
         };
-        ToolDefinition {
-            name: "web_search".into(),
-            description: format!(
+        ToolDefinition::new(
+            "web_search",
+            format!(
                 "Search the web using {}. Returns titles, URLs, and snippets.{desc_suffix}",
                 backend
             ),
-            input_schema: schema_object(schema, &["query"]),
-        }
+            schema_object(schema, &["query"]),
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

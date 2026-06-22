@@ -122,6 +122,9 @@ export type LlmConfigResponse = {
 export type MultimodelConfigResponse = {
   ok?: boolean
   enabled?: boolean
+  local_base_url?: string
+  local_model?: string
+  local_tools_ok?: boolean
   tier1_base_url?: string
   tier1_model?: string
   tier2_base_url?: string

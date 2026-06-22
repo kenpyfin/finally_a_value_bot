@@ -26,10 +26,10 @@ impl Tool for EditFileTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "edit_file".into(),
-            description: "Edit a file by replacing an exact string match with new content. The old_string must be unique in the file.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "edit_file",
+            "Edit a file by replacing an exact string match with new content. The old_string must be unique in the file.",
+            schema_object(
                 json!({
                     "path": {
                         "type": "string",
@@ -46,7 +46,7 @@ impl Tool for EditFileTool {
                 }),
                 &["path", "old_string", "new_string"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

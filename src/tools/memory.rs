@@ -34,10 +34,10 @@ impl Tool for ReadMemoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_memory".into(),
-            description: "Read memory. Use scope 'global' to read principles (AGENTS.md at workspace root, read-only), or 'chat' to read this persona's canonical memory_state.json. For tiered operations use read_tiered_memory/write_tiered_memory.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "read_memory",
+            "Read memory. Use scope 'global' to read principles (AGENTS.md at workspace root, read-only), or 'chat' to read this persona's canonical memory_state.json. For tiered operations use read_tiered_memory/write_tiered_memory.",
+            schema_object(
                 json!({
                     "scope": {
                         "type": "string",
@@ -55,7 +55,7 @@ impl Tool for ReadMemoryTool {
                 }),
                 &["scope"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -140,10 +140,10 @@ impl Tool for WriteMemoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "write_memory".into(),
-            description: "Write memory daily log only. Use scope 'chat_daily' to append a note to groups/{chat_id}/{persona_id}/memory/YYYY-MM-DD.md. For tiered state updates use write_tiered_memory.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "write_memory",
+            "Write memory daily log only. Use scope 'chat_daily' to append a note to groups/{chat_id}/{persona_id}/memory/YYYY-MM-DD.md. For tiered state updates use write_tiered_memory.",
+            schema_object(
                 json!({
                     "scope": {
                         "type": "string",
@@ -169,7 +169,7 @@ impl Tool for WriteMemoryTool {
                 }),
                 &["scope", "content"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

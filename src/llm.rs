@@ -10,8 +10,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::claude::{
-    ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, MessagesResponse,
-    ResponseContentBlock, ToolDefinition, Usage,
+    CacheControl, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest,
+    MessagesResponse, ResponseContentBlock, SystemBlock, SystemContent, ToolDefinition, Usage,
 };
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
@@ -441,7 +441,12 @@ impl LlmHandle {
         let provider = self.current_provider();
         crate::llm_catalog::default_base_url_for_provider(&provider)
             .map(|s| s.to_string())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+            .unwrap_or_else(|| match provider.as_str() {
+                "anthropic" => "https://api.anthropic.com/v1/messages".to_string(),
+                "google" => "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+                "xai" => "https://api.x.ai/v1".to_string(),
+                _ => "https://api.openai.com/v1".to_string(),
+            })
     }
 
     fn strategy_tier_snapshot(&self) -> crate::multimodel::TierEndpointSnapshot {
@@ -462,20 +467,15 @@ impl LlmHandle {
         if !mm_cfg.enabled || tier == crate::multimodel::ModelTier::Strategy {
             return self.strategy_tier_snapshot();
         }
-        match tier {
-            crate::multimodel::ModelTier::Technical => crate::multimodel::TierEndpointSnapshot {
+        if tier.is_local() {
+            crate::multimodel::TierEndpointSnapshot {
                 tier,
                 provider: "llama".into(),
-                model: mm_cfg.tier1_model.clone(),
-                endpoint: mm_cfg.tier1_base_url.clone(),
-            },
-            crate::multimodel::ModelTier::Knowledge => crate::multimodel::TierEndpointSnapshot {
-                tier,
-                provider: "llama".into(),
-                model: mm_cfg.tier2_model.clone(),
-                endpoint: mm_cfg.tier2_base_url.clone(),
-            },
-            crate::multimodel::ModelTier::Strategy => self.strategy_tier_snapshot(),
+                model: mm_cfg.local_model.clone(),
+                endpoint: mm_cfg.local_base_url.clone(),
+            }
+        } else {
+            self.strategy_tier_snapshot()
         }
     }
 
@@ -488,6 +488,8 @@ impl LlmHandle {
             strategy_provider: strategy.provider,
             strategy_model: strategy.model,
             strategy_endpoint: strategy.endpoint,
+            local_model: mm_cfg.local_model.clone(),
+            local_endpoint: mm_cfg.local_base_url.clone(),
             tier1_model: mm_cfg.tier1_model,
             tier1_endpoint: mm_cfg.tier1_base_url,
             tier2_model: mm_cfg.tier2_model,
@@ -715,10 +717,10 @@ pub async fn test_multimodel_tools(
         .filter(|u| !u.is_empty())
         .ok_or_else(|| "base_url is required for local providers".to_string())?;
     let provider = create_openai_compatible_provider(&test_config, base_url, model);
-    let tools = vec![ToolDefinition {
-        name: "add".into(),
-        description: "Add two integers".into(),
-        input_schema: json!({
+    let tools = vec![ToolDefinition::new(
+        "add",
+        "Add two integers",
+        json!({
             "type": "object",
             "properties": {
                 "a": { "type": "integer" },
@@ -726,7 +728,7 @@ pub async fn test_multimodel_tools(
             },
             "required": ["a", "b"]
         }),
-    }];
+    )];
     let messages = vec![Message {
         role: "user".into(),
         content: MessageContent::Text("Use add to compute 2+3. You must call the tool.".into()),
@@ -801,6 +803,7 @@ impl AnthropicProvider {
                 .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "prompt-caching-2024-07-31")
                 .header("content-type", "application/json")
                 .json(&streamed_request)
                 .send()
@@ -930,6 +933,8 @@ fn usage_from_json(v: &serde_json::Value) -> Option<Usage> {
     Some(Usage {
         input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
         output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     })
 }
 
@@ -1241,6 +1246,20 @@ struct AnthropicApiErrorDetail {
     error_type: String,
 }
 
+fn build_cached_system(text: &str) -> SystemContent {
+    if text.len() > 1024 {
+        SystemContent::Blocks(vec![SystemBlock {
+            block_type: "text".into(),
+            text: text.to_string(),
+            cache_control: Some(CacheControl {
+                control_type: "ephemeral".into(),
+            }),
+        }])
+    } else {
+        SystemContent::Text(text.to_string())
+    }
+}
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn send_message(
@@ -1251,14 +1270,21 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
 
-        let request = MessagesRequest {
+        let mut request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
-            system: system.to_string(),
+            system: build_cached_system(system),
             messages,
             tools,
             stream: None,
         };
+        if let Some(ref mut tools) = request.tools {
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = Some(CacheControl {
+                    control_type: "ephemeral".into(),
+                });
+            }
+        }
 
         let mut retries = 0u32;
         let max_retries = 3;
@@ -1269,6 +1295,7 @@ impl LlmProvider for AnthropicProvider {
                 .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "prompt-caching-2024-07-31")
                 .header("content-type", "application/json")
                 .json(&request)
                 .send()
@@ -1341,14 +1368,21 @@ impl LlmProvider for AnthropicProvider {
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
-        let request = MessagesRequest {
+        let mut request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
-            system: system.to_string(),
+            system: build_cached_system(system),
             messages,
             tools,
             stream: Some(true),
         };
+        if let Some(ref mut tools) = request.tools {
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = Some(CacheControl {
+                    control_type: "ephemeral".into(),
+                });
+            }
+        }
 
         self.send_message_stream_single_pass(&request, text_tx)
             .await
@@ -2133,6 +2167,8 @@ fn process_gemini_stream_event(
                     .get("candidatesTokenCount")
                     .and_then(|t| t.as_u64())
                     .unwrap_or(0) as u32,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             });
         }
     }
@@ -2373,6 +2409,8 @@ fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBo
                 .get("candidatesTokenCount")
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0) as u32,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         });
     }
 
@@ -2752,6 +2790,8 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
     let usage = oai.usage.map(|u| Usage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     });
 
     MessagesResponse {
@@ -2831,11 +2871,7 @@ mod tests {
     #[test]
     fn test_build_oai_chat_request_body_tool_choice() {
         let msgs = vec![json!({"role": "user", "content": "hi"})];
-        let tools = vec![ToolDefinition {
-            name: "add".into(),
-            description: "add".into(),
-            input_schema: json!({"type": "object"}),
-        }];
+        let tools = vec![ToolDefinition::new("add", "add", json!({"type": "object"}))];
         let body = build_oai_chat_request_body(
             "qwen",
             100,
@@ -3046,11 +3082,11 @@ mod tests {
 
     #[test]
     fn test_translate_tools_to_oai() {
-        let tools = vec![ToolDefinition {
-            name: "bash".into(),
-            description: "Run bash".into(),
-            input_schema: json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
-        }];
+        let tools = vec![ToolDefinition::new(
+            "bash",
+            "Run bash",
+            json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+        )];
         let out = translate_tools_to_oai(&tools);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "function");

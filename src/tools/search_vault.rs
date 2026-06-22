@@ -130,10 +130,10 @@ impl Tool for SearchVaultTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "search_vault".into(),
-            description: "Semantically search the ORIGIN vault (Obsidian notes, documents) using vector similarity. Use this to find relevant knowledge base entries. This searches the vault knowledge base, NOT conversation history — use search_chat_history for that.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "search_vault",
+            "Semantically search the ORIGIN vault (Obsidian notes, documents) using vector similarity. Use this to find relevant knowledge base entries. This searches the vault knowledge base, NOT conversation history — use search_chat_history for that.",
+            schema_object(
                 json!({
                     "query": {
                         "type": "string",
@@ -146,7 +146,7 @@ impl Tool for SearchVaultTool {
                 }),
                 &["query"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

@@ -26,10 +26,10 @@ impl Tool for WriteFileTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "write_file".into(),
-            description: "Write content to a file. Creates the file and any parent directories if they don't exist. Overwrites existing content.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "write_file",
+            "Write content to a file. Creates the file and any parent directories if they don't exist. Overwrites existing content.",
+            schema_object(
                 json!({
                     "path": {
                         "type": "string",
@@ -42,7 +42,7 @@ impl Tool for WriteFileTool {
                 }),
                 &["path", "content"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

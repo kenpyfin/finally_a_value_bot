@@ -5111,6 +5111,8 @@ async fn api_llm_patch(
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_db)?;
         if let Some(ref url) = base_url_db {
             db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, url)?;
+        } else {
+            db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, "")?;
         }
         Ok(())
     })
@@ -5154,6 +5156,9 @@ async fn api_multimodel_get(
     Ok(Json(json!({
         "ok": true,
         "enabled": cfg.enabled,
+        "local_base_url": cfg.local_base_url,
+        "local_model": cfg.local_model,
+        "local_tools_ok": cfg.local_tools_ok,
         "tier1_base_url": cfg.tier1_base_url,
         "tier1_model": cfg.tier1_model,
         "tier2_base_url": cfg.tier2_base_url,
@@ -5162,7 +5167,7 @@ async fn api_multimodel_get(
         "tier2_tools_ok": cfg.tier2_tools_ok,
         "strategy_provider": strategy_provider,
         "strategy_model": strategy_model,
-        "description": "Tier 1 (technical) and Tier 2 (knowledge) use local llama.cpp OpenAI-compatible servers. Tier 3 (strategy) uses the provider/model from Settings → LLM.",
+        "description": "Local model handles tool execution. Strategy (cloud) handles planning and synthesis.",
     })))
 }
 
@@ -5177,6 +5182,14 @@ async fn api_multimodel_patch(
     if let Some(enabled) = body.enabled {
         cfg.enabled = enabled;
     }
+    // New unified local fields
+    if let Some(ref url) = body.local_base_url {
+        cfg.local_base_url = url.trim().to_string();
+    }
+    if let Some(ref model) = body.local_model {
+        cfg.local_model = model.trim().to_string();
+    }
+    // Legacy fields (accepted for backward compat)
     if let Some(ref url) = body.tier1_base_url {
         cfg.tier1_base_url = url.trim().to_string();
     }
@@ -5189,37 +5202,24 @@ async fn api_multimodel_patch(
     if let Some(ref model) = body.tier2_model {
         cfg.tier2_model = model.trim().to_string();
     }
-    let tier1_changed = body.tier1_base_url.is_some() || body.tier1_model.is_some();
-    let tier2_changed = body.tier2_base_url.is_some() || body.tier2_model.is_some();
-    if tier1_changed
-        && (old.tier1_base_url != cfg.tier1_base_url || old.tier1_model != cfg.tier1_model)
+    // Invalidate tools_ok if local config changed
+    let local_changed = body.local_base_url.is_some() || body.local_model.is_some();
+    if local_changed
+        && (old.local_base_url != cfg.local_base_url || old.local_model != cfg.local_model)
     {
-        cfg.tier1_tools_ok = false;
-    }
-    if tier2_changed
-        && (old.tier2_base_url != cfg.tier2_base_url || old.tier2_model != cfg.tier2_model)
-    {
-        cfg.tier2_tools_ok = false;
+        cfg.local_tools_ok = false;
     }
     cfg = cfg.normalize();
-    if cfg.enabled && !cfg.tier1_configured() {
+    if cfg.enabled && !cfg.local_configured() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Tier 1 (Technical) base URL and model are required to enable multi-model routing."
-                .into(),
+            "Local model base URL and model are required to enable multi-model routing.".into(),
         ));
     }
-    if cfg.enabled && !cfg.tier2_configured() {
+    if cfg.enabled && !cfg.local_tools_ok {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Tier 2 (Knowledge) base URL and model are required to enable multi-model routing."
-                .into(),
-        ));
-    }
-    if cfg.enabled && (!cfg.tier1_tools_ok || !cfg.tier2_tools_ok) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Run the tool-calling test for both Tier 1 (technical) and Tier 2 (knowledge) before enabling multi-model routing."
+            "Run the tool-calling test for the local model before enabling multi-model routing."
                 .into(),
         ));
     }
@@ -5238,14 +5238,13 @@ async fn api_multimodel_patch(
     Ok(Json(json!({
         "ok": true,
         "enabled": cfg.enabled,
-        "tier1_base_url": cfg.tier1_base_url,
-        "tier1_model": cfg.tier1_model,
-        "tier2_base_url": cfg.tier2_base_url,
-        "tier2_model": cfg.tier2_model,
+        "local_base_url": cfg.local_base_url,
+        "local_model": cfg.local_model,
+        "local_tools_ok": cfg.local_tools_ok,
         "message": if cfg.enabled {
-            "Multi-model routing enabled. New agent runs route tool iterations to local tiers when appropriate."
+            "Multi-model routing enabled. Execute phase routes to local model."
         } else {
-            "Multi-model routing disabled. All iterations use the main LLM."
+            "Multi-model routing disabled. All iterations use the strategy LLM."
         },
     })))
 }
@@ -5257,12 +5256,12 @@ async fn api_multimodel_test_post(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let tier = match body.tier.trim().to_ascii_lowercase().as_str() {
-        "technical" | "tier1" | "1" => crate::multimodel::ModelTier::Technical,
-        "knowledge" | "tier2" | "2" => crate::multimodel::ModelTier::Knowledge,
+        "local" | "technical" | "tier1" | "1" => crate::multimodel::ModelTier::Local,
+        "knowledge" | "tier2" | "2" => crate::multimodel::ModelTier::Local,
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("Unknown tier {:?}. Use technical or knowledge.", other),
+                format!("Unknown tier {:?}. Use 'local'.", other),
             ))
         }
     };
@@ -5274,11 +5273,8 @@ async fn api_multimodel_test_post(
     if base_url_raw.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "base_url is required".into()));
     }
-    let (label, fallback_base) = match tier {
-        crate::multimodel::ModelTier::Technical => ("technical", ""),
-        crate::multimodel::ModelTier::Knowledge => ("knowledge", ""),
-        crate::multimodel::ModelTier::Strategy => unreachable!("strategy tier not testable here"),
-    };
+    let label = "local";
+    let fallback_base = "";
     let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, fallback_base);
     let base = state.app_state.config.clone();
     let mut test_cfg = base;

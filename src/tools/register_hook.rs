@@ -38,10 +38,10 @@ impl Tool for RegisterHookTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "register_hook".into(),
-            description: "Create or update a bot lifecycle hook. New hooks default to the current persona only unless global=true is set. Use this instead of calling /api/hooks directly when authoring hooks from an agent run.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "register_hook",
+            "Create or update a bot lifecycle hook. New hooks default to the current persona only unless global=true is set. Use this instead of calling /api/hooks directly when authoring hooks from an agent run.",
+            schema_object(
                 json!({
                     "id": {
                         "type": "integer",
@@ -83,7 +83,7 @@ impl Tool for RegisterHookTool {
                 }),
                 &["name", "event_name", "action_type"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

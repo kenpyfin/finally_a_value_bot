@@ -33,10 +33,10 @@ impl Tool for SpawnBackgroundCommandTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "spawn_background_command".into(),
-            description: "Run a long shell command in a detached tmux session. Returns immediately with a job id; the bot sends a separate message when the command finishes. Use for work that may exceed interactive bash timeouts (builds, GPU jobs, long scripts). Not available in Docker.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "spawn_background_command",
+            "Run a long shell command in a detached tmux session. Returns immediately with a job id; the bot sends a separate message when the command finishes. Use for work that may exceed interactive bash timeouts (builds, GPU jobs, long scripts). Not available in Docker.",
+            schema_object(
                 json!({
                     "command": {
                         "type": "string",
@@ -53,7 +53,7 @@ impl Tool for SpawnBackgroundCommandTool {
                 }),
                 &["command"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

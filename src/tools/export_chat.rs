@@ -28,10 +28,10 @@ impl Tool for ExportChatTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "export_chat".into(),
-            description: "Export chat history to a markdown file. Returns the file path.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "export_chat",
+            "Export chat history to a markdown file. Returns the file path.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -44,7 +44,7 @@ impl Tool for ExportChatTool {
                 }),
                 &["chat_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

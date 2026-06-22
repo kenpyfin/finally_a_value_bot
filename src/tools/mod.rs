@@ -1077,11 +1077,11 @@ mod tests {
         }
 
         fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: self.tool_name.clone(),
-                description: "dummy".into(),
-                input_schema: schema_object(json!({}), &[]),
-            }
+            ToolDefinition::new(
+                self.tool_name.clone(),
+                "dummy",
+                schema_object(json!({}), &[]),
+            )
         }
 
         async fn execute(&self, _input: serde_json::Value) -> ToolResult {

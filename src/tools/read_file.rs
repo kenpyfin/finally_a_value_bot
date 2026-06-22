@@ -26,10 +26,10 @@ impl Tool for ReadFileTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_file".into(),
-            description: "Read the contents of a file at the given path. Returns the file content with line numbers.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "read_file",
+            "Read the contents of a file at the given path. Returns the file content with line numbers.",
+            schema_object(
                 json!({
                     "path": {
                         "type": "string",
@@ -58,7 +58,7 @@ impl Tool for ReadFileTool {
                 }),
                 &["path"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

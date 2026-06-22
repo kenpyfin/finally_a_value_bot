@@ -78,6 +78,8 @@ src/
 
 The bot redacts **only literal values** loaded from **env-like files** on disk at startup (`.env`, `.env.local`, names ending in `.env` such as `mercari.env`; excludes `*.example` / `*.sample`). Implementation: `src/safety_redaction.rs` (`EnvSecretRedactor::discover`, `redact`). Sources: configuration `.env` (`FINALLY_A_VALUE_BOT_CONFIG` or `./.env`), files under `WORKSPACE_DIR`, and resolved `builtin_skills/` when present.
 
+- Only **credential-like env keys** enter the catalog (`*TOKEN*`, `*SECRET*`, `*API_KEY*`, `*_KEY`, `DATABASE_URL`, etc.). Config keys (`WORKSPACE_DIR`, models, ports, paths, limits) are skipped.
+- Path-like, boolean, numeric, and plain `http(s)://` URL values are skipped even when the key name would qualify.
 - Values shorter than 8 characters (or `ENV_REDACT_MIN_VALUE_LEN` when set at process start) are not redacted.
 - Placeholder values (`changeme`, `your_api_key_here`, etc.) are skipped.
 - **Restart the bot** after changing any env-like file so the catalog refreshes.

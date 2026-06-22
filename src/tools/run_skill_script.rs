@@ -216,10 +216,10 @@ impl Tool for RunSkillScriptTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "run_skill_script".into(),
-            description: "Run a script from an agent skill directory. Prefer this over bash for skill bundled scripts (e.g. read_email_tool.py): paths resolve to the canonical skill folder regardless of persona tool cwd. Activate the skill first when you need its full SKILL.md instructions.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "run_skill_script",
+            "Run a script from an agent skill directory. Prefer this over bash for skill bundled scripts (e.g. read_email_tool.py): paths resolve to the canonical skill folder regardless of persona tool cwd. Activate the skill first when you need its full SKILL.md instructions.",
+            schema_object(
                 json!({
                     "skill_name": {
                         "type": "string",
@@ -245,7 +245,7 @@ impl Tool for RunSkillScriptTool {
                 }),
                 &["skill_name", "script"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

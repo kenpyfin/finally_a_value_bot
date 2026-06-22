@@ -117,10 +117,10 @@ impl Tool for SymbolEditTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "symbol_edit".into(),
-            description: "Replace a symbol block by name using language-aware span detection. Use as a guarded fallback when search/replace is insufficient.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "symbol_edit",
+            "Replace a symbol block by name using language-aware span detection. Use as a guarded fallback when search/replace is insufficient.",
+            schema_object(
                 json!({
                     "path": {
                         "type": "string",
@@ -141,7 +141,7 @@ impl Tool for SymbolEditTool {
                 }),
                 &["path", "symbol", "replacement"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

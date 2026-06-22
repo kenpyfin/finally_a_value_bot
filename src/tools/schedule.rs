@@ -213,10 +213,10 @@ impl Tool for ScheduleTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "schedule_task".into(),
-            description: "Create a new scheduled task (cron or one-time). Cron schedules live in `scheduled_tasks` only — not authored YAML workflows. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used. To change an existing task, use `update_scheduled_task`.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "schedule_task",
+            "Create a new scheduled task (cron or one-time). Cron schedules live in `scheduled_tasks` only — not authored YAML workflows. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used. To change an existing task, use `update_scheduled_task`.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -242,7 +242,7 @@ impl Tool for ScheduleTaskTool {
                 }),
                 &["chat_id", "prompt", "schedule_type", "schedule_value"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -348,10 +348,10 @@ impl Tool for ListTasksTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "list_scheduled_tasks".into(),
-            description: "List scheduled tasks (active, running, paused, completed) for the current chat and caller persona. Control chats see all personas in the chat. Learned workflows (queue `workflow_id`) are unrelated to these cron/once schedules.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "list_scheduled_tasks",
+            "List scheduled tasks (active, running, paused, completed) for the current chat and caller persona. Control chats see all personas in the chat. Learned workflows (queue `workflow_id`) are unrelated to these cron/once schedules.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -360,7 +360,7 @@ impl Tool for ListTasksTool {
                 }),
                 &["chat_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -407,10 +407,10 @@ impl Tool for PauseTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "pause_scheduled_task".into(),
-            description: "Pause a scheduled task (cron/once row in `scheduled_tasks`). It will not run until resumed.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "pause_scheduled_task",
+            "Pause a scheduled task (cron/once row in `scheduled_tasks`). It will not run until resumed.",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -419,7 +419,7 @@ impl Tool for PauseTaskTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -471,10 +471,10 @@ impl Tool for ResumeTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "resume_scheduled_task".into(),
-            description: "Resume a paused scheduled task (`scheduled_tasks`).".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "resume_scheduled_task",
+            "Resume a paused scheduled task (`scheduled_tasks`).",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -483,7 +483,7 @@ impl Tool for ResumeTaskTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -535,10 +535,10 @@ impl Tool for CancelTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "cancel_scheduled_task".into(),
-            description: "Cancel a scheduled task permanently (marks cancelled).".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "cancel_scheduled_task",
+            "Cancel a scheduled task permanently (marks cancelled).",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -547,7 +547,7 @@ impl Tool for CancelTaskTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -603,10 +603,10 @@ impl Tool for UpdateScheduledTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "update_scheduled_task".into(),
-            description: "Update an existing scheduled task by id: optional status (paused/active/cancelled), persona_id, prompt, and/or schedule (schedule_type + schedule_value with optional timezone). Same preflight rules as `schedule_task`. Activate the `schedule-job` skill before changing schedule fields.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "update_scheduled_task",
+            "Update an existing scheduled task by id: optional status (paused/active/cancelled), persona_id, prompt, and/or schedule (schedule_type + schedule_value with optional timezone). Same preflight rules as `schedule_task`. Activate the `schedule-job` skill before changing schedule fields.",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -640,7 +640,7 @@ impl Tool for UpdateScheduledTaskTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -848,10 +848,10 @@ impl Tool for GetTaskHistoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "get_task_history".into(),
-            description: "Get the execution history/run logs for a scheduled task.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "get_task_history",
+            "Get the execution history/run logs for a scheduled task.",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -864,7 +864,7 @@ impl Tool for GetTaskHistoryTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

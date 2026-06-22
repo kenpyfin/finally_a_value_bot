@@ -19,6 +19,98 @@ const MAX_ENV_FILE_BYTES: u64 = 256 * 1024;
 
 const SKIP_DIR_NAMES: &[&str] = &[".git", "node_modules", "target", "runtime"];
 
+/// Config / operational keys whose values are not credentials (exact match, uppercase).
+const NON_SECRET_ENV_KEYS: &[&str] = &[
+    "WORKSPACE_DIR",
+    "FINALLY_A_VALUE_BOT_WORKSPACE_DIR",
+    "FINALLY_A_VALUE_BOT_CONFIG",
+    "FINALLY_A_VALUE_BOT_BUILTIN_SKILLS",
+    "FINALLY_A_VALUE_BOT_BUILTIN_HOOKS",
+    "TIMEZONE",
+    "WEB_HOST",
+    "WEB_PORT",
+    "WEB_ENABLED",
+    "BOT_USERNAME",
+    "AGENT_DISPLAY_NAME",
+    "UNIVERSAL_CHAT_ID",
+    "LLM_BASE_URL",
+    "EVALUATOR_BASE_URL",
+    "SEARXNG_URL",
+    "SOCIAL_BASE_URL",
+    "CURSOR_AGENT_RUNNER_URL",
+    "VAULT_EMBEDDING_SERVER_URL",
+    "VAULT_VECTOR_DB_URL",
+    "VAULT_ORIGIN_VAULT_PATH",
+    "VAULT_VECTOR_DB_PATH",
+    "VAULT_ORIGIN_VAULT_REPO",
+    "VAULT_GIT_URL",
+    "VAULT_PRINCIPLES_PATH",
+    "VAULT_SEARCH_COMMAND",
+    "VAULT_INDEX_COMMAND",
+    "VAULT_VECTOR_DB_COLLECTION",
+    "CURSOR_AGENT_CLI_PATH",
+    "AGENT_BROWSER_PATH",
+    "BROWSER_EXECUTABLE_PATH",
+    "POST_EDIT_VALIDATION_COMMANDS",
+    "GIT_USERNAME",
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "DISCORD_ALLOWED_CHANNELS",
+    "QUALITY_EVAL_CHANNELS",
+    "ORCHESTRATOR_MODEL",
+    "CURSOR_AGENT_MODEL",
+    "HOOK_PROMPT_MODEL",
+    "EVALUATOR_MODEL",
+    "RESPONSE_QUALITY_EVALUATOR_MODEL",
+    "POST_TOOL_EVALUATOR_MODEL",
+    "RUNTIME_RELIABILITY_PROFILE",
+    "PROJECT_AUTO_ASSOCIATION_STRICTNESS",
+    "SAFETY_OUTPUT_GUARD_MODE",
+    "SAFETY_EXECUTION_MODE",
+    "SAFETY_RISKY_CATEGORIES",
+    "MAX_TOKENS",
+    "MAX_TOOL_ITERATIONS",
+    "MAX_HISTORY_MESSAGES",
+    "MAX_DOCUMENT_SIZE_MB",
+    "WEB_MAX_INFLIGHT_PER_SESSION",
+    "WEB_MAX_REQUESTS_PER_WINDOW",
+    "WEB_RATE_WINDOW_SECONDS",
+    "WEB_RUN_HISTORY_LIMIT",
+    "WEB_SESSION_IDLE_TTL_SECONDS",
+    "SCHEDULER_TASK_TIMEOUT_SECS",
+    "SCHEDULER_STALE_RUNNING_RECLAIM_SECS",
+    "SCHEDULER_MAX_CONCURRENT_TASKS",
+    "SCHEDULER_POLL_INTERVAL_SECS",
+    "BACKGROUND_JOB_LEASE_TTL_SECS",
+    "BACKGROUND_JOB_LEASE_FALLBACK_RENEW_SECS",
+    "BACKGROUND_JOB_PENDING_START_TIMEOUT_SECS",
+    "BACKGROUND_SHELL_MONITOR_POLL_SECS",
+    "BACKGROUND_SHELL_TMUX_SESSION_PREFIX",
+    "CURSOR_AGENT_TMUX_SESSION_PREFIX",
+    "CURSOR_AGENT_TIMEOUT_SECS",
+    "BROWSER_CDP_PORT_BASE",
+    "BROWSER_HEADLESS",
+    "BROWSER_MANAGED",
+    "HOOK_COMMAND_TIMEOUT_SECS",
+    "HOOK_PROMPT_TIMEOUT_SECS",
+    "QUALITY_EVAL_MAX_NUDGES_PER_RUN",
+    "QUALITY_EVAL_MIN_CONFIDENCE",
+    "SAFETY_MAX_EMOJIS_PER_RESPONSE",
+    "SAFETY_TAIL_REPEAT_LIMIT",
+    "ENV_REDACT_MIN_VALUE_LEN",
+    "RECENT_HISTORY_MIN_USER_MESSAGES",
+    "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES",
+    "SHOW_THINKING",
+    "TOOL_OUTPUT_DEBUG",
+    "ORCHESTRATOR_ENABLED",
+    "POST_TOOL_EVALUATOR_ENABLED",
+    "RESPONSE_QUALITY_EVALUATOR_ENABLED",
+    "BACKGROUND_SHELL_TMUX_ENABLED",
+    "CURSOR_AGENT_TMUX_ENABLED",
+    "BACKGROUND_SHELL_AUTO_RETRY_ON_FAILURE",
+    "BACKGROUND_SHELL_AUTO_RETRY_MAX",
+    "BACKGROUND_SHELL_AUTO_AGENT_ON_SUCCESS",
+];
+
 const PLACEHOLDER_VALUES: &[&str] = &[
     "changeme",
     "change_me",
@@ -93,9 +185,12 @@ impl EnvSecretRedactor {
             }
             match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    for (_key, value) in parse_env_content(&content) {
+                    for (key, value) in parse_env_content(&content) {
                         if value_set.len() >= MAX_NEEDLES {
                             break;
+                        }
+                        if !should_redact_env_key(&key) {
+                            continue;
                         }
                         if should_redact_value(&value, min_value_len) {
                             value_set.insert(value);
@@ -259,9 +354,38 @@ fn parse_env_value(raw: &str) -> String {
     raw.to_string()
 }
 
+/// True when an env key names a credential-like setting (not paths, models, limits, etc.).
+fn should_redact_env_key(key: &str) -> bool {
+    let k = key.trim().to_ascii_uppercase();
+    if k.is_empty() || NON_SECRET_ENV_KEYS.contains(&k.as_str()) {
+        return false;
+    }
+    if k.ends_with("_CLIENT_ID") {
+        return false;
+    }
+    if k.contains("SECRET")
+        || k.contains("PASSWORD")
+        || k.contains("PASSWD")
+        || k.contains("TOKEN")
+        || k.contains("API_KEY")
+        || k.ends_with("_KEY")
+        || k.contains("PRIVATE_KEY")
+        || k.contains("CREDENTIAL")
+        || k.contains("DATABASE_URL")
+        || k == "DSN"
+        || k.ends_with("_DSN")
+    {
+        return true;
+    }
+    false
+}
+
 fn should_redact_value(value: &str, min_len: usize) -> bool {
     let trimmed = value.trim();
     if trimmed.len() < min_len {
+        return false;
+    }
+    if is_non_secret_config_value(trimmed) {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
@@ -273,6 +397,38 @@ fn should_redact_value(value: &str, min_len: usize) -> bool {
         return false;
     }
     true
+}
+
+fn is_non_secret_config_value(value: &str) -> bool {
+    if value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('/')
+        || value.starts_with("~/")
+    {
+        return true;
+    }
+    if value.len() >= 3 {
+        let bytes = value.as_bytes();
+        if bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            return true;
+        }
+    }
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "false" | "on" | "off" | "yes" | "no"
+    ) {
+        return true;
+    }
+    if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if (value.starts_with("http://") || value.starts_with("https://")) && !value.contains('@') {
+        return true;
+    }
+    false
 }
 
 fn expand_url_encoded_needles(needles: &mut Vec<String>) {
@@ -352,6 +508,44 @@ mod tests {
         assert!(out.contains(REDACTED));
         assert!(!out.contains("supersecret12345678"));
         assert!(redactor.redact("SHORT=abc").contains("abc"));
+    }
+
+    #[test]
+    fn discover_skips_non_secret_config_keys() {
+        let tmp = TempDir::new().unwrap();
+        write_env(
+            tmp.path(),
+            ".env",
+            "WORKSPACE_DIR=/home/operator/projects/bot/workspace\nTELEGRAM_BOT_TOKEN=telegramsecret123456\n",
+        );
+
+        let mut config = crate::config::test_config();
+        config.workspace_dir = tmp.path().to_string_lossy().to_string();
+
+        let redactor = EnvSecretRedactor::discover(&config);
+        let path_msg = "Successfully wrote to /home/operator/projects/bot/workspace/shared/personas/1/2/output.md";
+        assert_eq!(redactor.redact(path_msg), path_msg);
+        assert!(redactor
+            .redact("token telegramsecret123456")
+            .contains(REDACTED));
+    }
+
+    #[test]
+    fn secret_env_key_detection() {
+        assert!(should_redact_env_key("TELEGRAM_BOT_TOKEN"));
+        assert!(should_redact_env_key("OPENAI_API_KEY"));
+        assert!(should_redact_env_key("SOCIAL_TIKTOK_CLIENT_SECRET"));
+        assert!(!should_redact_env_key("WORKSPACE_DIR"));
+        assert!(!should_redact_env_key("SOCIAL_TIKTOK_CLIENT_ID"));
+        assert!(!should_redact_env_key("ORCHESTRATOR_MODEL"));
+    }
+
+    #[test]
+    fn skips_path_and_url_config_values() {
+        assert!(is_non_secret_config_value("./workspace"));
+        assert!(is_non_secret_config_value("/var/data/workspace"));
+        assert!(is_non_secret_config_value("https://api.example.com/v1"));
+        assert!(!is_non_secret_config_value("supersecret12345678"));
     }
 
     #[test]

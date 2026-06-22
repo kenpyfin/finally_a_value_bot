@@ -177,10 +177,10 @@ impl Tool for ApplySearchReplaceTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "apply_search_replace".into(),
-            description: "Apply deterministic search/replace edits. Exact matching is default; fuzzy is opt-in and conservative.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "apply_search_replace",
+            "Apply deterministic search/replace edits. Exact matching is default; fuzzy is opt-in and conservative.",
+            schema_object(
                 json!({
                     "path": {
                         "type": "string",
@@ -224,7 +224,7 @@ impl Tool for ApplySearchReplaceTool {
                 }),
                 &["path"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

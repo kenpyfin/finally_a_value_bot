@@ -4,6 +4,31 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-20 — Env redaction: skip non-secret config keys and values
+
+- **Area:** safety redaction
+- **Summary:** `EnvSecretRedactor::discover` now catalogs values only from credential-like env keys (`*TOKEN*`, `*SECRET*`, `*API_KEY*`, `*_KEY`, `DATABASE_URL`, etc.) and skips known config keys (`WORKSPACE_DIR`, models, ports, paths, limits). Path-like, boolean, numeric, and plain `http(s)://` URL values are skipped even for secret key names. Fixes `[REDACTED_SECRET]` appearing in tool output paths when `WORKSPACE_DIR` or other config values matched as needles.
+- **Key files / symbols:** `should_redact_env_key`, `is_non_secret_config_value`, `NON_SECRET_ENV_KEYS` in `src/safety_redaction.rs`.
+- **Rationale:** Env-only redaction was still false-positiving on workspace paths and operational config echoed in tool results; TSA removal did not change this layer.
+- **Follow-ups:** Restart bot after deploy so catalog rebuilds; add skill-specific key names if a non-standard secret key is missed.
+
+### 2026-06-19 — Multi-model redesign: phase-based routing with single local executor
+
+- **Area:** multimodel / agent loop / frontend
+- **Summary:** Replaced the backward-looking tool-name routing (Technical/Knowledge tiers, two local models) with a phase-based state machine: Plan (Strategy) → Execute (Local) → Synthesize (Strategy). Consolidated two local tiers into one (`ModelTier::Local`). Added Anthropic prompt caching (`cache_control: ephemeral` on system + last tool definition). Frontend settings panel simplified to single Local Model section.
+- **Key files / symbols:**
+  - `src/multimodel.rs` — `AgentPhase`, `PhaseTransition`, `advance_phase()`, `is_mutation_tool()`, `ModelTier::Local`, `local_routable()`, `ready_for_routing()`
+  - `src/channels/telegram.rs` — `use_phases`, `current_phase`, `EXECUTE_PREAMBLE`, `effective_system`, phase escalation handling
+  - `src/claude.rs` — `CacheControl`, `SystemContent`, `SystemBlock`, `ToolDefinition::new()`
+  - `src/llm.rs` — `build_cached_system()`, `anthropic-beta: prompt-caching-2024-07-31` header, unified `tier_endpoint_snapshot`
+  - `src/run_optimizer.rs` — `send_local_tier_message`, `local_tier_config_ready`
+  - `src/web.rs` — `local_base_url`/`local_model`/`local_tools_ok` in GET/PATCH/POST multimodel endpoints
+  - `web/src/components/settings-multimodel.tsx` — single Local Model UI
+  - `web/src/types.ts` — `local_base_url`, `local_model`, `local_tools_ok` fields
+- **Rationale:** Previous design forced two local models competing for 16GB VRAM and classified by tool names backward-looking. Phase-based routing means one model gets full VRAM, Strategy only runs when needed (plan/synthesize), prompt caching cuts repeated input tokens ~90%.
+- **Design:** Plan phase stays on Strategy until a mutation tool is called → transitions to Execute on Local → transitions to Synthesize on: natural completion, error streak ≥2, `[ESCALATE]` text, or iteration cap. Legacy `Technical`/`Knowledge` variants kept as aliases for DB migration.
+- **Follow-ups:** Step 4 (legacy code removal) deferred to after production validation.
+
 ### 2026-06-18 — Remove TSA (Tool and Skill Agent) gatekeeper
 
 - **Area:** agent loop / config
