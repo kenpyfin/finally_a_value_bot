@@ -651,6 +651,89 @@ html:not(.dark) .aui-composer-send:hover {
   opacity: 1;
 }
 
+.mc-msg-action-btn {
+  border: 0;
+  background: transparent;
+  color: var(--mc-text-muted, #94a3b8);
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  opacity: 0.85;
+  padding: 0 0.2rem;
+}
+
+.mc-msg-action-btn:hover {
+  color: var(--mc-accent);
+  opacity: 1;
+}
+
+.mc-msg-action-btn-danger:hover {
+  color: #f87171;
+}
+
+.mc-reply-quote-preview {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+  margin: 0 0.35rem 0.4rem;
+  padding: 0.45rem 0.55rem 0.45rem 0;
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--mc-accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--mc-accent) 22%, transparent);
+}
+
+.mc-reply-quote-bar {
+  width: 3px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: var(--mc-accent);
+  margin-left: 0.55rem;
+}
+
+.mc-reply-quote-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.mc-reply-quote-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--mc-accent);
+  margin-bottom: 0.15rem;
+}
+
+.mc-reply-quote-snippet {
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--mc-text-muted, #94a3b8);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.mc-reply-quote-dismiss {
+  flex-shrink: 0;
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  color: var(--mc-text-muted, #94a3b8);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.1rem 0.25rem;
+  border-radius: 0.25rem;
+}
+
+.mc-reply-quote-dismiss:hover {
+  color: var(--mc-text-primary, #e2e8f0);
+  background: color-mix(in srgb, var(--mc-text-primary, #e2e8f0) 8%, transparent);
+}
+
 .mc-msg-meta-row .aui-assistant-action-bar-root,
 .mc-msg-meta-row .aui-user-action-bar-root {
   position: static;

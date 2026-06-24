@@ -4,6 +4,21 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-24 — Web Reply: full fetch with composer quote chip
+
+- **Area:** web frontend
+- **Summary:** Reply now `GET`s the full message by id; composer shows a quote chip with a 200-char snippet only; send injects `[quoted_message …]…[/quoted_message]` plus user follow-up into the agent request body.
+- **Key files / symbols:** `web/src/lib/reply-quote.ts` (`makeReplySnippet`, `formatReplyForSend`, `PendingReplyQuote`); `ComposerQuotePreview` in `web/src/components/thread-pane.tsx`; `pendingReplyByThreadKey` / `handleReplyToMessage` in `web/src/main.tsx`.
+- **Follow-ups:** Optional system-prompt line describing `[quoted_message]` blocks for models that ignore unfamiliar tags.
+
+### 2026-06-24 — PEP Part 1: scheduled history isolation + web reply/delete/session persistence
+
+- **Area:** db / scheduler / channels / web
+- **Summary:** Added `messages.origin` (`interactive` | `scheduled`); scheduler deliveries tag `scheduled` and agent history loaders exclude them while web `/api/history` stays unfiltered. Web UI: Reply injects `> snippet` into composer draft; Delete calls `DELETE /api/personas/:id/messages/:message_id` (full DB delete + bookmark cleanup); persona session id persists in `localStorage` and restores on persona switch.
+- **Key files / symbols:** `MESSAGE_ORIGIN_*`, `migrate_messages_origin`, `get_recent_messages(..., exclude_scheduled)`, `delete_message` in `src/db.rs`; `MessageStoreOrigin`, `deliver_*_with_origin` in `src/channel.rs`; scheduler `MessageStoreOrigin::Scheduled`; `load_messages_from_db` in `src/channels/telegram.rs`; `api_persona_message_delete` in `src/web.rs`; `ThreadPane` reply/delete in `web/src/components/thread-pane.tsx`; `PERSONA_SESSION_STORAGE_KEY` + `resolveStoredSessionId` in `web/src/main.tsx`.
+- **Rationale:** Scheduled job listings were bloating agent context; operators need quote-reply and message delete in web chat; persona switches should return to the last active session, not always Main.
+- **Follow-ups:** Part 2 agent-loop fixes (Execute→Synthesize handoff, degenerate `?` guard) remain deferred.
+
 ### 2026-06-20 — Env redaction: skip non-secret config keys and values
 
 - **Area:** safety redaction

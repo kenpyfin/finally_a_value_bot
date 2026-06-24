@@ -40,6 +40,7 @@ fn test_message_full_lifecycle() {
             content: format!("chat1 message {i}"),
             is_from_bot: false,
             timestamp: format!("2024-01-01T00:00:{:02}Z", i),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
     }
@@ -52,6 +53,7 @@ fn test_message_full_lifecycle() {
             content: format!("chat2 message {i}"),
             is_from_bot: false,
             timestamp: format!("2024-01-01T00:00:{:02}Z", i),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
     }
@@ -68,7 +70,7 @@ fn test_message_full_lifecycle() {
     assert_eq!(chat1_msgs[4].content, "chat1 message 4");
 
     // Verify recent messages with limit
-    let recent = db.get_recent_messages(100, pid1, 2).unwrap();
+    let recent = db.get_recent_messages(100, pid1, 2, false).unwrap();
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].content, "chat1 message 3"); // oldest of 2 most recent
     assert_eq!(recent[1].content, "chat1 message 4"); // most recent
@@ -323,13 +325,14 @@ fn test_catch_up_query_complex() {
             content: content.to_string(),
             is_from_bot: *is_bot,
             timestamp: ts.to_string(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
     }
 
     // Should get bot message + everything after it
     let catchup = db
-        .get_messages_since_last_bot_response(100, pid, 50, 50)
+        .get_messages_since_last_bot_response(100, pid, 50, 50, false)
         .unwrap();
     assert!(catchup.len() >= 3); // at least bot msg + 3 after
     assert_eq!(catchup[0].id, "m3"); // starts with bot msg
@@ -361,6 +364,7 @@ fn test_new_user_messages_since() {
             content: content.to_string(),
             is_from_bot: *is_bot,
             timestamp: ts.to_string(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
     }
@@ -394,6 +398,7 @@ fn test_chat_and_messages_together() {
         content: "hello".into(),
         is_from_bot: false,
         timestamp: "2024-01-01T00:00:00Z".into(),
+        origin: crate::db::message_origin_interactive(),
     })
     .unwrap();
 

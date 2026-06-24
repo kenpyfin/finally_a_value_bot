@@ -669,7 +669,7 @@ async fn api_history(
     } else {
         match requested_limit {
             Some(limit) => call_blocking(state.app_state.db.clone(), move |db| {
-                db.get_recent_messages(cid2, pid, limit)
+                db.get_recent_messages(cid2, pid, limit, false)
             })
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
@@ -1898,7 +1898,7 @@ async fn send_and_store_response_with_events(
                 let cid2 = chat_id;
                 let pid = persona_id;
                 let history = call_blocking(state.app_state.db.clone(), move |db| {
-                    db.get_recent_messages(cid2, pid, 500)
+                    db.get_recent_messages(cid2, pid, 500, false)
                 })
                 .await
                 .unwrap_or_default();
@@ -1969,6 +1969,7 @@ async fn send_and_store_response_with_events(
         content: text,
         is_from_bot: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        origin: crate::db::message_origin_interactive(),
     };
     call_blocking(state.app_state.db.clone(), move |db| {
         db.store_message(&user_msg)
@@ -3022,6 +3023,7 @@ async fn api_chat_sessions_create(
             content: format!("Session ready. Context loaded for: {}", intent),
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            origin: crate::db::message_origin_interactive(),
         };
         let _ = call_blocking(state.app_state.db.clone(), move |db| {
             db.store_message(&bot_msg)
@@ -3943,6 +3945,50 @@ async fn api_persona_message_get(
             "is_from_bot": m.is_from_bot,
             "timestamp": m.timestamp,
         }
+    })))
+}
+
+async fn api_persona_message_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMessagePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let message_id = path.message_id.trim().to_string();
+    if message_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+
+    let pid_delete = path.persona_id;
+    let deleted = call_blocking(state.app_state.db.clone(), {
+        let message_id = message_id.clone();
+        move |db| db.delete_message(chat_id, pid_delete, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "message not found".into()));
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "message_id": path.message_id,
+        "deleted": true,
     })))
 }
 
@@ -6046,7 +6092,7 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route(
             "/api/personas/:persona_id/messages/:message_id",
-            get(api_persona_message_get),
+            get(api_persona_message_get).delete(api_persona_message_delete),
         )
         .route(
             "/api/personas/:persona_id/memory",

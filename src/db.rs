@@ -23,6 +23,17 @@ where
         .map_err(|e| FinallyAValueBotError::ToolExecution(format!("DB task join error: {e}")))?
 }
 
+pub const MESSAGE_ORIGIN_INTERACTIVE: &str = "interactive";
+pub const MESSAGE_ORIGIN_SCHEDULED: &str = "scheduled";
+
+pub fn message_origin_interactive() -> String {
+    MESSAGE_ORIGIN_INTERACTIVE.to_string()
+}
+
+pub fn message_origin_scheduled() -> String {
+    MESSAGE_ORIGIN_SCHEDULED.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
     pub id: String,
@@ -33,7 +44,29 @@ pub struct StoredMessage {
     pub content: String,
     pub is_from_bot: bool,
     pub timestamp: String,
+    /// `interactive` (default) or `scheduled` (scheduler final delivery).
+    pub origin: String,
 }
+
+fn stored_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    Ok(StoredMessage {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        persona_id: row.get(2)?,
+        session_id: row.get(3)?,
+        sender_name: row.get(4)?,
+        content: row.get(5)?,
+        is_from_bot: row.get::<_, i32>(6)? != 0,
+        timestamp: row.get(7)?,
+        origin: row
+            .get::<_, Option<String>>(8)?
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(message_origin_interactive),
+    })
+}
+
+const MESSAGE_SELECT_COLS: &str =
+    "id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp, origin";
 
 #[derive(Debug, Clone)]
 pub struct ChatSession {
@@ -418,6 +451,7 @@ impl Database {
                 content TEXT NOT NULL,
                 is_from_bot INTEGER NOT NULL DEFAULT 0,
                 timestamp TEXT NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'interactive',
                 PRIMARY KEY (id, chat_id, persona_id)
             );
 
@@ -671,6 +705,7 @@ impl Database {
         Self::migrate_hook_policy_schema(&conn)?;
         Self::ensure_builtin_hook_definitions(&conn)?;
         Self::migrate_chat_sessions_schema(&conn)?;
+        Self::migrate_messages_origin(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -1279,6 +1314,16 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_messages_origin(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "messages", "origin")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN origin TEXT NOT NULL DEFAULT 'interactive'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     fn migrate_background_jobs_lease_schema(
         conn: &Connection,
     ) -> Result<(), FinallyAValueBotError> {
@@ -1449,9 +1494,14 @@ impl Database {
 
     pub fn store_message(&self, msg: &StoredMessage) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
+        let origin = if msg.origin.trim().is_empty() {
+            MESSAGE_ORIGIN_INTERACTIVE
+        } else {
+            msg.origin.as_str()
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 msg.id,
                 msg.chat_id,
@@ -1461,9 +1511,29 @@ impl Database {
                 msg.content,
                 msg.is_from_bot as i32,
                 msg.timestamp,
+                origin,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn delete_message(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM persona_message_bookmarks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND message_id = ?3",
+            params![chat_id, persona_id, message_id],
+        )?;
+        let rows = conn.execute(
+            "DELETE FROM messages WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3",
+            params![chat_id, persona_id, message_id],
+        )?;
+        Ok(rows > 0)
     }
 
     /// True when the **latest** row for this chat is a bot message with the same body as `content`
@@ -1514,33 +1584,38 @@ impl Database {
         chat_id: i64,
         persona_id: i64,
         limit: usize,
+        exclude_scheduled: bool,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
-             FROM messages
-             WHERE chat_id = ?1 AND persona_id = ?2
-             ORDER BY timestamp DESC
-             LIMIT ?3",
-        )?;
-
-        let messages = stmt
-            .query_map(params![chat_id, persona_id, limit as i64], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    session_id: row.get(3)?,
-                    sender_name: row.get(4)?,
-                    content: row.get(5)?,
-                    is_from_bot: row.get::<_, i32>(6)? != 0,
-                    timestamp: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut messages = if exclude_scheduled {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND origin != ?4
+                 ORDER BY timestamp DESC
+                 LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, limit as i64, MESSAGE_ORIGIN_SCHEDULED],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                 ORDER BY timestamp DESC
+                 LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, limit as i64],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
 
         // Reverse so oldest first
-        let mut messages = messages;
         messages.reverse();
         Ok(messages)
     }
@@ -1551,25 +1626,14 @@ impl Database {
         persona_id: i64,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
-             ORDER BY timestamp ASC",
-        )?;
+             ORDER BY timestamp ASC"
+        ))?;
         let messages = stmt
-            .query_map(params![chat_id, persona_id], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    session_id: row.get(3)?,
-                    sender_name: row.get(4)?,
-                    content: row.get(5)?,
-                    is_from_bot: row.get::<_, i32>(6)? != 0,
-                    timestamp: row.get(7)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id], stored_message_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
     }
@@ -1583,30 +1647,19 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
                AND (?3 IS NULL OR timestamp >= ?3)
                AND (?4 IS NULL OR timestamp <= ?4)
              ORDER BY timestamp ASC
-             LIMIT ?5",
-        )?;
+             LIMIT ?5"
+        ))?;
         let messages = stmt
             .query_map(
                 params![chat_id, persona_id, from_date, to_date, limit as i64],
-                |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        session_id: row.get(3)?,
-                        sender_name: row.get(4)?,
-                        content: row.get(5)?,
-                        is_from_bot: row.get::<_, i32>(6)? != 0,
-                        timestamp: row.get(7)?,
-                    })
-                },
+                stored_message_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
@@ -2678,66 +2731,90 @@ impl Database {
         persona_id: i64,
         max: usize,
         fallback: usize,
+        exclude_scheduled: bool,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
 
-        // Find timestamp of last bot message
-        let last_bot_ts: Option<String> = conn
-            .query_row(
+        let last_bot_ts: Option<String> = if exclude_scheduled {
+            conn.query_row(
+                "SELECT timestamp FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
+                   AND origin != ?3
+                 ORDER BY timestamp DESC LIMIT 1",
+                params![chat_id, persona_id, MESSAGE_ORIGIN_SCHEDULED],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            conn.query_row(
                 "SELECT timestamp FROM messages
                  WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
                  ORDER BY timestamp DESC LIMIT 1",
                 params![chat_id, persona_id],
                 |row| row.get(0),
             )
-            .ok();
+            .ok()
+        };
+
+        let origin_filter = if exclude_scheduled {
+            " AND origin != ?5"
+        } else {
+            ""
+        };
 
         let mut messages = if let Some(ts) = last_bot_ts {
-            let mut stmt = conn.prepare(
-                "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+            let sql = format!(
+                "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3{origin_filter}
                  ORDER BY timestamp DESC
-                 LIMIT ?4",
-            )?;
-            let rows = stmt
-                .query_map(params![chat_id, persona_id, ts, max as i64], |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        session_id: row.get(3)?,
-                        sender_name: row.get(4)?,
-                        content: row.get(5)?,
-                        is_from_bot: row.get::<_, i32>(6)? != 0,
-                        timestamp: row.get(7)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
+                 LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = if exclude_scheduled {
+                stmt.query_map(
+                    params![
+                        chat_id,
+                        persona_id,
+                        ts,
+                        max as i64,
+                        MESSAGE_ORIGIN_SCHEDULED
+                    ],
+                    stored_message_from_row,
+                )?
+            } else {
+                stmt.query_map(
+                    params![chat_id, persona_id, ts, max as i64],
+                    stored_message_from_row,
+                )?
+            };
+            rows.collect::<Result<Vec<_>, _>>()?
         } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+            let sql = format!(
+                "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2
+                 WHERE chat_id = ?1 AND persona_id = ?2{origin_filter}
                  ORDER BY timestamp DESC
-                 LIMIT ?3",
-            )?;
-            let rows = stmt
-                .query_map(params![chat_id, persona_id, fallback as i64], |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        session_id: row.get(3)?,
-                        sender_name: row.get(4)?,
-                        content: row.get(5)?,
-                        is_from_bot: row.get::<_, i32>(6)? != 0,
-                        timestamp: row.get(7)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
+                 LIMIT ?3"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = if exclude_scheduled {
+                stmt.query_map(
+                    params![
+                        chat_id,
+                        persona_id,
+                        fallback as i64,
+                        MESSAGE_ORIGIN_SCHEDULED
+                    ],
+                    stored_message_from_row,
+                )?
+            } else {
+                stmt.query_map(
+                    params![chat_id, persona_id, fallback as i64],
+                    stored_message_from_row,
+                )?
+            };
+            rows.collect::<Result<Vec<_>, _>>()?
         };
 
         messages.reverse();
@@ -3868,23 +3945,14 @@ impl Database {
     ) -> Result<Option<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+            &format!(
+                "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3
-             LIMIT 1",
+             LIMIT 1"
+            ),
             params![chat_id, persona_id, message_id],
-            |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    session_id: row.get(3)?,
-                    sender_name: row.get(4)?,
-                    content: row.get(5)?,
-                    is_from_bot: row.get::<_, i64>(6)? != 0,
-                    timestamp: row.get(7)?,
-                })
-            },
+            stored_message_from_row,
         );
         match result {
             Ok(msg) => Ok(Some(msg)),
@@ -5077,25 +5145,14 @@ impl Database {
         since: &str,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp > ?3 AND is_from_bot = 0
-             ORDER BY timestamp ASC",
-        )?;
+             ORDER BY timestamp ASC"
+        ))?;
         let messages = stmt
-            .query_map(params![chat_id, persona_id, since], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    session_id: row.get(3)?,
-                    sender_name: row.get(4)?,
-                    content: row.get(5)?,
-                    is_from_bot: row.get::<_, i32>(6)? != 0,
-                    timestamp: row.get(7)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id, since], stored_message_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
     }
@@ -5408,7 +5465,7 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.chat_id, m.persona_id, m.session_id, m.sender_name, m.content, m.is_from_bot, m.timestamp
+            "SELECT m.id, m.chat_id, m.persona_id, m.session_id, m.sender_name, m.content, m.is_from_bot, m.timestamp, m.origin
              FROM messages_fts
              JOIN messages m ON m.rowid = messages_fts.rowid
              WHERE messages_fts MATCH ?1
@@ -5422,18 +5479,7 @@ impl Database {
         let messages = stmt
             .query_map(
                 params![query, chat_id, persona_id, from_date, to_date, limit as i64],
-                |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        session_id: row.get(3)?,
-                        sender_name: row.get(4)?,
-                        content: row.get(5)?,
-                        is_from_bot: row.get::<_, i32>(6)? != 0,
-                        timestamp: row.get(7)?,
-                    })
-                },
+                stored_message_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
@@ -5618,25 +5664,14 @@ impl Database {
         session_id: &str,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE session_id = ?1
-             ORDER BY timestamp ASC",
-        )?;
+             ORDER BY timestamp ASC"
+        ))?;
         let messages = stmt
-            .query_map(params![session_id], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    session_id: row.get(3)?,
-                    sender_name: row.get(4)?,
-                    content: row.get(5)?,
-                    is_from_bot: row.get::<_, i32>(6)? != 0,
-                    timestamp: row.get(7)?,
-                })
-            })?
+            .query_map(params![session_id], stored_message_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
     }
@@ -5695,7 +5730,7 @@ mod tests {
     fn test_new_database_creates_tables() {
         let (db, dir) = test_db();
         let pid = test_persona(&db, 1);
-        let msgs = db.get_recent_messages(1, pid, 10).unwrap();
+        let msgs = db.get_recent_messages(1, pid, 10, false).unwrap();
         assert!(msgs.is_empty());
         let tasks = db.get_due_tasks("2099-01-01T00:00:00Z").unwrap();
         assert!(tasks.is_empty());
@@ -5726,10 +5761,11 @@ mod tests {
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".into(),
+            origin: crate::db::message_origin_interactive(),
         };
         db.store_message(&msg).unwrap();
 
-        let messages = db.get_recent_messages(100, pid, 10).unwrap();
+        let messages = db.get_recent_messages(100, pid, 10, false).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, "msg1");
         assert_eq!(messages[0].sender_name, "alice");
@@ -5751,6 +5787,7 @@ mod tests {
             content: "original".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".into(),
+            origin: crate::db::message_origin_interactive(),
         };
         db.store_message(&msg).unwrap();
 
@@ -5764,10 +5801,11 @@ mod tests {
             content: "updated".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         };
         db.store_message(&msg2).unwrap();
 
-        let messages = db.get_recent_messages(100, pid, 10).unwrap();
+        let messages = db.get_recent_messages(100, pid, 10, false).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "updated");
         cleanup(&dir);
@@ -5786,12 +5824,13 @@ mod tests {
                 content: format!("message {i}"),
                 is_from_bot: false,
                 timestamp: format!("2024-01-01T00:00:0{i}Z"),
+                origin: crate::db::message_origin_interactive(),
             };
             db.store_message(&msg).unwrap();
         }
 
         // Limit to 3 - should get the 3 most recent, but reversed to oldest-first
-        let messages = db.get_recent_messages(100, pid, 3).unwrap();
+        let messages = db.get_recent_messages(100, pid, 3, false).unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "message 2"); // oldest of the 3 most recent
         assert_eq!(messages[1].content, "message 3");
@@ -5799,7 +5838,7 @@ mod tests {
 
         // Different chat_id should be empty
         let pid2 = test_persona(&db, 200);
-        let messages = db.get_recent_messages(200, pid2, 10).unwrap();
+        let messages = db.get_recent_messages(200, pid2, 10, false).unwrap();
         assert!(messages.is_empty());
         cleanup(&dir);
     }
@@ -5819,6 +5858,7 @@ mod tests {
             content: "hi".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -5832,6 +5872,7 @@ mod tests {
             content: "hello!".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:02Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -5845,6 +5886,7 @@ mod tests {
             content: "how are you?".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:03Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -5858,11 +5900,12 @@ mod tests {
             content: "me too".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:04Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
         let messages = db
-            .get_messages_since_last_bot_response(100, pid, 50, 10)
+            .get_messages_since_last_bot_response(100, pid, 50, 10, false)
             .unwrap();
         // Should include the bot message and everything after it
         assert!(messages.len() >= 2);
@@ -5887,13 +5930,14 @@ mod tests {
                 content: format!("msg {i}"),
                 is_from_bot: false,
                 timestamp: format!("2024-01-01T00:00:0{i}Z"),
+                origin: crate::db::message_origin_interactive(),
             })
             .unwrap();
         }
 
         // Fallback to last 3
         let messages = db
-            .get_messages_since_last_bot_response(100, pid, 50, 3)
+            .get_messages_since_last_bot_response(100, pid, 50, 3, false)
             .unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "msg 2");
@@ -6093,6 +6137,7 @@ mod tests {
                 content: format!("message {i}"),
                 is_from_bot: false,
                 timestamp: format!("2024-01-01T00:00:0{i}Z"),
+                origin: crate::db::message_origin_interactive(),
             })
             .unwrap();
         }
@@ -6223,6 +6268,7 @@ mod tests {
             content: "old msg".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -6236,6 +6282,7 @@ mod tests {
             content: "response".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:02Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -6249,6 +6296,7 @@ mod tests {
             content: "new msg 1".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:03Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -6261,6 +6309,7 @@ mod tests {
             content: "new msg 2".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:04Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -6274,6 +6323,7 @@ mod tests {
             content: "bot again".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:05Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -6352,6 +6402,7 @@ mod tests {
             content: "bookmark me".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
         assert!(db

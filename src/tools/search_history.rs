@@ -183,6 +183,7 @@ mod tests {
             content: "alpha secret keyword".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
         db.store_message(&StoredMessage {
@@ -194,6 +195,7 @@ mod tests {
             content: "beta secret keyword".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 

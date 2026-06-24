@@ -7,10 +7,31 @@ use teloxide::prelude::*;
 use crate::channels::telegram::{
     send_response_result, strip_embedded_bulletin_focus, WorkspaceAutoImageContext,
 };
-use crate::db::{call_blocking, Database, StoredMessage};
+use crate::db::{call_blocking, message_origin_interactive, Database, StoredMessage};
 use crate::final_delivery_dedupe::{plan_agent_final_delivery, AgentFinalDeliveryPlan};
 use crate::final_delivery_media::normalize_assistant_artifact_references;
 use crate::tools::auth_context_from_input;
+
+/// How a stored outbound message should be classified in `messages.origin`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MessageStoreOrigin {
+    #[default]
+    Interactive,
+    Scheduled,
+}
+
+impl MessageStoreOrigin {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Interactive => crate::db::MESSAGE_ORIGIN_INTERACTIVE,
+            Self::Scheduled => crate::db::MESSAGE_ORIGIN_SCHEDULED,
+        }
+    }
+
+    fn into_origin_string(self) -> String {
+        self.as_db_str().to_string()
+    }
+}
 
 pub async fn is_web_chat(db: Arc<Database>, chat_id: i64) -> bool {
     matches!(
@@ -94,6 +115,7 @@ pub async fn deliver_and_store_bot_message(
             content: text.to_string(),
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            origin: message_origin_interactive(),
         };
         call_blocking(db.clone(), move |d| d.store_message(&msg))
             .await
@@ -116,6 +138,7 @@ pub async fn deliver_and_store_bot_message(
             content: text.to_string(),
             is_from_bot: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            origin: message_origin_interactive(),
         };
         match &send_result {
             Ok(_) => {}
@@ -175,6 +198,35 @@ pub async fn deliver_to_contact(
     scope: DeliveryScope,
     session_id: Option<String>,
 ) -> Result<(), String> {
+    deliver_to_contact_with_origin(
+        db,
+        telegram_bots,
+        discord_http,
+        bot_username,
+        canonical_chat_id,
+        persona_id,
+        text,
+        workspace_root,
+        scope,
+        session_id,
+        MessageStoreOrigin::Interactive,
+    )
+    .await
+}
+
+pub async fn deliver_to_contact_with_origin(
+    db: Arc<Database>,
+    telegram_bots: &HashMap<i64, Bot>,
+    discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
+    bot_username: &str,
+    canonical_chat_id: i64,
+    persona_id: i64,
+    text: &str,
+    workspace_root: Option<PathBuf>,
+    scope: DeliveryScope,
+    session_id: Option<String>,
+    message_origin: MessageStoreOrigin,
+) -> Result<(), String> {
     let text = strip_embedded_bulletin_focus(text);
     let text = crate::agent_turn_context::strip_stored_dialogue_markup(&text);
     let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
@@ -187,6 +239,7 @@ pub async fn deliver_to_contact(
         content: text.to_string(),
         is_from_bot: true,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        origin: message_origin.into_origin_string(),
     };
     call_blocking(db.clone(), move |d| d.store_message(&msg))
         .await
@@ -341,6 +394,35 @@ pub async fn deliver_agent_final_to_contact(
     scope: DeliveryScope,
     session_id: Option<String>,
 ) -> Result<AgentFinalDeliveryOutcome, String> {
+    deliver_agent_final_to_contact_with_origin(
+        db,
+        telegram_bots,
+        discord_http,
+        bot_username,
+        canonical_chat_id,
+        persona_id,
+        raw_final,
+        workspace_root,
+        scope,
+        session_id,
+        MessageStoreOrigin::Interactive,
+    )
+    .await
+}
+
+pub async fn deliver_agent_final_to_contact_with_origin(
+    db: Arc<Database>,
+    telegram_bots: &HashMap<i64, Bot>,
+    discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
+    bot_username: &str,
+    canonical_chat_id: i64,
+    persona_id: i64,
+    raw_final: &str,
+    workspace_root: Option<PathBuf>,
+    scope: DeliveryScope,
+    session_id: Option<String>,
+    message_origin: MessageStoreOrigin,
+) -> Result<AgentFinalDeliveryOutcome, String> {
     let cleaned = normalize_final_for_delivery(
         raw_final,
         workspace_root.as_deref(),
@@ -352,7 +434,7 @@ pub async fn deliver_agent_final_to_contact(
 
     match plan {
         AgentFinalDeliveryPlan::DeliverFull => {
-            deliver_to_contact(
+            deliver_to_contact_with_origin(
                 db.clone(),
                 telegram_bots,
                 discord_http,
@@ -363,6 +445,7 @@ pub async fn deliver_agent_final_to_contact(
                 workspace_root,
                 scope,
                 session_id,
+                message_origin,
             )
             .await?;
             Ok(AgentFinalDeliveryOutcome {
@@ -376,7 +459,7 @@ pub async fn deliver_agent_final_to_contact(
                 canonical_chat_id,
                 persona_id,
             );
-            deliver_to_contact(
+            deliver_to_contact_with_origin(
                 db.clone(),
                 telegram_bots,
                 discord_http,
@@ -387,6 +470,7 @@ pub async fn deliver_agent_final_to_contact(
                 workspace_root,
                 scope,
                 session_id,
+                message_origin,
             )
             .await?;
             Ok(AgentFinalDeliveryOutcome {

@@ -239,7 +239,7 @@ impl EventHandler for Handler {
                     } else {
                         let pid_f = pid;
                         let history = call_blocking(self.app_state.db.clone(), move |db| {
-                            db.get_recent_messages(canonical_chat_id, pid_f, 500)
+                            db.get_recent_messages(canonical_chat_id, pid_f, 500, false)
                         })
                         .await
                         .unwrap_or_default();
@@ -325,6 +325,7 @@ impl EventHandler for Handler {
             content: text.clone(),
             is_from_bot: false,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            origin: crate::db::message_origin_interactive(),
         };
         let _ = call_blocking(self.app_state.db.clone(), move |db| {
             db.store_message(&stored)

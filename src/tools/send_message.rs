@@ -615,6 +615,7 @@ impl Tool for SendMessageTool {
                         content,
                         is_from_bot: true,
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        origin: crate::db::message_origin_interactive(),
                     };
                     if let Err(e) = call_blocking(db, move |db| db.store_message(&msg)).await {
                         return ToolResult::error(e.to_string());

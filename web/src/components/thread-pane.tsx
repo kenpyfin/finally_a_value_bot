@@ -30,6 +30,7 @@ import {
 } from '@assistant-ui/react-ui'
 import remarkGfm from 'remark-gfm'
 import { historiesEqual } from '../lib/history-sync'
+import type { PendingReplyQuote } from '../lib/reply-quote'
 import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -98,6 +99,10 @@ function MessageTimestamp({ align }: { align: 'left' | 'right' }) {
 type ThreadPaneUiContextValue = {
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
+  onReplyToMessage?: (messageId: string) => void
+  onDeleteMessage?: (messageId: string) => void
+  pendingReply?: PendingReplyQuote | null
+  onDismissPendingReply?: () => void
   draftText: string
   onDraftTextChange?: (text: string) => void
   uploadHint?: string
@@ -106,10 +111,42 @@ type ThreadPaneUiContextValue = {
 const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
   bookmarkedMessageIds: undefined,
   onToggleBookmark: undefined,
+  onReplyToMessage: undefined,
+  onDeleteMessage: undefined,
+  pendingReply: null,
+  onDismissPendingReply: undefined,
   draftText: '',
   onDraftTextChange: undefined,
   uploadHint: undefined,
 })
+
+function ComposerQuotePreview() {
+  const { pendingReply, onDismissPendingReply } = React.useContext(ThreadPaneUiContext)
+  if (!pendingReply) return null
+  const label = pendingReply.isFromBot
+    ? 'assistant'
+    : (pendingReply.senderName.trim() || 'user')
+  return (
+    <div className="mc-reply-quote-preview" role="note" aria-label={`Replying to ${label}`}>
+      <div className="mc-reply-quote-bar" aria-hidden />
+      <div className="mc-reply-quote-body">
+        <div className="mc-reply-quote-label">Replying to {label}</div>
+        <div className="mc-reply-quote-snippet">{pendingReply.snippet}</div>
+      </div>
+      {onDismissPendingReply ? (
+        <button
+          type="button"
+          className="mc-reply-quote-dismiss"
+          onClick={onDismissPendingReply}
+          aria-label="Remove quoted message"
+          title="Remove quote"
+        >
+          ×
+        </button>
+      ) : null}
+    </div>
+  )
+}
 
 function MessageBookmarkButton({
   role,
@@ -132,6 +169,40 @@ function MessageBookmarkButton({
       aria-label={isBookmarked ? 'Remove bookmark' : 'Bookmark message'}
     >
       {isBookmarked ? '★' : '☆'}
+    </button>
+  )
+}
+
+function MessageReplyButton() {
+  const { onReplyToMessage } = React.useContext(ThreadPaneUiContext)
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  if (!onReplyToMessage || !messageId) return null
+  return (
+    <button
+      type="button"
+      className="mc-msg-action-btn"
+      onClick={() => onReplyToMessage(messageId)}
+      title="Reply with quote"
+      aria-label="Reply with quote"
+    >
+      Reply
+    </button>
+  )
+}
+
+function MessageDeleteButton() {
+  const { onDeleteMessage } = React.useContext(ThreadPaneUiContext)
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  if (!onDeleteMessage || !messageId) return null
+  return (
+    <button
+      type="button"
+      className="mc-msg-action-btn mc-msg-action-btn-danger"
+      onClick={() => onDeleteMessage(messageId)}
+      title="Delete message"
+      aria-label="Delete message"
+    >
+      Delete
     </button>
   )
 }
@@ -162,6 +233,8 @@ function CustomAssistantMessage() {
       <BranchPicker />
       <div className="mc-msg-meta-row">
         <MessageBookmarkButton role="assistant" />
+        <MessageReplyButton />
+        <MessageDeleteButton />
         <AssistantActionBar />
         <MessageTimestamp align="left" />
       </div>
@@ -177,6 +250,8 @@ function CustomUserMessage() {
       <MessagePrimitive.If hasContent>
         <div className="mc-msg-meta-row mc-msg-meta-row-user">
           <MessageBookmarkButton role="user" />
+          <MessageReplyButton />
+          <MessageDeleteButton />
           <UserActionBar />
         </div>
         <div className="mc-user-content-wrap">
@@ -235,6 +310,10 @@ export type ThreadPaneProps = {
   onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
+  onReplyToMessage?: (messageId: string) => void
+  onDeleteMessage?: (messageId: string) => void
+  pendingReply?: PendingReplyQuote | null
+  onDismissPendingReply?: () => void
   /** Mobile (max-width 767px): report scroll direction so the app shell can collapse the main header. */
   onMobileThreadScroll?: (opts: {
     collapseHeader: boolean
@@ -263,6 +342,7 @@ function DraftAwareComposer() {
 
   return (
     <ComposerPrimitive.AttachmentDropzone className="mc-composer-dropzone">
+      <ComposerQuotePreview />
       <Composer />
       {uploadHint ? (
         <div className="mc-upload-hint" aria-live="polite">
@@ -288,6 +368,10 @@ export const ThreadPane = React.memo(function ThreadPane({
   onDraftTextChange,
   bookmarkedMessageIds,
   onToggleBookmark,
+  onReplyToMessage,
+  onDeleteMessage,
+  pendingReply,
+  onDismissPendingReply,
   onMobileThreadScroll,
   uploadHint,
 }: ThreadPaneProps) {
@@ -339,11 +423,25 @@ export const ThreadPane = React.memo(function ThreadPane({
     () => ({
       bookmarkedMessageIds,
       onToggleBookmark,
+      onReplyToMessage,
+      onDeleteMessage,
+      pendingReply,
+      onDismissPendingReply,
       draftText,
       onDraftTextChange,
       uploadHint,
     }),
-    [bookmarkedMessageIds, draftText, onDraftTextChange, onToggleBookmark, uploadHint],
+    [
+      bookmarkedMessageIds,
+      draftText,
+      onDeleteMessage,
+      onDismissPendingReply,
+      onDraftTextChange,
+      onReplyToMessage,
+      onToggleBookmark,
+      pendingReply,
+      uploadHint,
+    ],
   )
 
   const viewportScrollCleanupRef = React.useRef<(() => void) | null>(null)

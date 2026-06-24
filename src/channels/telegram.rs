@@ -1104,7 +1104,7 @@ async fn handle_message(
                 } else {
                     let pid_f = pid;
                     let history = call_blocking(state.db.clone(), move |db| {
-                        db.get_recent_messages(canonical_chat_id, pid_f, 500)
+                        db.get_recent_messages(canonical_chat_id, pid_f, 500, false)
                     })
                     .await
                     .unwrap_or_default();
@@ -1393,6 +1393,7 @@ async fn handle_message(
             content: stored_content,
             is_from_bot: false,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            origin: crate::db::message_origin_interactive(),
         };
         let _ = call_blocking(state.db.clone(), move |db| db.store_message(&stored)).await;
         return Ok(());
@@ -1437,6 +1438,7 @@ async fn handle_message(
         content: stored_content,
         is_from_bot: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        origin: crate::db::message_origin_interactive(),
     };
     let _ = call_blocking(state.db.clone(), move |db| db.store_message(&stored)).await;
 
@@ -4384,12 +4386,18 @@ async fn load_messages_from_db(
     let max_history = state.config.max_history_messages;
     let history = if chat_type == "group" {
         call_blocking(state.db.clone(), move |db| {
-            db.get_messages_since_last_bot_response(chat_id, persona_id, max_history, max_history)
+            db.get_messages_since_last_bot_response(
+                chat_id,
+                persona_id,
+                max_history,
+                max_history,
+                true,
+            )
         })
         .await?
     } else {
         call_blocking(state.db.clone(), move |db| {
-            db.get_recent_messages(chat_id, persona_id, max_history)
+            db.get_recent_messages(chat_id, persona_id, max_history, true)
         })
         .await?
     };
@@ -6789,6 +6797,7 @@ mod tests {
             content: content.into(),
             is_from_bot: is_bot,
             timestamp: ts.into(),
+            origin: crate::db::message_origin_interactive(),
         }
     }
 

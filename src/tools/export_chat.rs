@@ -167,6 +167,7 @@ mod tests {
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
         db.store_message(&StoredMessage {
@@ -178,6 +179,7 @@ mod tests {
             content: "hi there!".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:02Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -210,6 +212,7 @@ mod tests {
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -241,6 +244,7 @@ mod tests {
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
         let out_path = dir.join("control_export.md");

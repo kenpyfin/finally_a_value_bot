@@ -11,7 +11,10 @@ use crate::background_jobs::{
     await_handoff_startup_ack, is_background_handoff_response, try_enqueue_background_handoff,
     HandoffEnqueueOutcome,
 };
-use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact, DeliveryScope};
+use crate::channel::{
+    deliver_agent_final_to_contact_with_origin, deliver_to_contact, DeliveryScope,
+    MessageStoreOrigin,
+};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::{call_blocking, ScheduledTask};
 use crate::error::FinallyAValueBotError;
@@ -553,7 +556,7 @@ async fn run_scheduled_agent_and_finalize(
             }
 
             let response_text = state.env_redactor.redact(&response_text);
-            match deliver_agent_final_to_contact(
+            match deliver_agent_final_to_contact_with_origin(
                 state.db.clone(),
                 state.telegram_bots.as_ref(),
                 state.discord_http.as_ref(),
@@ -564,6 +567,7 @@ async fn run_scheduled_agent_and_finalize(
                 Some(state.config.workspace_root_absolute()),
                 DeliveryScope::ContactWide,
                 None,
+                MessageStoreOrigin::Scheduled,
             )
             .await
             {

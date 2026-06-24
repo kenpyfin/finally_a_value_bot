@@ -303,7 +303,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 let pid_f = pid;
                                 let history =
                                     call_blocking(state.app_state.db.clone(), move |db| {
-                                        db.get_recent_messages(chat_id, pid_f, 500)
+                                        db.get_recent_messages(chat_id, pid_f, 500, false)
                                     })
                                     .await
                                     .unwrap_or_default();
@@ -516,6 +516,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     content: text.clone(),
                     is_from_bot: false,
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    origin: crate::db::message_origin_interactive(),
                 };
                 let _ = call_blocking(state.app_state.db.clone(), move |db| {
                     db.store_message(&stored)

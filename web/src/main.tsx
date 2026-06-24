@@ -42,6 +42,7 @@ import {
   type SendAttachmentRef,
 } from './lib/attachments'
 import { historiesEqual, mapBackendHistory } from './lib/history-sync'
+import { formatReplyForSend, makeReplySnippet, type PendingReplyQuote } from './lib/reply-quote'
 import {
   formatTierBadgeLabel,
   parseAgentHistoryMarkdown,
@@ -221,6 +222,7 @@ function saveDesktopSidebarWidth(width: number): void {
 }
 
 const PERSONA_STORAGE_KEY = 'finally-a-value-bot_selected_persona_id'
+const PERSONA_SESSION_STORAGE_KEY = 'finally-a-value-bot_persona_session_v1'
 const PERSONA_LAST_READ_STORAGE_KEY = 'finally-a-value-bot_persona_last_read_v1'
 
 function readStoredPersonaId(): number | null {
@@ -242,6 +244,55 @@ function writeStoredPersonaId(id: number): void {
   } catch {
     // ignore
   }
+}
+
+function readPersonaSessionMap(): Record<string, string> {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = localStorage.getItem(PERSONA_SESSION_STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, string> = {}
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'string' && value.trim()) out[key] = value
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function writePersonaSessionMap(map: Record<string, string>): void {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(PERSONA_SESSION_STORAGE_KEY, JSON.stringify(map))
+  } catch {
+    // ignore
+  }
+}
+
+function readStoredSessionForPersona(personaId: number): string | null {
+  const stored = readPersonaSessionMap()[String(personaId)]
+  return stored && stored.trim() ? stored : null
+}
+
+function writeStoredSessionForPersona(personaId: number, sessionId: string | null): void {
+  const map = readPersonaSessionMap()
+  const key = String(personaId)
+  if (sessionId) {
+    map[key] = sessionId
+  } else {
+    delete map[key]
+  }
+  writePersonaSessionMap(map)
+}
+
+function resolveStoredSessionId(sessions: ChatSession[], personaId: number): string | null {
+  const stored = readStoredSessionForPersona(personaId)
+  if (!stored) return null
+  const match = sessions.find((s) => s.id === stored && s.status === 'active')
+  return match ? match.id : null
 }
 
 function readPersonaLastReadAt(chatId: number, personaId: number): string | null {
@@ -529,6 +580,8 @@ function App() {
   const [agentsMdError, setAgentsMdError] = useState('')
   const [personaReadNonce, setPersonaReadNonce] = useState<number>(0)
   const [draftByThreadKey, setDraftByThreadKey] = useState<Record<string, string>>({})
+  const [pendingReplyByThreadKey, setPendingReplyByThreadKey] = useState<Record<string, PendingReplyQuote>>({})
+  const pendingReplyRef = useRef<PendingReplyQuote | null>(null)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [settingsError, setSettingsError] = useState('')
   const [installationStatus, setInstallationStatus] = useState<InstallationStatus | null>(null)
@@ -638,6 +691,11 @@ function App() {
   useEffect(() => {
     historyVisibleLimitRef.current = historyVisibleLimit
   }, [historyVisibleLimit])
+
+  useEffect(() => {
+    const threadKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
+    pendingReplyRef.current = pendingReplyByThreadKey[threadKey] ?? null
+  }, [chatId, activePersonaId, pendingReplyByThreadKey])
 
   const resetHistoryPagination = useCallback(() => {
     setHistoryVisibleLimit(HISTORY_PAGE_SIZE)
@@ -770,7 +828,6 @@ function App() {
   async function switchPersona(personaName: string): Promise<void> {
     if (chatId == null) return
     setHistoryLoading(true)
-    setActiveSessionId(null)
     try {
       await api('/api/personas/switch', {
         method: 'POST',
@@ -779,9 +836,15 @@ function App() {
       const p = personas.find((x) => x.name === personaName)
       if (p) writeStoredPersonaId(p.id)
       await loadPersonas(chatId)
-      void loadSessions(chatId, p?.id)
+      const sessions = await loadSessions(chatId, p?.id)
+      const restoredSessionId = p ? resolveStoredSessionId(sessions, p.id) : null
+      setActiveSessionId(restoredSessionId)
       resetHistoryPagination()
-      await loadHistory(chatId, p?.id ?? undefined, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
+      await loadHistory(chatId, p?.id ?? undefined, null, {
+        force: true,
+        limitOverride: HISTORY_PAGE_SIZE,
+        sessionId: restoredSessionId,
+      })
       if (p) markPersonaRead(p.id)
       if (p) await loadPersonaBulletin(p.id)
     } finally {
@@ -789,22 +852,31 @@ function App() {
     }
   }
 
-  async function loadSessions(cid?: number | null, personaId?: number | null): Promise<void> {
+  async function loadSessions(cid?: number | null, personaId?: number | null): Promise<ChatSession[]> {
     const c = cid ?? chatId
     const p = personaId ?? activePersonaId
-    if (c == null || p == null) return
+    if (c == null || p == null) {
+      setChatSessions([])
+      return []
+    }
     try {
       const data = await api<{ sessions?: ChatSession[] }>(
         `/api/chat_sessions?chat_id=${c}&persona_id=${p}&include_archived=true`,
       )
-      setChatSessions(Array.isArray(data.sessions) ? data.sessions : [])
+      const sessions = Array.isArray(data.sessions) ? data.sessions : []
+      setChatSessions(sessions)
+      return sessions
     } catch {
       setChatSessions([])
+      return []
     }
   }
 
   async function handleSelectSession(sessionId: string | null): Promise<void> {
     setActiveSessionId(sessionId)
+    if (activePersonaId != null) {
+      writeStoredSessionForPersona(activePersonaId, sessionId)
+    }
     resetHistoryPagination()
     await loadHistory(chatId, activePersonaId ?? undefined, null, {
       force: true,
@@ -822,6 +894,9 @@ function App() {
     if (data.session) {
       await loadSessions()
       setActiveSessionId(data.session.id)
+      if (activePersonaId != null) {
+        writeStoredSessionForPersona(activePersonaId, data.session.id)
+      }
       resetHistoryPagination()
       await loadHistory(chatId, activePersonaId, null, {
         force: true,
@@ -838,6 +913,9 @@ function App() {
     })
     if (activeSessionId === sessionId) {
       setActiveSessionId(null)
+      if (activePersonaId != null) {
+        writeStoredSessionForPersona(activePersonaId, null)
+      }
       resetHistoryPagination()
       await loadHistory(chatId, activePersonaId ?? undefined, null, {
         force: true,
@@ -848,10 +926,31 @@ function App() {
     await loadSessions()
   }
 
+  async function handleReopenSession(sessionId: string): Promise<void> {
+    await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'active' }),
+    })
+    setActiveSessionId(sessionId)
+    if (activePersonaId != null) {
+      writeStoredSessionForPersona(activePersonaId, sessionId)
+    }
+    await loadSessions()
+    resetHistoryPagination()
+    await loadHistory(chatId, activePersonaId ?? undefined, null, {
+      force: true,
+      limitOverride: HISTORY_PAGE_SIZE,
+      sessionId,
+    })
+  }
+
   async function handleDeleteSession(sessionId: string): Promise<void> {
     await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
     if (activeSessionId === sessionId) {
       setActiveSessionId(null)
+      if (activePersonaId != null) {
+        writeStoredSessionForPersona(activePersonaId, null)
+      }
       resetHistoryPagination()
       await loadHistory(chatId, activePersonaId ?? undefined, null, {
         force: true,
@@ -988,6 +1087,63 @@ function App() {
     }
   }, [activePersonaId, personaBookmarks])
 
+  const handleReplyToMessage = useCallback(async (messageId: string) => {
+    if (activePersonaId == null) return
+    try {
+      setStatusText('Loading quote…')
+      const data = await api<{ message?: BackendMessage }>(
+        `/api/personas/${activePersonaId}/messages/${encodeURIComponent(messageId)}`,
+      )
+      const m = data.message
+      const raw = typeof m?.content === 'string' ? m.content.trim() : ''
+      if (!raw) {
+        setError('Cannot reply: message has no text content')
+        setStatusText('Idle')
+        return
+      }
+      const threadKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
+      const quote: PendingReplyQuote = {
+        messageId,
+        snippet: makeReplySnippet(raw),
+        fullContent: raw,
+        senderName: typeof m?.sender_name === 'string' ? m.sender_name : '',
+        isFromBot: Boolean(m?.is_from_bot),
+      }
+      setPendingReplyByThreadKey((prev) => ({ ...prev, [threadKey]: quote }))
+      pendingReplyRef.current = quote
+      setStatusText('Quote ready — add your reply')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setStatusText('Idle')
+    }
+  }, [activePersonaId, chatId])
+
+  const handleDismissPendingReply = useCallback(() => {
+    const threadKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
+    setPendingReplyByThreadKey((prev) => {
+      if (!prev[threadKey]) return prev
+      const next = { ...prev }
+      delete next[threadKey]
+      return next
+    })
+    pendingReplyRef.current = null
+  }, [activePersonaId, chatId])
+
+  const handleDeleteMessage = useCallback(async (messageId: string) => {
+    if (activePersonaId == null) return
+    if (!window.confirm('Delete this message permanently?')) return
+    try {
+      await api(`/api/personas/${activePersonaId}/messages/${encodeURIComponent(messageId)}`, {
+        method: 'DELETE',
+      })
+      setHistorySeed((prev) => prev.filter((m) => m.id !== messageId))
+      setPersonaBookmarks((prev) => prev.filter((b) => b.message_id !== messageId))
+      setStatusText('Message deleted')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [activePersonaId])
+
   /** Remove bookmark from server and local bulletin state; returns whether it succeeded. */
   async function removePersonaBookmark(messageId: string): Promise<boolean> {
     if (activePersonaId == null) return false
@@ -1110,7 +1266,9 @@ function App() {
           signal: options.abortSignal,
           onUploadProgress: (msg) => setStatusText(msg),
         })
-        if (!userText && attachments.length === 0) return
+        const pendingReply = pendingReplyRef.current
+        const messageText = pendingReply ? formatReplyForSend(pendingReply, userText) : userText
+        if (!messageText.trim() && attachments.length === 0) return
 
         setStatusText(attachments.length > 0 ? 'Sending message…' : 'Sending...')
         setReplayNotice('')
@@ -1130,7 +1288,7 @@ function App() {
             attachments?: SendAttachmentRef[]
           } = {
             sender_name: 'web-user',
-            message: userText,
+            message: messageText,
           }
           if (chatId != null) sendBody.chat_id = chatId
           if (activePersonaId != null && activePersonaId > 0) sendBody.persona_id = activePersonaId
@@ -1151,6 +1309,13 @@ function App() {
             if (!prev[threadKey]) return prev
             return { ...prev, [threadKey]: '' }
           })
+          setPendingReplyByThreadKey((prev) => {
+            if (!prev[threadKey]) return prev
+            const next = { ...prev }
+            delete next[threadKey]
+            return next
+          })
+          pendingReplyRef.current = null
           const pid = activePersonaId != null && activePersonaId > 0 ? activePersonaId : 0
           setPendingRuns((prev) =>
             prev.some((r) => r.runId === runId)
@@ -1451,9 +1616,17 @@ function App() {
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
           void invalidateOps(cid)
-          void loadSessions(cid, chosen?.id ?? pid)
+          const personaForSession = chosen?.id ?? pid ?? null
+          const sessions = await loadSessions(cid, personaForSession)
+          const restoredSessionId =
+            personaForSession != null ? resolveStoredSessionId(sessions, personaForSession) : null
+          if (restoredSessionId) setActiveSessionId(restoredSessionId)
           resetHistoryPagination()
-          await loadHistory(cid, chosen?.id ?? pid, null, { force: true, limitOverride: HISTORY_PAGE_SIZE })
+          await loadHistory(cid, chosen?.id ?? pid, null, {
+            force: true,
+            limitOverride: HISTORY_PAGE_SIZE,
+            sessionId: restoredSessionId,
+          })
           if (chosen?.id != null) {
             await loadPersonaBulletin(chosen.id)
           } else if (pid != null) {
@@ -2001,6 +2174,7 @@ function App() {
 
   const activeDraftKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
   const activeDraftText = draftByThreadKey[activeDraftKey] ?? ''
+  const activePendingReply = pendingReplyByThreadKey[activeDraftKey] ?? null
   const handleDraftTextChange = useCallback((nextText: string) => {
     setDraftByThreadKey((prev) => {
       const current = prev[activeDraftKey] ?? ''
@@ -3574,6 +3748,7 @@ function App() {
                       onSelectSession={(sid) => void handleSelectSession(sid)}
                       onCreateSession={handleCreateSession}
                       onArchiveSession={handleArchiveSession}
+                      onReopenSession={handleReopenSession}
                       onDeleteSession={handleDeleteSession}
                       loading={historyLoading}
                     />
@@ -3650,6 +3825,10 @@ function App() {
                     onDraftTextChange={handleDraftTextChange}
                     bookmarkedMessageIds={bookmarkedMessageIds}
                     onToggleBookmark={toggleMessageBookmark}
+                    onReplyToMessage={(id) => void handleReplyToMessage(id)}
+                    onDeleteMessage={(id) => void handleDeleteMessage(id)}
+                    pendingReply={activePendingReply}
+                    onDismissPendingReply={handleDismissPendingReply}
                     onMobileThreadScroll={handleMobileThreadScroll}
                     uploadHint={
                       statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
