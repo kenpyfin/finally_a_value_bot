@@ -4,6 +4,69 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-26 — Run optimizer: pin memory scope for tool auth
+
+- **Area:** run optimizer
+- **Summary:** Learn & optimize completed but wrote no memory when the local model passed wrong `persona_id` (often `997894126` from trace paths). Optimizer system prompt now states required `chat_id`/`persona_id`; memory tool inputs are force-pinned before `execute_with_auth`; tool errors log at warn with preview.
+- **Key files / symbols:** `build_optimize_system_prompt`, `pin_memory_tool_scope` in `src/run_optimizer.rs`.
+- **Follow-ups:** Rebuild/restart bot; retry Learn & optimize on `20260626-164700.md`.
+
+### 2026-06-26 — Run optimizer: 1000s timeout + run-optimizer subagent
+
+- **Area:** run optimizer / llm HTTP client / Cursor subagent
+- **Summary:** Learn & optimize jobs failed at exactly 120s because `OPTIMIZE_LLM_TIMEOUT_SECS` and the reqwest client both capped at 120s while local 30B + tool-use with inherited `max_tokens=8192 could exceed that. Raised optimizer timeout to **1000s** and route optimizer LLM calls through `create_openai_compatible_provider_with_timeout` so HTTP and tokio limits align. Added project subagent `.cursor/agents/run-optimizer.md` for future optimizer/evaluation debugging.
+- **Key files / symbols:** `OPTIMIZE_LLM_TIMEOUT_SECS`, `send_local_tier_message`, `resolve_optimizer_local_endpoint` in `src/run_optimizer.rs`; `create_openai_compatible_provider_with_timeout`, `OpenAiProvider::new_with_request_timeout` in `src/llm.rs`.
+- **Follow-ups:** Optional dedicated optimizer `max_tokens` cap (512–1024) to avoid slow generation; fix web enqueue gate to check `local_*` not only legacy `tier2_*`.
+
+### 2026-06-25 — Jump to latest: refined scroll FAB
+
+- **Area:** web frontend
+- **Summary:** Replaced default `Thread.ScrollToBottom` (outline lucide arrow) with custom `ScrollToLatest` using `ThreadPrimitive.ScrollToBottom`, matching `--mc-*` tokens: circular 40px FAB above the composer, backdrop blur, accent hover, fade-in animation, and larger mobile touch target.
+- **Key files / symbols:** `web/src/components/scroll-to-latest.tsx` (`ScrollToLatest`); `web/src/components/thread-pane.tsx`; `web/src/styles.css` (`.mc-scroll-to-latest-wrap`, `.mc-scroll-to-latest-btn`).
+- **Deploy:** Rebuild `web/dist` then rebuild/restart the Rust binary.
+
+### 2026-06-25 — Load earlier messages: thread-integrated control
+
+- **Area:** web frontend
+- **Summary:** Replaced the awkward top-chrome `Load 30 older messages` soft button with a `LoadEarlierMessages` pill at the top of the thread viewport: shorter copy, chevron-up icon, loading spinner, and placement inside `ThreadPane` where pagination belongs.
+- **Key files / symbols:** `web/src/components/load-earlier-messages.tsx` (`LoadEarlierMessages`); `web/src/components/thread-pane.tsx` (`historyHasMore`, `onLoadMoreHistory`); `web/src/app/App.tsx` (removed button from status stack); `web/src/styles.css` (`.mc-load-earlier`, `.mc-load-earlier-btn`).
+- **Deploy:** Rebuild `web/dist` then rebuild/restart the Rust binary.
+
+### 2026-06-25 — Header session picker: larger touch targets
+
+- **Area:** web frontend
+- **Summary:** Enlarged header `SessionPicker` controls to match adjacent header icon buttons: Radix size `2`, removed `font-size-1` overrides, 36px desktop / 40px mobile min touch targets, wider session label truncation (220px compact), responsive `+ Session` label on `md+`, and `IconMoreVertical` on an `IconButton` for the session actions menu.
+- **Key files / symbols:** `web/src/components/session-picker.tsx` (`SessionPicker`, `data-compact`); `web/src/components/icons.tsx` (`IconMoreVertical`); `web/src/styles.css` (`.mc-session-picker`, `.mc-session-picker-trigger`, `.mc-session-picker-btn`).
+- **Deploy:** Rebuild `web/dist` then rebuild/restart the Rust binary for embedded assets.
+
+### 2026-06-25 — Web UI blank page: missing `usePersonaSession` import
+
+- **Area:** web frontend
+- **Summary:** After the App refactor, `usePersonaSession` was called in `App.tsx` but never imported, causing a runtime `ReferenceError` and blank page. Also removed duplicate `useDocumentVisible` import; cross-hook refs (`loadHistory`, bulletin, pagination) sync via `useLayoutEffect` instead of render-time assignment. Pinned `vite` back to `^5.4.10` — `^8.1.0` broke `npm install` in `reload.sh` (`@tailwindcss/vite@4.1.18` peer requires vite ≤7).
+- **Key files:** `web/src/app/App.tsx` (`LoadHistoryFn`, `usePersonaSession` import, `useLayoutEffect` ref bridge); `web/package.json`, `web/package-lock.json`.
+- **Deploy:** Rebuild `web/dist` (`npm run build` in `web/`) then rebuild/restart the Rust binary — assets are embedded via `include_dir!` in `src/web.rs`.
+
+### 2026-06-24 — Web UX pass closed: last confirm + dialog skeletons
+
+- **Area:** web frontend
+- **Summary:** Replaced final `window.confirm` (bot instance delete) with `ConfirmDialog`; settings overview, artifacts list, artifact preview, and agent-history dialogs now use skeleton loaders; mobile shell gets `overflow-x: hidden` on `html`/`body`/`#root` and `.mc-layout-grid`.
+- **Key files:** `web/src/app/App.tsx` (`removeBotInstance`), `web/src/app/AppDialogs.tsx`, `web/src/components/skeleton.tsx` (`OverviewStatusSkeleton`, `ArtifactListSkeleton`, `ContentPreviewSkeleton`), `web/src/styles.css`.
+
+### 2026-06-24 — Web UX pass (continued): hooks, AuthContext, AppHeader/AppDialogs split
+
+- **Area:** web frontend
+- **Summary:** Completed remaining UX plan items: `usePersonaSession`, `useChatHistory`, `useOperatorOps` hooks; `AuthProvider` + `AuthDialog`; `AppHeader` (header chrome + toolbar triggers) and `AppDialogs` (~1.6k lines); `lib/persona-storage`, `lib/bulletin`; settings skeletons on all panels; mobile message tap action sheet; `ThreadWelcomeHints` with shortcut footer; archived-sessions empty label in session picker.
+- **Key files / symbols:** `web/src/hooks/use-persona-session.ts`, `use-chat-history.ts`, `use-operator-ops.ts`; `web/src/context/AuthContext.tsx`; `web/src/app/AppHeader.tsx`, `AppDialogs.tsx`; `web/src/lib/persona-storage.ts`, `lib/bulletin.ts`; `thread-pane.tsx`, `thread-welcome-hints.tsx`.
+- **Follow-ups:** `App.tsx` still ~2k lines (adapter/SSE/scheduling); optional further split of `AppDialogs` tabs.
+
+### 2026-06-24 — Web UX full pass: feedback, IA, mobile ops, App split
+
+- **Area:** web frontend
+- **Summary:** Operator cockpit UX pass: `ConfirmDialog` + `useConfirmDialog` for destructive deletes (message, session, persona); `ErrorBanner` (`role="alert"`) and `StatusRegion` (`aria-live`); SVG bookmark icons and larger touch targets; session picker in header with actions menu; mobile Settings + Ops sheet (replaces "More"); header `CockpitStatusChip`; thread/history skeletons; multi-model settings stepper; keyboard shortcuts (`?`, `/`, Esc); light-mode `--mc-text-faint` contrast fix; `main.tsx` → thin bootstrap + `app/App.tsx`.
+- **Key files / symbols:** `web/src/components/confirm-dialog.tsx`, `error-banner.tsx`, `status-region.tsx`, `skeleton.tsx`, `empty-state.tsx`, `ops-ui.tsx`, `icons.tsx`; `web/src/hooks/use-keyboard-shortcuts.ts`; `web/src/app/App.tsx`, `web/src/app/constants.ts`; `session-picker.tsx`, `thread-pane.tsx`, `settings-multimodel.tsx`, `cockpit-bar.tsx`, `styles.css`.
+- **Design:** Persisted ui-ux-pro-max rules under `design-system/finallyavaluebot/MASTER.md`; kept existing `--mc-*` tokens and Instrument Sans (no rebrand).
+- **Follow-ups:** Extract `AppHeader` / `usePersonaSession` hooks from `App.tsx` when next touching shell layout; optional controlled CockpitBar collapse animation audit on iOS.
+
 ### 2026-06-24 — Web Reply: full fetch with composer quote chip
 
 - **Area:** web frontend

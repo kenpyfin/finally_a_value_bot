@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { EmptyState } from './empty-state'
 import { Button, Dialog, Flex, Select, Text, TextArea } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
@@ -75,6 +76,8 @@ export type CockpitBarProps = {
   /** Short status line updates after successful saves. */
   onBulletinStatus?: (message: string) => void
   floating?: boolean
+  /** Controlled expand state (optional). */
+  expanded?: boolean
   onExpandedChange?: (expanded: boolean) => void
 }
 
@@ -99,9 +102,18 @@ export function CockpitBar({
   reloadBulletin,
   onBulletinStatus,
   floating = false,
+  expanded: expandedControlled,
   onExpandedChange,
 }: CockpitBarProps) {
-  const [expanded, setExpanded] = useState(false)
+  const [expandedInternal, setExpandedInternal] = useState(false)
+  const expanded = expandedControlled ?? expandedInternal
+  const setExpanded = useCallback(
+    (value: boolean) => {
+      if (expandedControlled === undefined) setExpandedInternal(value)
+      onExpandedChange?.(value)
+    },
+    [expandedControlled, onExpandedChange],
+  )
   const [selectedBookmark, setSelectedBookmark] = useState<PersonaMessageBookmark | null>(null)
   const [bookmarkMessage, setBookmarkMessage] = useState<BackendMessage | null>(null)
   const [bookmarkMessageLoading, setBookmarkMessageLoading] = useState(false)
@@ -263,8 +275,10 @@ export function CockpitBar({
   }, [selectedBookmark, activePersonaId])
 
   useEffect(() => {
-    onExpandedChange?.(expanded)
-  }, [expanded, onExpandedChange])
+    if (expandedControlled !== undefined && expandedControlled !== expandedInternal) {
+      setExpandedInternal(expandedControlled)
+    }
+  }, [expandedControlled, expandedInternal])
 
   useEffect(() => {
     if (!expanded) return
@@ -605,9 +619,11 @@ export function CockpitBar({
                   ))}
                 </div>
               ) : (
-                <Text size="1" color="gray" className="mt-1 block">
-                  No bookmarks yet.
-                </Text>
+                <EmptyState
+                  title="No bookmarks yet"
+                  description="Bookmark messages from the thread to revisit them here."
+                  className="mt-2"
+                />
               )}
             </div>
           </div>

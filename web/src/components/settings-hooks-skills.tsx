@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button, Checkbox, Flex, Switch, Text, TextField } from '@radix-ui/themes'
+import { SettingsPanelSkeleton } from './skeleton'
 import type { HookDefinition, PersonaHookSkillPolicy } from '../types'
 
 type SkillRow = {
@@ -249,7 +250,7 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   }
 
   if (loading) {
-    return <Text size="2" color="gray">Loading hook and skill policies…</Text>
+    return <SettingsPanelSkeleton />
   }
 
   return (

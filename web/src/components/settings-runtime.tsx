@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Flex, Switch, Text } from '@radix-ui/themes'
+import { SettingsPanelSkeleton } from './skeleton'
 import type { RuntimeConfigResponse } from '../types'
 
 type Props = {
@@ -47,11 +48,7 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
   }
 
   if (loading) {
-    return (
-      <Text size="2" color="gray">
-        Loading runtime options…
-      </Text>
-    )
+    return <SettingsPanelSkeleton />
   }
 
   const enabled = runtime?.tool_output_debug ?? false

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button, Callout, Flex, Select, Text, TextField } from '@radix-ui/themes'
+import { SettingsPanelSkeleton } from './skeleton'
 import type { LlmConfigResponse, LlmProviderOption } from '../types'
 
 type Props = {
@@ -137,11 +138,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
   }
 
   if (loading) {
-    return (
-      <Text size="2" color="gray">
-        Loading LLM configuration…
-      </Text>
-    )
+    return <SettingsPanelSkeleton />
   }
 
   if (!llm?.ok) {

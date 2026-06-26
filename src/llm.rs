@@ -250,6 +250,22 @@ pub fn create_openai_compatible_provider(
     base_url: &str,
     model: &str,
 ) -> Box<dyn LlmProvider> {
+    create_openai_compatible_provider_with_timeout(
+        base_config,
+        base_url,
+        model,
+        std::time::Duration::from_secs(LLM_HTTP_REQUEST_TIMEOUT_SECS),
+    )
+}
+
+/// Same as [`create_openai_compatible_provider`] but with a custom HTTP request timeout
+/// (e.g. run optimizer jobs that may run long on local 30B + tool-use).
+pub fn create_openai_compatible_provider_with_timeout(
+    base_config: &Config,
+    base_url: &str,
+    model: &str,
+    request_timeout: std::time::Duration,
+) -> Box<dyn LlmProvider> {
     let mut cfg = base_config.clone();
     cfg.llm_provider = "llama".into();
     cfg.api_key = String::new();
@@ -258,7 +274,10 @@ pub fn create_openai_compatible_provider(
         base_url,
         crate::multimodel::DEFAULT_TIER1_BASE_URL,
     ));
-    Box::new(OpenAiProvider::new(&cfg))
+    Box::new(OpenAiProvider::new_with_request_timeout(
+        &cfg,
+        request_timeout,
+    ))
 }
 
 /// Sidecar LLM for PTE / PDQE (Perplexity Sonar via OpenAI-compatible API). Never used for the main agent loop.
@@ -1462,11 +1481,18 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: &Config) -> Self {
+        Self::new_with_request_timeout(
+            config,
+            std::time::Duration::from_secs(LLM_HTTP_REQUEST_TIMEOUT_SECS),
+        )
+    }
+
+    pub fn new_with_request_timeout(config: &Config, request_timeout: std::time::Duration) -> Self {
         let base = oai_resolve_base_url(config);
         let chat_url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
         OpenAiProvider {
-            http: default_llm_http_client(),
+            http: build_llm_http_client(request_timeout),
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,

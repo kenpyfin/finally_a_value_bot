@@ -1,4 +1,6 @@
 import React from 'react'
+import { ThreadHistorySkeleton } from './skeleton'
+import { IconStar } from './icons'
 import {
   AssistantRuntimeProvider,
   CompositeAttachmentAdapter,
@@ -17,13 +19,15 @@ import {
   type ThreadMessageLike,
   type ToolCallMessagePartProps,
 } from '@assistant-ui/react'
+import { ThreadWelcomeHints } from './thread-welcome-hints'
+import { LoadEarlierMessages } from './load-earlier-messages'
+import { ScrollToLatest } from './scroll-to-latest'
 import {
   AssistantActionBar,
   AssistantMessage,
   BranchPicker,
   Composer,
   Thread,
-  ThreadWelcome,
   UserActionBar,
   UserMessage,
   makeMarkdownText,
@@ -106,6 +110,8 @@ type ThreadPaneUiContextValue = {
   draftText: string
   onDraftTextChange?: (text: string) => void
   uploadHint?: string
+  mobileActionMessageId?: string | null
+  onMobileMessageTap?: (messageId: string) => void
 }
 
 const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
@@ -118,6 +124,8 @@ const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
   draftText: '',
   onDraftTextChange: undefined,
   uploadHint: undefined,
+  mobileActionMessageId: null,
+  onMobileMessageTap: undefined,
 })
 
 function ComposerQuotePreview() {
@@ -148,6 +156,77 @@ function ComposerQuotePreview() {
   )
 }
 
+function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
+  const {
+    mobileActionMessageId,
+    onToggleBookmark,
+    onReplyToMessage,
+    onDeleteMessage,
+    onMobileMessageTap,
+  } = React.useContext(ThreadPaneUiContext)
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  if (!messageId || mobileActionMessageId !== messageId) return null
+  return (
+    <div className="mc-msg-mobile-actions" role="toolbar" aria-label="Message actions">
+      {onReplyToMessage ? (
+        <button
+          type="button"
+          className="mc-msg-action-btn cursor-pointer"
+          onClick={() => {
+            onReplyToMessage(messageId)
+            onMobileMessageTap?.('')
+          }}
+        >
+          Reply
+        </button>
+      ) : null}
+      {onToggleBookmark ? (
+        <button
+          type="button"
+          className="mc-bookmark-btn cursor-pointer"
+          onClick={() => onToggleBookmark(messageId, role)}
+          aria-label="Bookmark message"
+        >
+          <IconStar />
+        </button>
+      ) : null}
+      {onDeleteMessage ? (
+        <button
+          type="button"
+          className="mc-msg-action-btn mc-msg-action-btn-danger cursor-pointer"
+          onClick={() => {
+            onDeleteMessage(messageId)
+            onMobileMessageTap?.('')
+          }}
+        >
+          Delete
+        </button>
+      ) : null}
+      <button
+        type="button"
+        className="mc-msg-action-btn cursor-pointer"
+        onClick={() => onMobileMessageTap?.('')}
+        aria-label="Close actions"
+      >
+        Close
+      </button>
+    </div>
+  )
+}
+
+function useMobileMessageTapProps(messageId: string) {
+  const { onMobileMessageTap } = React.useContext(ThreadPaneUiContext)
+  return {
+    onClick: (e: React.MouseEvent) => {
+      if (typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches) return
+      const target = e.target as HTMLElement
+      if (target.closest('button, a, input, textarea, [role="toolbar"]')) return
+      if (!messageId || !onMobileMessageTap) return
+      onMobileMessageTap(messageId)
+    },
+  }
+}
+
 function MessageBookmarkButton({
   role,
 }: {
@@ -168,7 +247,7 @@ function MessageBookmarkButton({
       title={isBookmarked ? 'Remove bookmark' : 'Bookmark this bubble'}
       aria-label={isBookmarked ? 'Remove bookmark' : 'Bookmark message'}
     >
-      {isBookmarked ? '★' : '☆'}
+      <IconStar filled={isBookmarked} />
     </button>
   )
 }
@@ -209,6 +288,7 @@ function MessageDeleteButton() {
 
 function CustomAssistantMessage() {
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  const mobileTap = useMobileMessageTapProps(messageId)
   const hasRenderableContent = useMessage((m) =>
     Array.isArray(m.content)
       ? m.content.some((part) => {
@@ -219,7 +299,7 @@ function CustomAssistantMessage() {
   )
 
   return (
-    <AssistantMessage.Root data-message-id={messageId || undefined}>
+    <AssistantMessage.Root data-message-id={messageId || undefined} {...mobileTap}>
       {hasRenderableContent ? (
         <AssistantMessage.Content />
       ) : (
@@ -231,29 +311,32 @@ function CustomAssistantMessage() {
         </div>
       )}
       <BranchPicker />
-      <div className="mc-msg-meta-row">
+      <div className="mc-msg-meta-row mc-msg-meta-row-desktop">
         <MessageBookmarkButton role="assistant" />
         <MessageReplyButton />
         <MessageDeleteButton />
         <AssistantActionBar />
         <MessageTimestamp align="left" />
       </div>
+      <MessageMobileActionSheet role="assistant" />
     </AssistantMessage.Root>
   )
 }
 
 function CustomUserMessage() {
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  const mobileTap = useMobileMessageTapProps(messageId)
   return (
-    <UserMessage.Root data-message-id={messageId || undefined}>
+    <UserMessage.Root data-message-id={messageId || undefined} {...mobileTap}>
       <UserMessage.Attachments />
       <MessagePrimitive.If hasContent>
-        <div className="mc-msg-meta-row mc-msg-meta-row-user">
+        <div className="mc-msg-meta-row mc-msg-meta-row-user mc-msg-meta-row-desktop">
           <MessageBookmarkButton role="user" />
           <MessageReplyButton />
           <MessageDeleteButton />
           <UserActionBar />
         </div>
+        <MessageMobileActionSheet role="user" />
         <div className="mc-user-content-wrap">
           <UserMessage.Content />
           <MessageTimestamp align="right" />
@@ -307,6 +390,10 @@ export type ThreadPaneProps = {
   isStreaming?: boolean
   /** If true, show a loading indicator while initial chat history is being fetched. */
   historyLoading?: boolean
+  /** When true, older messages exist above the current window. */
+  historyHasMore?: boolean
+  historyLoadingMore?: boolean
+  onLoadMoreHistory?: () => void
   onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
@@ -322,6 +409,7 @@ export type ThreadPaneProps = {
   }) => void
   /** Shown under the composer during multipart uploads (e.g. "Uploading photo.png (10.2 MB)…"). */
   uploadHint?: string
+  onShowShortcuts?: () => void
 }
 
 function DraftAwareComposer() {
@@ -365,6 +453,9 @@ export const ThreadPane = React.memo(function ThreadPane({
   draftText,
   isStreaming = false,
   historyLoading = false,
+  historyHasMore = false,
+  historyLoadingMore = false,
+  onLoadMoreHistory,
   onDraftTextChange,
   bookmarkedMessageIds,
   onToggleBookmark,
@@ -374,7 +465,12 @@ export const ThreadPane = React.memo(function ThreadPane({
   onDismissPendingReply,
   onMobileThreadScroll,
   uploadHint,
+  onShowShortcuts,
 }: ThreadPaneProps) {
+  const [mobileActionMessageId, setMobileActionMessageId] = React.useState<string | null>(null)
+  const onMobileMessageTap = React.useCallback((messageId: string) => {
+    setMobileActionMessageId((prev) => (messageId && prev === messageId ? null : messageId || null))
+  }, [])
   const MarkdownText = makeMarkdownText({
     remarkPlugins: [remarkGfm],
     components: {
@@ -430,10 +526,14 @@ export const ThreadPane = React.memo(function ThreadPane({
       draftText,
       onDraftTextChange,
       uploadHint,
+      mobileActionMessageId,
+      onMobileMessageTap,
     }),
     [
       bookmarkedMessageIds,
       draftText,
+      mobileActionMessageId,
+      onMobileMessageTap,
       onDeleteMessage,
       onDismissPendingReply,
       onDraftTextChange,
@@ -543,17 +643,16 @@ export const ThreadPane = React.memo(function ThreadPane({
         >
           <div className="mc-thread-shell flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
             {historyLoading && initialMessages.length === 0 ? (
-              <div className="mc-history-loading">
-                <div className="mc-history-loading-indicator">
-                  <div className="mc-assistant-placeholder-dot" />
-                  <div className="mc-assistant-placeholder-dot" />
-                  <div className="mc-assistant-placeholder-dot" />
-                </div>
-                <span className="mc-history-loading-text">Loading conversation...</span>
-              </div>
+              <ThreadHistorySkeleton />
             ) : (
             <Thread.Viewport ref={bindThreadViewport} className="aui-thread-viewport mc-thread-viewport">
-              <ThreadWelcome />
+              {historyHasMore && onLoadMoreHistory ? (
+                <LoadEarlierMessages
+                  loading={historyLoadingMore}
+                  onLoadMore={() => void onLoadMoreHistory()}
+                />
+              ) : null}
+              <ThreadWelcomeHints onShowShortcuts={onShowShortcuts} />
               <Thread.Messages
                 components={{
                   AssistantMessage: CustomAssistantMessage,
@@ -570,7 +669,9 @@ export const ThreadPane = React.memo(function ThreadPane({
               }
             >
               <div className="relative mx-auto w-full max-w-[var(--aui-thread-max-width)] px-2 pb-1 pt-1 md:px-3">
-                <Thread.ScrollToBottom />
+                <div className="mc-scroll-to-latest-wrap">
+                  <ScrollToLatest />
+                </div>
                 <DraftAwareComposer />
               </div>
             </div>
