@@ -5,7 +5,7 @@ use crate::agent_turn_context::extract_session_goal;
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
-use crate::llm;
+use crate::llm::{self, EVALUATOR_TIMEOUT_SECS};
 use crate::safety_redaction::EnvSecretRedactor;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -24,6 +24,19 @@ pub enum PteAction {
 pub struct PteResult {
     pub action: PteAction,
     pub reason: String,
+    pub provider_label: Option<String>,
+    pub disabled: bool,
+    pub provider_skipped: bool,
+}
+
+pub fn pte_action_name(action: &PteAction) -> &'static str {
+    match action {
+        PteAction::Continue => "continue",
+        PteAction::Complete => "complete",
+        PteAction::AskUser => "ask_user",
+        PteAction::HandoffBackground => "handoff_background",
+        PteAction::StopWithSummary => "stop_with_summary",
+    }
 }
 
 /// Build the PTE system prompt with principles and memory context baked in.
@@ -223,17 +236,22 @@ fn build_pte_user_prompt(
 /// Evaluate whether the task is complete after tool execution.
 /// Returns Continue immediately if PTE is disabled.
 pub async fn evaluate_completion(
+    enabled: bool,
     config: &Config,
+    multimodel: Option<&crate::multimodel::MultimodelConfig>,
     env_redactor: &EnvSecretRedactor,
     principles_content: &str,
     memory_context: &str,
     messages: &[Message],
     iteration: usize,
 ) -> Result<PteResult, FinallyAValueBotError> {
-    if !config.post_tool_evaluator_enabled {
+    if !enabled {
         return Ok(PteResult {
             action: PteAction::Continue,
             reason: String::new(),
+            provider_label: None,
+            disabled: true,
+            provider_skipped: false,
         });
     }
 
@@ -243,6 +261,9 @@ pub async fn evaluate_completion(
         return Ok(PteResult {
             action: PteAction::AskUser,
             reason: "Repeated stalled failures detected; stop loop and ask user whether to retry or wait.".to_string(),
+            provider_label: None,
+            disabled: false,
+            provider_skipped: false,
         });
     }
     if has_repeated_no_progress_signatures(messages) {
@@ -250,6 +271,9 @@ pub async fn evaluate_completion(
             action: PteAction::StopWithSummary,
             reason: "Repeated no-progress tool outcomes detected; stop and return concise summary."
                 .to_string(),
+            provider_label: None,
+            disabled: false,
+            provider_skipped: false,
         });
     }
 
@@ -266,19 +290,50 @@ pub async fn evaluate_completion(
         content: MessageContent::Text(user_prompt),
     }];
 
-    let provider = match llm::create_evaluator_provider(config) {
+    let provider_bundle = match llm::create_evaluator_provider(config, multimodel) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("PTE skipped: {e}");
             return Ok(PteResult {
                 action: PteAction::Continue,
-                reason: String::new(),
+                reason: e.to_string(),
+                provider_label: None,
+                disabled: false,
+                provider_skipped: true,
             });
         }
     };
-    let response = provider
-        .send_message(&system_prompt, pte_messages, None)
-        .await?;
+    let provider_label = provider_bundle.label.clone();
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(EVALUATOR_TIMEOUT_SECS),
+        provider_bundle
+            .provider
+            .send_message(&system_prompt, pte_messages, None),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!("PTE evaluation failed (fail-open): {e}");
+            return Ok(PteResult {
+                action: PteAction::Continue,
+                reason: e.to_string(),
+                provider_label: Some(provider_label),
+                disabled: false,
+                provider_skipped: true,
+            });
+        }
+        Err(_) => {
+            tracing::warn!("PTE evaluation timed out after {EVALUATOR_TIMEOUT_SECS}s (fail-open)");
+            return Ok(PteResult {
+                action: PteAction::Continue,
+                reason: format!("evaluator timed out after {EVALUATOR_TIMEOUT_SECS}s"),
+                provider_label: Some(provider_label),
+                disabled: false,
+                provider_skipped: true,
+            });
+        }
+    };
 
     let text: String = response
         .content
@@ -290,7 +345,8 @@ pub async fn evaluate_completion(
         .collect::<Vec<_>>()
         .join("");
 
-    let parsed = parse_pte_response(&text)?;
+    let mut parsed = parse_pte_response(&text)?;
+    parsed.provider_label = Some(provider_label);
     info!(
         "PTE decision: {:?} at iteration {} - {}",
         parsed.action,
@@ -333,6 +389,9 @@ fn parse_pte_response(text: &str) -> Result<PteResult, FinallyAValueBotError> {
     Ok(PteResult {
         action,
         reason: raw.reason.unwrap_or_default(),
+        provider_label: None,
+        disabled: false,
+        provider_skipped: false,
     })
 }
 

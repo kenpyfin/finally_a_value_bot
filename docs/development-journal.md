@@ -4,6 +4,32 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-27 — Learn & optimize: operator notes + PDQE input
+
+- **Area:** run optimizer / agent history / web
+- **Summary:** Learn & optimize now accepts optional operator guidance via POST body (`operator_notes`) and a textarea in the Agent run debug dialog. Optimizer user message includes the PDQE timeline section from the run file (issues, confidence, retry reasons) alongside the iteration trace; initial LLM snapshot remains excluded. System suffix instructs the model to weigh PDQE and operator input when updating memory.
+- **Key files / symbols:** `split_pdqe_for_optimize` in `src/agent_history.rs`; `build_optimize_user_message(..., operator_notes, ...)` in `src/run_optimizer.rs`; `AgentHistoryOptimizeRequest` + `api_persona_agent_history_optimize` in `src/web.rs`; `agentHistoryOptimizeNotes` + textarea in `web/src/app/AppDialogs.tsx`.
+- **Deploy:** Rebuild `web/dist`, rebuild/restart Rust binary.
+
+### 2026-06-26 — Web UI: hot-reload PTE and PDQE toggles
+
+- **Area:** web / runtime toggles / evaluators
+- **Summary:** Settings → Overview → **Runtime toggles** exposes switches for post-tool evaluator (PTE) and pre-delivery quality (PDQE), alongside verbose pipeline logging. Values persist in `app_settings` and apply immediately to the agent loop (no restart). `.env` remains the default when no app override exists.
+- **Key files:** `RuntimeToggles` + `APP_SETTING_POST_TOOL_EVALUATOR_ENABLED` / `APP_SETTING_RESPONSE_QUALITY_EVALUATOR_ENABLED` in `src/runtime_toggles.rs`; `GET/PATCH /api/runtime` in `src/web.rs`; `SettingsRuntimePanel` in `web/src/components/settings-runtime.tsx`.
+
+### 2026-06-26 — Evaluators tab: structured verdict details (issues, feedback)
+
+- **Area:** evaluators / agent history / web
+- **Summary:** PDQE steps now persist structured JSON (`verdict`, `confidence`, `issues`, `feedback`, `note`) on indented `eval:` lines in agent history. Web Evaluators tab renders issues list, evaluator feedback block, confidence %, skip/error reasons — not just pass/fail badges. PTE cards label source (LLM vs heuristic) and show rationale prominently. Skipped PDQE runs record `quality_eval_skipped` with reason.
+- **Key files:** `format_pdqe_verdict_detail` in `src/response_quality_evaluator.rs`; `EvaluatorStepRecord::format_pdqe_line`; `parsePdqeEvalDetail` / `EvalDetailBlock` in web.
+
+### 2026-06-26 — PTE/PDQE observability + local-first evaluator provider
+
+- **Area:** evaluators / agent history / web Last agent run
+- **Summary:** PTE and PDQE now prefer the local multimodel OpenAI-compat endpoint (`resolve_local_evaluator_endpoint`), falling back to Perplexity; evaluator calls cap `max_tokens` at 512 and use a 120s timeout (PTE previously had none). Agent history persists PTE per iteration (`IterationRecord.pte`) and PDQE steps inline before the snapshot (`AgentRunRecord.pdqe_steps`), fixing the PDQE basename ordering bug. Web **Last agent run** dialog adds an **Evaluators** tab (PTE list + PDQE timeline) via extended `parse-agent-history.ts`.
+- **Key files / symbols:** `create_evaluator_provider`, `resolve_evaluator_provider_label`, `EVALUATOR_MAX_TOKENS` in `src/llm.rs`; `EvaluatorStepRecord`, `split_trace_for_optimize` in `src/agent_history.rs`; `record_pte_on_last_iteration`, `push_pdqe_step` in `src/channels/telegram.rs`; `evaluate_completion` / `evaluate_delivery_quality`; `AgentHistoryEvaluatorsPanel` in `web/src/app/AppDialogs.tsx`.
+- **Deploy:** Rebuild `web/dist`, rebuild/restart Rust binary. New history fields appear on runs saved after deploy.
+
 ### 2026-06-26 — Run optimizer: pin memory scope for tool auth
 
 - **Area:** run optimizer

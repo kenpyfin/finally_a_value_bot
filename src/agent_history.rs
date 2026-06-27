@@ -21,12 +21,31 @@ pub const QUALITY_EVAL_SECTION_START: &str = "\n## Post-delivery quality evaluat
 /// Max bytes read for a single agent history file (web UI / API).
 pub const MAX_AGENT_HISTORY_READ_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Trace markdown only (no initial LLM snapshot suffix) for optimizer input.
+/// Trace markdown only (no PDQE section or initial LLM snapshot suffix) for optimizer input.
 pub fn split_trace_for_optimize(content: &str) -> String {
-    let idx = content.find(SNAPSHOT_SECTION_START);
-    match idx {
-        Some(i) => content[..i].trim_end().to_string(),
-        None => content.trim_end().to_string(),
+    let mut end = content.len();
+    if let Some(i) = content.find(QUALITY_EVAL_SECTION_START) {
+        end = end.min(i);
+    }
+    if let Some(i) = content.find(SNAPSHOT_SECTION_START) {
+        end = end.min(i);
+    }
+    content[..end].trim_end().to_string()
+}
+
+/// PDQE timeline markdown (without section header) for optimizer input, if present.
+pub fn split_pdqe_for_optimize(content: &str) -> Option<String> {
+    let start = content.find(QUALITY_EVAL_SECTION_START)?;
+    let body_start = start + QUALITY_EVAL_SECTION_START.len();
+    let end = content[body_start..]
+        .find(SNAPSHOT_SECTION_START)
+        .map(|i| body_start + i)
+        .unwrap_or(content.len());
+    let body = content[body_start..end].trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
     }
 }
 
@@ -145,12 +164,118 @@ pub struct ToolCallRecord {
     pub is_error: bool,
 }
 
+pub struct EvaluatorStepRecord {
+    /// PTE action (`continue`, `complete`, …) or PDQE step (`quality_eval_pass`, …).
+    pub step: String,
+    pub detail: String,
+    pub duration_ms: Option<u128>,
+    pub provider_label: String,
+    pub at: Option<DateTime<Utc>>,
+}
+
+impl EvaluatorStepRecord {
+    pub fn pte_disabled() -> Self {
+        Self {
+            step: "disabled".into(),
+            detail: String::new(),
+            duration_ms: None,
+            provider_label: String::new(),
+            at: None,
+        }
+    }
+
+    pub fn pte_decision(
+        action: &str,
+        duration_ms: u128,
+        reason: &str,
+        provider_label: &str,
+    ) -> Self {
+        Self {
+            step: action.into(),
+            detail: reason.into(),
+            duration_ms: Some(duration_ms),
+            provider_label: provider_label.to_string(),
+            at: None,
+        }
+    }
+
+    pub fn pte_skipped(reason: &str) -> Self {
+        Self {
+            step: "skipped".into(),
+            detail: reason.into(),
+            duration_ms: None,
+            provider_label: String::new(),
+            at: None,
+        }
+    }
+
+    pub fn pdqe(step: &str, detail: &str, provider_label: &str) -> Self {
+        Self {
+            step: step.into(),
+            detail: detail.into(),
+            duration_ms: None,
+            provider_label: provider_label.to_string(),
+            at: Some(Utc::now()),
+        }
+    }
+
+    pub fn format_pte_iteration_line(&self) -> String {
+        if self.step == "disabled" {
+            return "- PTE: disabled".to_string();
+        }
+        if self.step == "skipped" {
+            return format!("- PTE: skipped — {}", self.detail.trim());
+        }
+        let provider = if self.provider_label.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", self.provider_label.trim())
+        };
+        let dur = self
+            .duration_ms
+            .map(|d| format!(" ({d}ms)"))
+            .unwrap_or_default();
+        let reason = self.detail.trim();
+        if reason.is_empty() {
+            format!("- PTE: {}{}", self.step, dur) + &provider
+        } else {
+            format!("- PTE: {}{} — \"{}\"{}", self.step, dur, reason, provider)
+        }
+    }
+
+    pub fn format_pdqe_line(&self) -> String {
+        let at = self
+            .at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string());
+        let provider = if self.provider_label.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", self.provider_label.trim())
+        };
+        let detail = self.detail.trim();
+        let line = format!(
+            "- **{at}** `{step}`{provider}",
+            step = self.step,
+            provider = provider
+        );
+        if detail.is_empty() {
+            line
+        } else if detail.starts_with('{') {
+            format!("{line}\n  eval: {detail}")
+        } else {
+            format!("{line} — {detail}")
+        }
+    }
+}
+
 pub struct IterationRecord {
     pub iteration: usize,
     pub stop_reason: String,
     pub assistant_text_preview: String,
     pub tool_calls: Vec<ToolCallRecord>,
     pub hook_events: Vec<String>,
+    pub pte: Option<EvaluatorStepRecord>,
     pub model_tier: String,
     pub provider: String,
     pub model: String,
@@ -175,6 +300,7 @@ pub struct AgentRunRecord {
     pub channel: String,
     pub user_message_preview: String,
     pub iterations: Vec<IterationRecord>,
+    pub pdqe_steps: Vec<EvaluatorStepRecord>,
     pub total_iterations: usize,
     pub stop_reason: String,
     pub total_duration_ms: u128,
@@ -239,8 +365,19 @@ impl AgentRunRecord {
                 }
             }
 
+            if let Some(ref pte) = iter.pte {
+                md.push_str(&format!("{}\n", pte.format_pte_iteration_line()));
+            }
+
             if !iter.assistant_text_preview.is_empty() {
                 md.push_str(&format!("Assistant: \"{}\"\n", iter.assistant_text_preview));
+            }
+        }
+
+        if !self.pdqe_steps.is_empty() {
+            md.push_str(QUALITY_EVAL_SECTION_START);
+            for step in &self.pdqe_steps {
+                md.push_str(&format!("{}\n", step.format_pdqe_line()));
             }
         }
 
@@ -459,11 +596,13 @@ mod tests {
                 assistant_text_preview: String::new(),
                 tool_calls: vec![],
                 hook_events: vec![],
+                pte: None,
                 model_tier: "technical".into(),
                 provider: "llama".into(),
                 model: "qwen-test".into(),
                 endpoint: "http://127.0.0.1:8080/v1".into(),
             }],
+            pdqe_steps: vec![],
             total_iterations: 1,
             stop_reason: "end_turn".into(),
             total_duration_ms: 42,
@@ -495,6 +634,90 @@ mod tests {
     }
 
     #[test]
+    fn to_markdown_includes_pte_and_pdqe_sections() {
+        let pte = EvaluatorStepRecord::pte_decision(
+            "continue",
+            842,
+            "tool results partial",
+            "local · qwen @ http://127.0.0.1:8080/v1",
+        );
+        let record = AgentRunRecord {
+            timestamp: Utc.with_ymd_and_hms(2026, 6, 26, 12, 0, 0).unwrap(),
+            channel: "web".into(),
+            user_message_preview: "hello".into(),
+            iterations: vec![IterationRecord {
+                iteration: 1,
+                stop_reason: "tool_use".into(),
+                assistant_text_preview: String::new(),
+                tool_calls: vec![],
+                hook_events: vec![],
+                pte: Some(pte),
+                model_tier: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                endpoint: String::new(),
+            }],
+            pdqe_steps: vec![EvaluatorStepRecord::pdqe(
+                "quality_eval_fail",
+                &crate::response_quality_evaluator::format_pdqe_verdict_detail(
+                    &crate::response_quality_evaluator::QualityVerdict {
+                        kind: crate::response_quality_evaluator::QualityVerdictKind::Fail,
+                        issues: vec!["incomplete".into()],
+                        feedback_for_agent: "Add missing steps.".into(),
+                        confidence: 0.92,
+                    },
+                    Some("retry 1/1 triggered"),
+                ),
+                "local · qwen @ http://127.0.0.1:8080/v1",
+            )],
+            total_iterations: 1,
+            stop_reason: "end_turn".into(),
+            total_duration_ms: 42,
+            initial_llm_snapshot: Some("{}".into()),
+            multimodel_summary: MultimodelRunSummary {
+                enabled: false,
+                strategy_provider: "google".into(),
+                strategy_model: "gemini".into(),
+                strategy_endpoint: "https://example.com/v1".into(),
+                tier1_model: String::new(),
+                tier1_endpoint: String::new(),
+                tier2_model: String::new(),
+                tier2_endpoint: String::new(),
+            },
+        };
+        let md = record.to_markdown();
+        assert!(md.contains("- PTE: continue (842ms)"));
+        assert!(md.contains(QUALITY_EVAL_SECTION_START.trim()));
+        assert!(md.contains("`quality_eval_fail`"));
+        assert!(md.contains("eval:"));
+        assert!(md.contains("\"issues\""));
+        let snap_idx = md.find(SNAPSHOT_SECTION_START).unwrap();
+        let pdqe_idx = md.find(QUALITY_EVAL_SECTION_START).unwrap();
+        assert!(pdqe_idx < snap_idx);
+    }
+
+    #[test]
+    fn split_trace_for_optimize_strips_pdqe_and_snapshot() {
+        let content = "# Run\n## Iteration 1\nStop: end_turn\n\
+            ## Post-delivery quality evaluation\n- step\n\
+            ## Initial LLM prompt (debug snapshot)\n{}";
+        let trace = split_trace_for_optimize(content);
+        assert!(trace.contains("Iteration 1"));
+        assert!(!trace.contains("Post-delivery quality evaluation"));
+        assert!(!trace.contains("debug snapshot"));
+    }
+
+    #[test]
+    fn split_pdqe_for_optimize_extracts_section_body() {
+        let content = "# Run\n## Iteration 1\nStop: end_turn\n\
+            ## Post-delivery quality evaluation\n- **2026-06-26** `quality_eval_pass`\n\
+            ## Initial LLM prompt (debug snapshot)\n{}";
+        let pdqe = split_pdqe_for_optimize(content).unwrap();
+        assert!(pdqe.contains("quality_eval_pass"));
+        assert!(!pdqe.contains("Initial LLM prompt"));
+    }
+
+    #[test]
     fn append_pdqe_step_adds_section_and_entries() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap();
@@ -505,6 +728,7 @@ mod tests {
             channel: "web".into(),
             user_message_preview: "hello".into(),
             iterations: vec![],
+            pdqe_steps: vec![],
             total_iterations: 0,
             stop_reason: "end_turn".into(),
             total_duration_ms: 1,

@@ -280,10 +280,59 @@ pub fn create_openai_compatible_provider_with_timeout(
     ))
 }
 
-/// Sidecar LLM for PTE / PDQE (Perplexity Sonar via OpenAI-compatible API). Never used for the main agent loop.
+/// Max output tokens for PTE/PDQE sidecar calls (JSON-only; avoids slow local generation).
+pub const EVALUATOR_MAX_TOKENS: u32 = 512;
+
+/// Tokio + HTTP timeout for PTE/PDQE sidecar calls.
+pub const EVALUATOR_TIMEOUT_SECS: u64 = 120;
+
+pub struct EvaluatorProviderBundle {
+    pub provider: Box<dyn LlmProvider>,
+    pub label: String,
+}
+
+/// Human-readable backend label for agent history / UI (`local · model @ url` or `perplexity · sonar`).
+pub fn resolve_evaluator_provider_label(
+    config: &Config,
+    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+) -> String {
+    if let Some(mm) = multimodel {
+        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+            return format!("local · {} @ {}", model, base_url);
+        }
+    }
+    if config
+        .perplexity_api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return format!("perplexity · {}", config.evaluator_model);
+    }
+    String::new()
+}
+
+/// Sidecar LLM for PTE / PDQE. Prefers local multimodel endpoint; falls back to Perplexity.
+/// Never used for the main agent loop.
 pub fn create_evaluator_provider(
     config: &Config,
-) -> Result<Box<dyn LlmProvider>, FinallyAValueBotError> {
+    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+) -> Result<EvaluatorProviderBundle, FinallyAValueBotError> {
+    let request_timeout = std::time::Duration::from_secs(EVALUATOR_TIMEOUT_SECS);
+    if let Some(mm) = multimodel {
+        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+            let mut eval_config = config.clone();
+            eval_config.max_tokens = EVALUATOR_MAX_TOKENS;
+            let label = format!("local · {} @ {}", model, base_url);
+            let provider = create_openai_compatible_provider_with_timeout(
+                &eval_config,
+                &base_url,
+                &model,
+                request_timeout,
+            );
+            return Ok(EvaluatorProviderBundle { provider, label });
+        }
+    }
     let key = config
         .perplexity_api_key
         .as_deref()
@@ -291,16 +340,21 @@ pub fn create_evaluator_provider(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             FinallyAValueBotError::Config(
-                "PERPLEXITY_API_KEY is required when post-tool or post-delivery evaluators are enabled"
+                "No evaluator provider: configure local multimodel (MULTIMODEL_LOCAL_* or tier URLs) or set PERPLEXITY_API_KEY"
                     .into(),
             )
         })?;
     let mut eval_config = config.clone();
+    eval_config.max_tokens = EVALUATOR_MAX_TOKENS;
     eval_config.llm_provider = "openai".into();
     eval_config.api_key = key.to_string();
     eval_config.model = config.evaluator_model.clone();
     eval_config.llm_base_url = Some(config.evaluator_base_url.clone());
-    Ok(create_provider(&eval_config))
+    let label = format!("perplexity · {}", config.evaluator_model);
+    Ok(EvaluatorProviderBundle {
+        provider: create_provider(&eval_config),
+        label,
+    })
 }
 
 /// Hot-swappable main agent LLM (model changes from Web UI without full process restart).

@@ -62,7 +62,14 @@ export type LlmCatalogModel = {
 export type RuntimeConfigResponse = {
   ok?: boolean
   tool_output_debug?: boolean
+  post_tool_evaluator_enabled?: boolean
+  response_quality_evaluator_enabled?: boolean
   source?: 'env' | 'app_settings'
+  sources?: {
+    tool_output_debug?: 'env' | 'app_settings'
+    post_tool_evaluator_enabled?: 'env' | 'app_settings'
+    response_quality_evaluator_enabled?: 'env' | 'app_settings'
+  }
   description?: string
   message?: string
 }
@@ -141,6 +148,10 @@ export type AgentHistoryOptimizeResponse = {
   job_id?: string
   filename?: string
   message?: string
+}
+
+export type AgentHistoryOptimizeRequest = {
+  operator_notes?: string
 }
 
 /** Redacted row from `GET /api/channel_bot_instances`. */

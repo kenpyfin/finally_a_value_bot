@@ -1607,3 +1607,42 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   background: var(--mc-bg-panel);
   padding-bottom: 0.25rem;
 }
+
+.mc-eval-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+}
+
+.mc-eval-badge--pass {
+  background: color-mix(in srgb, var(--mc-accent) 18%, transparent);
+  color: var(--mc-accent);
+}
+
+.mc-eval-badge--fail {
+  background: color-mix(in srgb, var(--mc-warning) 20%, transparent);
+  color: var(--mc-warning);
+}
+
+.mc-eval-badge--skip {
+  background: color-mix(in srgb, var(--mc-text-faint) 22%, transparent);
+  color: var(--mc-text-secondary);
+}
+
+.mc-eval-badge--neutral {
+  background: color-mix(in srgb, var(--mc-border-strong) 35%, transparent);
+  color: var(--mc-text-secondary);
+}
+
+.mc-eval-issues li {
+  margin-bottom: 0.25rem;
+}
+
+.mc-eval-feedback {
+  margin-top: 0.25rem;
+}

@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::agent_history::{
     format_initial_llm_snapshot_json, truncate_preview, write_agent_history_run, AgentRunRecord,
-    IterationRecord, ToolCallRecord,
+    EvaluatorStepRecord, IterationRecord, ToolCallRecord,
 };
 use crate::background_jobs::BackgroundJobControl;
 use crate::chat_queue::{ChatRunQueue, QueueEnqueueMeta, QueueSource};
@@ -33,7 +33,7 @@ use crate::memory::{
     enrich_persona_memory_for_prompt, render_identity_and_tier1_for_system, render_memory_for_llm,
     render_persona_context_memory_with_options, MemoryPromptBuildOptions,
 };
-use crate::post_tool_evaluator::{evaluate_completion, PteAction};
+use crate::post_tool_evaluator::{evaluate_completion, pte_action_name, PteAction, PteResult};
 use crate::safety_redaction::EnvSecretRedactor;
 use crate::skills::SkillManager;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
@@ -461,13 +461,18 @@ pub async fn run_bot(
 
     let mut config = config;
     config.merge_llm_model_from_app_settings(&db)?;
-    let tool_output_debug =
-        crate::runtime_toggles::RuntimeToggles::merge_tool_output_debug_from_app_settings(
-            config.tool_output_debug,
-            &db,
-        )?;
-    config.tool_output_debug = tool_output_debug;
-    let runtime_toggles = crate::runtime_toggles::RuntimeToggles::new(tool_output_debug);
+    let toggle_init = crate::runtime_toggles::RuntimeToggles::merge_from_app_settings(
+        crate::runtime_toggles::RuntimeToggleInit {
+            tool_output_debug: config.tool_output_debug,
+            post_tool_evaluator_enabled: config.post_tool_evaluator_enabled,
+            response_quality_evaluator_enabled: config.response_quality_evaluator_enabled,
+        },
+        &db,
+    )?;
+    config.tool_output_debug = toggle_init.tool_output_debug;
+    config.post_tool_evaluator_enabled = toggle_init.post_tool_evaluator_enabled;
+    config.response_quality_evaluator_enabled = toggle_init.response_quality_evaluator_enabled;
+    let runtime_toggles = crate::runtime_toggles::RuntimeToggles::from_init(toggle_init);
     let llm = crate::llm::LlmHandle::new(&config);
     if let Ok(mm_cfg) = crate::multimodel::load_from_db(&db) {
         if let Err(e) = llm.apply_multimodel_config(mm_cfg) {
@@ -2310,6 +2315,7 @@ pub async fn process_with_agent_with_events(
     let mut deferred_commitment_nudges: usize = 0;
     let mut agent_history_basename: Option<String> = None;
     let mut pdqe_retries: usize = 0;
+    let mut pdqe_steps: Vec<EvaluatorStepRecord> = Vec::new();
 
     macro_rules! save_run_history {
         ($stop_reason:expr) => {{
@@ -2320,6 +2326,7 @@ pub async fn process_with_agent_with_events(
                 user_message_preview: user_msg_preview.clone(),
                 total_iterations: history_iterations.len(),
                 iterations: std::mem::take(&mut history_iterations),
+                pdqe_steps: std::mem::take(&mut pdqe_steps),
                 stop_reason: stop_reason_owned.clone(),
                 total_duration_ms: run_start.elapsed().as_millis(),
                 initial_llm_snapshot: Some(initial_llm_snapshot_json.clone()),
@@ -2408,6 +2415,7 @@ pub async fn process_with_agent_with_events(
                     &mut messages,
                     protected_message_count,
                     &mut pdqe_retries,
+                    &mut pdqe_steps,
                     &mut history_iterations,
                     &principles_content,
                     is_conversational,
@@ -2537,6 +2545,7 @@ pub async fn process_with_agent_with_events(
                         &mut messages,
                         protected_message_count,
                         &mut pdqe_retries,
+                        &mut pdqe_steps,
                         &mut history_iterations,
                         &principles_content,
                         is_conversational,
@@ -2573,6 +2582,7 @@ pub async fn process_with_agent_with_events(
                         &mut messages,
                         protected_message_count,
                         &mut pdqe_retries,
+                        &mut pdqe_steps,
                         &mut history_iterations,
                         &principles_content,
                         is_conversational,
@@ -2777,6 +2787,7 @@ pub async fn process_with_agent_with_events(
                 assistant_text_preview: assistant_text_preview.clone(),
                 tool_calls: Vec::new(),
                 hook_events: Vec::new(),
+                pte: None,
                 model_tier: tier_label.clone(),
                 provider: tier_provider.clone(),
                 model: tier_model.clone(),
@@ -3166,6 +3177,7 @@ pub async fn process_with_agent_with_events(
                                 &mut messages,
                                 protected_message_count,
                                 &mut pdqe_retries,
+                                &mut pdqe_steps,
                                 &mut history_iterations,
                                 &principles_content,
                                 is_conversational,
@@ -3407,6 +3419,7 @@ pub async fn process_with_agent_with_events(
                 assistant_text_preview: assistant_text_preview.clone(),
                 tool_calls: history_tool_calls,
                 hook_events: history_hook_events.clone(),
+                pte: None,
                 model_tier: tier_label.clone(),
                 provider: tier_provider.clone(),
                 model: tier_model.clone(),
@@ -3602,7 +3615,7 @@ pub async fn process_with_agent_with_events(
 
             // Post-Tool Evaluator: check if task is complete after tool execution
             if !iteration_timed_out {
-                if state.config.post_tool_evaluator_enabled {
+                if state.runtime_toggles.post_tool_evaluator_enabled() {
                     info!(
                         "Main agent iteration {}/{}: PTE evaluating task completion",
                         iteration + 1,
@@ -3612,7 +3625,9 @@ pub async fn process_with_agent_with_events(
                 let pte_start = std::time::Instant::now();
                 match await_with_cancel(
                     evaluate_completion(
+                        state.runtime_toggles.post_tool_evaluator_enabled(),
                         &state.config,
+                        Some(&state.llm.multimodel_config()),
                         state.env_redactor.as_ref(),
                         &principles_content,
                         &pte_memory_prose,
@@ -3631,48 +3646,55 @@ pub async fn process_with_agent_with_events(
                         );
                         finish_turn!("cancelled", "Run cancelled.".to_string());
                     }
-                    Ok(Ok(pte_result)) if pte_result.action == PteAction::Complete => {
-                        info!(
+                    Ok(Ok(pte_result)) => {
+                        record_pte_on_last_iteration(
+                            &mut history_iterations,
+                            &pte_result,
+                            pte_start.elapsed().as_millis(),
+                        );
+                        match pte_result.action {
+                            PteAction::Complete => {
+                                info!(
                             "Main agent iteration {}/{}: PTE decision=COMPLETE in {}ms, reason=\"{}\" — synthesizing final response",
                             iteration + 1,
                             state.config.max_tool_iterations,
                             pte_start.elapsed().as_millis(),
                             pte_result.reason
                         );
-                        let synth_start = std::time::Instant::now();
-                        let final_response = match await_with_cancel(
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                                state.llm.send_message_for_tier(
-                                    crate::multimodel::ModelTier::Strategy,
-                                    &system_prompt,
-                                    messages.clone(),
-                                    None,
-                                ),
-                            ),
-                            cancel.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(Ok(r))) => r,
-                            Ok(Ok(Err(e))) => {
-                                info!(
+                                let synth_start = std::time::Instant::now();
+                                let final_response = match await_with_cancel(
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
+                                        state.llm.send_message_for_tier(
+                                            crate::multimodel::ModelTier::Strategy,
+                                            &system_prompt,
+                                            messages.clone(),
+                                            None,
+                                        ),
+                                    ),
+                                    cancel.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(Ok(r))) => r,
+                                    Ok(Ok(Err(e))) => {
+                                        info!(
                                     "Main agent iteration {}/{}: PTE synthesis LLM error after {}ms: {}",
                                     iteration + 1,
                                     state.config.max_tool_iterations,
                                     synth_start.elapsed().as_millis(),
                                     e
                                 );
-                                return Err(e.into());
-                            }
-                            Ok(Err(_)) => {
-                                info!(
+                                        return Err(e.into());
+                                    }
+                                    Ok(Err(_)) => {
+                                        info!(
                                     "Main agent iteration {}/{}: PTE synthesis LLM timed out after {}s",
                                     iteration + 1,
                                     state.config.max_tool_iterations,
                                     LLM_ROUND_TIMEOUT_SECS
                                 );
-                                if let Some(r) = try_finish_agent_turn(
+                                        if let Some(r) = try_finish_agent_turn(
                                     state,
                                     &context,
                                     event_tx,
@@ -3686,6 +3708,7 @@ pub async fn process_with_agent_with_events(
                                     &mut messages,
                                     protected_message_count,
                                     &mut pdqe_retries,
+                                    &mut pdqe_steps,
                                     &mut history_iterations,
                                     &principles_content,
                                     is_conversational,
@@ -3701,57 +3724,58 @@ pub async fn process_with_agent_with_events(
                                 {
                                     return Ok(r);
                                 }
-                                continue 'agent_loop;
-                            }
-                            Err(()) => {
-                                info!(
+                                        continue 'agent_loop;
+                                    }
+                                    Err(()) => {
+                                        info!(
                                     "Main agent iteration {}/{}: PTE synthesis interrupted by cancel request",
                                     iteration + 1,
                                     state.config.max_tool_iterations
                                 );
-                                if let Some(r) = try_finish_agent_turn(
-                                    state,
-                                    &context,
-                                    event_tx,
-                                    &run_key,
-                                    chat_id,
-                                    persona_id,
-                                    "cancelled",
-                                    "Run cancelled.".to_string(),
-                                    &system_prompt,
-                                    &mut messages,
-                                    protected_message_count,
-                                    &mut pdqe_retries,
-                                    &mut history_iterations,
-                                    &principles_content,
-                                    is_conversational,
-                                    &run_tool_names,
-                                    &mut agent_history_basename,
-                                    iteration > 0,
-                                    &user_msg_preview,
-                                    run_start,
-                                    &initial_llm_snapshot_json,
-                                    &multimodel_run_summary,
-                                )
-                                .await?
-                                {
-                                    return Ok(r);
-                                }
-                                continue 'agent_loop;
-                            }
-                        };
+                                        if let Some(r) = try_finish_agent_turn(
+                                            state,
+                                            &context,
+                                            event_tx,
+                                            &run_key,
+                                            chat_id,
+                                            persona_id,
+                                            "cancelled",
+                                            "Run cancelled.".to_string(),
+                                            &system_prompt,
+                                            &mut messages,
+                                            protected_message_count,
+                                            &mut pdqe_retries,
+                                            &mut pdqe_steps,
+                                            &mut history_iterations,
+                                            &principles_content,
+                                            is_conversational,
+                                            &run_tool_names,
+                                            &mut agent_history_basename,
+                                            iteration > 0,
+                                            &user_msg_preview,
+                                            run_start,
+                                            &initial_llm_snapshot_json,
+                                            &multimodel_run_summary,
+                                        )
+                                        .await?
+                                        {
+                                            return Ok(r);
+                                        }
+                                        continue 'agent_loop;
+                                    }
+                                };
 
-                        let text = final_response
-                            .content
-                            .iter()
-                            .filter_map(|block| match block {
-                                ResponseContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
+                                let text = final_response
+                                    .content
+                                    .iter()
+                                    .filter_map(|block| match block {
+                                        ResponseContentBlock::Text { text } => Some(text.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
 
-                        info!(
+                                info!(
                             "Main agent iteration {}/{}: PTE synthesis completed in {}ms, response_len={}",
                             iteration + 1,
                             state.config.max_tool_iterations,
@@ -3759,77 +3783,92 @@ pub async fn process_with_agent_with_events(
                             text.len()
                         );
 
-                        let pte_snap = state
-                            .llm
-                            .tier_endpoint_snapshot(crate::multimodel::ModelTier::Strategy);
-                        if let Some(last) = history_iterations.last_mut() {
-                            last.hook_events
-                                .push(format!("PTE synthesis: {}", pte_snap.format_tier_line()));
-                        }
+                                let pte_snap = state
+                                    .llm
+                                    .tier_endpoint_snapshot(crate::multimodel::ModelTier::Strategy);
+                                if let Some(last) = history_iterations.last_mut() {
+                                    last.hook_events.push(format!(
+                                        "PTE synthesis: {}",
+                                        pte_snap.format_tier_line()
+                                    ));
+                                }
 
-                        messages.push(Message {
-                            role: "assistant".into(),
-                            content: MessageContent::Text(text.clone()),
-                        });
-                        let display_text = if state.config.show_thinking {
-                            text
-                        } else {
-                            strip_thinking(&text)
-                        };
-                        let guarded_text = apply_output_safeguards(
-                            &display_text,
-                            &state.config,
-                            state.env_redactor.as_ref(),
-                        );
-                        let final_text = if guarded_text.trim().is_empty() {
-                            "Done.".to_string()
-                        } else {
-                            guarded_text
-                        };
-                        info!(
+                                messages.push(Message {
+                                    role: "assistant".into(),
+                                    content: MessageContent::Text(text.clone()),
+                                });
+                                let display_text = if state.config.show_thinking {
+                                    text
+                                } else {
+                                    strip_thinking(&text)
+                                };
+                                let guarded_text = apply_output_safeguards(
+                                    &display_text,
+                                    &state.config,
+                                    state.env_redactor.as_ref(),
+                                );
+                                let final_text = if guarded_text.trim().is_empty() {
+                                    "Done.".to_string()
+                                } else {
+                                    guarded_text
+                                };
+                                info!(
                             "Main agent finishing (PTE complete): final_response_len={}, total_iterations={}",
                             final_text.len(),
                             iteration + 1
                         );
-                        finish_turn!("pte_complete", final_text);
-                    }
-                    Ok(Ok(pte_result)) if pte_result.action == PteAction::AskUser => {
-                        let ask_text = format!(
+                                finish_turn!("pte_complete", final_text);
+                            }
+                            PteAction::AskUser => {
+                                let ask_text = format!(
                             "I paused because progress is stalled: {}. Choose: retry now, wait, or adjust the request.",
                             pte_result.reason
                         );
-                        finish_turn!("pte_ask_user", ask_text);
-                    }
-                    Ok(Ok(pte_result)) if pte_result.action == PteAction::StopWithSummary => {
-                        let summary_text = format!(
-                            "I stopped this run to avoid repeated no-progress loops. {}",
-                            pte_result.reason
-                        );
-                        finish_turn!("pte_stop_with_summary", summary_text);
-                    }
-                    Ok(Ok(pte_result)) if pte_result.action == PteAction::HandoffBackground => {
-                        if context.caller_channel == "web" && !context.is_background_job {
-                            finish_turn!(
-                                "pte_background_handoff",
-                                format!(
-                                    "{}\npte_handoff\n{}",
-                                    BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview
-                                )
-                            );
-                        }
-                    }
-                    Ok(Ok(pte_result)) => {
-                        if state.config.post_tool_evaluator_enabled {
-                            info!(
+                                finish_turn!("pte_ask_user", ask_text);
+                            }
+                            PteAction::StopWithSummary => {
+                                let summary_text = format!(
+                                    "I stopped this run to avoid repeated no-progress loops. {}",
+                                    pte_result.reason
+                                );
+                                finish_turn!("pte_stop_with_summary", summary_text);
+                            }
+                            PteAction::HandoffBackground => {
+                                if context.caller_channel == "web" && !context.is_background_job {
+                                    finish_turn!(
+                                        "pte_background_handoff",
+                                        format!(
+                                            "{}\npte_handoff\n{}",
+                                            BACKGROUND_JOB_HANDOFF_PREFIX, user_msg_preview
+                                        )
+                                    );
+                                }
+                            }
+                            PteAction::Continue => {
+                                if state.runtime_toggles.post_tool_evaluator_enabled() {
+                                    info!(
                                 "Main agent iteration {}/{}: PTE decision=CONTINUE in {}ms, reason=\"{}\"",
                                 iteration + 1,
                                 state.config.max_tool_iterations,
                                 pte_start.elapsed().as_millis(),
                                 pte_result.reason
                             );
+                                }
+                            }
                         }
                     }
                     Ok(Err(e)) => {
+                        record_pte_on_last_iteration(
+                            &mut history_iterations,
+                            &PteResult {
+                                action: PteAction::Continue,
+                                reason: e.to_string(),
+                                provider_label: None,
+                                disabled: false,
+                                provider_skipped: true,
+                            },
+                            pte_start.elapsed().as_millis(),
+                        );
                         info!(
                             "Main agent iteration {}/{}: PTE evaluation FAILED in {}ms, continuing: {}",
                             iteration + 1,
@@ -3930,6 +3969,7 @@ pub async fn process_with_agent_with_events(
             assistant_text_preview: assistant_text_preview.clone(),
             tool_calls: Vec::new(),
             hook_events: Vec::new(),
+            pte: None,
             model_tier: tier_label.clone(),
             provider: tier_provider.clone(),
             model: tier_model.clone(),
@@ -3972,6 +4012,7 @@ pub async fn process_with_agent_with_events(
         &mut messages,
         protected_message_count,
         &mut pdqe_retries,
+        &mut pdqe_steps,
         &mut history_iterations,
         &principles_content,
         is_conversational,
@@ -3998,6 +4039,47 @@ enum FinishTurnOutcome {
     Retry,
 }
 
+fn record_pte_on_last_iteration(
+    history_iterations: &mut Vec<IterationRecord>,
+    pte_result: &PteResult,
+    duration_ms: u128,
+) {
+    let pte = if pte_result.disabled {
+        EvaluatorStepRecord::pte_disabled()
+    } else if pte_result.provider_skipped {
+        EvaluatorStepRecord::pte_skipped(&pte_result.reason)
+    } else {
+        let provider_label = pte_result.provider_label.as_deref().unwrap_or_default();
+        let label = if provider_label.is_empty()
+            && matches!(
+                pte_result.action,
+                PteAction::AskUser | PteAction::StopWithSummary
+            ) {
+            "heuristic"
+        } else {
+            provider_label
+        };
+        EvaluatorStepRecord::pte_decision(
+            pte_action_name(&pte_result.action),
+            duration_ms,
+            &pte_result.reason,
+            label,
+        )
+    };
+    if let Some(last) = history_iterations.last_mut() {
+        last.pte = Some(pte);
+    }
+}
+
+fn push_pdqe_step(
+    pdqe_steps: &mut Vec<EvaluatorStepRecord>,
+    step: &str,
+    detail: &str,
+    provider_label: &str,
+) {
+    pdqe_steps.push(EvaluatorStepRecord::pdqe(step, detail, provider_label));
+}
+
 async fn try_finish_agent_turn(
     state: &AppState,
     context: &AgentRequestContext<'_>,
@@ -4011,6 +4093,7 @@ async fn try_finish_agent_turn(
     messages: &mut Vec<Message>,
     protected_message_count: usize,
     pdqe_retries: &mut usize,
+    pdqe_steps: &mut Vec<EvaluatorStepRecord>,
     history_iterations: &mut Vec<IterationRecord>,
     principles_content: &str,
     is_conversational: bool,
@@ -4036,6 +4119,7 @@ async fn try_finish_agent_turn(
         messages,
         protected_message_count,
         pdqe_retries,
+        pdqe_steps,
         history_iterations,
         principles_content,
         is_conversational,
@@ -4067,6 +4151,7 @@ async fn finish_turn_with_quality_gate(
     messages: &mut Vec<Message>,
     protected_message_count: usize,
     pdqe_retries: &mut usize,
+    pdqe_steps: &mut Vec<EvaluatorStepRecord>,
     history_iterations: &mut Vec<IterationRecord>,
     principles_content: &str,
     is_conversational: bool,
@@ -4130,7 +4215,18 @@ async fn finish_turn_with_quality_gate(
         runtime_data_dir: state.config.runtime_data_dir(),
     };
 
-    if crate::response_quality_evaluator::should_skip_pdqe(&state.config, &pdqe_ctx).is_none() {
+    if crate::response_quality_evaluator::should_skip_pdqe(
+        state.runtime_toggles.response_quality_evaluator_enabled(),
+        &state.config,
+        &pdqe_ctx,
+    )
+    .is_none()
+    {
+        let provider_label = crate::llm::resolve_evaluator_provider_label(
+            &state.config,
+            Some(&state.llm.multimodel_config()),
+        );
+        push_pdqe_step(pdqe_steps, "quality_eval_started", "", &provider_label);
         crate::response_quality_evaluator::append_quality_timeline(
             state.db.clone(),
             run_key,
@@ -4142,13 +4238,21 @@ async fn finish_turn_with_quality_gate(
         .await;
 
         match crate::response_quality_evaluator::evaluate_delivery_quality(
+            state.runtime_toggles.response_quality_evaluator_enabled(),
             &state.config,
+            Some(&state.llm.multimodel_config()),
             state.env_redactor.as_ref(),
             &pdqe_ctx,
         )
         .await
         {
-            Ok(verdict) => {
+            Ok(outcome) => {
+                let verdict = outcome.verdict;
+                let eval_provider_label = if outcome.provider_label.is_empty() {
+                    provider_label.as_str()
+                } else {
+                    outcome.provider_label.as_str()
+                };
                 let payload = serde_json::json!({
                     "verdict": format!("{:?}", verdict.kind),
                     "confidence": verdict.confidence,
@@ -4166,10 +4270,13 @@ async fn finish_turn_with_quality_gate(
                             &payload,
                         )
                         .await;
-                        crate::response_quality_evaluator::log_pdqe_to_agent_history(
-                            &pdqe_ctx,
+                        push_pdqe_step(
+                            pdqe_steps,
                             "quality_eval_pass",
-                            &format!("confidence={}", verdict.confidence),
+                            &crate::response_quality_evaluator::format_pdqe_verdict_detail(
+                                &verdict, None,
+                            ),
+                            eval_provider_label,
                         );
                     }
                     crate::response_quality_evaluator::QualityVerdictKind::Fail => {
@@ -4184,13 +4291,17 @@ async fn finish_turn_with_quality_gate(
                                     &session_goal,
                                     &verdict,
                                 );
-                            crate::response_quality_evaluator::log_pdqe_to_agent_history(
-                                &pdqe_ctx,
+                            push_pdqe_step(
+                                pdqe_steps,
                                 "quality_eval_fail",
-                                &format!(
-                                    "retry={}/{} confidence={}",
-                                    pdqe_retries, max_nudges, verdict.confidence
+                                &crate::response_quality_evaluator::format_pdqe_verdict_detail(
+                                    &verdict,
+                                    Some(&format!(
+                                        "retry {}/{} triggered",
+                                        pdqe_retries, max_nudges
+                                    )),
                                 ),
+                                eval_provider_label,
                             );
                             crate::response_quality_evaluator::append_quality_timeline(
                                 state.db.clone(),
@@ -4217,23 +4328,39 @@ async fn finish_turn_with_quality_gate(
                             confidence = verdict.confidence,
                             "PDQE fail: delivering last candidate (budget exhausted or low confidence)"
                         );
-                        crate::response_quality_evaluator::log_pdqe_to_agent_history(
-                            &pdqe_ctx,
+                        push_pdqe_step(
+                            pdqe_steps,
                             "quality_eval_fail_deliver_anyway",
-                            &format!("confidence={}", verdict.confidence),
+                            &crate::response_quality_evaluator::format_pdqe_verdict_detail(
+                                &verdict,
+                                Some("delivered anyway (retry budget exhausted or low confidence)"),
+                            ),
+                            eval_provider_label,
                         );
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("PDQE evaluation failed (fail-open): {e}");
-                crate::response_quality_evaluator::log_pdqe_to_agent_history(
-                    &pdqe_ctx,
+                push_pdqe_step(
+                    pdqe_steps,
                     "quality_eval_error",
-                    &e.to_string(),
+                    &serde_json::json!({ "error": e.to_string() }).to_string(),
+                    &provider_label,
                 );
             }
         }
+    } else if let Some(skip_reason) = crate::response_quality_evaluator::should_skip_pdqe(
+        state.runtime_toggles.response_quality_evaluator_enabled(),
+        &state.config,
+        &pdqe_ctx,
+    ) {
+        push_pdqe_step(
+            pdqe_steps,
+            "quality_eval_skipped",
+            &serde_json::json!({ "reason": skip_reason }).to_string(),
+            "",
+        );
     }
 
     if should_run_focus_sync {
@@ -4264,6 +4391,7 @@ async fn finish_turn_with_quality_gate(
         user_message_preview: user_msg_preview.to_string(),
         total_iterations: history_iterations.len(),
         iterations: std::mem::take(history_iterations),
+        pdqe_steps: std::mem::take(pdqe_steps),
         stop_reason: stop_reason_owned.clone(),
         total_duration_ms: run_start.elapsed().as_millis(),
         initial_llm_snapshot: Some(initial_llm_snapshot_json.to_string()),

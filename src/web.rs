@@ -2752,6 +2752,12 @@ struct PersonaMemoryPathParams {
     persona_id: i64,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AgentHistoryOptimizeRequest {
+    #[serde(default)]
+    operator_notes: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct PersonaBookmarkPathParams {
     persona_id: i64,
@@ -4252,6 +4258,7 @@ async fn api_persona_agent_history_optimize(
     headers: HeaderMap,
     State(state): State<WebState>,
     Path(path): Path<PersonaMemoryPathParams>,
+    body: Option<Json<AgentHistoryOptimizeRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
@@ -4296,6 +4303,17 @@ async fn api_persona_agent_history_optimize(
         }
     };
 
+    let operator_notes = body
+        .and_then(|Json(req)| req.operator_notes)
+        .and_then(|notes| {
+            let trimmed = notes.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+
     let app_state = state.app_state.clone();
     match crate::run_optimizer::try_enqueue_run_optimize(
         app_state,
@@ -4303,6 +4321,7 @@ async fn api_persona_agent_history_optimize(
         pid,
         history.filename.clone(),
         history.content,
+        operator_notes,
     )
     .await
     {
@@ -4949,7 +4968,12 @@ struct LlmModelPatchRequest {
 
 #[derive(Debug, Deserialize)]
 struct RuntimePatchRequest {
-    tool_output_debug: bool,
+    #[serde(default)]
+    tool_output_debug: Option<bool>,
+    #[serde(default)]
+    post_tool_evaluator_enabled: Option<bool>,
+    #[serde(default)]
+    response_quality_evaluator_enabled: Option<bool>,
 }
 
 async fn api_runtime_get(
@@ -4957,16 +4981,29 @@ async fn api_runtime_get(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let from_app = call_blocking(state.app_state.db.clone(), |db| {
-        crate::runtime_toggles::RuntimeToggles::tool_output_debug_from_app_settings(db)
+    let sources = call_blocking(state.app_state.db.clone(), |db| {
+        Ok::<_, crate::error::FinallyAValueBotError>((
+            crate::runtime_toggles::RuntimeToggles::tool_output_debug_from_app_settings(db)?,
+            crate::runtime_toggles::RuntimeToggles::post_tool_evaluator_from_app_settings(db)?,
+            crate::runtime_toggles::RuntimeToggles::response_quality_evaluator_from_app_settings(
+                db,
+            )?,
+        ))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let toggles = &state.app_state.runtime_toggles;
     Ok(Json(json!({
         "ok": true,
-        "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
-        "source": if from_app { "app_settings" } else { "env" },
+        "tool_output_debug": toggles.tool_output_debug(),
+        "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
+        "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
+        "sources": {
+            "tool_output_debug": if sources.0 { "app_settings" } else { "env" },
+            "post_tool_evaluator_enabled": if sources.1 { "app_settings" } else { "env" },
+            "response_quality_evaluator_enabled": if sources.2 { "app_settings" } else { "env" },
+        },
         "description": "When enabled, verbose shell output is shown in chat (including background-job completion). When off, full logs are agent-only.",
     })))
 }
@@ -4977,26 +5014,65 @@ async fn api_runtime_patch(
     Json(body): Json<RuntimePatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let enabled = body.tool_output_debug;
-    state
-        .app_state
-        .runtime_toggles
-        .set_tool_output_debug(enabled);
-    call_blocking(state.app_state.db.clone(), move |db| {
-        crate::runtime_toggles::RuntimeToggles::persist_tool_output_debug(db, enabled)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let toggles = &state.app_state.runtime_toggles;
+    let mut messages: Vec<&str> = Vec::new();
+
+    if let Some(enabled) = body.tool_output_debug {
+        toggles.set_tool_output_debug(enabled);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_tool_output_debug(db, enabled)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(if enabled {
+            "Verbose pipeline logging enabled."
+        } else {
+            "Verbose pipeline logging disabled."
+        });
+    }
+    if let Some(enabled) = body.post_tool_evaluator_enabled {
+        toggles.set_post_tool_evaluator_enabled(enabled);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_post_tool_evaluator_enabled(db, enabled)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(if enabled {
+            "Post-tool evaluator (PTE) enabled."
+        } else {
+            "Post-tool evaluator (PTE) disabled."
+        });
+    }
+    if let Some(enabled) = body.response_quality_evaluator_enabled {
+        toggles.set_response_quality_evaluator_enabled(enabled);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_response_quality_evaluator_enabled(
+                db, enabled,
+            )
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(if enabled {
+            "Pre-delivery quality evaluator (PDQE) enabled."
+        } else {
+            "Pre-delivery quality evaluator (PDQE) disabled."
+        });
+    }
+
+    if messages.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No runtime toggle fields provided".to_string(),
+        ));
+    }
 
     Ok(Json(json!({
         "ok": true,
-        "tool_output_debug": enabled,
+        "tool_output_debug": toggles.tool_output_debug(),
+        "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
+        "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
         "source": "app_settings",
-        "message": if enabled {
-            "Verbose pipeline logging enabled: shell output visible in chat."
-        } else {
-            "Verbose pipeline logging disabled: shell output agent-only in chat."
-        },
+        "message": messages.join(" "),
     })))
 }
 
@@ -5378,6 +5454,16 @@ async fn api_settings_get(
             !s.key
                 .eq_ignore_ascii_case(crate::runtime_toggles::APP_SETTING_TOOL_OUTPUT_DEBUG)
         })
+        .filter(|s| {
+            !s.key.eq_ignore_ascii_case(
+                crate::runtime_toggles::APP_SETTING_POST_TOOL_EVALUATOR_ENABLED,
+            )
+        })
+        .filter(|s| {
+            !s.key.eq_ignore_ascii_case(
+                crate::runtime_toggles::APP_SETTING_RESPONSE_QUALITY_EVALUATOR_ENABLED,
+            )
+        })
         .map(|s| {
             let secret = setting_is_secret(&s.key);
             json!({
@@ -5424,6 +5510,8 @@ async fn api_settings_get(
             "runtime_env_merge_from_app_settings": true,
             "llm_model_from_app_settings": true,
             "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
+            "post_tool_evaluator_enabled": state.app_state.runtime_toggles.post_tool_evaluator_enabled(),
+            "response_quality_evaluator_enabled": state.app_state.runtime_toggles.response_quality_evaluator_enabled(),
         }
     })))
 }

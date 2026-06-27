@@ -213,6 +213,22 @@ fn check_llm_provider_base_url(report: &mut DoctorReport) {
     }
 }
 
+fn evaluator_local_endpoint_from_env() -> Option<(String, String)> {
+    let mm = crate::multimodel::MultimodelConfig {
+        local_base_url: std::env::var(crate::multimodel::APP_SETTING_LOCAL_BASE_URL)
+            .unwrap_or_default(),
+        local_model: std::env::var(crate::multimodel::APP_SETTING_LOCAL_MODEL).unwrap_or_default(),
+        tier1_base_url: std::env::var(crate::multimodel::APP_SETTING_TIER1_BASE_URL)
+            .unwrap_or_default(),
+        tier1_model: std::env::var(crate::multimodel::APP_SETTING_TIER1_MODEL).unwrap_or_default(),
+        tier2_base_url: std::env::var(crate::multimodel::APP_SETTING_TIER2_BASE_URL)
+            .unwrap_or_default(),
+        tier2_model: std::env::var(crate::multimodel::APP_SETTING_TIER2_MODEL).unwrap_or_default(),
+        ..crate::multimodel::MultimodelConfig::default()
+    };
+    crate::multimodel::resolve_local_evaluator_endpoint(&mm)
+}
+
 fn check_evaluator_api_key(report: &mut DoctorReport) {
     let Ok(config) = Config::load() else {
         return;
@@ -221,26 +237,37 @@ fn check_evaluator_api_key(report: &mut DoctorReport) {
     if !needs_key {
         return;
     }
-    let configured = config
+    let local_ready = evaluator_local_endpoint_from_env().is_some();
+    let perplexity_configured = config
         .perplexity_api_key
         .as_ref()
         .is_some_and(|k| !k.trim().is_empty());
-    if configured {
+    if local_ready {
+        report.push(
+            "evaluator.local",
+            "Local evaluator endpoint (PTE/PDQE)",
+            CheckStatus::Pass,
+            "Local multimodel endpoint configured (preferred for PTE/PDQE)".to_string(),
+            None,
+        );
+    }
+    if perplexity_configured {
         report.push(
             "evaluator.perplexity_key",
-            "Perplexity API key (PTE/PDQE)",
+            "Perplexity API key (PTE/PDQE fallback)",
             CheckStatus::Pass,
             "PERPLEXITY_API_KEY is set".to_string(),
             None,
         );
-    } else {
+    } else if !local_ready {
         report.push(
-            "evaluator.perplexity_key",
-            "Perplexity API key (PTE/PDQE)",
+            "evaluator.provider",
+            "Evaluator provider (PTE/PDQE)",
             CheckStatus::Warn,
-            "PERPLEXITY_API_KEY is missing".to_string(),
+            "No local multimodel endpoint and PERPLEXITY_API_KEY is missing".to_string(),
             Some(
-                "Post-tool and post-delivery evaluators use Perplexity (EVALUATOR_MODEL/EVALUATOR_BASE_URL); set PERPLEXITY_API_KEY in .env.".to_string(),
+                "Configure MULTIMODEL_LOCAL_* (or tier URLs) or set PERPLEXITY_API_KEY for PTE/PDQE."
+                    .to_string(),
             ),
         );
     }

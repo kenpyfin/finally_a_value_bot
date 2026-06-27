@@ -14,11 +14,11 @@ use crate::config::Config;
 use crate::db::call_blocking;
 use crate::db::Database;
 use crate::error::FinallyAValueBotError;
-use crate::llm;
+use crate::llm::{self, EVALUATOR_TIMEOUT_SECS};
 use crate::post_tool_evaluator::build_tool_results_summary;
 use crate::safety_redaction::EnvSecretRedactor;
 
-const EVAL_TIMEOUT_SECS: u64 = 60;
+const EVAL_TIMEOUT_SECS: u64 = EVALUATOR_TIMEOUT_SECS;
 const PDQE_TOOL_TRACE_MAX_MESSAGES: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,27 @@ pub struct QualityVerdict {
     pub issues: Vec<String>,
     pub feedback_for_agent: String,
     pub confidence: f64,
+}
+
+/// Structured JSON persisted in agent history PDQE `eval:` lines (web UI parses this).
+pub fn format_pdqe_verdict_detail(verdict: &QualityVerdict, note: Option<&str>) -> String {
+    let verdict_label = match verdict.kind {
+        QualityVerdictKind::Pass => "pass",
+        QualityVerdictKind::Fail => "fail",
+        QualityVerdictKind::Skip => "skip",
+    };
+    let mut obj = serde_json::json!({
+        "verdict": verdict_label,
+        "confidence": verdict.confidence,
+        "issues": verdict.issues,
+    });
+    if !verdict.feedback_for_agent.trim().is_empty() {
+        obj["feedback"] = serde_json::Value::String(verdict.feedback_for_agent.clone());
+    }
+    if let Some(note) = note.filter(|n| !n.trim().is_empty()) {
+        obj["note"] = serde_json::Value::String(note.to_string());
+    }
+    serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into())
 }
 
 /// Context for pre-delivery quality evaluation (in-loop gate).
@@ -68,8 +89,12 @@ pub fn quality_eval_channel_allowed(config: &Config, channel: &str) -> bool {
         .any(|allowed| allowed == ch)
 }
 
-pub fn should_skip_pdqe(config: &Config, ctx: &PostDeliveryEvalContext) -> Option<&'static str> {
-    if !config.response_quality_evaluator_enabled {
+pub fn should_skip_pdqe(
+    pdqe_enabled: bool,
+    config: &Config,
+    ctx: &PostDeliveryEvalContext,
+) -> Option<&'static str> {
+    if !pdqe_enabled {
         return Some("disabled");
     }
     if !quality_eval_channel_allowed(config, &ctx.caller_channel) {
@@ -215,25 +240,40 @@ fn fast_path_verdict(config: &Config, ctx: &PostDeliveryEvalContext) -> Option<Q
     None
 }
 
+#[derive(Debug, Clone)]
+pub struct QualityEvalOutcome {
+    pub verdict: QualityVerdict,
+    pub provider_label: String,
+}
+
 pub async fn evaluate_delivery_quality(
+    pdqe_enabled: bool,
     config: &Config,
+    multimodel: Option<&crate::multimodel::MultimodelConfig>,
     env_redactor: &EnvSecretRedactor,
     ctx: &PostDeliveryEvalContext,
-) -> Result<QualityVerdict, FinallyAValueBotError> {
-    if let Some(_reason) = should_skip_pdqe(config, ctx) {
-        return Ok(QualityVerdict {
-            kind: QualityVerdictKind::Skip,
-            issues: vec![],
-            feedback_for_agent: String::new(),
-            confidence: 0.0,
+) -> Result<QualityEvalOutcome, FinallyAValueBotError> {
+    if let Some(_reason) = should_skip_pdqe(pdqe_enabled, config, ctx) {
+        return Ok(QualityEvalOutcome {
+            verdict: QualityVerdict {
+                kind: QualityVerdictKind::Skip,
+                issues: vec![],
+                feedback_for_agent: String::new(),
+                confidence: 0.0,
+            },
+            provider_label: String::new(),
         });
     }
 
     if let Some(v) = fast_path_verdict(config, ctx) {
-        return Ok(v);
+        return Ok(QualityEvalOutcome {
+            verdict: v,
+            provider_label: String::new(),
+        });
     }
 
-    let provider = llm::create_evaluator_provider(config)?;
+    let provider_bundle = llm::create_evaluator_provider(config, multimodel)?;
+    let provider_label = provider_bundle.label.clone();
     let system = build_pdqe_system_prompt(&ctx.principles_excerpt);
     let user = build_pdqe_user_prompt(ctx);
     let messages = vec![Message {
@@ -243,10 +283,12 @@ pub async fn evaluate_delivery_quality(
 
     let response = tokio::time::timeout(
         Duration::from_secs(EVAL_TIMEOUT_SECS),
-        provider.send_message(&system, messages, None),
+        provider_bundle
+            .provider
+            .send_message(&system, messages, None),
     )
     .await
-    .map_err(|_| FinallyAValueBotError::Config("PDQE Perplexity call timed out".into()))??;
+    .map_err(|_| FinallyAValueBotError::Config("PDQE evaluator call timed out".into()))??;
 
     let text: String = response
         .content
@@ -259,7 +301,11 @@ pub async fn evaluate_delivery_quality(
         .join("");
 
     let _ = env_redactor;
-    parse_evaluator_json_response(&text)
+    let verdict = parse_evaluator_json_response(&text)?;
+    Ok(QualityEvalOutcome {
+        verdict,
+        provider_label,
+    })
 }
 
 pub fn log_pdqe_to_agent_history(ctx: &PostDeliveryEvalContext, step: &str, detail: &str) {
@@ -331,6 +377,22 @@ mod tests {
         let v = parse_evaluator_json_response(j).unwrap();
         assert_eq!(v.kind, QualityVerdictKind::Fail);
         assert_eq!(v.issues, vec!["incomplete"]);
+    }
+
+    #[test]
+    fn format_pdqe_verdict_detail_includes_issues_and_feedback() {
+        let detail = format_pdqe_verdict_detail(
+            &QualityVerdict {
+                kind: QualityVerdictKind::Fail,
+                issues: vec!["off-topic".into()],
+                feedback_for_agent: "Stay on current_request.".into(),
+                confidence: 0.88,
+            },
+            Some("retry 1/1 triggered"),
+        );
+        assert!(detail.contains("\"issues\""));
+        assert!(detail.contains("\"feedback\""));
+        assert!(detail.contains("\"note\""));
     }
 
     #[test]
