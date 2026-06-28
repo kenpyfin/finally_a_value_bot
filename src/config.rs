@@ -121,6 +121,26 @@ fn default_cursor_agent_timeout_secs() -> u64 {
     3600
 }
 
+pub(crate) fn default_cursor_sdk_model() -> String {
+    "composer-2.5".into()
+}
+
+fn default_cursor_sdk_runner_port() -> u16 {
+    3848
+}
+
+fn default_cursor_sdk_python() -> String {
+    "python3".into()
+}
+
+fn default_cursor_sdk_auto_start() -> bool {
+    true
+}
+
+fn default_cursor_sdk_auto_install() -> bool {
+    true
+}
+
 fn default_scheduler_task_timeout_secs() -> u64 {
     3600
 }
@@ -579,6 +599,24 @@ pub struct Config {
     /// URL of a host runner that executes cursor-agent (e.g. http://host.docker.internal:3847). When set, the bot POSTs spawn requests instead of running cursor-agent locally.
     #[serde(default)]
     pub cursor_agent_runner_url: Option<String>,
+    /// URL of the Cursor SDK sidecar for the Cursor agent engine (e.g. http://127.0.0.1:3848).
+    #[serde(default)]
+    pub cursor_sdk_runner_url: Option<String>,
+    /// Model id for Cursor SDK engine runs (local runtime). Default: composer-2.5.
+    #[serde(default = "default_cursor_sdk_model")]
+    pub cursor_sdk_model: String,
+    /// When true (default), bot starts the local Cursor SDK sidecar on startup.
+    #[serde(default = "default_cursor_sdk_auto_start")]
+    pub cursor_sdk_auto_start: bool,
+    /// When true (default), bot creates a runtime venv and pip-installs cursor-sdk + aiohttp.
+    #[serde(default = "default_cursor_sdk_auto_install")]
+    pub cursor_sdk_auto_install: bool,
+    /// Local port for the auto-started Cursor SDK sidecar. Default: 3848.
+    #[serde(default = "default_cursor_sdk_runner_port")]
+    pub cursor_sdk_runner_port: u16,
+    /// Python executable used to launch the Cursor SDK sidecar. Default: python3.
+    #[serde(default = "default_cursor_sdk_python")]
+    pub cursor_sdk_python: String,
     /// Max wall-clock time (seconds) for a single scheduled-agent run. Default 3600.
     #[serde(default = "default_scheduler_task_timeout_secs")]
     pub scheduler_task_timeout_secs: u64,
@@ -1025,6 +1063,23 @@ impl Config {
             ),
             cursor_agent_runner_url: Self::env("CURSOR_AGENT_RUNNER_URL")
                 .filter(|s| !s.trim().is_empty()),
+            cursor_sdk_runner_url: Self::env("CURSOR_SDK_RUNNER_URL")
+                .filter(|s| !s.trim().is_empty()),
+            cursor_sdk_model: Self::env("CURSOR_SDK_MODEL")
+                .unwrap_or_else(default_cursor_sdk_model),
+            cursor_sdk_auto_start: Self::env_bool(
+                "CURSOR_SDK_AUTO_START",
+                default_cursor_sdk_auto_start(),
+            ),
+            cursor_sdk_auto_install: Self::env_bool(
+                "CURSOR_SDK_AUTO_INSTALL",
+                default_cursor_sdk_auto_install(),
+            ),
+            cursor_sdk_runner_port: Self::env("CURSOR_SDK_RUNNER_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_cursor_sdk_runner_port),
+            cursor_sdk_python: Self::env("CURSOR_SDK_PYTHON")
+                .unwrap_or_else(default_cursor_sdk_python),
             scheduler_task_timeout_secs: Self::env_u64(
                 "SCHEDULER_TASK_TIMEOUT_SECS",
                 default_scheduler_task_timeout_secs(),
@@ -1753,6 +1808,12 @@ pub fn test_config() -> Config {
         cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
         cursor_agent_tmux_enabled: true,
         cursor_agent_runner_url: None,
+        cursor_sdk_runner_url: None,
+        cursor_sdk_model: default_cursor_sdk_model(),
+        cursor_sdk_auto_start: default_cursor_sdk_auto_start(),
+        cursor_sdk_auto_install: default_cursor_sdk_auto_install(),
+        cursor_sdk_runner_port: default_cursor_sdk_runner_port(),
+        cursor_sdk_python: default_cursor_sdk_python(),
         scheduler_task_timeout_secs: default_scheduler_task_timeout_secs(),
         scheduler_stale_running_reclaim_secs: default_scheduler_stale_running_reclaim_secs(),
         scheduler_max_concurrent_tasks: default_scheduler_max_concurrent_tasks(),

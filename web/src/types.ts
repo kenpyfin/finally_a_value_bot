@@ -42,6 +42,7 @@ export type RuntimeSettingItem = {
 export type InstallationStatus = {
   llm_ready: boolean
   channel_ready: boolean
+  cursor_engine_ready?: boolean
   web_enabled: boolean
   /** @deprecated use requires_restart_for_env_changes */
   requires_restart_to_apply_runtime_settings?: boolean
@@ -59,12 +60,34 @@ export type LlmCatalogModel = {
   from_active_config?: boolean
 }
 
+export type CursorEngineConfigResponse = {
+  ok?: boolean
+  sdk_runner_url?: string
+  sdk_model?: string
+  sdk_runner_ok?: boolean
+  sidecar_managed?: boolean
+  sidecar_reachable?: boolean
+  api_key_configured?: boolean
+  engine_ready?: boolean
+  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  cli_path?: string
+  cli_model?: string
+  cli_runner_url?: string
+  cli_on_path?: boolean
+  timeout_secs?: number
+  tmux_enabled?: boolean
+  install_steps?: string[]
+  sidecar_error?: string | null
+  health_ok?: boolean
+  message?: string
+}
+
 export type RuntimeConfigResponse = {
   ok?: boolean
   tool_output_debug?: boolean
   post_tool_evaluator_enabled?: boolean
   response_quality_evaluator_enabled?: boolean
-  agent_engine?: 'classic' | 'deterministic'
+  agent_engine?: 'classic' | 'deterministic' | 'cursor'
   source?: 'env' | 'app_settings'
   sources?: {
     tool_output_debug?: 'env' | 'app_settings'

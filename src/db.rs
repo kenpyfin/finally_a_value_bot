@@ -706,6 +706,7 @@ impl Database {
         Self::ensure_builtin_hook_definitions(&conn)?;
         Self::migrate_chat_sessions_schema(&conn)?;
         Self::migrate_messages_origin(&conn)?;
+        Self::migrate_cursor_engine_agents(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
@@ -1321,6 +1322,22 @@ impl Database {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    fn migrate_cursor_engine_agents(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cursor_engine_agents (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                session_scope TEXT NOT NULL DEFAULT '',
+                agent_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id, session_scope)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cursor_engine_agents_updated
+                ON cursor_engine_agents(updated_at DESC);",
+        )?;
         Ok(())
     }
 
@@ -3492,6 +3509,64 @@ impl Database {
     }
 
     // --- Cursor agent runs ---
+
+    pub fn get_cursor_engine_agent_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        session_scope: &str,
+    ) -> Result<Option<String>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM cursor_engine_agents
+             WHERE chat_id = ?1 AND persona_id = ?2 AND session_scope = ?3",
+        )?;
+        let mut rows = stmt.query(params![chat_id, persona_id, session_scope])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            if id.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(id))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_cursor_engine_agent_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        session_scope: &str,
+        agent_id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO cursor_engine_agents (chat_id, persona_id, session_scope, agent_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, persona_id, session_scope)
+             DO UPDATE SET agent_id = excluded.agent_id, updated_at = excluded.updated_at",
+            params![chat_id, persona_id, session_scope, agent_id, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_cursor_engine_agent_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        session_scope: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM cursor_engine_agents
+             WHERE chat_id = ?1 AND persona_id = ?2 AND session_scope = ?3",
+            params![chat_id, persona_id, session_scope],
+        )?;
+        Ok(())
+    }
 
     pub fn insert_cursor_agent_run(
         &self,

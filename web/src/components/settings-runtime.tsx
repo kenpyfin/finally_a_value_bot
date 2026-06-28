@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Flex, Switch, Text } from '@radix-ui/themes'
+import { Callout, Flex, Switch, Text } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
-import type { RuntimeConfigResponse } from '../types'
+import type { CursorEngineConfigResponse, RuntimeConfigResponse } from '../types'
 
 type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
@@ -14,6 +14,7 @@ function sourceLabel(source?: 'env' | 'app_settings'): string {
 
 export function SettingsRuntimePanel({ api, onError }: Props) {
   const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null)
+  const [cursorStatus, setCursorStatus] = useState<CursorEngineConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
 
@@ -22,9 +23,20 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
     try {
       const data = await api<RuntimeConfigResponse>('/api/runtime')
       setRuntime(data)
+      if (data.agent_engine === 'cursor') {
+        try {
+          const cursor = await api<CursorEngineConfigResponse>('/api/cursor-engine')
+          setCursorStatus(cursor)
+        } catch {
+          setCursorStatus(null)
+        }
+      } else {
+        setCursorStatus(null)
+      }
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       setRuntime(null)
+      setCursorStatus(null)
     } finally {
       setLoading(false)
     }
@@ -132,11 +144,12 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
         </Text>
         <Text size="1" color="gray">
           Classic: heuristic tool loop with optional Plan/Execute/Synthesize phases. Deterministic:
-          structured intent → plan → per-step local execution → cloud synthesis. Applies immediately (
-          {sourceLabel(sources.agent_engine)}).
+          structured intent → plan → per-step local execution → cloud synthesis. Cursor: delegates
+          the full turn to a local Cursor SDK sidecar (auto-started with the bot). Applies
+          immediately ({sourceLabel(sources.agent_engine)}).
         </Text>
         <Flex gap="2" wrap="wrap">
-          {(['classic', 'deterministic'] as const).map((engine) => (
+          {(['classic', 'deterministic', 'cursor'] as const).map((engine) => (
             <button
               key={engine}
               type="button"
@@ -148,10 +161,24 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
               }
               onClick={() => void patchRuntime({ agent_engine: engine }, 'agent_engine')}
             >
-              {engine === 'classic' ? 'Classic' : 'Deterministic'}
+              {engine === 'classic'
+                ? 'Classic'
+                : engine === 'deterministic'
+                  ? 'Deterministic'
+                  : 'Cursor (SDK)'}
             </button>
           ))}
         </Flex>
+        {runtime?.agent_engine === 'cursor' && cursorStatus && !cursorStatus.engine_ready ? (
+          <Callout.Root color="orange" size="1" variant="soft">
+            <Callout.Text>
+              Cursor engine is active but not ready ({cursorStatus.sidecar_reachable ? 'sidecar up' : 'sidecar down'}
+              , API key {cursorStatus.api_key_configured ? 'ok' : 'missing'}, health{' '}
+              {cursorStatus.sdk_runner_ok ? 'verified' : 'not verified'}). Open Settings → Cursor to
+              finish setup.
+            </Callout.Text>
+          </Callout.Root>
+        ) : null}
       </Flex>
     </Flex>
   )

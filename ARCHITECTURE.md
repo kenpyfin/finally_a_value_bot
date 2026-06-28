@@ -50,10 +50,11 @@ The central entry point is `process_with_agent` (and `process_with_agent_with_ev
 
 ### Agent Loop Flow
 
-Two engines are selectable in Settings → Runtime (`AGENT_ENGINE` in `app_settings`, default `classic`):
+Three engines are selectable in Settings → Runtime (`AGENT_ENGINE` in `app_settings`, default `classic`):
 
 - **Classic** — heuristic tool loop with optional Plan/Execute/Synthesize multi-model phases (`advance_phase` in `src/multimodel.rs`).
 - **Deterministic** — structured pipeline in `src/agent_pipeline/`: cloud intent JSON → clarification gate → vault SOP or ephemeral plan → per-step local execution (retry + cloud escalation) → cloud synthesis → shared PDQE delivery. Dispatched from `process_with_agent_with_events` when `runtime_toggles.agent_engine()` is `Deterministic`. Shared bootstrap: `prepare_agent_run` in `src/channels/agent_run_prep.rs`.
+- **Cursor** — delegates the full turn to a local **Cursor SDK sidecar** (`scripts/cursor-sdk-runner.py`), **auto-started on bot boot** on native installs (`CURSOR_SDK_AUTO_START`, default true). Rust flattens `prepare_agent_run` context into a prompt, streams assistant text from NDJSON, persists resume `agent_id` in `cursor_engine_agents`, and finishes via `pipeline_finish_turn`. Falls back to Classic when the sidecar is unreachable. Requires `CURSOR_API_KEY` in repo-root `.env` (passed to sidecar subprocess; not stored in SQLite).
 
 The main chat agent is the single orchestrator: it decides when to reply directly and when to call tools (including `sub_agent` for delegation). There is no separate plan-first layer.
 

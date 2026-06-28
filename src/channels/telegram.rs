@@ -272,6 +272,8 @@ pub struct AppState {
     pub config: Config,
     pub env_redactor: Arc<EnvSecretRedactor>,
     pub runtime_toggles: Arc<crate::runtime_toggles::RuntimeToggles>,
+    pub cursor_settings: Arc<std::sync::RwLock<crate::cursor_engine_config::CursorEngineSettings>>,
+    pub cursor_sidecar: Arc<crate::cursor_sdk_sidecar::SidecarHandle>,
     /// Telegram bots keyed by `channel_bot_instances.id` (see `Database::sync_channel_bot_instances_from_config`).
     pub telegram_bots: Arc<HashMap<i64, Bot>>,
     pub db: Arc<Database>,
@@ -486,6 +488,14 @@ pub async fn run_bot(
             warn!("Failed to apply multi-model config: {e}");
         }
     }
+    let cursor_settings = Arc::new(std::sync::RwLock::new(
+        crate::cursor_engine_config::load_from_db(&db, &config).unwrap_or_else(|e| {
+            warn!("Failed to load Cursor settings from DB: {e}");
+            crate::cursor_engine_config::CursorEngineSettings::from_env(&config)
+        }),
+    ));
+    let cursor_sidecar =
+        crate::cursor_sdk_sidecar::bootstrap(&config, &db, cursor_settings.clone()).await;
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
         Arc::new(std::sync::OnceLock::new());
     let env_redactor = Arc::new(EnvSecretRedactor::discover(&config));
@@ -576,6 +586,8 @@ pub async fn run_bot(
         config,
         env_redactor,
         runtime_toggles,
+        cursor_settings,
+        cursor_sidecar,
         telegram_bots: Arc::new(telegram_bots_map),
         db,
         memory,
@@ -1749,6 +1761,12 @@ pub async fn process_with_agent_with_events(
         .await;
     }
 
+    if state.runtime_toggles.agent_engine() == crate::runtime_toggles::AgentEngine::Cursor {
+        let prep = prepare_agent_run(state, &context, override_prompt, image_data.clone()).await?;
+        return crate::cursor_engine::run_cursor_engine(state, context, prep, event_tx, cancel)
+            .await;
+    }
+
     process_classic_agent_with_events(
         state,
         context,
@@ -1760,7 +1778,7 @@ pub async fn process_with_agent_with_events(
     .await
 }
 
-async fn process_classic_agent_with_events(
+pub(crate) async fn process_classic_agent_with_events(
     state: &AppState,
     context: AgentRequestContext<'_>,
     override_prompt: Option<&str>,

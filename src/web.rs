@@ -5071,13 +5071,15 @@ async fn api_runtime_patch(
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        messages.push(
-            if engine == crate::runtime_toggles::AgentEngine::Deterministic {
+        messages.push(match engine {
+            crate::runtime_toggles::AgentEngine::Deterministic => {
                 "Agent engine set to deterministic pipeline."
-            } else {
-                "Agent engine set to classic loop."
-            },
-        );
+            }
+            crate::runtime_toggles::AgentEngine::Cursor => {
+                "Agent engine set to Cursor SDK (local sidecar)."
+            }
+            crate::runtime_toggles::AgentEngine::Classic => "Agent engine set to classic loop.",
+        });
     }
 
     if messages.is_empty() {
@@ -5460,6 +5462,218 @@ async fn api_multimodel_test_post(
     }
 }
 
+fn cursor_engine_json(
+    cfg: &crate::cursor_engine_config::CursorEngineSettings,
+    health: &crate::cursor_engine_config::SidecarHealth,
+    agent_engine: &str,
+    sidecar_managed: bool,
+) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "sdk_runner_url": cfg.sdk_runner_url,
+        "sdk_model": cfg.sdk_model,
+        "sdk_runner_ok": cfg.sdk_runner_ok,
+        "sidecar_reachable": health.reachable,
+        "api_key_configured": health.api_key_configured,
+        "engine_ready": cfg.engine_ready(health),
+        "sidecar_managed": sidecar_managed,
+        "agent_engine": agent_engine,
+        "cli_path": cfg.cli_path,
+        "cli_model": cfg.cli_model,
+        "cli_runner_url": cfg.cli_runner_url,
+        "cli_on_path": crate::cursor_engine_config::cli_on_path(&cfg.cli_path),
+        "timeout_secs": cfg.timeout_secs,
+        "tmux_enabled": cfg.tmux_enabled,
+        "install_steps": [
+            "Set CURSOR_API_KEY in repo-root .env (Cursor Dashboard → Integrations)",
+            "Restart the bot — it auto-creates a runtime venv and installs cursor-sdk + aiohttp",
+            "Optional: CURSOR_SDK_AUTO_INSTALL=false to manage Python deps yourself",
+        ],
+        "sidecar_error": health.error,
+    })
+}
+
+async fn api_cursor_engine_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
+    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    Ok(Json(cursor_engine_json(
+        &cfg,
+        &health,
+        agent_engine,
+        state.app_state.cursor_sidecar.managed_locally,
+    )))
+}
+
+async fn api_cursor_engine_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<crate::cursor_engine_config::CursorEnginePatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let mut cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+
+    if let Some(ref url) = body.sdk_runner_url {
+        let trimmed = url.trim().to_string();
+        if !trimmed.is_empty() {
+            crate::cursor_engine_config::validate_runner_url(&trimmed)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+        if trimmed != cfg.sdk_runner_url {
+            cfg.sdk_runner_ok = false;
+        }
+        cfg.sdk_runner_url = trimmed;
+    }
+    if let Some(ref model) = body.sdk_model {
+        cfg.sdk_model = model.trim().to_string();
+    }
+    if let Some(ref path) = body.cli_path {
+        cfg.cli_path = path.trim().to_string();
+    }
+    if let Some(ref model) = body.cli_model {
+        cfg.cli_model = model.trim().to_string();
+    }
+    if let Some(ref url) = body.cli_runner_url {
+        let trimmed = url.trim().to_string();
+        if !trimmed.is_empty() {
+            crate::cursor_engine_config::validate_runner_url(&trimmed)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+        cfg.cli_runner_url = trimmed;
+    }
+    if let Some(secs) = body.timeout_secs {
+        cfg.timeout_secs = secs.clamp(60, 86_400);
+    }
+    if let Some(enabled) = body.tmux_enabled {
+        cfg.tmux_enabled = enabled;
+    }
+
+    if cfg.sdk_model.trim().is_empty() {
+        cfg.sdk_model = crate::config::default_cursor_sdk_model();
+    }
+    if cfg.cli_path.trim().is_empty() {
+        cfg.cli_path = crate::config::default_cursor_agent_cli_path();
+    }
+
+    call_blocking(state.app_state.db.clone(), {
+        let cfg_db = cfg.clone();
+        move |db| crate::cursor_engine_config::persist_to_db(db, &cfg_db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    {
+        let mut guard = state
+            .app_state
+            .cursor_settings
+            .write()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        *guard = cfg.clone();
+    }
+
+    let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
+    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    let mut out = cursor_engine_json(
+        &cfg,
+        &health,
+        agent_engine,
+        state.app_state.cursor_sidecar.managed_locally,
+    );
+    if let serde_json::Value::Object(ref mut map) = out {
+        map.insert(
+            "message".into(),
+            serde_json::Value::String("Cursor settings saved.".into()),
+        );
+    }
+    Ok(Json(out))
+}
+
+async fn api_cursor_engine_health_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let mut cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
+
+    let ok = health.reachable && health.api_key_configured;
+    if ok {
+        cfg.sdk_runner_ok = true;
+        call_blocking(state.app_state.db.clone(), {
+            let cfg_db = cfg.clone();
+            move |db| crate::cursor_engine_config::persist_to_db(db, &cfg_db)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Ok(mut guard) = state.app_state.cursor_settings.write() {
+            *guard = cfg.clone();
+        }
+    }
+
+    let message = if ok {
+        "Sidecar reachable and CURSOR_API_KEY is configured on the host.".to_string()
+    } else if !health.reachable {
+        health
+            .error
+            .clone()
+            .unwrap_or_else(|| "Sidecar is not reachable.".into())
+    } else {
+        "Sidecar is up but CURSOR_API_KEY is not set on the host.".into()
+    };
+
+    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    let mut out = cursor_engine_json(
+        &cfg,
+        &health,
+        agent_engine,
+        state.app_state.cursor_sidecar.managed_locally,
+    );
+    if let serde_json::Value::Object(ref mut map) = out {
+        map.insert("message".into(), serde_json::Value::String(message));
+        map.insert("health_ok".into(), serde_json::Value::Bool(ok));
+    }
+    Ok(Json(out))
+}
+
+async fn api_cursor_engine_models_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    match crate::cursor_engine_config::fetch_sidecar_models(&cfg.sdk_runner_url).await {
+        Ok(models) => Ok(Json(json!({
+            "ok": true,
+            "models": models,
+        }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
+}
+
 async fn api_settings_get(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -5513,6 +5727,13 @@ async fn api_settings_get(
     });
 
     let cfg = &state.app_state.config;
+    let cursor_cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    let cursor_engine_ready = cursor_cfg.sdk_configured() && cursor_cfg.sdk_runner_ok;
     Ok(Json(json!({
         "ok": true,
         "settings": items,
@@ -5526,6 +5747,7 @@ async fn api_settings_get(
         "installation_status": {
             "llm_ready": is_llm_ready(cfg),
             "channel_ready": is_channel_ready(cfg),
+            "cursor_engine_ready": cursor_engine_ready,
             "web_enabled": cfg.web_enabled,
             // PATCH /api/settings is disabled; no in-app "pending restart" until we track real diffs.
             "requires_restart_for_env_changes": false,
@@ -6121,6 +6343,18 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route("/api/multimodel/test", post(api_multimodel_test_post))
         .route(
+            "/api/cursor-engine",
+            get(api_cursor_engine_get).patch(api_cursor_engine_patch),
+        )
+        .route(
+            "/api/cursor-engine/health",
+            post(api_cursor_engine_health_post),
+        )
+        .route(
+            "/api/cursor-engine/models",
+            get(api_cursor_engine_models_get),
+        )
+        .route(
             "/api/runtime",
             get(api_runtime_get).patch(api_runtime_patch),
         )
@@ -6539,10 +6773,16 @@ mod tests {
         let runtime_toggles = crate::runtime_toggles::RuntimeToggles::new(cfg.tool_output_debug);
         let env_redactor =
             std::sync::Arc::new(crate::safety_redaction::EnvSecretRedactor::discover(&cfg));
+        let cursor_settings = Arc::new(std::sync::RwLock::new(
+            crate::cursor_engine_config::CursorEngineSettings::from_env(&cfg),
+        ));
+        let cursor_sidecar = crate::cursor_sdk_sidecar::SidecarHandle::inactive();
         let state = AppState {
             config: cfg.clone(),
             env_redactor: env_redactor.clone(),
             runtime_toggles: runtime_toggles.clone(),
+            cursor_settings,
+            cursor_sidecar,
             telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),

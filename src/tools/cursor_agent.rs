@@ -331,6 +331,15 @@ impl Tool for CursorAgentTool {
 
         let auth = auth_context_from_input(&input);
         let started_at = chrono::Utc::now().to_rfc3339();
+        let config = self.config.clone();
+        let live = match crate::db::call_blocking(self.db.clone(), move |db| {
+            crate::cursor_engine_config::load_from_db(db, &config)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => crate::cursor_engine_config::CursorEngineSettings::from_env(&self.config),
+        };
         let workspace_root = PathBuf::from(self.config.working_dir());
         let working_dir = super::resolve_tool_working_dir_for_auth(&workspace_root, auth.as_ref());
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
@@ -347,13 +356,13 @@ impl Tool for CursorAgentTool {
         let timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(self.config.cursor_agent_timeout_secs);
+            .unwrap_or(live.timeout_secs);
         let model_override = input
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
         let model = model_override
-            .unwrap_or_else(|| self.config.cursor_agent_model.as_str())
+            .unwrap_or_else(|| live.cli_model.as_str())
             .trim();
 
         let detach = input
@@ -362,8 +371,8 @@ impl Tool for CursorAgentTool {
             .unwrap_or(false);
 
         // When runner URL is set (e.g. Docker), POST to host instead of running locally
-        if let Some(ref runner_url) = self.config.cursor_agent_runner_url {
-            let url = runner_url.trim().trim_end_matches('/').to_string() + "/spawn";
+        if !live.cli_runner_url.trim().is_empty() {
+            let url = live.cli_runner_url.trim().trim_end_matches('/').to_string() + "/spawn";
             return self
                 .execute_via_runner(
                     &url,
@@ -376,7 +385,7 @@ impl Tool for CursorAgentTool {
                 .await;
         }
 
-        let cli_path = self.config.cursor_agent_cli_path.trim();
+        let cli_path = live.cli_path.trim();
         if cli_path.is_empty() {
             return ToolResult::error("cursor_agent_cli_path is not configured".into());
         }

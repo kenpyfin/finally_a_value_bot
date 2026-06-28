@@ -14,11 +14,13 @@ pub const APP_SETTING_AGENT_ENGINE: &str = "AGENT_ENGINE";
 
 const AGENT_ENGINE_CLASSIC: u8 = 0;
 const AGENT_ENGINE_DETERMINISTIC: u8 = 1;
+const AGENT_ENGINE_CURSOR: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentEngine {
     Classic,
     Deterministic,
+    Cursor,
 }
 
 impl AgentEngine {
@@ -26,12 +28,14 @@ impl AgentEngine {
         match self {
             Self::Classic => "classic",
             Self::Deterministic => "deterministic",
+            Self::Cursor => "cursor",
         }
     }
 
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "deterministic" | "pipeline" => Self::Deterministic,
+            "cursor" | "cursor_sdk" | "cursor-sdk" => Self::Cursor,
             _ => Self::Classic,
         }
     }
@@ -39,6 +43,7 @@ impl AgentEngine {
     fn from_u8(v: u8) -> Self {
         match v {
             AGENT_ENGINE_DETERMINISTIC => Self::Deterministic,
+            AGENT_ENGINE_CURSOR => Self::Cursor,
             _ => Self::Classic,
         }
     }
@@ -47,6 +52,7 @@ impl AgentEngine {
         match self {
             Self::Classic => AGENT_ENGINE_CLASSIC,
             Self::Deterministic => AGENT_ENGINE_DETERMINISTIC,
+            Self::Cursor => AGENT_ENGINE_CURSOR,
         }
     }
 }
@@ -265,6 +271,7 @@ mod tests {
             AgentEngine::parse("deterministic"),
             AgentEngine::Deterministic
         );
+        assert_eq!(AgentEngine::parse("cursor"), AgentEngine::Cursor);
         assert_eq!(AgentEngine::parse("classic"), AgentEngine::Classic);
         assert_eq!(AgentEngine::parse(""), AgentEngine::Classic);
     }

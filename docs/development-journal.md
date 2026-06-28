@@ -4,6 +4,26 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-28 — Cursor SDK sidecar auto-start on bot boot
+
+- **Area:** cursor integration / startup
+- **Summary:** Bot now auto-starts `scripts/cursor-sdk-runner.py` on native installs (`CURSOR_SDK_AUTO_START=true` default), waits for `/health`, persists runner URL + `sdk_runner_ok`, and keeps the child alive for the bot lifetime. Default URL `http://127.0.0.1:3848`. Skips spawn inside Docker (still probes configured URL). Web UI simplified: sidecar is managed; only `CURSOR_API_KEY` in `.env` + model selection remain user-facing.
+- **Key files / symbols:** `src/cursor_sdk_sidecar.rs` (`bootstrap`, `SidecarHandle`); `AppState.cursor_sidecar`; startup in `run_bot`; `SettingsCursorPanel` simplified.
+
+### 2026-06-28 — Cursor engine settings in Web UI
+
+- **Area:** web / cursor integration / runtime settings
+- **Summary:** Added Settings → **Cursor** tab with stepper UI for SDK sidecar install, runner URL, model picker (via sidecar `/models`), health check, and CLI tool fields. Settings persist in `app_settings` and hot-reload via `AppState.cursor_settings`. API: `GET/PATCH /api/cursor-engine`, `POST /api/cursor-engine/health`, `GET /api/cursor-engine/models`. Overview shows `cursor_engine_ready`; Runtime panel warns when Cursor engine is selected but not ready.
+- **Key files / symbols:** `src/cursor_engine_config.rs`; `AppState.cursor_settings`; web handlers in `src/web.rs`; `SettingsCursorPanel` in `web/src/components/settings-cursor.tsx`; sidecar `GET /models` in `scripts/cursor-sdk-runner.py`.
+- **Deploy:** Rebuild `web/dist`, restart Rust binary. Sidecar host still needs `CURSOR_API_KEY` in environment (never stored in UI/DB).
+
+### 2026-06-28 — Cursor SDK agent engine (local sidecar)
+
+- **Area:** agent loop / runtime toggles / cursor integration / web
+- **Summary:** Added a third selectable agent engine **Cursor** that delegates a full turn to a local Python sidecar wrapping `cursor_sdk` (`scripts/cursor-sdk-runner.py`). Rust flattens `prepare_agent_run` into a prompt, POSTs to `CURSOR_SDK_RUNNER_URL/run`, streams NDJSON text deltas to web channels, persists resume `agent_id` per chat/persona/session in `cursor_engine_agents`, and finishes via `pipeline_finish_turn`. Falls back to Classic when the sidecar URL is unset or unreachable. Image input is noted as unsupported in v1.
+- **Key files / symbols:** `src/cursor_engine.rs` (`run_cursor_engine`); `AgentEngine::Cursor` in `src/runtime_toggles.rs`; dispatch in `process_with_agent_with_events`; `get/set_cursor_engine_agent_id` + `migrate_cursor_engine_agents` in `src/db.rs`; `cursor_sdk_runner_url` / `cursor_sdk_model` in `src/config.rs`; `SettingsRuntimePanel` Cursor option in `web/src/components/settings-runtime.tsx`.
+- **Deploy:** On host: `pip install cursor-sdk aiohttp`, `export CURSOR_API_KEY=...`, `python3 scripts/cursor-sdk-runner.py 3848`. Bot `.env`: `CURSOR_SDK_RUNNER_URL=http://127.0.0.1:3848`. Web UI → Settings → Runtime → Agent engine → Cursor (SDK). Rebuild `web/dist` and restart Rust binary.
+
 ### 2026-06-27 — Deterministic agent pipeline (web-selectable engine)
 
 - **Area:** agent loop / multimodel / runtime toggles / web
@@ -91,6 +111,27 @@ Use **newest entries first** (reverse chronological). Each entry should be self-
 - **Summary:** Completed remaining UX plan items: `usePersonaSession`, `useChatHistory`, `useOperatorOps` hooks; `AuthProvider` + `AuthDialog`; `AppHeader` (header chrome + toolbar triggers) and `AppDialogs` (~1.6k lines); `lib/persona-storage`, `lib/bulletin`; settings skeletons on all panels; mobile message tap action sheet; `ThreadWelcomeHints` with shortcut footer; archived-sessions empty label in session picker.
 - **Key files / symbols:** `web/src/hooks/use-persona-session.ts`, `use-chat-history.ts`, `use-operator-ops.ts`; `web/src/context/AuthContext.tsx`; `web/src/app/AppHeader.tsx`, `AppDialogs.tsx`; `web/src/lib/persona-storage.ts`, `lib/bulletin.ts`; `thread-pane.tsx`, `thread-welcome-hints.tsx`.
 - **Follow-ups:** `App.tsx` still ~2k lines (adapter/SSE/scheduling); optional further split of `AppDialogs` tabs.
+
+### 2026-06-28 — Cursor engine: recover from stale resume agent ids
+
+- **Area:** cursor engine / sidecar
+- **Summary:** Cursor SDK sessions expire or vanish across API key / sidecar changes. Sidecar now falls back from `Agent.resume` to `Agent.create` when the stored id is missing; Rust clears `cursor_engine_agents` and retries once without `agent_id` if the sidecar still returns an agent-not-found error.
+- **Key files / symbols:** `_open_agent`, `_stream_run` in `scripts/cursor-sdk-runner.py`; `is_stale_cursor_agent_error`, `consume_sidecar_stream` in `src/cursor_engine.rs`; `clear_cursor_engine_agent_id` in `src/db.rs`.
+- **Follow-ups:** Restart bot so the sidecar reloads the updated Python script (Rust retry covers stale ids even before restart).
+
+### 2026-06-28 — Cursor SDK sidecar auto-install (runtime venv)
+
+- **Area:** cursor sidecar bootstrap
+- **Summary:** Bot now creates `{runtime}/cursor-sdk-venv`, pip-installs `cursor-sdk` + `aiohttp`, and restarts a local sidecar missing those deps. Sidecar `/health` reports `cursor_sdk_installed`; `engine_ready` requires it. Opt out with `CURSOR_SDK_AUTO_INSTALL=false`.
+- **Key files / symbols:** `ensure_sidecar_venv`, `bootstrap` in `src/cursor_sdk_sidecar.rs`; `SidecarHealth::cursor_sdk_installed` in `src/cursor_engine_config.rs`; `handle_health` in `scripts/cursor-sdk-runner.py`; `CURSOR_SDK_AUTO_INSTALL` in `src/config.rs`.
+- **Follow-ups:** Restart bot once to migrate off a stale system-python sidecar on :3848.
+
+### 2026-06-28 — Cursor settings: model dropdown + clearer sidecar 503 errors
+
+- **Area:** web frontend / cursor sidecar
+- **Summary:** Settings → Cursor now auto-fetches available SDK models when the sidecar is reachable and `CURSOR_API_KEY` is set, shows a Select dropdown (with optional custom id), and surfaces sidecar error text instead of bare HTTP codes. `fetch_sidecar_models` parses JSON `error` from the Python runner.
+- **Key files / symbols:** `web/src/components/settings-cursor.tsx`; `fetch_sidecar_models` in `src/cursor_engine_config.rs`; `handle_models` in `scripts/cursor-sdk-runner.py` (503 when key or `cursor-sdk` missing).
+- **Follow-ups:** Restart bot after adding `CURSOR_API_KEY`; `pip install cursor-sdk aiohttp` on the sidecar host.
 
 ### 2026-06-24 — Web UX full pass: feedback, IA, mobile ops, App split
 
