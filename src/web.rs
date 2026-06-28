@@ -4974,6 +4974,8 @@ struct RuntimePatchRequest {
     post_tool_evaluator_enabled: Option<bool>,
     #[serde(default)]
     response_quality_evaluator_enabled: Option<bool>,
+    #[serde(default)]
+    agent_engine: Option<String>,
 }
 
 async fn api_runtime_get(
@@ -4988,6 +4990,7 @@ async fn api_runtime_get(
             crate::runtime_toggles::RuntimeToggles::response_quality_evaluator_from_app_settings(
                 db,
             )?,
+            crate::runtime_toggles::RuntimeToggles::agent_engine_from_app_settings(db)?,
         ))
     })
     .await
@@ -4999,10 +5002,12 @@ async fn api_runtime_get(
         "tool_output_debug": toggles.tool_output_debug(),
         "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
         "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
+        "agent_engine": toggles.agent_engine().as_str(),
         "sources": {
             "tool_output_debug": if sources.0 { "app_settings" } else { "env" },
             "post_tool_evaluator_enabled": if sources.1 { "app_settings" } else { "env" },
             "response_quality_evaluator_enabled": if sources.2 { "app_settings" } else { "env" },
+            "agent_engine": if sources.3.is_some() { "app_settings" } else { "env" },
         },
         "description": "When enabled, verbose shell output is shown in chat (including background-job completion). When off, full logs are agent-only.",
     })))
@@ -5058,6 +5063,22 @@ async fn api_runtime_patch(
             "Pre-delivery quality evaluator (PDQE) disabled."
         });
     }
+    if let Some(ref engine_raw) = body.agent_engine {
+        let engine = crate::runtime_toggles::AgentEngine::parse(engine_raw);
+        toggles.set_agent_engine(engine);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_agent_engine(db, engine)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(
+            if engine == crate::runtime_toggles::AgentEngine::Deterministic {
+                "Agent engine set to deterministic pipeline."
+            } else {
+                "Agent engine set to classic loop."
+            },
+        );
+    }
 
     if messages.is_empty() {
         return Err((
@@ -5071,6 +5092,7 @@ async fn api_runtime_patch(
         "tool_output_debug": toggles.tool_output_debug(),
         "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
         "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
+        "agent_engine": toggles.agent_engine().as_str(),
         "source": "app_settings",
         "message": messages.join(" "),
     })))

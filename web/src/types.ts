@@ -64,11 +64,13 @@ export type RuntimeConfigResponse = {
   tool_output_debug?: boolean
   post_tool_evaluator_enabled?: boolean
   response_quality_evaluator_enabled?: boolean
+  agent_engine?: 'classic' | 'deterministic'
   source?: 'env' | 'app_settings'
   sources?: {
     tool_output_debug?: 'env' | 'app_settings'
     post_tool_evaluator_enabled?: 'env' | 'app_settings'
     response_quality_evaluator_enabled?: 'env' | 'app_settings'
+    agent_engine?: 'env' | 'app_settings'
   }
   description?: string
   message?: string

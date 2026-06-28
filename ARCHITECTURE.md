@@ -50,6 +50,11 @@ The central entry point is `process_with_agent` (and `process_with_agent_with_ev
 
 ### Agent Loop Flow
 
+Two engines are selectable in Settings → Runtime (`AGENT_ENGINE` in `app_settings`, default `classic`):
+
+- **Classic** — heuristic tool loop with optional Plan/Execute/Synthesize multi-model phases (`advance_phase` in `src/multimodel.rs`).
+- **Deterministic** — structured pipeline in `src/agent_pipeline/`: cloud intent JSON → clarification gate → vault SOP or ephemeral plan → per-step local execution (retry + cloud escalation) → cloud synthesis → shared PDQE delivery. Dispatched from `process_with_agent_with_events` when `runtime_toggles.agent_engine()` is `Deterministic`. Shared bootstrap: `prepare_agent_run` in `src/channels/agent_run_prep.rs`.
+
 The main chat agent is the single orchestrator: it decides when to reply directly and when to call tools (including `sub_agent` for delegation). There is no separate plan-first layer.
 
 1. **Load session / history** from SQLite (`sessions`, `messages`). Only a **bounded recent window** is sent to the LLM: when the session exceeds `max_session_messages` (default 40), older messages are summarized and the last `compact_keep_recent` (default 20) are kept verbatim. So we do not stuff long history into context; the rest is retrieved on demand via **search_chat_history** (past messages) and **search_vault** (ORIGIN vault). The system prompt guarantees "at least 2 from you and 2 from the user" for coherence; the actual window is configurable.

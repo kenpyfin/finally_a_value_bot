@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-27 — Deterministic agent pipeline (web-selectable engine)
+
+- **Area:** agent loop / multimodel / runtime toggles / web
+- **Summary:** Added a second agent engine selectable in Settings → Runtime: **Deterministic** runs a structured pipeline (cloud intent → clarification gate → vault-SOP or ephemeral plan → per-step local execution with retry/escalation → cloud synthesis → PDQE). **Classic** remains the default heuristic tool loop. Multi-model routing: Strategy for intent/plan/synthesis/escalation; Local for bounded step execution when `ready_for_routing()`. Agent history records pipeline stages and cloud-call count.
+- **Key files / symbols:** `src/agent_pipeline/` (`run_deterministic_pipeline`, `intent`, `plan`, `execute`, `consolidate`); `prepare_agent_run` in `src/channels/agent_run_prep.rs`; dispatch in `process_with_agent_with_events`; `AgentEngine` + `APP_SETTING_AGENT_ENGINE` in `src/runtime_toggles.rs`; `PipelineStageRecord` / `PipelineFinishExtras` in `src/agent_history.rs`; `SettingsRuntimePanel` engine selector in `web/src/components/settings-runtime.tsx`.
+- **Deploy:** Rebuild `web/dist`, rebuild/restart Rust binary. Enable via Settings → Runtime → Agent engine → Deterministic.
+
 ### 2026-06-27 — Learn & optimize: operator notes + PDQE input
 
 - **Area:** run optimizer / agent history / web

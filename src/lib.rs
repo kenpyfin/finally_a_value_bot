@@ -1,5 +1,6 @@
 pub mod agent_history;
 pub mod agent_path_discipline;
+pub mod agent_pipeline;
 pub mod agent_turn_context;
 pub mod background_jobs;
 pub mod background_shell;

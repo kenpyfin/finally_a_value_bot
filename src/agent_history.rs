@@ -156,6 +156,7 @@ pub fn read_latest_agent_history(
 
 const MAX_HISTORY_FILES: usize = 50;
 
+#[derive(Clone, Debug)]
 pub struct ToolCallRecord {
     pub name: String,
     pub input_preview: String,
@@ -164,6 +165,7 @@ pub struct ToolCallRecord {
     pub is_error: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct EvaluatorStepRecord {
     /// PTE action (`continue`, `complete`, …) or PDQE step (`quality_eval_pass`, …).
     pub step: String,
@@ -269,6 +271,7 @@ impl EvaluatorStepRecord {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct IterationRecord {
     pub iteration: usize,
     pub stop_reason: String,
@@ -295,6 +298,20 @@ impl IterationRecord {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PipelineStageRecord {
+    pub stage: String,
+    pub detail: String,
+    pub duration_ms: u128,
+}
+
+/// Optional metadata for deterministic pipeline runs passed into delivery/history.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineFinishExtras {
+    pub pipeline_stages: Vec<PipelineStageRecord>,
+    pub cloud_calls: u32,
+}
+
 pub struct AgentRunRecord {
     pub timestamp: DateTime<Utc>,
     pub channel: String,
@@ -307,6 +324,10 @@ pub struct AgentRunRecord {
     /// JSON (pretty) of `system_prompt`, `tool_names_first_turn`, and `messages` as sent on the first LLM call.
     pub initial_llm_snapshot: Option<String>,
     pub multimodel_summary: MultimodelRunSummary,
+    /// Deterministic pipeline stage timeline (empty for classic runs).
+    pub pipeline_stages: Vec<PipelineStageRecord>,
+    pub cloud_calls: u32,
+    pub agent_engine: String,
 }
 
 fn history_dir(data_dir: &str, chat_id: i64, persona_id: i64) -> PathBuf {
@@ -336,6 +357,19 @@ impl AgentRunRecord {
             self.total_duration_ms,
         ));
         md.push_str(&self.multimodel_summary.format_markdown_block());
+
+        if !self.pipeline_stages.is_empty() {
+            md.push_str(&format!(
+                "\n## Deterministic pipeline (engine: {} | cloud calls: {})\n",
+                self.agent_engine, self.cloud_calls
+            ));
+            for stage in &self.pipeline_stages {
+                md.push_str(&format!(
+                    "- **{}** ({}ms): {}\n",
+                    stage.stage, stage.duration_ms, stage.detail
+                ));
+            }
+        }
 
         for iter in &self.iterations {
             md.push_str(&format!(
@@ -581,6 +615,8 @@ mod tests {
             tier1_endpoint: "http://127.0.0.1:8080/v1".into(),
             tier2_model: "mistral-test".into(),
             tier2_endpoint: "http://127.0.0.1:8081/v1".into(),
+            local_model: "qwen-test".into(),
+            local_endpoint: "http://127.0.0.1:8080/v1".into(),
         }
     }
 
@@ -608,6 +644,9 @@ mod tests {
             total_duration_ms: 42,
             initial_llm_snapshot: None,
             multimodel_summary: sample_multimodel_summary(),
+            pipeline_stages: vec![],
+            cloud_calls: 0,
+            agent_engine: "classic".into(),
         };
         let md = record.to_markdown();
         assert!(md.contains("Multi-model: enabled"));
@@ -679,11 +718,16 @@ mod tests {
                 strategy_provider: "google".into(),
                 strategy_model: "gemini".into(),
                 strategy_endpoint: "https://example.com/v1".into(),
+                local_model: String::new(),
+                local_endpoint: String::new(),
                 tier1_model: String::new(),
                 tier1_endpoint: String::new(),
                 tier2_model: String::new(),
                 tier2_endpoint: String::new(),
             },
+            pipeline_stages: vec![],
+            cloud_calls: 0,
+            agent_engine: "classic".into(),
         };
         let md = record.to_markdown();
         assert!(md.contains("- PTE: continue (842ms)"));
@@ -738,11 +782,16 @@ mod tests {
                 strategy_provider: "google".into(),
                 strategy_model: "gemini".into(),
                 strategy_endpoint: "https://example.com/v1".into(),
+                local_model: String::new(),
+                local_endpoint: String::new(),
                 tier1_model: String::new(),
                 tier1_endpoint: String::new(),
                 tier2_model: String::new(),
                 tier2_endpoint: String::new(),
             },
+            pipeline_stages: vec![],
+            cloud_calls: 0,
+            agent_engine: "classic".into(),
         };
         let basename = write_agent_history_run(data_dir, chat_id, persona_id, &record).unwrap();
         append_pdqe_step_to_agent_history(

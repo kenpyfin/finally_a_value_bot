@@ -34,7 +34,7 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
     void load()
   }, [load])
 
-  async function patchRuntime(body: Record<string, boolean>, key: string) {
+  async function patchRuntime(body: Record<string, boolean | string>, key: string) {
     setSavingKey(key)
     try {
       const res = await api<RuntimeConfigResponse>('/api/runtime', {
@@ -124,6 +124,34 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
             )
           }
         />
+      </Flex>
+
+      <Flex direction="column" gap="2">
+        <Text size="2" weight="medium">
+          Agent engine
+        </Text>
+        <Text size="1" color="gray">
+          Classic: heuristic tool loop with optional Plan/Execute/Synthesize phases. Deterministic:
+          structured intent → plan → per-step local execution → cloud synthesis. Applies immediately (
+          {sourceLabel(sources.agent_engine)}).
+        </Text>
+        <Flex gap="2" wrap="wrap">
+          {(['classic', 'deterministic'] as const).map((engine) => (
+            <button
+              key={engine}
+              type="button"
+              disabled={savingKey != null}
+              className={
+                runtime?.agent_engine === engine
+                  ? 'mc-engine-option mc-engine-option--active'
+                  : 'mc-engine-option'
+              }
+              onClick={() => void patchRuntime({ agent_engine: engine }, 'agent_engine')}
+            >
+              {engine === 'classic' ? 'Classic' : 'Deterministic'}
+            </button>
+          ))}
+        </Flex>
       </Flex>
     </Flex>
   )

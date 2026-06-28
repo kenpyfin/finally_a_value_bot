@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[path = "agent_run_prep.rs"]
+mod agent_run_prep;
+pub(crate) use agent_run_prep::{prepare_agent_run, AgentRunPrep};
+
 use regex::Regex;
 use serenity::http::Http as SerenityHttp;
 use teloxide::prelude::*;
@@ -155,7 +159,7 @@ fn mark_messages_as_prior_turn(messages: &mut [Message]) {
     }
 }
 
-fn build_current_request_from_message(msg: Message) -> Message {
+pub(super) fn build_current_request_from_message(msg: Message) -> Message {
     match msg.content {
         MessageContent::Text(t) => {
             let (sender, at, body, needs_sanitize) =
@@ -215,7 +219,9 @@ fn build_current_request_from_message(msg: Message) -> Message {
 }
 
 /// Split the trailing user turn (the triggering ask) from prior conversation history.
-fn split_trailing_user_request(messages: Vec<Message>) -> (Vec<Message>, Option<Message>) {
+pub(super) fn split_trailing_user_request(
+    messages: Vec<Message>,
+) -> (Vec<Message>, Option<Message>) {
     if messages.is_empty() {
         return (messages, None);
     }
@@ -466,6 +472,7 @@ pub async fn run_bot(
             tool_output_debug: config.tool_output_debug,
             post_tool_evaluator_enabled: config.post_tool_evaluator_enabled,
             response_quality_evaluator_enabled: config.response_quality_evaluator_enabled,
+            agent_engine: crate::runtime_toggles::AgentEngine::Classic,
         },
         &db,
     )?;
@@ -1734,6 +1741,33 @@ pub async fn process_with_agent_with_events(
     event_tx: Option<&UnboundedSender<AgentEvent>>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<AgentProcessResult> {
+    if state.runtime_toggles.agent_engine() == crate::runtime_toggles::AgentEngine::Deterministic {
+        let prep = prepare_agent_run(state, &context, override_prompt, image_data.clone()).await?;
+        return crate::agent_pipeline::run_deterministic_pipeline(
+            state, context, prep, event_tx, cancel,
+        )
+        .await;
+    }
+
+    process_classic_agent_with_events(
+        state,
+        context,
+        override_prompt,
+        image_data,
+        event_tx,
+        cancel,
+    )
+    .await
+}
+
+async fn process_classic_agent_with_events(
+    state: &AppState,
+    context: AgentRequestContext<'_>,
+    override_prompt: Option<&str>,
+    image_data: Option<(String, String)>,
+    event_tx: Option<&UnboundedSender<AgentEvent>>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<AgentProcessResult> {
     let chat_id = context.chat_id;
     let persona_id = context.persona_id;
     ensure_persona_memory_file_exists(state, chat_id, persona_id);
@@ -2331,6 +2365,9 @@ pub async fn process_with_agent_with_events(
                 total_duration_ms: run_start.elapsed().as_millis(),
                 initial_llm_snapshot: Some(initial_llm_snapshot_json.clone()),
                 multimodel_summary: multimodel_run_summary.clone(),
+                pipeline_stages: Vec::new(),
+                cloud_calls: 0,
+                agent_engine: "classic".into(),
             };
             let basename = write_agent_history_run(
                 &state.config.runtime_data_dir(),
@@ -2426,6 +2463,7 @@ pub async fn process_with_agent_with_events(
                     run_start,
                     &initial_llm_snapshot_json,
                     &multimodel_run_summary,
+                    None,
                 )
                 .await?
                 {
@@ -2556,6 +2594,7 @@ pub async fn process_with_agent_with_events(
                         run_start,
                         &initial_llm_snapshot_json,
                         &multimodel_run_summary,
+                        None,
                     )
                     .await?
                     {
@@ -2593,6 +2632,7 @@ pub async fn process_with_agent_with_events(
                         run_start,
                         &initial_llm_snapshot_json,
                         &multimodel_run_summary,
+                        None,
                     )
                     .await?
                     {
@@ -3188,6 +3228,7 @@ pub async fn process_with_agent_with_events(
                                 run_start,
                                 &initial_llm_snapshot_json,
                                 &multimodel_run_summary,
+                                None,
                             )
                             .await?
                             {
@@ -3719,6 +3760,7 @@ pub async fn process_with_agent_with_events(
                                     run_start,
                                     &initial_llm_snapshot_json,
                                     &multimodel_run_summary,
+                                    None,
                                 )
                                 .await?
                                 {
@@ -3756,6 +3798,7 @@ pub async fn process_with_agent_with_events(
                                             run_start,
                                             &initial_llm_snapshot_json,
                                             &multimodel_run_summary,
+                                            None,
                                         )
                                         .await?
                                         {
@@ -4023,6 +4066,7 @@ pub async fn process_with_agent_with_events(
         run_start,
         &initial_llm_snapshot_json,
         &multimodel_run_summary,
+        None,
     )
     .await?
     {
@@ -4104,6 +4148,7 @@ async fn try_finish_agent_turn(
     run_start: std::time::Instant,
     initial_llm_snapshot_json: &str,
     multimodel_summary: &crate::multimodel::MultimodelRunSummary,
+    pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
 ) -> anyhow::Result<Option<AgentProcessResult>> {
     let mut final_text = response;
     match finish_turn_with_quality_gate(
@@ -4130,12 +4175,69 @@ async fn try_finish_agent_turn(
         run_start,
         initial_llm_snapshot_json,
         multimodel_summary,
+        pipeline_extras,
     )
     .await?
     {
         FinishTurnOutcome::Complete(r) => Ok(Some(r)),
         FinishTurnOutcome::Retry => Ok(None),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn pipeline_finish_turn(
+    state: &AppState,
+    context: &AgentRequestContext<'_>,
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    run_key: &str,
+    chat_id: i64,
+    persona_id: i64,
+    stop_reason: &str,
+    response: String,
+    system_prompt: &str,
+    messages: &mut Vec<Message>,
+    protected_message_count: usize,
+    pdqe_retries: &mut usize,
+    pdqe_steps: &mut Vec<EvaluatorStepRecord>,
+    history_iterations: &mut Vec<IterationRecord>,
+    principles_content: &str,
+    is_conversational: bool,
+    run_tool_names: &[String],
+    agent_history_basename: &mut Option<String>,
+    had_tool_calls: bool,
+    user_msg_preview: &str,
+    run_start: std::time::Instant,
+    initial_llm_snapshot_json: &str,
+    multimodel_summary: &crate::multimodel::MultimodelRunSummary,
+    pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
+) -> anyhow::Result<Option<AgentProcessResult>> {
+    try_finish_agent_turn(
+        state,
+        context,
+        event_tx,
+        run_key,
+        chat_id,
+        persona_id,
+        stop_reason,
+        response,
+        system_prompt,
+        messages,
+        protected_message_count,
+        pdqe_retries,
+        pdqe_steps,
+        history_iterations,
+        principles_content,
+        is_conversational,
+        run_tool_names,
+        agent_history_basename,
+        had_tool_calls,
+        user_msg_preview,
+        run_start,
+        initial_llm_snapshot_json,
+        multimodel_summary,
+        pipeline_extras,
+    )
+    .await
 }
 
 async fn finish_turn_with_quality_gate(
@@ -4162,6 +4264,7 @@ async fn finish_turn_with_quality_gate(
     run_start: std::time::Instant,
     initial_llm_snapshot_json: &str,
     multimodel_summary: &crate::multimodel::MultimodelRunSummary,
+    pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
 ) -> anyhow::Result<FinishTurnOutcome> {
     let (hook_summary, should_run_focus_sync) = run_post_delivery_hooks_before_gate(
         state,
@@ -4385,6 +4488,16 @@ async fn finish_turn_with_quality_gate(
     }
 
     let stop_reason_owned = stop_reason.to_string();
+    let (pipeline_stages, cloud_calls, agent_engine) = pipeline_extras.map_or_else(
+        || (Vec::new(), 0u32, "classic".to_string()),
+        |ex| {
+            (
+                ex.pipeline_stages.clone(),
+                ex.cloud_calls,
+                "deterministic".to_string(),
+            )
+        },
+    );
     let record = AgentRunRecord {
         timestamp: chrono::Utc::now(),
         channel: context.caller_channel.to_string(),
@@ -4396,6 +4509,9 @@ async fn finish_turn_with_quality_gate(
         total_duration_ms: run_start.elapsed().as_millis(),
         initial_llm_snapshot: Some(initial_llm_snapshot_json.to_string()),
         multimodel_summary: multimodel_summary.clone(),
+        pipeline_stages,
+        cloud_calls,
+        agent_engine,
     };
     *agent_history_basename = write_agent_history_run(
         &state.config.runtime_data_dir(),
@@ -4474,7 +4590,7 @@ async fn run_post_delivery_hooks_before_gate(
     (None, false)
 }
 
-fn ensure_persona_memory_file_exists(state: &AppState, chat_id: i64, persona_id: i64) {
+pub(super) fn ensure_persona_memory_file_exists(state: &AppState, chat_id: i64, persona_id: i64) {
     let path = state.memory.persona_memory_state_path(chat_id, persona_id);
     if path.exists() {
         return;
@@ -4504,7 +4620,7 @@ fn ensure_persona_memory_file_exists(state: &AppState, chat_id: i64, persona_id:
 }
 
 /// Load messages from DB history (non-session path).
-async fn load_messages_from_db(
+pub(super) async fn load_messages_from_db(
     state: &AppState,
     chat_id: i64,
     persona_id: i64,
@@ -4536,7 +4652,7 @@ async fn load_messages_from_db(
     ))
 }
 
-fn latest_user_text_from_message(msg: &Message) -> String {
+pub(super) fn latest_user_text_from_message(msg: &Message) -> String {
     let text = text_from_message_content(&msg.content);
     if let Some(inner) = parse_current_request_content(&text) {
         return inner;
@@ -4550,7 +4666,7 @@ fn latest_user_text_from_message(msg: &Message) -> String {
     text
 }
 
-fn latest_user_text(messages: &[Message]) -> String {
+pub(super) fn latest_user_text(messages: &[Message]) -> String {
     for m in messages.iter().rev() {
         if m.role != "user" {
             continue;
@@ -4714,7 +4830,7 @@ fn estimate_message_tokens(message: &Message) -> usize {
     }
 }
 
-fn trim_to_token_budget(
+pub(super) fn trim_to_token_budget(
     messages: &mut Vec<Message>,
     system_prompt: &str,
     tool_defs: &[crate::claude::ToolDefinition],
@@ -5331,7 +5447,7 @@ fn mark_swap_task_stalled_best_effort(
 /// `workspace_root`. If the first path segment equals the last segment of `workspace_root`
 /// (e.g. `.../workspace` + `workspace/shared/...`), the redundant leading segment is dropped
 /// so paths do not contain `workspace/workspace`.
-fn workspace_data_path_display(workspace_root: &Path, configured: &str) -> String {
+pub(super) fn workspace_data_path_display(workspace_root: &Path, configured: &str) -> String {
     let trimmed = configured.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -5361,7 +5477,7 @@ fn workspace_data_path_display(workspace_root: &Path, configured: &str) -> Strin
     workspace_root.join(tail).to_string_lossy().into_owned()
 }
 
-fn format_bookmarks_section(bookmarks: &[PersonaMessageBookmark]) -> Option<String> {
+pub(super) fn format_bookmarks_section(bookmarks: &[PersonaMessageBookmark]) -> Option<String> {
     if bookmarks.is_empty() {
         return None;
     }
@@ -5396,7 +5512,9 @@ fn format_bookmarks_section(bookmarks: &[PersonaMessageBookmark]) -> Option<Stri
     Some(lines.join("\n"))
 }
 
-fn format_bulletin_focus_section(focus: Option<&PersonaBulletinFocus>) -> Option<String> {
+pub(super) fn format_bulletin_focus_section(
+    focus: Option<&PersonaBulletinFocus>,
+) -> Option<String> {
     let focus = focus?;
     let title = focus
         .title
@@ -5423,7 +5541,7 @@ fn format_bulletin_focus_section(focus: Option<&PersonaBulletinFocus>) -> Option
     }
 }
 
-fn build_persona_context_message(
+pub(super) fn build_persona_context_message(
     memory_prose: &str,
     _tier1_in_system_prompt: bool,
     bulletin_focus: Option<&str>,
@@ -5462,7 +5580,7 @@ fn build_persona_context_message(
 }
 
 /// Capsule + prose for vault Standard Operating Procedures.
-fn sops_prompt_sections() -> (String, String) {
+pub(super) fn sops_prompt_sections() -> (String, String) {
     let caps = "- **SOPs (vault):** If `[persona_context]` lists any Tier 2 **SOP** (`id` + `vault_path`), or the task matches a pipeline, **read that vault file and follow it** before improvising; execute with `activate_skill` + `run_skill_script`\n".to_string();
     let body = format!(
         "## Standard Operating Procedures (SOPs)\n\
@@ -5478,7 +5596,7 @@ fn sops_prompt_sections() -> (String, String) {
     (caps, body)
 }
 
-fn build_system_prompt(
+pub(super) fn build_system_prompt(
     _bot_username: &str,
     principles_content: &str,
     agents_md_path: &str,
@@ -5754,7 +5872,7 @@ fn is_operational_bot_content(text: &str) -> bool {
     false
 }
 
-fn history_to_claude_messages(
+pub(super) fn history_to_claude_messages(
     history: &[StoredMessage],
     _bot_username: &str,
     keep_trailing_assistant: bool,
