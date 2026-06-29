@@ -29,10 +29,10 @@ impl Tool for ReadAgentHistoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_agent_history".into(),
-            description: "Read this persona's recent agent run history (iterations, tool calls, durations, outcomes). Use when asked to optimize your workflow, review past behavior, or improve efficiency.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "read_agent_history",
+            "Read this persona's recent agent run history (iterations, tool calls, durations, outcomes). Newer run files may also include a JSON snapshot of the first-turn system prompt and messages after the trace. Use when asked to optimize your workflow, review past behavior, or improve efficiency.",
+            schema_object(
                 json!({
                     "limit": {
                         "type": "integer",
@@ -53,7 +53,7 @@ impl Tool for ReadAgentHistoryTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

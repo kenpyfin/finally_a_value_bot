@@ -5,10 +5,12 @@
 ```sh
 git clone <repo-url>
 cd finally-a-value-bot
-cp finally-a-value-bot.config.example.yaml finally-a-value-bot.config.yaml
-# Edit finally-a-value-bot.config.yaml with your credentials
+cp .env.example .env
+# Set bootstrap vars in .env (workspace + web host/port/auth when needed)
 cargo run -- start
 ```
+
+Then open `http://127.0.0.1:10961` and finish runtime configuration in Web UI Settings. CLI `config` and `setup` are retired.
 
 ## Prerequisites
 
@@ -23,7 +25,7 @@ No other external dependencies. SQLite is bundled via `rusqlite`.
 ```
 src/
     main.rs              # Entry point. Parses CLI args, initializes subsystems, starts bot.
-    config.rs            # Config struct. All settings loaded from finally-a-value-bot.config.yaml.
+    config.rs            # Config struct. Bootstrap from .env (no startup merge from app_settings).
     error.rs             # FinallyAValueBotError enum (thiserror). Centralized error types.
     telegram.rs          # Core orchestration:
                          #   - Telegram message handler
@@ -54,13 +56,16 @@ src/
         mod.rs           # Tool trait, ToolRegistry, ToolResult.
                          # Registry takes data_dir, Bot, Arc<Database>.
         bash.rs          # Shell command execution (tokio::process::Command)
-        read_file.rs     # File reading with line numbers, offset/limit
+        read_file.rs     # File reading with line numbers, offset/limit, and centered context windows
+        read_repo_map.rs # Lightweight repository map (files + symbol signatures)
         write_file.rs    # File creation/overwrite, auto-creates directories
         edit_file.rs     # Find/replace editing, validates uniqueness
+        apply_search_replace.rs # Deterministic block-based search/replace (exact-first, optional fuzzy)
+        symbol_edit.rs   # Optional language-aware symbol-span replacement
         glob.rs          # File pattern matching (glob crate)
         grep.rs          # Recursive regex search, directory traversal
         memory.rs        # read_memory / write_memory tools
-        web_search.rs    # DuckDuckGo HTML search, regex result parsing
+        web_search.rs    # Tavily (TAVILY_API_KEY), optional SearXNG (SEARXNG_URL), else DuckDuckGo HTML
         web_fetch.rs     # URL fetching, HTML tag stripping, 20KB limit
         send_message.rs  # Mid-conversation Telegram messaging
         schedule.rs      # 5 scheduling tools (create/list/pause/resume/cancel)
@@ -68,6 +73,28 @@ src/
 ```
 
 ## Architecture overview
+
+### Secret redaction
+
+The bot redacts **only literal values** loaded from **env-like files** on disk at startup (`.env`, `.env.local`, names ending in `.env` such as `mercari.env`; excludes `*.example` / `*.sample`). Implementation: `src/safety_redaction.rs` (`EnvSecretRedactor::discover`, `redact`). Sources: configuration `.env` (`FINALLY_A_VALUE_BOT_CONFIG` or `./.env`), files under `WORKSPACE_DIR`, and resolved `builtin_skills/` when present.
+
+- Only **credential-like env keys** enter the catalog (`*TOKEN*`, `*SECRET*`, `*API_KEY*`, `*_KEY`, `DATABASE_URL`, etc.). Config keys (`WORKSPACE_DIR`, models, ports, paths, limits) are skipped.
+- Path-like, boolean, numeric, and plain `http(s)://` URL values are skipped even when the key name would qualify.
+- Values shorter than 8 characters (or `ENV_REDACT_MIN_VALUE_LEN` when set at process start) are not redacted.
+- Placeholder values (`changeme`, `your_api_key_here`, etc.) are skipped.
+- **Restart the bot** after changing any env-like file so the catalog refreshes.
+- Secrets not stored in env-like files are **not** redacted (inline chat secrets, generated tokens, etc.).
+
+Redaction runs on tool results, logs, hook/PTE prompts, scheduler delivery, final assistant output safeguards, and background-shell output.
+
+### Related documentation
+
+| Topic | Doc |
+| --- | --- |
+| Multi-model local tiers (llama.cpp, tool probe, cross-install setup) | [`docs/multimodel-local-tiers.md`](docs/multimodel-local-tiers.md) |
+| Vault SOPs (workflows as procedure context) | [`docs/sops.md`](docs/sops.md) |
+| Deprecated SQLite learned workflows | [`docs/workflow.md`](docs/workflow.md) |
+| Runtime parity / deferred agent-runtime items | [`docs/runtime-gap-analysis.md`](docs/runtime-gap-analysis.md) |
 
 ### Data flow
 
@@ -92,18 +119,19 @@ Telegram message
            - Group: all messages since last bot response (catch-up)
        |
        v
-    Build system prompt (bot identity + memory context + chat_id)
+    Build system prompt (bot identity + memory context + optional operator memo + chat_id)
        |
        v
-    Compact if needed (messages > max_session_messages):
-       - Summarize old messages via Claude
-       - Keep recent messages verbatim
+    Trim loaded history to a balanced suffix (at least N user + N assistant text
+    messages; defaults from config, optional per-persona overrides via DB / web bulletin)
        |
        v
     Agentic loop (up to max_tool_iterations):
        1. Call Claude API with messages + tool definitions
-       2. If stop_reason == "tool_use" -> execute tools -> append results -> loop
-       3. If stop_reason == "end_turn" -> extract text -> return
+       2. If stop_reason == "tool_use" -> execute tools
+          - For code edits, optional post-edit validator checks run and feed structured PASS/FAIL output back into tool results
+       3. Append tool results -> loop
+       4. If stop_reason == "end_turn" -> extract text -> return
        |
        v
     Strip image base64 data, save session to SQLite
@@ -138,6 +166,12 @@ Telegram message
 - Telegram handler has `Arc<AppState>` via dptree dependencies
 - Scheduler gets `Arc<AppState>` at spawn time
 - Tools that need `Bot` or `Database` hold their own clones/arcs (passed at construction)
+
+### Foreground agent queue
+
+- `ChatRunQueue` (`src/chat_queue.rs`) serializes **foreground** agent runs (Telegram/Discord/WhatsApp/web send, scheduler due tasks) with one FIFO worker per **`(canonical chat_id, persona_id)`**.
+- Different personas in the same contact can run in parallel; the same persona stays one-at-a-time.
+- `GET /api/queue_diagnostics` returns one lane per persona; web cockpit filters to the active persona (optional “All personas” in the queue dialog).
 
 ### Multi-chat permission model
 
@@ -295,12 +329,12 @@ The scheduler is a `tokio::spawn` task started in `run_bot()`. Every `SCHEDULER_
 2. Queries `scheduled_tasks` for rows where `status = 'active' AND next_run <= NOW()`, ordered by `next_run`, then `id`.
 3. For each due task, spawns work with a semaphore (`SCHEDULER_MAX_CONCURRENT_TASKS`, default 2) so one long run does not block the scheduler loop.
 4. Atomically claims the task (`try_mark_task_running`: only if still `active` and due), then calls `process_with_agent()` with `override_prompt = Some(task.prompt)` and a wall-clock `tokio::time::timeout` of `SCHEDULER_TASK_TIMEOUT_SECS` (default 3600).
-5. Sends the agent's final response via `deliver_to_contact` (scheduled runs inject policy + block `send_message` to the same chat to avoid duplicate Telegram messages).
+5. Sends the agent's final response via `deliver_to_contact` (scheduled runs inject policy + block `send_message` to the same chat to avoid duplicate Telegram messages). If the agent returns a web **background handoff** sentinel (e.g. long tool timeout on web-typed chats), the scheduler enqueues a `background_jobs` row and delivers a normal user-facing summary instead of the internal token.
 6. For cron tasks: finalizes with the precomputed next run; for one-shot tasks: sets `status = 'completed'`
 
 Cron expressions use the `cron` crate's 6-field format: `sec min hour dom month dow`.
 
-Optional env (see `.env.example`): `SCHEDULER_TASK_TIMEOUT_SECS`, `SCHEDULER_STALE_RUNNING_RECLAIM_SECS`, `SCHEDULER_MAX_CONCURRENT_TASKS`, `SCHEDULER_POLL_INTERVAL_SECS`. When any task is due on a tick, an `info` line logs `due_count`, `claimed` (atomic claims), and `spawned` (tasks actually spawned).
+Optional env (see `.env.example`): `SCHEDULER_TASK_TIMEOUT_SECS`, `SCHEDULER_STALE_RUNNING_RECLAIM_SECS`, `SCHEDULER_MAX_CONCURRENT_TASKS`, `SCHEDULER_POLL_INTERVAL_SECS`. When any task is due on a tick, an `info` line logs `due_count`, `claimed` (atomic claims), and `spawned` (tasks actually spawned). Web handoff enqueue shares the same path as interactive web; `BACKGROUND_JOB_NOTIFY_CHAT_PROGRESS=1` opt-in re-enables per-tool “Background update” chat lines for manual background jobs (default off).
 
 ## Debugging
 
@@ -324,12 +358,15 @@ sqlite> SELECT * FROM chats;
 | Task                       | How                                                                                                                                         |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | Change the model           | Set `model: "claude-sonnet-4-20250514"` in `finally-a-value-bot.config.yaml`                                                                |
-| Increase context window    | Set `max_history_messages: 100` in `finally-a-value-bot.config.yaml` (uses more tokens)                                                     |
+| Increase context window    | Raise `max_history_messages` / `MAX_HISTORY_MESSAGES` (more DB rows eligible for the prompt; uses more tokens). Ensure it is ≥ user + assistant suffix minimums when turns alternate. |
+| More dialogue at the tail  | Set `recent_history_min_user_messages` / `recent_history_min_assistant_messages` (env `RECENT_HISTORY_MIN_USER_MESSAGES` / `RECENT_HISTORY_MIN_ASSISTANT_MESSAGES`, default 2) or per-persona overrides via web cockpit → `GET`/`PATCH /api/personas/:id/bulletin` (`history_suffix`). |
+| Operator steering note     | Per-persona `operator_memo` (web cockpit bulletin PATCH, injected in the system prompt). Distinct from the header Memory JSON editor (`memory_state`). |
+| Bulletin focus card        | `update_bulletin_focus` writes the cockpit focus card (`persona_bulletin_focus`). Bulletin is injected into `[persona_context]` on the next run; lifecycle focus-sync hooks persist routine updates after delivery. |
+| Focus-sync lifecycle hook  | Built-in hook `postdelivery-persona-focus-sync` (`PostDelivery`) triggers routine bulletin + Tier 3 hygiene sync. |
+| Tier 2 knowledge layer     | Tier 2 stores durable knowledge only (terminology, known steps, preferences). Active/recent execution focus belongs to Bulletin; Tier 3 remains scratch-only and should not duplicate bulletin status lines. |
 | Increase tool iterations   | Set `max_tool_iterations: 200` in `finally-a-value-bot.config.yaml`                                                                         |
 | Reset memory               | Delete files under `finally-a-value-bot.data/runtime/groups/`                                                                               |
 | Reset all data             | Delete the `finally-a-value-bot.data/` directory                                                                                            |
-| Tune compaction threshold  | Set `max_session_messages: 60` in `finally-a-value-bot.config.yaml` (higher = more context before compaction)                               |
-| Keep more recent messages  | Set `compact_keep_recent: 30` in `finally-a-value-bot.config.yaml` (more recent messages kept verbatim)                                     |
 | Reset a chat session       | Send `/reset` in the chat, or: `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "DELETE FROM sessions WHERE chat_id=XXXX;"` |
 | Cancel all scheduled tasks | `sqlite3 finally-a-value-bot.data/runtime/finally-a-value-bot.db "UPDATE scheduled_tasks SET status='cancelled' WHERE status='active';"`    |
 

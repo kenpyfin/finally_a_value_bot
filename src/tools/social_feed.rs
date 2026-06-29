@@ -81,10 +81,10 @@ impl Tool for FetchTiktokFeedTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "fetch_tiktok_feed".into(),
-            description: "Fetch TikTok videos from the user's feed. Requires one-time OAuth authorization per user. Omit username to fetch the caller's own videos. Public profile by username is not supported by the TikTok API.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "fetch_tiktok_feed",
+            "Fetch TikTok videos from the user's feed. Requires one-time OAuth authorization per user. Omit username to fetch the caller's own videos. Public profile by username is not supported by the TikTok API.",
+            schema_object(
                 json!({
                     "username": {
                         "type": "string",
@@ -101,7 +101,7 @@ impl Tool for FetchTiktokFeedTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -218,10 +218,10 @@ impl Tool for FetchInstagramFeedTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "fetch_instagram_feed".into(),
-            description: "Fetch Instagram media from the user's feed. Requires one-time OAuth authorization per user. Omit username to fetch your own feed. Public profile by username has limited API support.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "fetch_instagram_feed",
+            "Fetch Instagram media from the user's feed. Requires one-time OAuth authorization per user. Omit username to fetch your own feed. Public profile by username has limited API support.",
+            schema_object(
                 json!({
                     "username": {
                         "type": "string",
@@ -238,7 +238,7 @@ impl Tool for FetchInstagramFeedTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -374,10 +374,10 @@ impl Tool for FetchLinkedinFeedTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "fetch_linkedin_feed".into(),
-            description: "Fetch LinkedIn posts from the user's feed. Requires one-time OAuth authorization per user. Omit username to fetch your own posts. Public profile by username is not supported.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "fetch_linkedin_feed",
+            "Fetch LinkedIn posts from the user's feed. Requires one-time OAuth authorization per user. Omit username to fetch your own posts. Public profile by username is not supported.",
+            schema_object(
                 json!({
                     "username": {
                         "type": "string",
@@ -390,7 +390,7 @@ impl Tool for FetchLinkedinFeedTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

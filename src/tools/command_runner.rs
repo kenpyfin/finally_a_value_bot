@@ -38,12 +38,28 @@ pub fn agent_browser_program() -> String {
 }
 
 pub fn build_command(spec: &CommandSpec, working_dir: Option<&Path>) -> tokio::process::Command {
+    build_command_with_env(spec, working_dir, false)
+}
+
+pub fn build_command_with_env(
+    spec: &CommandSpec,
+    working_dir: Option<&Path>,
+    tool_output_debug: bool,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
+    apply_tool_output_debug_env(&mut cmd, tool_output_debug);
     cmd
+}
+
+/// Sets `TOOL_OUTPUT_DEBUG=1` for workspace PZ/ComfyUI scripts when debug logging is enabled.
+pub fn apply_tool_output_debug_env(cmd: &mut tokio::process::Command, tool_output_debug: bool) {
+    if tool_output_debug {
+        cmd.env("TOOL_OUTPUT_DEBUG", "1");
+    }
 }
 
 #[cfg(test)]

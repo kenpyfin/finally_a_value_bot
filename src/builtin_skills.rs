@@ -1,110 +1,83 @@
-use include_dir::{include_dir, Dir, DirEntry};
-use std::path::Path;
+//! Built-in skills live in the repository `builtin_skills/` tree. They are discovered from disk
+//! at runtime (no copy into `WORKSPACE_DIR/skills/`).
 
-static BUILTIN_SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/builtin_skills");
+use crate::config::Config;
+use std::path::PathBuf;
 
-pub fn ensure_builtin_skills(data_root: &Path) -> std::io::Result<()> {
-    let skills_root = data_root.join("skills");
-    std::fs::create_dir_all(&skills_root)?;
-    copy_missing_entries(&BUILTIN_SKILLS_DIR, &skills_root)
-}
+/// Resolve the on-disk `builtin_skills/` directory used for skill discovery and bundled scripts.
+///
+/// Precedence:
+/// 1. `FINALLY_A_VALUE_BOT_BUILTIN_SKILLS` if set and the path exists
+/// 2. Parent of the workspace data root + `builtin_skills` (typical layout: repo contains `workspace/` and `builtin_skills/`)
+/// 3. Current working directory + `builtin_skills`
+/// 4. Parent of the current executable + `builtin_skills` (deployment: ship folder next to the binary)
+/// 5. Compile-time `CARGO_MANIFEST_DIR/builtin_skills` if it exists (e.g. `cargo run` from the crate root)
+pub fn resolve_builtin_skills_dir(config: &Config) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("FINALLY_A_VALUE_BOT_BUILTIN_SKILLS") {
+        let pb = PathBuf::from(p.trim());
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
 
-fn copy_missing_entries(embedded: &Dir<'_>, destination: &Path) -> std::io::Result<()> {
-    for entry in embedded.entries() {
-        match entry {
-            DirEntry::Dir(dir) => {
-                let Some(name) = dir.path().file_name() else {
-                    continue;
-                };
-                let next_dest = destination.join(name);
-                std::fs::create_dir_all(&next_dest)?;
-                copy_missing_entries(dir, &next_dest)?;
-            }
-            DirEntry::File(file) => {
-                let Some(name) = file.path().file_name() else {
-                    continue;
-                };
-                let out_path = destination.join(name);
-                if !out_path.exists() {
-                    std::fs::write(out_path, file.contents())?;
-                }
+    let parent_builtin = config
+        .workspace_root_absolute()
+        .parent()
+        .map(|p| p.join("builtin_skills"));
+    if let Some(ref p) = parent_builtin {
+        if p.is_dir() {
+            return Some(p.clone());
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let p = cwd.join("builtin_skills");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let p = parent.join("builtin_skills");
+            if p.is_dir() {
+                return Some(p);
             }
         }
     }
-    Ok(())
+
+    let manifest_builtin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtin_skills");
+    if manifest_builtin.is_dir() {
+        return Some(manifest_builtin);
+    }
+
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp_root() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "finally_a_value_bot_builtin_skills_test_{}",
-            uuid::Uuid::new_v4()
-        ))
-    }
-
-    fn cleanup(path: &Path) {
-        let _ = std::fs::remove_dir_all(path);
-    }
+    use crate::config::test_config;
+    use std::fs;
 
     #[test]
-    fn test_ensure_builtin_skills_writes_missing_files() {
-        let root = temp_root();
-        ensure_builtin_skills(&root).unwrap();
-        let sample = root.join("skills").join("pdf").join("SKILL.md");
-        assert!(sample.exists());
-        let content = std::fs::read_to_string(sample).unwrap();
-        assert!(!content.trim().is_empty());
-        cleanup(&root);
-    }
+    fn resolve_finds_sibling_of_workspace() {
+        let tmp =
+            std::env::temp_dir().join(format!("fab_builtin_skills_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(tmp.join("workspace")).unwrap();
+        fs::create_dir_all(tmp.join("builtin_skills").join("demo")).unwrap();
+        fs::write(
+            tmp.join("builtin_skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: x\n---\n",
+        )
+        .unwrap();
 
-    #[test]
-    fn test_ensure_builtin_skills_does_not_overwrite_existing_file() {
-        let root = temp_root();
-        let custom_pdf = root.join("skills").join("pdf");
-        std::fs::create_dir_all(&custom_pdf).unwrap();
-        let custom_file = custom_pdf.join("SKILL.md");
-        std::fs::write(&custom_file, "custom-content").unwrap();
+        let mut config = test_config();
+        config.workspace_dir = tmp.join("workspace").to_string_lossy().to_string();
 
-        ensure_builtin_skills(&root).unwrap();
-        let content = std::fs::read_to_string(custom_file).unwrap();
-        assert_eq!(content, "custom-content");
-        cleanup(&root);
-    }
+        let got = resolve_builtin_skills_dir(&config).expect("expected builtin_skills");
+        assert_eq!(got, tmp.join("builtin_skills"));
 
-    #[test]
-    fn test_ensure_builtin_skills_includes_new_macos_and_weather_skills() {
-        let root = temp_root();
-        ensure_builtin_skills(&root).unwrap();
-
-        let skills_root = root.join("skills");
-        for skill in [
-            "apple-notes",
-            "apple-reminders",
-            "apple-calendar",
-            "weather",
-            "find-skills",
-            "search-vault",
-            "index-vault",
-            "create-skill",
-        ] {
-            let skill_file = skills_root.join(skill).join("SKILL.md");
-            assert!(skill_file.exists(), "missing built-in skill: {skill}");
-            let content = std::fs::read_to_string(skill_file).unwrap();
-            assert!(!content.trim().is_empty(), "empty skill file: {skill}");
-        }
-
-        // Verify bundled scripts are also copied
-        let search_script = skills_root.join("search-vault").join("query_vault.py");
-        assert!(
-            search_script.exists(),
-            "missing search-vault/query_vault.py"
-        );
-        let index_script = skills_root.join("index-vault").join("index_vault.py");
-        assert!(index_script.exists(), "missing index-vault/index_vault.py");
-
-        cleanup(&root);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

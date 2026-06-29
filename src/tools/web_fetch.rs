@@ -14,12 +14,10 @@ impl Tool for WebFetchTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "web_fetch".into(),
-            description:
-                "Fetch a URL and return its text content (HTML parsed, scripts/styles removed). Max 20KB."
-                    .into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "web_fetch",
+            "Fetch a URL and return its text content (HTML parsed, scripts/styles removed). Max 20KB.",
+            schema_object(
                 json!({
                     "url": {
                         "type": "string",
@@ -28,7 +26,7 @@ impl Tool for WebFetchTool {
                 }),
                 &["url"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

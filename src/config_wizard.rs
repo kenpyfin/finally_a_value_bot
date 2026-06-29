@@ -8,6 +8,8 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
 
+// Provider/model prompts retired — Web UI Settings → LLM; presets kept for future CLI use.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct ProviderPreset {
     id: &'static str,
@@ -16,12 +18,13 @@ struct ProviderPreset {
     models: &'static [&'static str],
 }
 
+#[allow(dead_code)]
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "openai",
         label: "OpenAI",
         default_base_url: "https://api.openai.com/v1",
-        models: &["gpt-5.2", "gpt-5", "gpt-5-mini"],
+        models: &["gpt-5.4", "gpt-5.2", "gpt-5-mini"],
     },
     ProviderPreset {
         id: "openrouter",
@@ -125,7 +128,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: "xai",
         label: "xAI",
         default_base_url: "https://api.x.ai/v1",
-        models: &["grok-4", "grok-3"],
+        models: &["grok-4.3", "grok-4", "grok-3"],
     },
     ProviderPreset {
         id: "huggingface",
@@ -150,6 +153,7 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
 ];
 
+#[allow(dead_code)]
 fn find_provider_preset(provider: &str) -> Option<&'static ProviderPreset> {
     PROVIDER_PRESETS
         .iter()
@@ -205,6 +209,7 @@ fn prompt_line(
     }
 }
 
+#[allow(dead_code)]
 fn prompt_provider(default_provider: &str) -> Result<Option<String>, FinallyAValueBotError> {
     println!();
     println!("Select LLM provider (press Enter for default):");
@@ -243,6 +248,7 @@ fn prompt_provider(default_provider: &str) -> Result<Option<String>, FinallyAVal
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OllamaTagsResponse {
     models: Vec<OllamaModel>,
 }
@@ -252,6 +258,7 @@ struct OllamaModel {
     name: String,
 }
 
+#[allow(dead_code)]
 fn ollama_tags_url(base_url: &str) -> String {
     let mut base = base_url.trim().trim_end_matches('/').to_string();
     if base.ends_with("/v1") {
@@ -263,6 +270,7 @@ fn ollama_tags_url(base_url: &str) -> String {
     format!("{base}/api/tags")
 }
 
+#[allow(dead_code)]
 fn detect_ollama_models(base_url: &str) -> Vec<String> {
     let tags_url = ollama_tags_url(base_url);
     let client = match reqwest::blocking::Client::builder()
@@ -283,6 +291,7 @@ fn detect_ollama_models(base_url: &str) -> Vec<String> {
     parsed.models.into_iter().map(|m| m.name).collect()
 }
 
+#[allow(dead_code)]
 fn prompt_model(
     provider: &str,
     default_model: &str,
@@ -370,15 +379,14 @@ fn save_config_env(path: &Path, config: &Config) -> Result<Option<PathBuf>, Fina
         "BOT_USERNAME={}",
         escape_env_val(&config.bot_username)
     ));
-    lines.push("".into());
-    lines.push("# LLM".into());
     lines.push(format!(
-        "LLM_PROVIDER={}",
-        escape_env_val(&config.llm_provider)
+        "AGENT_DISPLAY_NAME={}",
+        escape_env_val(&config.agent_display_name)
     ));
-    lines.push(format!("LLM_API_KEY={}", escape_env_val(&config.api_key)));
-    if !config.model.is_empty() {
-        lines.push(format!("LLM_MODEL={}", escape_env_val(&config.model)));
+    lines.push("".into());
+    lines.push("# LLM — API keys in .env; provider + model in Web UI → Settings → LLM".into());
+    if !config.api_key.is_empty() {
+        lines.push(format!("LLM_API_KEY={}", escape_env_val(&config.api_key)));
     }
     if let Some(ref u) = config.llm_base_url {
         if !u.is_empty() {
@@ -420,6 +428,7 @@ fn default_config() -> Config {
     Config {
         telegram_bot_token: String::new(),
         bot_username: String::new(),
+        agent_display_name: String::new(),
         llm_provider: "anthropic".into(),
         api_key: String::new(),
         model: "claude-sonnet-4-5-20250929".into(),
@@ -427,9 +436,12 @@ fn default_config() -> Config {
         max_tokens: 8192,
         max_tool_iterations: 100,
         max_history_messages: 50,
+        recent_history_min_user_messages: 2,
+        recent_history_min_assistant_messages: 2,
         max_document_size_mb: 100,
         workspace_dir: "./workspace".into(),
         openai_api_key: None,
+        gemini_api_key: None,
         timezone: "UTC".into(),
         allowed_groups: vec![],
         control_chat_ids: vec![],
@@ -466,29 +478,57 @@ fn default_config() -> Config {
             "package".into(),
         ],
         agent_browser_path: None,
+        tavily_api_key: None,
         web_search_searxng_url: None,
         cursor_agent_cli_path: crate::config::default_cursor_agent_cli_path(),
         cursor_agent_model: String::new(),
-        cursor_agent_timeout_secs: 1500,
+        cursor_agent_timeout_secs: 3600,
         social: None,
         vault: None,
         orchestrator_enabled: true,
         orchestrator_model: String::new(),
-        tool_skill_agent_enabled: true,
-        tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
+        response_quality_evaluator_enabled: false,
+        perplexity_api_key: None,
+        evaluator_model: "sonar".into(),
+        evaluator_base_url: "https://api.perplexity.ai".into(),
+        response_quality_evaluator_model: String::new(),
+        quality_eval_max_nudges_per_run: 1,
+        quality_eval_min_confidence: 0.85,
+        quality_eval_channels: "*".into(),
+        hook_command_timeout_secs: 10,
+        hook_prompt_timeout_secs: 15,
+        hook_prompt_model: String::new(),
+        allow_fuzzy_search_replace: false,
+        symbol_edit_enabled: false,
+        post_edit_validation_enabled: true,
+        post_edit_validation_commands: None,
         cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
         cursor_agent_tmux_enabled: true,
         cursor_agent_runner_url: None,
+        cursor_sdk_runner_url: None,
+        cursor_sdk_model: crate::config::default_cursor_sdk_model(),
+        cursor_sdk_auto_start: true,
+        cursor_sdk_auto_install: true,
+        cursor_sdk_runner_port: 3848,
+        cursor_sdk_python: "python3".into(),
         scheduler_task_timeout_secs: 3600,
         scheduler_stale_running_reclaim_secs: 7200,
         scheduler_max_concurrent_tasks: 2,
         scheduler_poll_interval_secs: 60,
+        background_job_lease_ttl_secs: 1800,
+        background_job_lease_fallback_renew_secs: 60,
+        background_job_pending_start_timeout_secs: 300,
+        background_job_notify_chat_progress: false,
+        tool_output_debug: false,
+        background_shell_tmux_enabled: true,
+        background_shell_tmux_session_prefix: "finally_a_value_bot-bg".into(),
+        background_shell_monitor_poll_secs: 8,
+        background_shell_auto_retry_on_failure: true,
+        background_shell_auto_retry_max: 1,
+        background_shell_auto_agent_on_success: true,
         runtime_reliability_profile: "balanced".into(),
-        workflow_auto_learn: true,
-        workflow_min_success_repetitions: 2,
-        workflow_replay_strictness: "adaptive".into(),
         project_auto_association_strictness: "balanced".into(),
     }
 }
@@ -517,72 +557,22 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
         Some(v) => v.trim_start_matches('@').to_string(),
         None => return Ok(false),
     };
-
-    let provider = match prompt_provider(&existing.llm_provider)? {
-        Some(v) => v,
-        None => return Ok(false),
-    };
-    let preset = find_provider_preset(&provider);
-
-    let provider_changed = !provider.eq_ignore_ascii_case(&existing.llm_provider);
-    let default_base_url = if provider_changed {
-        preset
-            .map(|p| p.default_base_url.to_string())
-            .unwrap_or_default()
-    } else {
-        existing.llm_base_url.clone().unwrap_or_else(|| {
-            preset
-                .map(|p| p.default_base_url.to_string())
-                .unwrap_or_default()
-        })
-    };
-    let llm_base_url = match prompt_line("LLM base URL (optional)", Some(&default_base_url), false)?
-    {
-        Some(v) => {
-            let t = v.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        }
-        None => return Ok(false),
-    };
-
-    let api_default = existing.api_key.clone();
-    let api_prompt = if provider.eq_ignore_ascii_case("ollama")
-        || provider.eq_ignore_ascii_case("llama")
-        || provider.eq_ignore_ascii_case("llamacpp")
-    {
-        "LLM API key (optional for local providers: ollama/llama)"
-    } else {
-        "LLM API key"
-    };
-    let api_key = match prompt_line(
-        api_prompt,
-        Some(&api_default),
-        !(provider.eq_ignore_ascii_case("ollama")
-            || provider.eq_ignore_ascii_case("llama")
-            || provider.eq_ignore_ascii_case("llamacpp")),
+    let agent_display_name = match prompt_line(
+        "Agent display name (used to seed identity memory)",
+        Some(&existing.agent_display_name),
+        false,
     )? {
         Some(v) => v,
         None => return Ok(false),
     };
 
-    let default_model = if provider_changed || existing.model.trim().is_empty() {
-        preset
-            .and_then(|p| p.models.first().copied())
-            .unwrap_or("gpt-5.2")
-            .to_string()
-    } else {
-        existing.model.clone()
-    };
-    let model = match prompt_model(
-        &provider,
-        &default_model,
-        llm_base_url
-            .as_deref()
-            .unwrap_or(preset.map(|p| p.default_base_url).unwrap_or("")),
+    println!(
+        "LLM provider and model are configured in Web UI → Settings → LLM (not written to .env)."
+    );
+    let api_key = match prompt_line(
+        "LLM API key (optional legacy ANTHROPIC_API_KEY / LLM_API_KEY; prefer provider-specific keys in .env)",
+        Some(&existing.api_key),
+        false,
     )? {
         Some(v) => v,
         None => return Ok(false),
@@ -616,10 +606,11 @@ pub fn run_config_wizard() -> Result<bool, FinallyAValueBotError> {
     let mut out = existing.clone();
     out.telegram_bot_token = telegram_bot_token;
     out.bot_username = bot_username;
-    out.llm_provider = provider;
+    out.agent_display_name = agent_display_name;
+    out.llm_provider.clear();
+    out.model.clear();
+    out.llm_base_url = None;
     out.api_key = api_key;
-    out.model = model;
-    out.llm_base_url = llm_base_url;
     out.workspace_dir = workspace_dir;
     out.timezone = timezone;
     out.post_deserialize()?;

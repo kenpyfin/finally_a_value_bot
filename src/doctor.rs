@@ -131,6 +131,10 @@ fn build_report() -> DoctorReport {
     );
 
     check_config(&mut report);
+    check_llm_provider_base_url(&mut report);
+    check_evaluator_api_key(&mut report);
+    check_shadow_workspace(&mut report);
+    check_legacy_flat_shared(&mut report);
     check_path(&mut report);
     check_shell(&mut report);
     check_node_and_browser(&mut report);
@@ -162,6 +166,179 @@ fn check_config(report: &mut DoctorReport) {
             err.to_string(),
             Some("Fix FINALLY_A_VALUE_BOT_CONFIG or create a valid config file.".to_string()),
         ),
+    }
+}
+
+fn check_llm_provider_base_url(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let provider = crate::llm_catalog::resolve_catalog_provider_id(&config.llm_provider);
+    if provider != "xai" {
+        return;
+    }
+    let base = config
+        .llm_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://api.openai.com/v1");
+    let openai_default = base.eq_ignore_ascii_case("https://api.openai.com/v1");
+    if openai_default {
+        report.push(
+            "llm.xai_base_url",
+            "xAI Grok base URL",
+            CheckStatus::Warn,
+            format!("LLM_PROVIDER=xai but LLM_BASE_URL resolves to {base} (OpenAI default)"),
+            Some(
+                "Select xAI in Web UI → Settings → LLM and set XAI_API_KEY in .env, or set LLM_BASE_URL=https://api.x.ai/v1.".to_string(),
+            ),
+        );
+    } else if !base.contains("api.x.ai") {
+        report.push(
+            "llm.xai_base_url",
+            "xAI Grok base URL",
+            CheckStatus::Warn,
+            format!("LLM_PROVIDER=xai with unexpected LLM_BASE_URL={base}"),
+            Some("Expected https://api.x.ai/v1 unless you use a deliberate proxy.".to_string()),
+        );
+    } else {
+        report.push(
+            "llm.xai_base_url",
+            "xAI Grok base URL",
+            CheckStatus::Pass,
+            format!("LLM_BASE_URL={base}"),
+            None,
+        );
+    }
+}
+
+fn evaluator_local_endpoint_from_env() -> Option<(String, String)> {
+    let mm = crate::multimodel::MultimodelConfig {
+        local_base_url: std::env::var(crate::multimodel::APP_SETTING_LOCAL_BASE_URL)
+            .unwrap_or_default(),
+        local_model: std::env::var(crate::multimodel::APP_SETTING_LOCAL_MODEL).unwrap_or_default(),
+        tier1_base_url: std::env::var(crate::multimodel::APP_SETTING_TIER1_BASE_URL)
+            .unwrap_or_default(),
+        tier1_model: std::env::var(crate::multimodel::APP_SETTING_TIER1_MODEL).unwrap_or_default(),
+        tier2_base_url: std::env::var(crate::multimodel::APP_SETTING_TIER2_BASE_URL)
+            .unwrap_or_default(),
+        tier2_model: std::env::var(crate::multimodel::APP_SETTING_TIER2_MODEL).unwrap_or_default(),
+        ..crate::multimodel::MultimodelConfig::default()
+    };
+    crate::multimodel::resolve_local_evaluator_endpoint(&mm)
+}
+
+fn check_evaluator_api_key(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let needs_key = config.post_tool_evaluator_enabled || config.response_quality_evaluator_enabled;
+    if !needs_key {
+        return;
+    }
+    let local_ready = evaluator_local_endpoint_from_env().is_some();
+    let perplexity_configured = config
+        .perplexity_api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty());
+    if local_ready {
+        report.push(
+            "evaluator.local",
+            "Local evaluator endpoint (PTE/PDQE)",
+            CheckStatus::Pass,
+            "Local multimodel endpoint configured (preferred for PTE/PDQE)".to_string(),
+            None,
+        );
+    }
+    if perplexity_configured {
+        report.push(
+            "evaluator.perplexity_key",
+            "Perplexity API key (PTE/PDQE fallback)",
+            CheckStatus::Pass,
+            "PERPLEXITY_API_KEY is set".to_string(),
+            None,
+        );
+    } else if !local_ready {
+        report.push(
+            "evaluator.provider",
+            "Evaluator provider (PTE/PDQE)",
+            CheckStatus::Warn,
+            "No local multimodel endpoint and PERPLEXITY_API_KEY is missing".to_string(),
+            Some(
+                "Configure MULTIMODEL_LOCAL_* (or tier URLs) or set PERPLEXITY_API_KEY for PTE/PDQE."
+                    .to_string(),
+            ),
+        );
+    }
+}
+
+fn check_shadow_workspace(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let root = config.workspace_root_absolute();
+    let shadow = crate::tools::shadow_workspace_path(&root);
+    if shadow.is_dir() {
+        report.push(
+            "workspace.shadow",
+            "Shadow workspace",
+            CheckStatus::Warn,
+            format!(
+                "nested workspace at {} — not WORKSPACE_DIR; agents may have doubled path prefixes",
+                shadow.display()
+            ),
+            Some(
+                "Migrate data from shared/workspace/ to the canonical tree, remove the shadow dir, \
+                 and use tool paths relative to shared/ without a workspace/ prefix."
+                    .to_string(),
+            ),
+        );
+    } else {
+        report.push(
+            "workspace.shadow",
+            "Shadow workspace",
+            CheckStatus::Pass,
+            "no shared/workspace/ nested copy detected".to_string(),
+            None,
+        );
+    }
+}
+
+fn check_legacy_flat_shared(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let shared = config.workspace_root_absolute().join("shared");
+    let legacy_candidates = ["scripts", "parking"];
+    let found: Vec<String> = legacy_candidates
+        .iter()
+        .map(|n| shared.join(n))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    if found.is_empty() {
+        report.push(
+            "workspace.persona_shared",
+            "Persona shared layout",
+            CheckStatus::Pass,
+            "no legacy flat shared/scripts or shared/parking directories detected".to_string(),
+            None,
+        );
+    } else {
+        report.push(
+            "workspace.persona_shared",
+            "Persona shared layout",
+            CheckStatus::Warn,
+            format!(
+                "legacy flat shared directories still present: {}",
+                found.join(", ")
+            ),
+            Some(
+                "Move reusable scripts into skills/<name>/ or shared/skills/<name>/, and move scratch/output files under shared/personas/{chat_id}/{persona_id}/."
+                    .to_string(),
+            ),
+        );
     }
 }
 

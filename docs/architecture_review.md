@@ -16,6 +16,8 @@ graph TD
     LOOP -->|"max iterations"| FALLBACK["Graceful fallback response"]
 ```
 
+
+
 ---
 
 ## Phase 1: Context Assembly
@@ -26,14 +28,21 @@ Before the loop starts, the system builds everything the LLM needs to know.
 
 [build_system_prompt()](file:///home/ken/big_storage/projects/finally-a-value-bot/src/channels/telegram.rs#L1295-L1411) assembles these sections in order:
 
-| Section | Source | Purpose |
-|---------|--------|---------|
-| Identity + timezone | Config | "You are {bot_username}..." with current time |
-| Capabilities | Hardcoded text | Lists all tool categories the agent can use |
-| Agent Skills | `build_skills_catalog()` | Available skills with invocation commands |
-| Principles | `AGENTS.md` | User-defined rules and identity |
-| Memory | Tiered MEMORY.md + daily log | Per-persona context from past conversations |
-| Vault paths | Config | Vector DB endpoints, search tools |
+
+| Section             | Source                       | Purpose                                       |
+| ------------------- | ---------------------------- | --------------------------------------------- |
+| Identity + timezone | Config                       | Capabilities, tool rules, timezone (clock in messages) |
+| Capabilities        | Hardcoded text               | Lists all tool categories the agent can use   |
+| Agent Skills        | `build_skills_catalog()`     | Per-skill YAML summary (`description`, `when_to_use`, meta); full SKILL.md via `activate_skill` |
+| Principles          | `AGENTS.md`                  | User-defined rules and identity               |
+| Vault paths         | Config                       | Vector DB endpoints, search tools             |
+
+**Initial messages (prepended):** `[system_runtime_context]`, optional scheduler policy, then **`[persona_context]`** (compiled `memory_state.json` prose, operator memo, bookmarks — prefixed with a background-only banner). Prior chat turns follow as `<user_message context="prior_turn">` / `<assistant_message context="prior_turn">`. The triggering user ask is always the final message, wrapped in **`[current_request]`** (not mixed into history). No raw JSON in prompts; Active Project Context auto-upsert removed.
+
+The system prompt includes **## Task scope (read first)**: `[current_request]` is the primary goal; `[persona_context]` and Tier 1 are background reference only unless the current ask needs them.
+
+
+**Vault SOPs:** Operating procedures in ORIGIN markdown; agent executes via skills. YAML `run_workflow` engine and SQLite learned workflows were removed; see [`docs/sops.md`](sops.md) and [`docs/workflow.md`](workflow.md).
 
 ### 1.2 Conversation History
 
@@ -42,7 +51,7 @@ Two paths to load history:
 - **Session resume** — deserialize saved session JSON, append new messages since last save
 - **DB history** — load from stored messages table, convert to LLM message format
 
-Then: `trim_to_recent_balanced()` keeps a small recent window, and `compact_messages()` summarizes old messages if the session exceeds `max_session_messages`.
+Then: non-text tool turns are stripped, and `trim_to_recent_balanced()` keeps the shortest suffix that still has at least **N** user and **N** assistant text messages (global defaults from config with optional per-persona overrides from the `personas` row; see `MAX_HISTORY_MESSAGES` and `RECENT_HISTORY_MIN_*` in `src/config.rs`). The trailing user turn is then split into **`[current_request]`**; remaining turns are tagged `context="prior_turn"`. Token trimming (`trim_to_token_budget`) never removes prepended runtime/persona blocks or the final `[current_request]`.
 
 ### 1.3 Tool Registry
 
@@ -93,12 +102,14 @@ return "max iterations reached"                            // Safety cap
 
 ### 2.2 Stop Reason Routing
 
-| `stop_reason` | Action |
-|---|---|
-| `end_turn` | Extract text, save session, return to user |
-| `max_tokens` | Same as end_turn (model hit context limit) |
-| `tool_use` | Execute tools, append results, loop again |
-| Other | Extract text, save session, return |
+
+| `stop_reason` | Action                                     |
+| ------------- | ------------------------------------------ |
+| `end_turn`    | Extract text, save session, return to user |
+| `max_tokens`  | Same as end_turn (model hit context limit) |
+| `tool_use`    | Execute tools, append results, loop again  |
+| Other         | Extract text, save session, return         |
+
 
 ### 2.3 Tool Execution Pipeline
 
@@ -137,11 +148,13 @@ After every terminal response (end_turn, timeout, max iterations), the full mess
 ## Phase 3: Entry Points
 
 ### Telegram Message
+
 ```
 handle_message() → process_with_agent() → process_with_agent_with_events()
 ```
 
 ### Scheduled Task
+
 ```
 scheduler::run_due_tasks() → process_with_agent(override_prompt: "run jsearch job")
 ```
@@ -149,6 +162,7 @@ scheduler::run_due_tasks() → process_with_agent(override_prompt: "run jsearch 
 The scheduler adds `[scheduler]: {prompt}` as a user message (line 915), so the agent sees it as a normal user request and executes with the same loop.
 
 ### Web API
+
 ```
 POST /api/chat → web::handle_chat() → process_with_agent_with_events()
 ```
@@ -213,15 +227,17 @@ def agent_loop(user_message: str, config: Config) -> str:
 
 ### Key Design Decisions
 
-| Decision | Rationale |
-|---|---|
-| **Single loop, no planner** | Simplicity; the LLM itself plans via its reasoning |
-| **All tools available** | Agent can do anything in one loop — no restricted registries |
-| **Timeout per LLM call + per tool** | Prevents indefinite hangs on either side |
-| **Session persistence** | Conversation state survives restarts |
-| **Message compaction** | Prevents context overflow on long conversations |
-| **Skills in system prompt** | Agent knows HOW to invoke skills without discovery |
-| **TSA gating (optional)** | Extra safety layer — a second LLM evaluates tool calls |
+
+| Decision                            | Rationale                                                    |
+| ----------------------------------- | ------------------------------------------------------------ |
+| **Single loop, no planner**         | Simplicity; the LLM itself plans via its reasoning           |
+| **All tools available**             | Agent can do anything in one loop — no restricted registries |
+| **Timeout per LLM call + per tool** | Prevents indefinite hangs on either side                     |
+| **Session persistence**             | Conversation state survives restarts                         |
+| **Message compaction**              | Prevents context overflow on long conversations              |
+| **Skills in system prompt**         | Agent knows HOW to invoke skills without discovery           |
+| **TSA gating (optional)**           | Extra safety layer — a second LLM evaluates tool calls       |
+
 
 ### What You Need to Build
 
@@ -233,3 +249,4 @@ def agent_loop(user_message: str, config: Config) -> str:
 6. **Skills Manager** — discover SKILL.md files, build catalog with invocation details
 7. **Memory Manager** — tiered memory (MEMORY.md) + daily logs
 8. **Entry Points** — Telegram bot handler, scheduler cron runner, web API
+

@@ -6,14 +6,49 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::claude::{
-    ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, MessagesResponse,
-    ResponseContentBlock, ToolDefinition, Usage,
+    CacheControl, ContentBlock, ImageSource, Message, MessageContent, MessagesRequest,
+    MessagesResponse, ResponseContentBlock, SystemBlock, SystemContent, ToolDefinition, Usage,
 };
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
+
+const LLM_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
+const LLM_HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Settings / persona connection probes (not full agent turns).
+const LLM_PROBE_TIMEOUT_SECS: u64 = 15;
+const LLM_TEST_MAX_TOKENS: u32 = 8;
+
+fn build_llm_http_client(request_timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            LLM_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .timeout(request_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn default_llm_http_client() -> reqwest::Client {
+    build_llm_http_client(std::time::Duration::from_secs(
+        LLM_HTTP_REQUEST_TIMEOUT_SECS,
+    ))
+}
+
+fn probe_llm_http_client() -> reqwest::Client {
+    build_llm_http_client(std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS))
+}
+
+fn llm_error_body_preview(body: &str, max_len: usize) -> String {
+    if body.len() <= max_len {
+        body.to_string()
+    } else {
+        format!("{}...", &body[..max_len])
+    }
+}
 
 /// Remove orphaned `ToolResult` blocks whose `tool_use_id` does not match any
 /// `ToolUse` block in the conversation.  This can happen after session
@@ -148,6 +183,20 @@ impl SseEventParser {
 // Provider trait
 // ---------------------------------------------------------------------------
 
+/// Per-request options for LLM calls (local OpenAI-compat tiers use `tool_choice`).
+#[derive(Debug, Clone, Default)]
+pub struct LlmSendOptions {
+    /// OpenAI `tool_choice`: `"required"`, `"auto"`, `"none"`, or a function name.
+    pub tool_choice: Option<String>,
+}
+
+impl LlmSendOptions {
+    pub fn with_tool_choice(mut self, choice: impl Into<String>) -> Self {
+        self.tool_choice = Some(choice.into());
+        self
+    }
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn send_message(
@@ -156,6 +205,17 @@ pub trait LlmProvider: Send + Sync {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError>;
+
+    async fn send_message_with_options(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: LlmSendOptions,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let _ = options;
+        self.send_message(system, messages, tools).await
+    }
 
     async fn send_message_stream(
         &self,
@@ -184,19 +244,592 @@ pub fn create_provider(config: &Config) -> Box<dyn LlmProvider> {
     }
 }
 
+/// OpenAI-compatible client for local llama.cpp / Ollama tiers (multi-model routing).
+pub fn create_openai_compatible_provider(
+    base_config: &Config,
+    base_url: &str,
+    model: &str,
+) -> Box<dyn LlmProvider> {
+    create_openai_compatible_provider_with_timeout(
+        base_config,
+        base_url,
+        model,
+        std::time::Duration::from_secs(LLM_HTTP_REQUEST_TIMEOUT_SECS),
+    )
+}
+
+/// Same as [`create_openai_compatible_provider`] but with a custom HTTP request timeout
+/// (e.g. run optimizer jobs that may run long on local 30B + tool-use).
+pub fn create_openai_compatible_provider_with_timeout(
+    base_config: &Config,
+    base_url: &str,
+    model: &str,
+    request_timeout: std::time::Duration,
+) -> Box<dyn LlmProvider> {
+    let mut cfg = base_config.clone();
+    cfg.llm_provider = "llama".into();
+    cfg.api_key = String::new();
+    cfg.model = model.trim().to_string();
+    cfg.llm_base_url = Some(crate::multimodel::normalize_base_url_for_provider(
+        base_url,
+        crate::multimodel::DEFAULT_TIER1_BASE_URL,
+    ));
+    Box::new(OpenAiProvider::new_with_request_timeout(
+        &cfg,
+        request_timeout,
+    ))
+}
+
+/// Max output tokens for PTE/PDQE sidecar calls (JSON-only; avoids slow local generation).
+pub const EVALUATOR_MAX_TOKENS: u32 = 512;
+
+/// Tokio + HTTP timeout for PTE/PDQE sidecar calls.
+pub const EVALUATOR_TIMEOUT_SECS: u64 = 120;
+
+pub struct EvaluatorProviderBundle {
+    pub provider: Box<dyn LlmProvider>,
+    pub label: String,
+}
+
+/// Human-readable backend label for agent history / UI (`local · model @ url` or `perplexity · sonar`).
+pub fn resolve_evaluator_provider_label(
+    config: &Config,
+    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+) -> String {
+    if let Some(mm) = multimodel {
+        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+            return format!("local · {} @ {}", model, base_url);
+        }
+    }
+    if config
+        .perplexity_api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return format!("perplexity · {}", config.evaluator_model);
+    }
+    String::new()
+}
+
+/// Sidecar LLM for PTE / PDQE. Prefers local multimodel endpoint; falls back to Perplexity.
+/// Never used for the main agent loop.
+pub fn create_evaluator_provider(
+    config: &Config,
+    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+) -> Result<EvaluatorProviderBundle, FinallyAValueBotError> {
+    let request_timeout = std::time::Duration::from_secs(EVALUATOR_TIMEOUT_SECS);
+    if let Some(mm) = multimodel {
+        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+            let mut eval_config = config.clone();
+            eval_config.max_tokens = EVALUATOR_MAX_TOKENS;
+            let label = format!("local · {} @ {}", model, base_url);
+            let provider = create_openai_compatible_provider_with_timeout(
+                &eval_config,
+                &base_url,
+                &model,
+                request_timeout,
+            );
+            return Ok(EvaluatorProviderBundle { provider, label });
+        }
+    }
+    let key = config
+        .perplexity_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            FinallyAValueBotError::Config(
+                "No evaluator provider: configure local multimodel (MULTIMODEL_LOCAL_* or tier URLs) or set PERPLEXITY_API_KEY"
+                    .into(),
+            )
+        })?;
+    let mut eval_config = config.clone();
+    eval_config.max_tokens = EVALUATOR_MAX_TOKENS;
+    eval_config.llm_provider = "openai".into();
+    eval_config.api_key = key.to_string();
+    eval_config.model = config.evaluator_model.clone();
+    eval_config.llm_base_url = Some(config.evaluator_base_url.clone());
+    let label = format!("perplexity · {}", config.evaluator_model);
+    Ok(EvaluatorProviderBundle {
+        provider: create_provider(&eval_config),
+        label,
+    })
+}
+
+/// Hot-swappable main agent LLM (model changes from Web UI without full process restart).
+pub struct LlmHandle {
+    model: std::sync::RwLock<String>,
+    provider: std::sync::RwLock<Arc<dyn LlmProvider>>,
+    base_config: std::sync::RwLock<Config>,
+    multimodel_config: std::sync::RwLock<crate::multimodel::MultimodelConfig>,
+    multimodel: std::sync::RwLock<Option<crate::multimodel::MultimodelRuntime>>,
+}
+
+impl LlmHandle {
+    pub fn new(config: &Config) -> Arc<Self> {
+        Self::from_provider(config, Arc::from(create_provider(config)))
+    }
+
+    pub fn from_provider(config: &Config, provider: Arc<dyn LlmProvider>) -> Arc<Self> {
+        Arc::new(Self {
+            model: std::sync::RwLock::new(config.model.clone()),
+            base_config: std::sync::RwLock::new(config.clone()),
+            provider: std::sync::RwLock::new(provider),
+            multimodel_config: std::sync::RwLock::new(
+                crate::multimodel::MultimodelConfig::default(),
+            ),
+            multimodel: std::sync::RwLock::new(None),
+        })
+    }
+
+    pub fn multimodel_config(&self) -> crate::multimodel::MultimodelConfig {
+        self.multimodel_config
+            .read()
+            .ok()
+            .map(|cfg| cfg.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn apply_multimodel_config(
+        &self,
+        config: crate::multimodel::MultimodelConfig,
+    ) -> Result<(), String> {
+        let config = config.normalize();
+        *self
+            .multimodel_config
+            .write()
+            .map_err(|_| "multimodel config lock poisoned".to_string())? = config.clone();
+        let base = self
+            .base_config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .clone();
+        let runtime = if config.ready_for_routing() {
+            Some(crate::multimodel::MultimodelRuntime::new(
+                &base,
+                config.clone(),
+            ))
+        } else {
+            None
+        };
+        *self
+            .multimodel
+            .write()
+            .map_err(|_| "multimodel lock poisoned".to_string())? = runtime;
+        Ok(())
+    }
+
+    pub fn resolve_route(
+        &self,
+        ctx: crate::multimodel::RouteContext<'_>,
+    ) -> crate::multimodel::ModelTier {
+        let cfg = self.multimodel_config();
+        crate::multimodel::resolve_route(&cfg, &ctx)
+    }
+
+    fn provider_for_tier(
+        &self,
+        tier: crate::multimodel::ModelTier,
+    ) -> Result<Arc<dyn LlmProvider>, FinallyAValueBotError> {
+        let strategy = self
+            .provider
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
+            .clone();
+        let mm = self
+            .multimodel
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("multimodel lock poisoned".into()))?;
+        Ok(if let Some(ref runtime) = *mm {
+            if runtime.config.ready_for_routing() {
+                runtime.provider_for_tier(tier, &strategy)
+            } else {
+                strategy
+            }
+        } else {
+            strategy
+        })
+    }
+
+    pub async fn send_message_for_tier(
+        &self,
+        tier: crate::multimodel::ModelTier,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let provider = self.provider_for_tier(tier)?;
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+        let options = LlmSendOptions {
+            tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+        };
+        provider
+            .send_message_with_options(system, messages, tools, options)
+            .await
+    }
+
+    pub async fn send_message_for_route(
+        &self,
+        ctx: crate::multimodel::RouteContext<'_>,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<(crate::multimodel::ModelTier, MessagesResponse), FinallyAValueBotError> {
+        let tier = self.resolve_route(ctx);
+        let response = self
+            .send_message_for_tier(tier, system, messages, tools)
+            .await?;
+        Ok((tier, response))
+    }
+
+    pub fn current_model(&self) -> String {
+        self.model
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_else(|_| String::new())
+    }
+
+    pub fn current_provider(&self) -> String {
+        self.base_config
+            .read()
+            .map(|c| c.llm_provider.clone())
+            .unwrap_or_else(|_| String::new())
+    }
+
+    pub fn current_base_url(&self) -> Option<String> {
+        self.base_config
+            .read()
+            .ok()
+            .and_then(|c| c.llm_base_url.clone())
+    }
+
+    fn strategy_endpoint(&self) -> String {
+        if let Some(url) = self.current_base_url() {
+            let t = url.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+        let provider = self.current_provider();
+        crate::llm_catalog::default_base_url_for_provider(&provider)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| match provider.as_str() {
+                "anthropic" => "https://api.anthropic.com/v1/messages".to_string(),
+                "google" => "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+                "xai" => "https://api.x.ai/v1".to_string(),
+                _ => "https://api.openai.com/v1".to_string(),
+            })
+    }
+
+    fn strategy_tier_snapshot(&self) -> crate::multimodel::TierEndpointSnapshot {
+        crate::multimodel::TierEndpointSnapshot {
+            tier: crate::multimodel::ModelTier::Strategy,
+            provider: self.current_provider(),
+            model: self.current_model(),
+            endpoint: self.strategy_endpoint(),
+        }
+    }
+
+    /// Resolved provider/model/endpoint for a tier (for agent history and debugging).
+    pub fn tier_endpoint_snapshot(
+        &self,
+        tier: crate::multimodel::ModelTier,
+    ) -> crate::multimodel::TierEndpointSnapshot {
+        let mm_cfg = self.multimodel_config();
+        if !mm_cfg.enabled || tier == crate::multimodel::ModelTier::Strategy {
+            return self.strategy_tier_snapshot();
+        }
+        if tier.is_local() {
+            crate::multimodel::TierEndpointSnapshot {
+                tier,
+                provider: "llama".into(),
+                model: mm_cfg.local_model.clone(),
+                endpoint: mm_cfg.local_base_url.clone(),
+            }
+        } else {
+            self.strategy_tier_snapshot()
+        }
+    }
+
+    /// Run-level routing summary for agent history (captured once per run).
+    pub fn multimodel_run_summary(&self) -> crate::multimodel::MultimodelRunSummary {
+        let mm_cfg = self.multimodel_config();
+        let strategy = self.strategy_tier_snapshot();
+        crate::multimodel::MultimodelRunSummary {
+            enabled: mm_cfg.enabled,
+            strategy_provider: strategy.provider,
+            strategy_model: strategy.model,
+            strategy_endpoint: strategy.endpoint,
+            local_model: mm_cfg.local_model.clone(),
+            local_endpoint: mm_cfg.local_base_url.clone(),
+            tier1_model: mm_cfg.tier1_model,
+            tier1_endpoint: mm_cfg.tier1_base_url,
+            tier2_model: mm_cfg.tier2_model,
+            tier2_endpoint: mm_cfg.tier2_base_url,
+        }
+    }
+
+    /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
+    pub fn apply_selection(
+        &self,
+        provider: String,
+        model: String,
+        local_base_url: Option<String>,
+    ) -> Result<(String, String), String> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err("model cannot be empty".into());
+        }
+        let provider_id = crate::llm_catalog::resolve_catalog_provider_id(&provider);
+        if provider_id.is_empty() {
+            return Err("provider cannot be empty".into());
+        }
+        if !crate::llm_catalog::is_local_provider(&provider_id)
+            && crate::llm_catalog::resolve_api_key_for_provider(&provider_id).is_empty()
+        {
+            let hints = crate::llm_catalog::provider_api_key_env_hints(&provider_id).join(", ");
+            return Err(format!(
+                "No API key in environment for provider {provider_id}. Set one of: {hints}"
+            ));
+        }
+        if crate::llm_catalog::is_local_provider(&provider_id)
+            && local_base_url
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        {
+            return Err(
+                "base_url is required when provider is Ollama or llama.cpp (configure in Settings → LLM)."
+                    .into(),
+            );
+        }
+        let mut cfg = self
+            .base_config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .clone();
+        cfg.apply_llm_provider_switch(&provider_id, &model, local_base_url.as_deref());
+        let new_provider = Arc::from(create_provider(&cfg));
+        *self
+            .model
+            .write()
+            .map_err(|_| "model lock poisoned".to_string())? = model.clone();
+        *self
+            .base_config
+            .write()
+            .map_err(|_| "config lock poisoned".to_string())? = cfg;
+        *self
+            .provider
+            .write()
+            .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
+        // Clone multimodel config before apply — holding a read guard across
+        // apply_multimodel_config would deadlock (it needs a write lock).
+        let mm_cfg = self.multimodel_config();
+        let _ = self.apply_multimodel_config(mm_cfg);
+        Ok((provider_id, model))
+    }
+
+    /// Update active model for the current provider, rebuild client, return the new model id.
+    pub fn set_model(&self, model: String) -> Result<String, String> {
+        let provider = self.current_provider();
+        let base_url = if crate::llm_catalog::is_local_provider(&provider) {
+            self.current_base_url()
+        } else {
+            None
+        };
+        self.apply_selection(provider, model, base_url)
+            .map(|(_, m)| m)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for LlmHandle {
+    async fn send_message(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let provider = self
+            .provider
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
+            .clone();
+        provider.send_message(system, messages, tools).await
+    }
+
+    async fn send_message_stream(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        text_tx: Option<&UnboundedSender<String>>,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let provider = self
+            .provider
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
+            .clone();
+        provider
+            .send_message_stream(system, messages, tools, text_tx)
+            .await
+    }
+}
+
+/// Lightweight reachability check for OpenAI-compatible local servers (llama.cpp, Ollama).
+async fn probe_openai_compatible_server(base_url: &str, model: &str) -> Result<(), String> {
+    let base = base_url.trim().trim_end_matches('/');
+    let models_url = format!("{base}/models");
+    let client = probe_llm_http_client();
+    let resp = client
+        .get(&models_url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach server at {base_url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Server at {base_url} returned HTTP {status}. Response: {}",
+            llm_error_body_preview(&body, 200)
+        ));
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
+            if !data.is_empty() && !model.trim().is_empty() {
+                let found = data.iter().any(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .is_some_and(|id| id == model.trim())
+                });
+                if !found {
+                    let listed: Vec<&str> = data
+                        .iter()
+                        .filter_map(|e| e.get("id").and_then(|id| id.as_str()))
+                        .take(8)
+                        .collect();
+                    return Err(format!(
+                        "Server reachable at {base_url}, but model {:?} was not listed in /models. Loaded models: {}",
+                        model,
+                        listed.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Test that a model override is reachable with the current provider/config.
 /// Returns Ok(()) on success, or an error string suitable for showing to the user.
 pub async fn test_model(config: &Config, model_override: &str) -> Result<(), String> {
+    let model = model_override.trim();
+    if model.is_empty() {
+        return Err("model is required".into());
+    }
+
+    if crate::llm_catalog::is_local_provider(&config.llm_provider) {
+        let base_url = config
+            .llm_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| "base_url is required for local providers".to_string())?;
+        return match tokio::time::timeout(
+            std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS),
+            probe_openai_compatible_server(base_url, model),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(format!(
+                "Connection test timed out after {LLM_PROBE_TIMEOUT_SECS}s (is the server running at {base_url}?)"
+            )),
+        };
+    }
+
     let mut test_config = config.clone();
-    test_config.model = model_override.to_string();
+    test_config.model = model.to_string();
+    test_config.max_tokens = LLM_TEST_MAX_TOKENS.min(test_config.max_tokens);
     let provider = create_provider(&test_config);
     let messages = vec![Message {
         role: "user".into(),
         content: MessageContent::Text("Hi".into()),
     }];
-    match provider.send_message("Test.", messages, None).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.to_string()),
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS),
+        provider.send_message("Test.", messages, None),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "Connection test timed out after {LLM_PROBE_TIMEOUT_SECS}s (server did not respond in time)"
+        )),
+    }
+}
+
+/// Probe tool-calling on a local OpenAI-compatible tier (llama.cpp).
+pub async fn test_multimodel_tools(
+    config: &Config,
+    model: &str,
+    tier: crate::multimodel::ModelTier,
+) -> Result<(), String> {
+    let mut test_config = config.clone();
+    test_config.model = model.to_string();
+    test_config.max_tokens = 256;
+    let base_url = config
+        .llm_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| "base_url is required for local providers".to_string())?;
+    let provider = create_openai_compatible_provider(&test_config, base_url, model);
+    let tools = vec![ToolDefinition::new(
+        "add",
+        "Add two integers",
+        json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "integer" },
+                "b": { "type": "integer" }
+            },
+            "required": ["a", "b"]
+        }),
+    )];
+    let messages = vec![Message {
+        role: "user".into(),
+        content: MessageContent::Text("Use add to compute 2+3. You must call the tool.".into()),
+    }];
+    let has_tools = true;
+    let options = LlmSendOptions {
+        tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+    };
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS.saturating_mul(4)),
+        provider.send_message_with_options("Test.", messages, Some(tools), options),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Tool-calling probe timed out after {}s",
+            LLM_PROBE_TIMEOUT_SECS.saturating_mul(4)
+        )
+    })?
+    .map_err(|e| e.to_string())?;
+    let has_tool_use = response
+        .content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+    if has_tool_use {
+        Ok(())
+    } else {
+        Err("Model responded without tool_calls (tool-calling not verified)".into())
     }
 }
 
@@ -215,7 +848,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(config: &Config) -> Self {
         AnthropicProvider {
-            http: reqwest::Client::new(),
+            http: default_llm_http_client(),
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -234,19 +867,61 @@ impl AnthropicProvider {
         let mut streamed_request = request.clone();
         streamed_request.stream = Some(true);
 
-        let response = self
-            .http
-            .post(&self.base_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&streamed_request)
-            .send()
-            .await?;
+        let mut retries = 0u32;
+        let max_retries = 3;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+        let response = loop {
+            let response_res = self
+                .http
+                .post(&self.base_url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "prompt-caching-2024-07-31")
+                .header("content-type", "application/json")
+                .json(&streamed_request)
+                .send()
+                .await;
+
+            let resp = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Anthropic stream request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                warn!(
+                    "Transient stream error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let body = resp.text().await.unwrap_or_default();
             if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
                 return Err(FinallyAValueBotError::LlmApi(format!(
                     "{}: {}",
@@ -256,7 +931,7 @@ impl AnthropicProvider {
             return Err(FinallyAValueBotError::LlmApi(format!(
                 "HTTP {status}: {body}"
             )));
-        }
+        };
 
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();
@@ -331,6 +1006,8 @@ fn usage_from_json(v: &serde_json::Value) -> Option<Usage> {
     Some(Usage {
         input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
         output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     })
 }
 
@@ -556,8 +1233,24 @@ fn normalize_stop_reason(reason: Option<String>) -> Option<String> {
         Some("max_tokens") | Some("length") => Some("max_tokens".into()),
         Some("end_turn") => Some("end_turn".into()),
         Some(r) if r.eq_ignore_ascii_case("stop") => Some("end_turn".into()),
+        Some(r) if r.eq_ignore_ascii_case("completed") => Some("end_turn".into()),
+        Some("clarification") | Some("ask_user") | Some("needs_clarification") => {
+            Some("ask_clarification".into())
+        }
         Some(other) => Some(other.to_string()),
     }
+}
+
+/// OpenAI-compatible APIs (notably xAI Grok) may return `finish_reason: "stop"` / `"completed"`
+/// while still populating `tool_calls`. Prefer tool content over finish_reason.
+fn oai_stop_reason_from_content(
+    finish_reason: Option<&str>,
+    has_tool_calls: bool,
+) -> Option<String> {
+    if has_tool_calls {
+        return Some("tool_use".into());
+    }
+    normalize_stop_reason(finish_reason.map(str::to_string))
 }
 
 fn parse_tool_input(input_json: &str) -> serde_json::Value {
@@ -598,9 +1291,18 @@ fn build_stream_response(
         });
     }
 
+    let has_tool_calls = content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+    let stop_reason = if has_tool_calls {
+        Some("tool_use".into())
+    } else {
+        normalize_stop_reason(stop_reason)
+    };
+
     MessagesResponse {
         content,
-        stop_reason: normalize_stop_reason(stop_reason),
+        stop_reason,
         usage,
     }
 }
@@ -617,6 +1319,20 @@ struct AnthropicApiErrorDetail {
     error_type: String,
 }
 
+fn build_cached_system(text: &str) -> SystemContent {
+    if text.len() > 1024 {
+        SystemContent::Blocks(vec![SystemBlock {
+            block_type: "text".into(),
+            text: text.to_string(),
+            cache_control: Some(CacheControl {
+                control_type: "ephemeral".into(),
+            }),
+        }])
+    } else {
+        SystemContent::Text(text.to_string())
+    }
+}
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn send_message(
@@ -627,28 +1343,53 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
 
-        let request = MessagesRequest {
+        let mut request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
-            system: system.to_string(),
+            system: build_cached_system(system),
             messages,
             tools,
             stream: None,
         };
+        if let Some(ref mut tools) = request.tools {
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = Some(CacheControl {
+                    control_type: "ephemeral".into(),
+                });
+            }
+        }
 
         let mut retries = 0u32;
         let max_retries = 3;
 
         loop {
-            let response = self
+            let response_res = self
                 .http
                 .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "prompt-caching-2024-07-31")
                 .header("content-type", "application/json")
                 .json(&request)
                 .send()
-                .await?;
+                .await;
+
+            let response = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Anthropic request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
 
             let status = response.status();
 
@@ -662,11 +1403,17 @@ impl LlmProvider for AnthropicProvider {
                 return Ok(parsed);
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
                 retries += 1;
                 let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
+                    "Transient error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
                     delay
                 );
                 tokio::time::sleep(delay).await;
@@ -694,14 +1441,21 @@ impl LlmProvider for AnthropicProvider {
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
-        let request = MessagesRequest {
+        let mut request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
-            system: system.to_string(),
+            system: build_cached_system(system),
             messages,
             tools,
             stream: Some(true),
         };
+        if let Some(ref mut tools) = request.tools {
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = Some(CacheControl {
+                    control_type: "ephemeral".into(),
+                });
+            }
+        }
 
         self.send_message_stream_single_pass(&request, text_tx)
             .await
@@ -711,6 +1465,65 @@ impl LlmProvider for AnthropicProvider {
 // ---------------------------------------------------------------------------
 // OpenAI-compatible provider  (OpenAI, OpenRouter, DeepSeek, Groq, Ollama …)
 // ---------------------------------------------------------------------------
+
+fn oai_resolve_base_url(config: &Config) -> String {
+    if let Some(ref url) = config.llm_base_url {
+        let t = url.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    crate::llm_catalog::default_base_url_for_provider(&config.llm_provider)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+}
+
+/// GPT-5 / o-series and some Grok reasoning models reject `max_tokens` on Chat Completions.
+fn oai_uses_max_completion_tokens(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("gpt-5")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("grok-4.20")
+        || m.contains("-reasoning")
+}
+
+fn oai_error_wants_max_completion_tokens(body: &str) -> bool {
+    body.contains("max_completion_tokens")
+}
+
+fn build_oai_chat_request_body(
+    model: &str,
+    max_tokens: u32,
+    oai_messages: &[serde_json::Value],
+    tools: Option<&[ToolDefinition]>,
+    tool_choice: Option<&str>,
+    stream: bool,
+    use_max_completion_tokens: bool,
+) -> serde_json::Value {
+    let mut body = json!({
+        "model": model,
+        "messages": oai_messages,
+    });
+    if use_max_completion_tokens {
+        body["max_completion_tokens"] = json!(max_tokens);
+    } else {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if stream {
+        body["stream"] = json!(true);
+    }
+    if let Some(tool_defs) = tools {
+        if !tool_defs.is_empty() {
+            body["tools"] = json!(translate_tools_to_oai(tool_defs));
+            if let Some(choice) = tool_choice {
+                body["tool_choice"] = json!(choice);
+            }
+        }
+    }
+    body
+}
 
 pub struct OpenAiProvider {
     http: reqwest::Client,
@@ -722,14 +1535,18 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: &Config) -> Self {
-        let base = config
-            .llm_base_url
-            .as_deref()
-            .unwrap_or("https://api.openai.com/v1");
+        Self::new_with_request_timeout(
+            config,
+            std::time::Duration::from_secs(LLM_HTTP_REQUEST_TIMEOUT_SECS),
+        )
+    }
+
+    pub fn new_with_request_timeout(config: &Config, request_timeout: std::time::Duration) -> Self {
+        let base = oai_resolve_base_url(config);
         let chat_url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
         OpenAiProvider {
-            http: reqwest::Client::new(),
+            http: build_llm_http_client(request_timeout),
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -827,24 +1644,36 @@ impl LlmProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        self.send_message_with_options(system, messages, tools, LlmSendOptions::default())
+            .await
+    }
+
+    async fn send_message_with_options(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: LlmSendOptions,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let oai_messages = translate_messages_to_oai(system, &messages);
-
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": oai_messages,
-        });
-
-        if let Some(ref tool_defs) = tools {
-            if !tool_defs.is_empty() {
-                body["tools"] = json!(translate_tools_to_oai(tool_defs));
-            }
-        }
-
+        let tool_slice = tools.as_deref();
+        let tool_choice = options.tool_choice.as_deref();
+        let mut use_max_completion_tokens = oai_uses_max_completion_tokens(&self.model);
+        let mut token_field_retried = false;
         let mut retries = 0u32;
         let max_retries = 3;
 
         loop {
+            let body = build_oai_chat_request_body(
+                &self.model,
+                self.max_tokens,
+                &oai_messages,
+                tool_slice,
+                tool_choice,
+                false,
+                use_max_completion_tokens,
+            );
+
             let mut req = self
                 .http
                 .post(&self.chat_url)
@@ -853,7 +1682,24 @@ impl LlmProvider for OpenAiProvider {
             if !self.api_key.trim().is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", self.api_key));
             }
-            let response = req.send().await?;
+            let response_res = req.send().await;
+
+            let response = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending OpenAI request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
 
             let status = response.status();
 
@@ -867,11 +1713,17 @@ impl LlmProvider for OpenAiProvider {
                 return Ok(translate_oai_response(oai));
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
                 retries += 1;
                 let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
+                    "Transient error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
                     delay
                 );
                 tokio::time::sleep(delay).await;
@@ -879,6 +1731,14 @@ impl LlmProvider for OpenAiProvider {
             }
 
             let text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 400
+                && !token_field_retried
+                && oai_error_wants_max_completion_tokens(&text)
+            {
+                token_field_retried = true;
+                use_max_completion_tokens = true;
+                continue;
+            }
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
                 let msg = format_oai_error(status, &err.error, &text);
                 return Err(FinallyAValueBotError::LlmApi(msg));
@@ -897,32 +1757,81 @@ impl LlmProvider for OpenAiProvider {
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let oai_messages = translate_messages_to_oai(system, &messages);
+        let tool_slice = tools.as_deref();
+        let mut use_max_completion_tokens = oai_uses_max_completion_tokens(&self.model);
+        let mut token_field_retried = false;
+        let mut retries = 0u32;
+        let max_retries = 3;
 
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": oai_messages,
-            "stream": true,
-        });
+        let response = loop {
+            let body = build_oai_chat_request_body(
+                &self.model,
+                self.max_tokens,
+                &oai_messages,
+                tool_slice,
+                None,
+                true,
+                use_max_completion_tokens,
+            );
 
-        if let Some(ref tool_defs) = tools {
-            if !tool_defs.is_empty() {
-                body["tools"] = json!(translate_tools_to_oai(tool_defs));
+            let mut req = self
+                .http
+                .post(&self.chat_url)
+                .header("Content-Type", "application/json")
+                .json(&body);
+            if !self.api_key.trim().is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
             }
-        }
+            let response_res = req.send().await;
 
-        let mut req = self
-            .http
-            .post(&self.chat_url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if !self.api_key.trim().is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
-        }
-        let response = req.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let resp = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending OpenAI stream request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                warn!(
+                    "Transient stream error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let text = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 400
+                && !token_field_retried
+                && oai_error_wants_max_completion_tokens(&text)
+            {
+                token_field_retried = true;
+                use_max_completion_tokens = true;
+                continue;
+            }
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
                 let msg = format_oai_error(status, &err.error, &text);
                 return Err(FinallyAValueBotError::LlmApi(msg));
@@ -930,7 +1839,7 @@ impl LlmProvider for OpenAiProvider {
             return Err(FinallyAValueBotError::LlmApi(format!(
                 "HTTP {status}: {text}"
             )));
-        }
+        };
 
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();
@@ -991,9 +1900,13 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
+        let has_tool_calls = content
+            .iter()
+            .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+
         Ok(MessagesResponse {
             content,
-            stop_reason: normalize_stop_reason(stop_reason),
+            stop_reason: oai_stop_reason_from_content(stop_reason.as_deref(), has_tool_calls),
             usage,
         })
     }
@@ -1013,7 +1926,7 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(config: &Config) -> Self {
         GeminiProvider {
-            http: reqwest::Client::new(),
+            http: default_llm_http_client(),
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -1064,13 +1977,30 @@ impl LlmProvider for GeminiProvider {
         let max_retries = 3;
 
         loop {
-            let response = self
+            let response_res = self
                 .http
                 .post(&self.generate_url())
                 .header("Content-Type", "application/json")
                 .json(&request_body)
                 .send()
-                .await?;
+                .await;
+
+            let response = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Gemini request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
 
             let status = response.status();
 
@@ -1079,11 +2009,17 @@ impl LlmProvider for GeminiProvider {
                 return parse_gemini_response(&body);
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
                 retries += 1;
                 let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
+                    "Transient error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
                     delay
                 );
                 tokio::time::sleep(delay).await;
@@ -1113,17 +2049,58 @@ impl LlmProvider for GeminiProvider {
         let messages = sanitize_messages(messages);
         let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
 
-        let response = self
-            .http
-            .post(&self.stream_url())
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
+        let mut retries = 0u32;
+        let max_retries = 3;
 
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+        let response = loop {
+            let response_res = self
+                .http
+                .post(&self.stream_url())
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send()
+                .await;
+
+            let resp = match response_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                        warn!(
+                            "Network error sending Gemini stream request: {e}. Retrying in {:?} (attempt {retries}/{max_retries})",
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+
+            let is_transient = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+
+            if is_transient && retries < max_retries {
+                retries += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                warn!(
+                    "Transient stream error status {status}, retrying in {:?} (attempt {retries}/{max_retries})",
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let text = resp.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<GeminiError>(&text) {
                 return Err(FinallyAValueBotError::LlmApi(format!(
                     "Gemini API error {}: {}",
@@ -1133,7 +2110,7 @@ impl LlmProvider for GeminiProvider {
             return Err(FinallyAValueBotError::LlmApi(format!(
                 "HTTP {status}: {text}"
             )));
-        }
+        };
 
         let mut byte_stream = response.bytes_stream();
         let mut sse = SseEventParser::default();
@@ -1270,6 +2247,8 @@ fn process_gemini_stream_event(
                     .get("candidatesTokenCount")
                     .and_then(|t| t.as_u64())
                     .unwrap_or(0) as u32,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             });
         }
     }
@@ -1510,6 +2489,8 @@ fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBo
                 .get("candidatesTokenCount")
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0) as u32,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         });
     }
 
@@ -1834,11 +2815,27 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
     };
 
     let mut content = Vec::new();
+    let tool_calls_from_api = choice.message.tool_calls.is_some();
 
-    if let Some(text) = choice.message.content {
-        if !text.is_empty() {
-            content.push(ResponseContentBlock::Text { text });
+    let mut text_content = choice.message.content.unwrap_or_default();
+
+    if !tool_calls_from_api {
+        let markup_tools = parse_embedded_tool_calls_from_content(&text_content);
+        if !markup_tools.is_empty() {
+            text_content = strip_tools_markup_from_content(&text_content);
+            for (idx, (name, input)) in markup_tools.into_iter().enumerate() {
+                content.push(ResponseContentBlock::ToolUse {
+                    id: format!("embedded_tool_{idx}_{}", Uuid::new_v4()),
+                    name,
+                    input,
+                    thought_signature: None,
+                });
+            }
         }
+    }
+
+    if !text_content.is_empty() {
+        content.push(ResponseContentBlock::Text { text: text_content });
     }
 
     if let Some(tool_calls) = choice.message.tool_calls {
@@ -1864,15 +2861,17 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
         });
     }
 
-    let stop_reason = match choice.finish_reason.as_deref() {
-        Some("tool_calls") => Some("tool_use".into()),
-        Some("length") => Some("max_tokens".into()),
-        _ => Some("end_turn".into()),
-    };
+    let has_tool_calls = content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+
+    let stop_reason = oai_stop_reason_from_content(choice.finish_reason.as_deref(), has_tool_calls);
 
     let usage = oai.usage.map(|u| Usage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     });
 
     MessagesResponse {
@@ -1882,10 +2881,103 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
     }
 }
 
+/// Qwen-Coder via llama.cpp may return `<tools>{ "name": "...", "arguments": {...} }</tools>` in content.
+fn parse_embedded_tool_calls_from_content(text: &str) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    const OPEN: &str = "<tools>";
+    const CLOSE: &str = "</tools>";
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(close_idx) = after_open.find(CLOSE) else {
+            break;
+        };
+        let inner = after_open[..close_idx].trim();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(inner) {
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                let input = v.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                out.push((name.to_string(), input));
+            } else if let Some(arr) = v.as_array() {
+                for item in arr {
+                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        let input = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                        out.push((name.to_string(), input));
+                    }
+                }
+            }
+        }
+        rest = &after_open[close_idx + CLOSE.len()..];
+    }
+    out
+}
+
+fn strip_tools_markup_from_content(text: &str) -> String {
+    let mut out = text.to_string();
+    while let Some(start) = out.find("<tools>") {
+        let Some(rel_end) = out[start..].find("</tools>") else {
+            break;
+        };
+        let end = start + rel_end + "</tools>".len();
+        out.replace_range(start..end, "");
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_oai_uses_max_completion_tokens() {
+        assert!(oai_uses_max_completion_tokens("gpt-5.4"));
+        assert!(oai_uses_max_completion_tokens("o3-mini"));
+        assert!(oai_uses_max_completion_tokens("grok-4.20-0309-reasoning"));
+        assert!(!oai_uses_max_completion_tokens("gpt-4o"));
+        assert!(!oai_uses_max_completion_tokens("grok-4.3"));
+    }
+
+    #[test]
+    fn test_build_oai_chat_request_body_token_fields() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let legacy = build_oai_chat_request_body("gpt-4o", 100, &msgs, None, None, false, false);
+        assert!(legacy.get("max_tokens").is_some());
+        assert!(legacy.get("max_completion_tokens").is_none());
+        let modern = build_oai_chat_request_body("gpt-5.2", 100, &msgs, None, None, false, true);
+        assert!(modern.get("max_completion_tokens").is_some());
+        assert!(modern.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_build_oai_chat_request_body_tool_choice() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let tools = vec![ToolDefinition::new("add", "add", json!({"type": "object"}))];
+        let body = build_oai_chat_request_body(
+            "qwen",
+            100,
+            &msgs,
+            Some(&tools),
+            Some("required"),
+            false,
+            false,
+        );
+        assert_eq!(body["tool_choice"], json!("required"));
+        assert!(body.get("tools").is_some());
+    }
+
+    #[test]
+    fn test_parse_embedded_tool_calls_from_qwen_markup() {
+        let raw = r#"<tools>
+{
+  "name": "add",
+  "arguments": { "a": 2, "b": 3 }
+}
+</tools>"#;
+        let parsed = parse_embedded_tool_calls_from_content(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "add");
+        assert_eq!(parsed[0].1["a"], 2);
+    }
 
     // -----------------------------------------------------------------------
     // translate_messages_to_oai
@@ -2070,11 +3162,11 @@ mod tests {
 
     #[test]
     fn test_translate_tools_to_oai() {
-        let tools = vec![ToolDefinition {
-            name: "bash".into(),
-            description: "Run bash".into(),
-            input_schema: json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
-        }];
+        let tools = vec![ToolDefinition::new(
+            "bash",
+            "Run bash",
+            json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+        )];
         let out = translate_tools_to_oai(&tools);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "function");
@@ -2267,6 +3359,58 @@ mod tests {
             ResponseContentBlock::ToolUse { name, .. } => assert_eq!(name, "read_file"),
             _ => panic!("Expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn test_translate_oai_response_xai_stop_with_tool_calls() {
+        let oai = OaiResponse {
+            choices: vec![OaiChoice {
+                message: OaiMessage {
+                    content: None,
+                    tool_calls: Some(vec![OaiToolCall {
+                        id: "call_abc".into(),
+                        function: OaiFunction {
+                            name: "bash".into(),
+                            arguments: r#"{"command":"ls"}"#.into(),
+                            thought_signature: None,
+                        },
+                        thought_signature: None,
+                    }]),
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+        let resp = translate_oai_response(oai);
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        assert!(resp.content.iter().any(|b| matches!(
+            b,
+            ResponseContentBlock::ToolUse { name, .. } if name == "bash"
+        )));
+    }
+
+    #[test]
+    fn test_translate_oai_response_xai_completed_with_tool_calls() {
+        let oai = OaiResponse {
+            choices: vec![OaiChoice {
+                message: OaiMessage {
+                    content: None,
+                    tool_calls: Some(vec![OaiToolCall {
+                        id: "call_xyz".into(),
+                        function: OaiFunction {
+                            name: "read_file".into(),
+                            arguments: "{}".into(),
+                            thought_signature: None,
+                        },
+                        thought_signature: None,
+                    }]),
+                },
+                finish_reason: Some("completed".into()),
+            }],
+            usage: None,
+        };
+        let resp = translate_oai_response(oai);
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
     }
 
     #[test]

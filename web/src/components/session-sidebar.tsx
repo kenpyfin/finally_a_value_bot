@@ -1,6 +1,47 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Badge, Button, Flex, ScrollArea, Separator, Text } from '@radix-ui/themes'
 import type { Persona } from '../types'
+
+const PRIMARY_THEME_KEYS = new Set(['green', 'slate', 'blue'])
+
+function IconPalette({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 2a10 10 0 1 0 0 20 4 4 0 0 0 0-8 2.5 2.5 0 0 1-2.4-2.4 4 4 0 0 0-1.6-3.2A10 10 0 0 0 12 2Z" />
+      <circle cx="7.5" cy="10.5" r="1" fill="currentColor" stroke="none" />
+      <circle cx="10.5" cy="7.5" r="1" fill="currentColor" stroke="none" />
+      <circle cx="14.5" cy="8.5" r="1" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+
+function IconSun({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+      <circle cx="12" cy="12" r="4" />
+      <path strokeLinecap="round" d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  )
+}
+
+function IconMoon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  )
+}
+
+function IconTrash({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
+    </svg>
+  )
+}
+
+const iconBtnClass =
+  'inline-flex h-8 w-8 items-center justify-center rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] text-[color:var(--mc-text-muted)] hover:text-[color:var(--mc-text-primary)] hover:brightness-110'
 
 type SessionSidebarProps = {
   appearance: 'dark' | 'light'
@@ -14,6 +55,44 @@ type SessionSidebarProps = {
   onPersonaSelect: (personaName: string) => void
   onCreatePersona: () => void
   onDeletePersona: (personaId: number) => void
+  onCloseRequest?: () => void
+}
+
+function ThemeSwatchButton({
+  theme,
+  selected,
+  onSelect,
+}: {
+  theme: { key: string; label: string; color: string }
+  selected: boolean
+  onSelect: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation()
+        onSelect()
+      }}
+      className={
+        selected
+          ? 'flex items-center gap-2 rounded-md border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-left text-xs text-[color:var(--mc-text-primary)]'
+          : 'flex items-center gap-2 rounded-md border border-transparent px-2 py-1 text-left text-xs text-[color:var(--mc-text-muted)] hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
+      }
+      style={
+        selected
+          ? { borderColor: 'var(--mc-accent)', backgroundColor: 'color-mix(in srgb, var(--mc-accent) 12%, var(--mc-surface-elevated))' }
+          : undefined
+      }
+    >
+      <span
+        className="h-3 w-3 rounded-sm border border-[color:var(--mc-border-soft)]"
+        style={{ backgroundColor: theme.color }}
+        aria-hidden="true"
+      />
+      {theme.label}
+    </button>
+  )
 }
 
 export function SessionSidebar({
@@ -28,25 +107,35 @@ export function SessionSidebar({
   onPersonaSelect,
   onCreatePersona,
   onDeletePersona,
+  onCloseRequest,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
+  const [moreThemesOpen, setMoreThemesOpen] = useState(false)
   const themeMenuRef = useRef<HTMLDivElement | null>(null)
   const themeButtonRef = useRef<HTMLButtonElement | null>(null)
+
+  const { primaryThemes, moreThemes } = useMemo(() => {
+    const primary = uiThemeOptions.filter((t) => PRIMARY_THEME_KEYS.has(t.key))
+    const more = uiThemeOptions.filter((t) => !PRIMARY_THEME_KEYS.has(t.key))
+    return { primaryThemes: primary, moreThemes: more }
+  }, [uiThemeOptions])
+
+  useEffect(() => {
+    if (moreThemes.some((t) => t.key === uiTheme)) {
+      setMoreThemesOpen(true)
+    }
+  }, [uiTheme, moreThemes])
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null
       if (!target) return
-
       if (themeButtonRef.current?.contains(target)) return
       if (themeMenuRef.current?.contains(target)) return
-
       setThemeMenuOpen(false)
     }
-
     const closeOnScroll = () => setThemeMenuOpen(false)
-
     window.addEventListener('pointerdown', onPointerDown)
     window.addEventListener('scroll', closeOnScroll, true)
     return () => {
@@ -57,23 +146,31 @@ export function SessionSidebar({
 
   return (
     <aside
-      className={isDark ? 'flex h-full min-h-0 flex-col border-r p-4' : 'flex h-full min-h-0 flex-col border-r border-slate-200 bg-white p-4'}
-      style={isDark ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-sidebar)' } : undefined}
+      className="flex h-full min-h-0 flex-col border-r border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] p-4"
     >
       <Flex justify="between" align="center" className="mb-4">
-        <div className="flex items-center gap-2">
-          <img
-            src="/icon.png"
-            alt="FinallyAValueBot"
-            className="h-7 w-7 rounded-md border border-black/10 object-cover"
-            loading="eager"
-            decoding="async"
-          />
-          <Text size="5" weight="bold">
+        <div className="min-w-0">
+          <Text size="5" weight="bold" className="tracking-tight">
             FinallyAValueBot
+          </Text>
+          <Text size="1" color="gray" className="mt-0.5 block">
+            Personas & sessions
           </Text>
         </div>
         <div className="relative flex items-center gap-2">
+          {onCloseRequest ? (
+            <button
+              type="button"
+              onClick={() => onCloseRequest()}
+              aria-label="Close menu"
+              title="Close"
+              className={`${iconBtnClass} h-10 w-10 shrink-0 md:hidden`}
+            >
+              <svg className="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+                <path d="M18 6L6 18M6 6l12 12" />
+              </svg>
+            </button>
+          ) : null}
           <button
             ref={themeButtonRef}
             type="button"
@@ -82,13 +179,10 @@ export function SessionSidebar({
               setThemeMenuOpen((v) => !v)
             }}
             aria-label="Change UI theme color"
-            className={
-              isDark
-                ? 'inline-flex h-8 w-8 items-center justify-center rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] text-slate-200 hover:brightness-110'
-                : 'inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
-            }
+            title="Theme color"
+            className={iconBtnClass}
           >
-            <span className="text-sm">🎨</span>
+            <IconPalette className="size-4" />
           </button>
           <button
             type="button"
@@ -97,54 +191,59 @@ export function SessionSidebar({
               onToggleAppearance()
             }}
             aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-            className={
-              isDark
-                ? 'inline-flex h-8 w-8 items-center justify-center rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] text-slate-200 hover:brightness-110'
-                : 'inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
-            }
+            title={isDark ? 'Light mode' : 'Dark mode'}
+            className={iconBtnClass}
           >
-            <span className="text-sm">{isDark ? '☀' : '☾'}</span>
+            {isDark ? <IconSun className="size-4" /> : <IconMoon className="size-4" />}
           </button>
           {themeMenuOpen ? (
             <div
               ref={themeMenuRef}
-              className={
-                isDark
-                  ? 'absolute right-0 top-10 z-50 w-56 rounded-lg border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] p-2 shadow-xl'
-                  : 'absolute right-0 top-10 z-50 w-56 rounded-lg border border-slate-300 bg-white p-2 shadow-xl'
-              }
+              className="absolute right-0 top-10 z-50 w-56 rounded-lg border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] p-2"
             >
               <Text size="1" color="gray">Theme</Text>
               <div className="mt-2 grid grid-cols-2 gap-1">
-                {uiThemeOptions.map((theme) => (
-                  <button
+                {primaryThemes.map((theme) => (
+                  <ThemeSwatchButton
                     key={theme.key}
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation()
+                    theme={theme}
+                    selected={uiTheme === theme.key}
+                    onSelect={() => {
                       onUiThemeChange(theme.key)
                       setThemeMenuOpen(false)
                     }}
-                    className={
-                      uiTheme === theme.key
-                        ? isDark
-                          ? 'flex items-center gap-2 rounded-md border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-left text-xs text-slate-100'
-                          : 'flex items-center gap-2 rounded-md border px-2 py-1 text-left text-xs text-slate-900'
-                        : isDark
-                          ? 'flex items-center gap-2 rounded-md border border-transparent px-2 py-1 text-left text-xs text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
-                          : 'flex items-center gap-2 rounded-md border border-transparent px-2 py-1 text-left text-xs text-slate-600 hover:border-slate-200 hover:bg-slate-50'
-                    }
-                    style={!isDark && uiTheme === theme.key ? { borderColor: 'var(--mc-accent)', backgroundColor: 'color-mix(in srgb, var(--mc-accent) 12%, white)' } : undefined}
-                  >
-                    <span
-                      className={isDark ? 'h-3 w-3 rounded-sm border border-white/20' : 'h-3 w-3 rounded-sm border border-slate-300'}
-                      style={{ backgroundColor: theme.color }}
-                      aria-hidden="true"
-                    />
-                    {theme.label}
-                  </button>
+                  />
                 ))}
               </div>
+              {moreThemes.length > 0 ? (
+                <div className="mt-2">
+                  <button
+                    type="button"
+                    className="w-full rounded-md px-1 py-1 text-left text-[11px] text-[color:var(--mc-text-muted)] hover:text-[color:var(--mc-text-primary)]"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setMoreThemesOpen((v) => !v)
+                    }}
+                  >
+                    {moreThemesOpen ? 'Fewer colors' : 'More colors'}
+                  </button>
+                  {moreThemesOpen ? (
+                    <div className="mt-1 grid grid-cols-2 gap-1">
+                      {moreThemes.map((theme) => (
+                        <ThemeSwatchButton
+                          key={theme.key}
+                          theme={theme}
+                          selected={uiTheme === theme.key}
+                          onSelect={() => {
+                            onUiThemeChange(theme.key)
+                            setThemeMenuOpen(false)
+                          }}
+                        />
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -161,46 +260,40 @@ export function SessionSidebar({
 
       <Separator size="4" className="my-2" />
 
-      <div
-        className={
-          isDark
-            ? 'min-h-0 flex-1 rounded-xl border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-2'
-            : 'min-h-0 flex-1 rounded-xl border border-slate-200 bg-slate-50/70 p-2'
-        }
-      >
-        <ScrollArea type="auto" style={{ height: '100%' }}>
-          <div className="flex flex-col gap-1 pr-1">
-            {personas.length === 0 ? (
-              <Text size="1" color="gray">Loading…</Text>
-            ) : (
-              personas.map((p) => (
+      <ScrollArea type="auto" className="min-h-0 flex-1">
+        <div className="flex flex-col pr-1">
+          {personas.length === 0 ? (
+            <Text size="1" color="gray">Loading…</Text>
+          ) : (
+            personas.map((p, index) => (
+              <div
+                key={p.id}
+                className={
+                  index < personas.length - 1
+                    ? 'border-b border-[color:var(--mc-border-soft)]'
+                    : undefined
+                }
+              >
                 <div
-                  key={p.id}
                   className={
                     selectedPersonaId === p.id
-                      ? isDark
-                        ? 'flex w-full items-center justify-between gap-1 rounded-lg border border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2 shadow-sm'
-                        : 'flex w-full items-center justify-between gap-1 rounded-lg border bg-white px-3 py-2 shadow-sm'
-                      : isDark
-                        ? 'flex w-full items-center justify-between gap-1 rounded-lg border border-transparent px-3 py-2 text-slate-300 hover:border-[color:var(--mc-border-soft)] hover:bg-[color:var(--mc-bg-panel)]'
-                        : 'flex w-full items-center justify-between gap-1 rounded-lg border border-transparent px-3 py-2 text-slate-600 hover:border-slate-200 hover:bg-white'
-                  }
-                  style={
-                    !isDark && selectedPersonaId === p.id
-                      ? { borderColor: 'color-mix(in srgb, var(--mc-accent) 36%, #94a3b8)' }
-                      : undefined
+                      ? 'flex w-full items-center justify-between gap-1 border-l-2 border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2'
+                      : 'flex w-full items-center justify-between gap-1 border-l-2 border-transparent px-3 py-2 text-[color:var(--mc-text-muted)] hover:bg-[color:var(--mc-bg-panel)]/60'
                   }
                 >
                   <button
                     type="button"
-                    className="min-w-0 flex-1 text-left text-sm font-medium"
-                    onClick={() => onPersonaSelect(p.name)}
+                    className="min-w-0 flex-1 text-left text-sm font-medium text-[color:var(--mc-text-primary)]"
+                    onClick={() => {
+                      onPersonaSelect(p.name)
+                      onCloseRequest?.()
+                    }}
                   >
                     <span className="inline-flex items-center gap-2">
                       <span className="truncate">{p.name}</span>
                       {personaHasNew?.[p.id] ? (
                         <span
-                          className={isDark ? 'h-2 w-2 rounded-full bg-[color:var(--mc-accent)]' : 'h-2 w-2 rounded-full bg-[color:var(--mc-accent)]'}
+                          className="h-2 w-2 rounded-full bg-[color:var(--mc-accent)]"
                           aria-label="New messages"
                           title="New messages"
                         />
@@ -211,48 +304,36 @@ export function SessionSidebar({
                   {p.name !== 'default' ? (
                     <button
                       type="button"
-                      onClick={(e) => { e.stopPropagation(); onDeletePersona(p.id) }}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onDeletePersona(p.id)
+                      }}
                       title={`Delete persona "${p.name}"`}
-                      className={
-                        isDark
-                          ? 'rounded p-1 text-slate-400 hover:bg-red-900/30 hover:text-red-400'
-                          : 'rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600'
-                      }
+                      className="rounded p-1 text-[color:var(--mc-text-muted)] hover:bg-red-900/20 hover:text-red-400"
                       aria-label={`Delete ${p.name}`}
                     >
-                      🗑
+                      <IconTrash className="size-3.5" />
                     </button>
                   ) : null}
                 </div>
-              ))
-            )}
-          </div>
-        </ScrollArea>
-      </div>
+              </div>
+            ))
+          )}
+        </div>
+      </ScrollArea>
 
-      <div className={isDark ? 'mt-4 rounded-lg border border-[color:var(--mc-border-soft)] p-3' : 'mt-4 rounded-lg border border-slate-200 p-3'}>
-        <Text size="2" weight="bold" className="mb-2 block">Human–AI relationship</Text>
-        <img
-          src="/human-ai-relationship.png"
-          alt="Human and AI collaboration"
-          className="w-full rounded-md border border-black/10 object-contain"
-          loading="lazy"
-        />
-      </div>
-
-      <div className={isDark ? 'mt-4 border-t border-[color:var(--mc-border-soft)] pt-3' : 'mt-4 border-t border-slate-200 pt-3'}>
+      <div className="mt-4 border-t border-[color:var(--mc-border-soft)] pt-3">
         <div className="mt-3 flex flex-col items-center gap-1">
           <a
             href="https://finally-a-value-bot.ai"
             target="_blank"
             rel="noreferrer"
-            className={isDark ? 'text-xs text-slate-400 hover:text-slate-200' : 'text-xs text-slate-600 hover:text-slate-900'}
+            className="text-xs text-[color:var(--mc-text-muted)] hover:text-[color:var(--mc-text-primary)]"
           >
             finally-a-value-bot.ai
           </a>
         </div>
       </div>
-
     </aside>
   )
 }

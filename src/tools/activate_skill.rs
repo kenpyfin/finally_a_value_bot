@@ -1,15 +1,18 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
+use crate::db::Database;
 use crate::skills::SkillManager;
 
-use super::{schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, schema_object, Tool, ToolResult};
 
 pub struct ActivateSkillTool {
     skill_manager: SkillManager,
+    db: Option<Arc<Database>>,
 }
 
 impl ActivateSkillTool {
@@ -17,6 +20,7 @@ impl ActivateSkillTool {
     pub fn new(skills_dir: &str) -> Self {
         ActivateSkillTool {
             skill_manager: SkillManager::from_skills_dir(skills_dir),
+            db: None,
         }
     }
 
@@ -25,6 +29,17 @@ impl ActivateSkillTool {
     pub fn new_with_dirs(dirs: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
         ActivateSkillTool {
             skill_manager: SkillManager::from_skills_dirs(dirs),
+            db: None,
+        }
+    }
+
+    pub fn new_with_dirs_and_db(
+        dirs: impl IntoIterator<Item = impl AsRef<Path>>,
+        db: Arc<Database>,
+    ) -> Self {
+        ActivateSkillTool {
+            skill_manager: SkillManager::from_skills_dirs(dirs),
+            db: Some(db),
         }
     }
 }
@@ -36,10 +51,10 @@ impl Tool for ActivateSkillTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "activate_skill".into(),
-            description: "Activate an agent skill to load its full instructions. Use this when you see a relevant skill in the available skills list and need its detailed instructions to complete a task. Skills are filtered by platform/dependencies before they are listed.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "activate_skill",
+            "Activate an agent skill to load its full instructions. Use this when you see a relevant skill in the available skills list and need its detailed instructions to complete a task. The catalog excludes skills for other platforms only; declared deps are not required locally (API/remote skills).",
+            schema_object(
                 json!({
                     "skill_name": {
                         "type": "string",
@@ -48,7 +63,7 @@ impl Tool for ActivateSkillTool {
                 }),
                 &["skill_name"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -59,10 +74,39 @@ impl Tool for ActivateSkillTool {
 
         info!("Activating skill: {}", skill_name);
 
+        if let (Some(db), Some(auth)) = (&self.db, auth_context_from_input(&input)) {
+            match db.is_skill_allowed_for_persona(
+                auth.caller_chat_id,
+                auth.caller_persona_id,
+                skill_name,
+            ) {
+                Ok(false) => {
+                    return ToolResult::error(format!(
+                        "Skill '{skill_name}' is not allowed for persona {}.",
+                        auth.caller_persona_id
+                    ))
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    return ToolResult::error(format!(
+                        "Failed to evaluate skill policy for '{skill_name}': {e}"
+                    ))
+                }
+            }
+        }
+
         match self.skill_manager.load_skill_checked(skill_name) {
             Ok((meta, body)) => {
                 let mut result = format!("# Skill: {}\n\n", meta.name);
                 result.push_str(&format!("Description: {}\n", meta.description));
+                if let Some(w) = meta
+                    .when_to_use
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    result.push_str(&format!("When to use:\n{w}\n"));
+                }
                 result.push_str(&format!("Skill directory: {}\n", meta.dir_path.display()));
                 result.push_str(&format!("Source: {}\n", meta.source));
                 if let Some(version) = &meta.version {
@@ -76,6 +120,12 @@ impl Tool for ActivateSkillTool {
                 }
                 if !meta.deps.is_empty() {
                     result.push_str(&format!("Dependencies: {}\n", meta.deps.join(", ")));
+                }
+                if let Some(hint) = super::run_skill_script::format_run_skill_script_hint(
+                    &meta.name,
+                    &meta.dir_path,
+                ) {
+                    result.push_str(&hint);
                 }
                 result.push_str("\n## Instructions\n\n");
                 result.push_str(&body);
@@ -102,7 +152,9 @@ mod tests {
     fn create_skill(base_dir: &std::path::Path, name: &str, desc: &str, body: &str) {
         let skill_dir = base_dir.join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
-        let content = format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n");
+        let content = format!(
+            "---\nname: {name}\ndescription: {desc}\nwhen_to_use: |\n  When testing activation output.\n---\n{body}\n"
+        );
         std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
     }
 
@@ -140,10 +192,32 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("# Skill: pdf"));
         assert!(result.content.contains("Convert to PDF"));
+        assert!(result.content.contains("When to use:"));
+        assert!(result.content.contains("When testing activation output."));
         assert!(result
             .content
             .contains("Use pdflatex to convert documents."));
         assert!(result.content.contains("Skill directory:"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_activate_skill_includes_run_skill_script_hint() {
+        let dir = test_dir();
+        let skill_dir = dir.join("mail");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: mail\ndescription: Mail skill\ndeps:\n  - python3\n---\n# Mail\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("read_mail_tool.py"), "# tool\n").unwrap();
+
+        let tool = ActivateSkillTool::new(dir.to_str().unwrap());
+        let result = tool.execute(json!({"skill_name": "mail"})).await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("run_skill_script"));
+        assert!(result.content.contains("read_mail_tool.py"));
         cleanup(&dir);
     }
 

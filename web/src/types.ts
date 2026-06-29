@@ -18,8 +18,175 @@ export type Persona = {
 }
 
 export type ChannelBinding = {
+  bot_instance_id: number
   channel_type: string
-  channel_handle: string
+  /** Telegram chat id or Discord channel id; null when not linked yet. */
+  channel_handle: string | null
+  platform?: string
+  label?: string
+  linked?: boolean
+  persona_mode?: 'all' | 'single'
+  persona_id?: number | null
+}
+
+export type RuntimeSettingItem = {
+  key: string
+  value: string
+  raw_value: string
+  is_secret: boolean
+  updated_at?: string
+  source?: string
+}
+
+/** Matches `/api/settings` `installation_status` and web Settings UI. */
+export type InstallationStatus = {
+  llm_ready: boolean
+  channel_ready: boolean
+  cursor_engine_ready?: boolean
+  web_enabled: boolean
+  /** @deprecated use requires_restart_for_env_changes */
+  requires_restart_to_apply_runtime_settings?: boolean
+  requires_restart_for_env_changes?: boolean
+  runtime_env_merge_from_app_settings?: boolean
+  llm_model_from_app_settings?: boolean
+}
+
+export type LlmCatalogModel = {
+  id: string
+  input_usd_per_mtok?: number | null
+  output_usd_per_mtok?: number | null
+  cost_tier: string
+  cost_summary: string
+  from_active_config?: boolean
+}
+
+export type CursorEngineConfigResponse = {
+  ok?: boolean
+  sdk_runner_url?: string
+  sdk_model?: string
+  sdk_runner_ok?: boolean
+  sidecar_managed?: boolean
+  sidecar_reachable?: boolean
+  api_key_configured?: boolean
+  engine_ready?: boolean
+  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  cli_path?: string
+  cli_model?: string
+  cli_runner_url?: string
+  cli_on_path?: boolean
+  timeout_secs?: number
+  tmux_enabled?: boolean
+  install_steps?: string[]
+  sidecar_error?: string | null
+  health_ok?: boolean
+  message?: string
+}
+
+export type RuntimeConfigResponse = {
+  ok?: boolean
+  tool_output_debug?: boolean
+  post_tool_evaluator_enabled?: boolean
+  response_quality_evaluator_enabled?: boolean
+  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  source?: 'env' | 'app_settings'
+  sources?: {
+    tool_output_debug?: 'env' | 'app_settings'
+    post_tool_evaluator_enabled?: 'env' | 'app_settings'
+    response_quality_evaluator_enabled?: 'env' | 'app_settings'
+    agent_engine?: 'env' | 'app_settings'
+  }
+  description?: string
+  message?: string
+}
+
+export type HookDefinition = {
+  id: number
+  name: string
+  event_name: string
+  matcher?: string | null
+  action_type: string
+  action_payload_json: string
+  action_payload?: Record<string, unknown>
+  scoped_persona_ids: number[] | null
+  is_global: boolean
+  enabled: boolean
+  updated_at: string
+  scoped_for_persona?: boolean
+  allowed_for_persona?: boolean
+  active_for_persona?: boolean
+}
+
+export type PersonaHookSkillPolicy = {
+  allowed_hook_ids: number[] | null
+  allowed_skill_names: string[] | null
+  uses_default_hooks: boolean
+  uses_default_skills: boolean
+  updated_at?: string | null
+}
+
+export type LlmProviderOption = {
+  id: string
+  label: string
+  api_key_configured: boolean
+  api_key_env_hints: string[]
+  default_base_url?: string | null
+  models: LlmCatalogModel[]
+}
+
+export type LlmConfigResponse = {
+  ok?: boolean
+  provider?: { id: string; label: string }
+  provider_source?: 'app_settings' | 'default'
+  api_key_configured?: boolean
+  model?: string
+  model_in_catalog?: boolean
+  model_source?: 'app_settings' | 'default'
+  is_local_provider?: boolean
+  base_url?: string | null
+  default_base_url?: string | null
+  base_url_source?: 'app_settings' | 'default' | 'n/a'
+  catalog?: LlmCatalogModel[]
+  providers?: LlmProviderOption[]
+  cost_reference_note?: string
+  custom_model_allowed?: boolean
+}
+
+export type MultimodelConfigResponse = {
+  ok?: boolean
+  enabled?: boolean
+  local_base_url?: string
+  local_model?: string
+  local_tools_ok?: boolean
+  tier1_base_url?: string
+  tier1_model?: string
+  tier2_base_url?: string
+  tier2_model?: string
+  tier1_tools_ok?: boolean
+  tier2_tools_ok?: boolean
+  strategy_provider?: string
+  strategy_model?: string
+  description?: string
+}
+
+export type AgentHistoryOptimizeResponse = {
+  ok?: boolean
+  job_id?: string
+  filename?: string
+  message?: string
+}
+
+export type AgentHistoryOptimizeRequest = {
+  operator_notes?: string
+}
+
+/** Redacted row from `GET /api/channel_bot_instances`. */
+export type BotInstanceRow = {
+  id: number
+  platform: string
+  label: string
+  token_redacted: string
+  created_at: string
+  env_primary: boolean
 }
 
 export type ScheduleTask = {
@@ -52,4 +219,118 @@ export type ArtifactItem = {
   source: string
   url: string
   preview_url: string
+}
+
+/** Message row from `GET /api/history`. */
+export type BackendMessage = {
+  id?: string
+  sender_name?: string
+  content?: string
+  is_from_bot?: boolean
+  timestamp?: string
+  is_bookmarked?: boolean
+}
+
+export type PersonaBulletinFocus = {
+  title?: string | null
+  content: string
+  updated_at: string
+}
+
+/** One side of history-suffix trim (user or assistant message counts). */
+export type PersonaHistorySuffixSide = {
+  effective: number
+  persona_override: number | null
+  uses_default: boolean
+}
+
+/** GET /api/personas/:id/bulletin `history_suffix` object. */
+export type PersonaBulletinHistorySuffix = {
+  min_user: PersonaHistorySuffixSide
+  min_assistant: PersonaHistorySuffixSide
+  defaults: { min_user: number; min_assistant: number }
+}
+
+/** Must match `OPERATOR_MEMO_MAX_CHARS` on the server. */
+export const OPERATOR_MEMO_MAX_CHARS = 4000
+
+export type PersonaMessageBookmark = {
+  message_id: string
+  role: 'user' | 'assistant' | string
+  content_preview: string
+  note?: string | null
+  created_at?: string
+  updated_at?: string
+}
+
+export type QueueItem = {
+  run_id: string
+  persona_id: number
+  persona_name: string
+  source: string
+  label: string
+  state: string
+  project_id?: number | null
+  workflow_id?: number | null
+  position: number
+}
+
+export type QueueLane = {
+  chat_id: number
+  persona_id: number
+  pending: number
+  active_for_ms: number
+  oldest_wait_ms: number
+  last_error?: string | null
+  project_id?: number | null
+  workflow_id?: number | null
+  items?: QueueItem[]
+}
+
+export type BackgroundJobHeartbeat = {
+  run_key: string
+  chat_id: number
+  persona_id: number
+  job_type: string
+  stage: string
+  message: string
+  active: boolean
+  updated_at: string
+}
+
+export type BackgroundJobItem = {
+  id: string
+  chat_id: number
+  persona_id: number
+  prompt: string
+  status: string
+  trigger_reason: string
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  result_preview?: string | null
+  error_text?: string | null
+  heartbeat?: BackgroundJobHeartbeat | null
+  job_kind?: string
+  label?: string | null
+  tmux_session?: string | null
+  shell_command?: string | null
+}
+
+export type QueueDiagnosticsResponse = {
+  lanes?: QueueLane[]
+  background_by_chat?: Record<string, BackgroundJobItem[]>
+}
+
+export type ChatSession = {
+  id: string
+  chat_id: number
+  persona_id: number
+  title: string
+  intent: string
+  status: 'active' | 'archived'
+  created_at: string
+  last_active_at: string
+  archived_at?: string | null
+  ttl_hours: number
 }

@@ -35,6 +35,7 @@ def _require_embed_openai_base() -> str:
 
 
 DB_PATH = os.environ.get("VAULT_VECTOR_DB_PATH") or os.environ.get("VAULT_DB_PATH") or _default_vault_db_path()
+print(f"DEBUG: DB_PATH={DB_PATH}")
 VAULT_PATH = _default_vault_path()
 EMBED_URL = _require_embed_openai_base()
 COLLECTION = os.environ.get("VAULT_VECTOR_DB_COLLECTION", "origin_vault")
@@ -42,17 +43,28 @@ COLLECTION = os.environ.get("VAULT_VECTOR_DB_COLLECTION", "origin_vault")
 import chromadb
 from chromadb.utils import embedding_functions
 
-llama_ef = embedding_functions.OpenAIEmbeddingFunction(
-    api_key="sk-no-key-required",
-    api_base=EMBED_URL,
-    model_name="ignored",
-)
+class CustomLlamaEF(chromadb.EmbeddingFunction):
+    def __init__(self, embed_url: str):
+        self.embed_url = embed_url.rstrip("/") + "/embeddings"
+
+    def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
+        import requests
+        payload = {
+            "model": "ignored",
+            "input": input
+        }
+        response = requests.post(self.embed_url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return [d["embedding"] for d in data["data"]]
+
+llama_ef = CustomLlamaEF(embed_url=EMBED_URL)
 
 client = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_or_create_collection(name=COLLECTION, embedding_function=llama_ef)
 
 
-def chunk_md(content: str, path: str, chunk_size: int = 1000, overlap: int = 200) -> list[tuple[str, str]]:
+def chunk_md(content: str, path: str, chunk_size: int = 2080, overlap: int = 400) -> list[tuple[str, str]]:
     """Split markdown into overlapping chunks."""
     content = re.sub(r"\s+", " ", content.strip())
     chunks = []
@@ -90,8 +102,13 @@ def index_vault() -> int:
         print("No documents to index.")
         return 0
 
-    collection.upsert(documents=docs, metadatas=metas, ids=ids)
-    print(f"Indexed {len(docs)} chunks from {vault}")
+    print(f"Prepared {len(docs)} chunks. Starting upsert...")
+    try:
+        collection.upsert(documents=docs, metadatas=metas, ids=ids)
+        print(f"Successfully indexed {len(docs)} chunks from {vault}")
+    except Exception as e:
+        print(f"Upsert failed: {e}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -1,10 +1,12 @@
 //! Post-Tool Evaluator (PTE): evaluates whether a task is complete after tool execution.
 //! Called after each tool iteration to decide whether to continue the agent loop or synthesize a final response.
 
+use crate::agent_turn_context::extract_session_goal;
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
 use crate::error::FinallyAValueBotError;
-use crate::llm;
+use crate::llm::{self, EVALUATOR_TIMEOUT_SECS};
+use crate::safety_redaction::EnvSecretRedactor;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -22,21 +24,34 @@ pub enum PteAction {
 pub struct PteResult {
     pub action: PteAction,
     pub reason: String,
+    pub provider_label: Option<String>,
+    pub disabled: bool,
+    pub provider_skipped: bool,
+}
+
+pub fn pte_action_name(action: &PteAction) -> &'static str {
+    match action {
+        PteAction::Continue => "continue",
+        PteAction::Complete => "complete",
+        PteAction::AskUser => "ask_user",
+        PteAction::HandoffBackground => "handoff_background",
+        PteAction::StopWithSummary => "stop_with_summary",
+    }
 }
 
 /// Build the PTE system prompt with principles and memory context baked in.
 fn build_pte_system_prompt(principles_content: &str, memory_context: &str) -> String {
     let mut prompt = String::from(
-        r#"You are a task-completion evaluator. Given the agent's principles, memory context, the user's original request, and the tool results so far, determine whether the task is complete.
+        r#"You are a task-completion evaluator. Judge whether the session goal (`current_request`) is fulfilled by tool results so far.
 
 Output JSON only: {"action": "continue" | "complete", "reason": "brief rationale"}
 
 Rules:
-- "complete" = all aspects of the user's request have been fulfilled by the tool results
-- "continue" = the task needs more steps, or the results are partial/inconclusive
-- Consider the agent's principles when evaluating: if principles require confirmation, verification, or follow-up steps, the task is not complete until those are done
-- Consider memory context: if the user has ongoing projects or preferences that affect what "done" means, factor those in
-- If in doubt, say "continue" — it is safer to let the LLM decide than to prematurely stop
+- "complete" = the session goal (`current_request`) is fulfilled by tool results
+- "continue" = more steps needed, or results are partial/inconclusive for that goal
+- Prior turns and bulletin/memory are background — judge only `current_request`
+- Consider principles as constraints only
+- If in doubt, say "continue"
 - Keep reason concise (one sentence)
 "#,
     );
@@ -56,39 +71,12 @@ Rules:
     prompt
 }
 
-/// Extract the original user request from the conversation (first user message text).
-fn extract_original_request(messages: &[Message]) -> String {
-    for msg in messages {
-        if msg.role == "user" {
-            match &msg.content {
-                MessageContent::Text(t) => {
-                    let truncated = if t.chars().count() > 500 {
-                        format!("{}...", t.chars().take(500).collect::<String>())
-                    } else {
-                        t.clone()
-                    };
-                    return truncated;
-                }
-                MessageContent::Blocks(blocks) => {
-                    for block in blocks {
-                        if let ContentBlock::Text { text } = block {
-                            let truncated = if text.chars().count() > 500 {
-                                format!("{}...", text.chars().take(500).collect::<String>())
-                            } else {
-                                text.clone()
-                            };
-                            return truncated;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    "(no user request found)".to_string()
-}
-
 /// Build a summary of the most recent tool calls and results.
-fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> String {
+pub fn build_tool_results_summary(
+    env_redactor: &EnvSecretRedactor,
+    messages: &[Message],
+    max_messages: usize,
+) -> String {
     let mut out = String::new();
     let start = messages.len().saturating_sub(max_messages);
 
@@ -107,7 +95,8 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                             };
                             out.push_str(&format!(
                                 "Tool called: {} with {}\n",
-                                name, input_preview
+                                name,
+                                env_redactor.redact(&input_preview)
                             ));
                         }
                         ContentBlock::ToolResult {
@@ -123,7 +112,11 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                             } else {
                                 content.clone()
                             };
-                            out.push_str(&format!("Result ({}): {}\n", status, preview));
+                            out.push_str(&format!(
+                                "Result ({}): {}\n",
+                                status,
+                                env_redactor.redact(&preview)
+                            ));
                         }
                         _ => {}
                     }
@@ -136,7 +129,7 @@ fn build_tool_results_summary(messages: &[Message], max_messages: usize) -> Stri
                     } else {
                         t.clone()
                     };
-                    out.push_str(&format!("Assistant: {}\n", preview));
+                    out.push_str(&format!("Assistant: {}\n", env_redactor.redact(&preview)));
                 }
             }
         }
@@ -217,29 +210,48 @@ fn has_repeated_no_progress_signatures(messages: &[Message]) -> bool {
 }
 
 /// Build the user message for PTE evaluation.
-fn build_pte_user_prompt(messages: &[Message], iteration: usize, max_iterations: usize) -> String {
-    let original_request = extract_original_request(messages);
-    let tool_summary = build_tool_results_summary(messages, 6);
-
-    format!(
-        "Original user request: {}\n\nTools called and their results:\n{}\nCurrent iteration: {} of {}",
-        original_request, tool_summary, iteration + 1, max_iterations
-    )
+fn build_pte_user_prompt(
+    env_redactor: &EnvSecretRedactor,
+    messages: &[Message],
+    iteration: usize,
+    max_iterations: usize,
+) -> String {
+    let goal = extract_session_goal(messages, Some(env_redactor));
+    let tool_summary = build_tool_results_summary(env_redactor, messages, 6);
+    let mut prompt = format!(
+        "Session goal (current_request): {}\n\nTools called and their results:\n{}\nCurrent iteration: {} of {}",
+        goal.current_request, tool_summary, iteration + 1, max_iterations
+    );
+    if goal.is_short_reply {
+        prompt.push_str("\nShort-reply turn: yes\n");
+        if let Some(ref d) = goal.disambiguation_assistant {
+            prompt.push_str("Disambiguation (prior assistant excerpt):\n");
+            prompt.push_str(d);
+            prompt.push('\n');
+        }
+    }
+    prompt
 }
 
 /// Evaluate whether the task is complete after tool execution.
 /// Returns Continue immediately if PTE is disabled.
 pub async fn evaluate_completion(
+    enabled: bool,
     config: &Config,
+    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    env_redactor: &EnvSecretRedactor,
     principles_content: &str,
     memory_context: &str,
     messages: &[Message],
     iteration: usize,
 ) -> Result<PteResult, FinallyAValueBotError> {
-    if !config.post_tool_evaluator_enabled {
+    if !enabled {
         return Ok(PteResult {
             action: PteAction::Continue,
             reason: String::new(),
+            provider_label: None,
+            disabled: true,
+            provider_skipped: false,
         });
     }
 
@@ -249,6 +261,9 @@ pub async fn evaluate_completion(
         return Ok(PteResult {
             action: PteAction::AskUser,
             reason: "Repeated stalled failures detected; stop loop and ask user whether to retry or wait.".to_string(),
+            provider_label: None,
+            disabled: false,
+            provider_skipped: false,
         });
     }
     if has_repeated_no_progress_signatures(messages) {
@@ -256,29 +271,69 @@ pub async fn evaluate_completion(
             action: PteAction::StopWithSummary,
             reason: "Repeated no-progress tool outcomes detected; stop and return concise summary."
                 .to_string(),
+            provider_label: None,
+            disabled: false,
+            provider_skipped: false,
         });
     }
 
-    let mut llm_config = config.clone();
-    let model = config.post_tool_evaluator_model.trim();
-    if !model.is_empty() {
-        llm_config.model = model.to_string();
-    } else if !config.orchestrator_model.trim().is_empty() {
-        llm_config.model = config.orchestrator_model.trim().to_string();
-    }
-
     let system_prompt = build_pte_system_prompt(principles_content, memory_context);
-    let user_prompt = build_pte_user_prompt(messages, iteration, config.max_tool_iterations);
+    let user_prompt = build_pte_user_prompt(
+        env_redactor,
+        messages,
+        iteration,
+        config.max_tool_iterations,
+    );
 
     let pte_messages = vec![Message {
         role: "user".into(),
         content: MessageContent::Text(user_prompt),
     }];
 
-    let provider = llm::create_provider(&llm_config);
-    let response = provider
-        .send_message(&system_prompt, pte_messages, None)
-        .await?;
+    let provider_bundle = match llm::create_evaluator_provider(config, multimodel) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("PTE skipped: {e}");
+            return Ok(PteResult {
+                action: PteAction::Continue,
+                reason: e.to_string(),
+                provider_label: None,
+                disabled: false,
+                provider_skipped: true,
+            });
+        }
+    };
+    let provider_label = provider_bundle.label.clone();
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(EVALUATOR_TIMEOUT_SECS),
+        provider_bundle
+            .provider
+            .send_message(&system_prompt, pte_messages, None),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!("PTE evaluation failed (fail-open): {e}");
+            return Ok(PteResult {
+                action: PteAction::Continue,
+                reason: e.to_string(),
+                provider_label: Some(provider_label),
+                disabled: false,
+                provider_skipped: true,
+            });
+        }
+        Err(_) => {
+            tracing::warn!("PTE evaluation timed out after {EVALUATOR_TIMEOUT_SECS}s (fail-open)");
+            return Ok(PteResult {
+                action: PteAction::Continue,
+                reason: format!("evaluator timed out after {EVALUATOR_TIMEOUT_SECS}s"),
+                provider_label: Some(provider_label),
+                disabled: false,
+                provider_skipped: true,
+            });
+        }
+    };
 
     let text: String = response
         .content
@@ -290,7 +345,8 @@ pub async fn evaluate_completion(
         .collect::<Vec<_>>()
         .join("");
 
-    let parsed = parse_pte_response(&text)?;
+    let mut parsed = parse_pte_response(&text)?;
+    parsed.provider_label = Some(provider_label);
     info!(
         "PTE decision: {:?} at iteration {} - {}",
         parsed.action,
@@ -333,6 +389,9 @@ fn parse_pte_response(text: &str) -> Result<PteResult, FinallyAValueBotError> {
     Ok(PteResult {
         action,
         reason: raw.reason.unwrap_or_default(),
+        provider_label: None,
+        disabled: false,
+        provider_skipped: false,
     })
 }
 
@@ -381,26 +440,18 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_original_request() {
-        let messages = vec![
-            Message {
-                role: "user".into(),
-                content: MessageContent::Text("Hello, help me".into()),
-            },
-            Message {
-                role: "assistant".into(),
-                content: MessageContent::Text("Sure!".into()),
-            },
-        ];
-        let req = extract_original_request(&messages);
-        assert_eq!(req, "Hello, help me");
-    }
-
-    #[test]
-    fn test_extract_original_request_empty() {
-        let messages: Vec<Message> = vec![];
-        let req = extract_original_request(&messages);
-        assert_eq!(req, "(no user request found)");
+    fn test_build_pte_user_prompt_session_goal() {
+        use crate::safety_redaction::EnvSecretRedactor;
+        let messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Text(
+                "[current_request]\nFix the login bug\n[/current_request]".into(),
+            ),
+        }];
+        let redactor = EnvSecretRedactor::empty();
+        let prompt = build_pte_user_prompt(&redactor, &messages, 0, 5);
+        assert!(prompt.contains("Session goal (current_request):"));
+        assert!(prompt.contains("Fix the login bug"));
     }
 
     #[test]

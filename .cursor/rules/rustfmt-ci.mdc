@@ -34,3 +34,11 @@ When clippy reports `type_complexity` (for example nested `Arc<Mutex<HashMap<...
 - `type` aliases near the top of the file for readability and reuse
 - descriptive alias names (`RunRegistry`, `RunCancel`, etc.)
 - keeping behavior unchanged while simplifying exposed type expressions
+
+## Preventing behavior-test drift
+
+When Rust changes alter a tool/input contract, update affected tests in the same change so CI does not fail on stale assumptions.
+
+- If attachment/tool behavior depends on `ToolAuthContext` (for example `caller_channel`), include `__finally_a_value_bot_auth` in tests that expect channel-specific code paths.
+- Keep error assertions aligned with the actual path under test (e.g. "config unavailable" vs. missing-auth errors).
+- For parser helpers (regex extraction, markdown/url parsing), assert exact token boundaries (exclude wrapping markdown punctuation like `[]()` when expecting raw URLs).

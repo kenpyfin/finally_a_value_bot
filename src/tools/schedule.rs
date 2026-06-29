@@ -4,12 +4,67 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
+use super::{
+    auth_context_from_input, authorize_chat_access, default_persona_id_for_chat, schema_object,
+    Tool, ToolResult,
+};
 use crate::channel::enforce_channel_policy;
 use crate::claude::ToolDefinition;
 use crate::db::{call_blocking, Database, ScheduledTask};
 
 const UTC_TIMEZONE: &str = "UTC";
+
+/// Control chats list every persona's schedules in a chat; normal runs see caller persona only.
+fn list_schedules_for_caller(
+    db: &Database,
+    chat_id: i64,
+    input: &serde_json::Value,
+) -> Result<Vec<ScheduledTask>, String> {
+    if auth_context_from_input(input)
+        .map(|a| a.is_control_chat())
+        .unwrap_or(false)
+    {
+        return db
+            .get_scheduled_tasks_for_chat_for_display(chat_id)
+            .map_err(|e| format!("Failed to list tasks: {e}"));
+    }
+    let persona_id = resolve_list_persona_id(db, chat_id, input)?;
+    db.get_scheduled_tasks_for_chat_and_persona(chat_id, persona_id)
+        .map_err(|e| format!("Failed to list tasks: {e}"))
+}
+
+fn resolve_list_persona_id(
+    db: &Database,
+    chat_id: i64,
+    input: &serde_json::Value,
+) -> Result<i64, String> {
+    if let Some(pid) = default_persona_id_for_chat(input, chat_id) {
+        return Ok(pid);
+    }
+    if let Some(auth) = auth_context_from_input(input) {
+        if auth.caller_chat_id == chat_id && auth.caller_persona_id > 0 {
+            return Ok(auth.caller_persona_id);
+        }
+    }
+    db.get_current_persona_id(chat_id)
+        .map_err(|e| format!("Failed to resolve persona: {e}"))
+}
+
+fn authorize_scheduled_task_access(
+    input: &serde_json::Value,
+    task: &ScheduledTask,
+) -> Result<(), String> {
+    authorize_chat_access(input, task.chat_id)?;
+    if let Some(auth) = auth_context_from_input(input) {
+        if !auth.can_access_chat_persona(task.chat_id, task.persona_id) {
+            return Err(format!(
+                "Permission denied: cannot access scheduled task for chat {} persona {}",
+                task.chat_id, task.persona_id
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Format scheduled tasks for slash-command or UI display.
 pub fn format_tasks_list(tasks: &[ScheduledTask]) -> String {
@@ -34,7 +89,7 @@ pub fn format_tasks_list_persona(tasks: &[ScheduledTask]) -> String {
             t.id, t.status, t.persona_id, t.prompt, t.schedule_type, t.schedule_value, t.next_run
         ));
     }
-    output.push_str("\nUse `schedule_task` to add; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
+    output.push_str("\nUse `schedule_task` to add; `update_scheduled_task` to change prompt/timing/status; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
     output
 }
 
@@ -42,7 +97,11 @@ fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> Str
     if tasks.is_empty() {
         return "No scheduled tasks. Ask me to schedule one (recurring or one-time).".to_string();
     }
-    let mut output = String::from("Scheduled tasks (all chats/personas):\n");
+    let mut output = if include_chat_id {
+        String::from("Scheduled tasks (all chats/personas):\n")
+    } else {
+        String::from("Scheduled tasks:\n")
+    };
     for t in tasks {
         if include_chat_id {
             output.push_str(&format!(
@@ -56,7 +115,7 @@ fn format_tasks_list_impl(tasks: &[ScheduledTask], include_chat_id: bool) -> Str
             ));
         }
     }
-    output.push_str("\nUse `schedule_task` to add; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
+    output.push_str("\nUse `schedule_task` to add; `update_scheduled_task` to change prompt/timing/status; `pause_scheduled_task` / `resume_scheduled_task` / `cancel_scheduled_task` to manage.");
     output
 }
 
@@ -154,10 +213,10 @@ impl Tool for ScheduleTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "schedule_task".into(),
-            description: "Schedule a recurring or one-time task. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "schedule_task",
+            "Create a new scheduled task (cron or one-time). Cron schedules live in `scheduled_tasks` only — not authored YAML workflows. Always activate the `schedule-job` skill before using this tool. For recurring tasks, provide a 5- or 6-field cron expression (5-field is normalized to 6-field: sec min hour dom month dow). For one-time tasks, provide an ISO 8601 timestamp. If timezone is omitted, the bot's configured default timezone is used. To change an existing task, use `update_scheduled_task`.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -183,7 +242,7 @@ impl Tool for ScheduleTaskTool {
                 }),
                 &["chat_id", "prompt", "schedule_type", "schedule_value"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -289,19 +348,19 @@ impl Tool for ListTasksTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "list_scheduled_tasks".into(),
-            description: "List all scheduled tasks (active, running, paused, completed) across all chats and personas.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "list_scheduled_tasks",
+            "List scheduled tasks (active, running, paused, completed) for the current chat and caller persona. Control chats see all personas in the chat. Learned workflows (queue `workflow_id`) are unrelated to these cron/once schedules.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
-                        "description": "Caller's chat ID (for auth); tasks shown are global."
+                        "description": "Caller's chat ID (for auth/filtering)."
                     }
                 }),
                 &["chat_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -316,12 +375,14 @@ impl Tool for ListTasksTool {
             return ToolResult::error(e);
         }
 
-        match call_blocking(self.db.clone(), |db| {
-            db.get_all_scheduled_tasks_for_display()
+        let input_for_list = input.clone();
+        match call_blocking(self.db.clone(), move |db| {
+            list_schedules_for_caller(&db, chat_id, &input_for_list)
+                .map_err(crate::error::FinallyAValueBotError::ToolExecution)
         })
         .await
         {
-            Ok(tasks) => ToolResult::success(format_tasks_list_all(&tasks)),
+            Ok(tasks) => ToolResult::success(format_tasks_list(&tasks)),
             Err(e) => ToolResult::error(format!("Failed to list tasks: {e}")),
         }
     }
@@ -346,10 +407,10 @@ impl Tool for PauseTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "pause_scheduled_task".into(),
-            description: "Pause a scheduled task. It will not run until resumed.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "pause_scheduled_task",
+            "Pause a scheduled task (cron/once row in `scheduled_tasks`). It will not run until resumed.",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -358,7 +419,7 @@ impl Tool for PauseTaskTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -372,7 +433,7 @@ impl Tool for PauseTaskTool {
             Ok(None) => return ToolResult::error(format!("Task #{task_id} not found.")),
             Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
         };
-        if let Err(e) = authorize_chat_access(&input, task.chat_id) {
+        if let Err(e) = authorize_scheduled_task_access(&input, &task) {
             return ToolResult::error(e);
         }
         if let Err(e) = enforce_channel_policy(self.db.clone(), &input, task.chat_id).await {
@@ -410,10 +471,10 @@ impl Tool for ResumeTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "resume_scheduled_task".into(),
-            description: "Resume a paused scheduled task.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "resume_scheduled_task",
+            "Resume a paused scheduled task (`scheduled_tasks`).",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -422,7 +483,7 @@ impl Tool for ResumeTaskTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -436,7 +497,7 @@ impl Tool for ResumeTaskTool {
             Ok(None) => return ToolResult::error(format!("Task #{task_id} not found.")),
             Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
         };
-        if let Err(e) = authorize_chat_access(&input, task.chat_id) {
+        if let Err(e) = authorize_scheduled_task_access(&input, &task) {
             return ToolResult::error(e);
         }
         if let Err(e) = enforce_channel_policy(self.db.clone(), &input, task.chat_id).await {
@@ -474,10 +535,10 @@ impl Tool for CancelTaskTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "cancel_scheduled_task".into(),
-            description: "Cancel (delete) a scheduled task permanently.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "cancel_scheduled_task",
+            "Cancel a scheduled task permanently (marks cancelled).",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -486,7 +547,7 @@ impl Tool for CancelTaskTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -500,7 +561,7 @@ impl Tool for CancelTaskTool {
             Ok(None) => return ToolResult::error(format!("Task #{task_id} not found.")),
             Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
         };
-        if let Err(e) = authorize_chat_access(&input, task.chat_id) {
+        if let Err(e) = authorize_scheduled_task_access(&input, &task) {
             return ToolResult::error(e);
         }
         if let Err(e) = enforce_channel_policy(self.db.clone(), &input, task.chat_id).await {
@@ -516,6 +577,255 @@ impl Tool for CancelTaskTool {
             Ok(false) => ToolResult::error(format!("Task #{task_id} not found.")),
             Err(e) => ToolResult::error(format!("Failed to cancel task: {e}")),
         }
+    }
+}
+
+// --- update_scheduled_task ---
+
+pub struct UpdateScheduledTaskTool {
+    db: Arc<Database>,
+    default_timezone: String,
+}
+
+impl UpdateScheduledTaskTool {
+    pub fn new(db: Arc<Database>, default_timezone: String) -> Self {
+        UpdateScheduledTaskTool {
+            db,
+            default_timezone,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for UpdateScheduledTaskTool {
+    fn name(&self) -> &str {
+        "update_scheduled_task"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "update_scheduled_task",
+            "Update an existing scheduled task by id: optional status (paused/active/cancelled), persona_id, prompt, and/or schedule (schedule_type + schedule_value with optional timezone). Same preflight rules as `schedule_task`. Activate the `schedule-job` skill before changing schedule fields.",
+            schema_object(
+                json!({
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Scheduled task id (from list_scheduled_tasks)"
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Optional: paused, active (or resumed), or cancelled"
+                    },
+                    "persona_id": {
+                        "type": "integer",
+                        "description": "Optional: persona id for this chat"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Optional: new prompt text (non-empty)"
+                    },
+                    "schedule_type": {
+                        "type": "string",
+                        "enum": ["cron", "once"],
+                        "description": "Optional: must be sent with schedule_value to change timing"
+                    },
+                    "schedule_value": {
+                        "type": "string",
+                        "description": "Optional: cron expression or ISO 8601 once timestamp; pair with schedule_type"
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone for schedule preflight; defaults to bot config or UTC"
+                    }
+                }),
+                &["task_id"],
+            ),
+        )
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> ToolResult {
+        let task_id = match input.get("task_id").and_then(|v| v.as_i64()) {
+            Some(id) => id,
+            None => return ToolResult::error("Missing required parameter: task_id".into()),
+        };
+
+        let task = match call_blocking(self.db.clone(), move |db| db.get_task_by_id(task_id)).await
+        {
+            Ok(Some(t)) => t,
+            Ok(None) => return ToolResult::error(format!("Task #{task_id} not found.")),
+            Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
+        };
+        if let Err(e) = authorize_scheduled_task_access(&input, &task) {
+            return ToolResult::error(e);
+        }
+        if let Err(e) = enforce_channel_policy(self.db.clone(), &input, task.chat_id).await {
+            return ToolResult::error(e);
+        }
+
+        let status = match input.get("status").and_then(|v| v.as_str()) {
+            Some("paused") => Some("paused"),
+            Some("active") | Some("resumed") => Some("active"),
+            Some("cancelled") => Some("cancelled"),
+            Some(other) => {
+                return ToolResult::error(format!(
+                    "status must be paused, active, resumed, or cancelled; got {other}"
+                ));
+            }
+            None => None,
+        };
+        let persona_id = input.get("persona_id").and_then(|v| v.as_i64());
+        let prompt_update = input
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|p| p.trim().to_string());
+        let schedule_type_in = input
+            .get("schedule_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string());
+        let schedule_value_in = input
+            .get("schedule_value")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string());
+        let has_schedule_pair = schedule_type_in.is_some() && schedule_value_in.is_some();
+        let schedule_partial = schedule_type_in.is_some() ^ schedule_value_in.is_some();
+        if schedule_partial {
+            return ToolResult::error(
+                "Provide both schedule_type and schedule_value to change the schedule.".into(),
+            );
+        }
+
+        if status.is_none() && persona_id.is_none() && prompt_update.is_none() && !has_schedule_pair
+        {
+            return ToolResult::error(
+                "Provide at least one of: status, persona_id, prompt, or schedule_type+schedule_value."
+                    .into(),
+            );
+        }
+
+        if let Some(pid) = persona_id {
+            if pid <= 0 {
+                return ToolResult::error("persona_id must be a positive integer".into());
+            }
+            if pid != task.persona_id {
+                let auth = match auth_context_from_input(&input) {
+                    Some(a) => a,
+                    None => {
+                        return ToolResult::error(
+                            "Reassigning scheduled task persona requires auth context".into(),
+                        );
+                    }
+                };
+                if !auth.is_control_chat() {
+                    return ToolResult::error(
+                        "Only control chats may reassign a scheduled task to another persona"
+                            .into(),
+                    );
+                }
+            }
+            let exists = match call_blocking(self.db.clone(), move |db| {
+                db.persona_exists(task.chat_id, pid)
+            })
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => return ToolResult::error(format!("Failed to check persona: {e}")),
+            };
+            if !exists {
+                return ToolResult::error(format!("Persona {} does not exist for this chat", pid));
+            }
+        }
+
+        if let Some(ref p) = prompt_update {
+            if p.is_empty() {
+                return ToolResult::error("prompt must not be empty".into());
+            }
+        }
+
+        let timezone_input = input.get("timezone").and_then(|v| v.as_str());
+        let configured_default_tz = self.default_timezone.trim();
+        let effective_tz = timezone_input.or_else(|| {
+            if configured_default_tz.is_empty() {
+                None
+            } else {
+                Some(configured_default_tz)
+            }
+        });
+
+        let schedule_preflight = if has_schedule_pair {
+            let st = schedule_type_in.as_ref().unwrap().as_str();
+            let sv = schedule_value_in.as_ref().unwrap().as_str();
+            Some(match preflight_schedule_request(st, sv, effective_tz) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::error(e),
+            })
+        } else {
+            None
+        };
+
+        if let Some(next_status) = status {
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_status(task_id, next_status)
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update status: {e}")),
+            }
+        }
+        if let Some(pid) = persona_id {
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_persona(task_id, pid)
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update persona: {e}")),
+            }
+        }
+        if let Some(p) = prompt_update {
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_prompt(task_id, &p)
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update prompt: {e}")),
+            }
+        }
+        if let Some(pref) = &schedule_preflight {
+            let schedule_type_owned = schedule_type_in.as_ref().unwrap().clone();
+            let schedule_value_owned = pref.schedule_value.clone();
+            let next_run_owned = pref.next_run.clone();
+            match call_blocking(self.db.clone(), move |db| {
+                db.update_task_schedule(
+                    task_id,
+                    &schedule_type_owned,
+                    &schedule_value_owned,
+                    &next_run_owned,
+                )
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return ToolResult::error(format!("Task #{task_id} not found.")),
+                Err(e) => return ToolResult::error(format!("Failed to update schedule: {e}")),
+            }
+        }
+
+        let mut msg = format!("Task #{task_id} updated.");
+        if let Some(pref) = schedule_preflight {
+            msg.push_str(&format!(
+                " Next run: {} (tz: {}).",
+                pref.next_run, pref.timezone_used
+            ));
+            if pref.timezone_defaulted_to_utc {
+                msg.push_str(" Timezone was not provided for preflight, so UTC was assumed.");
+            }
+        }
+        ToolResult::success(msg)
     }
 }
 
@@ -538,10 +848,10 @@ impl Tool for GetTaskHistoryTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "get_task_history".into(),
-            description: "Get the execution history/run logs for a scheduled task.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "get_task_history",
+            "Get the execution history/run logs for a scheduled task.",
+            schema_object(
                 json!({
                     "task_id": {
                         "type": "integer",
@@ -554,7 +864,7 @@ impl Tool for GetTaskHistoryTool {
                 }),
                 &["task_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -568,7 +878,7 @@ impl Tool for GetTaskHistoryTool {
             Ok(None) => return ToolResult::error(format!("Task #{task_id} not found.")),
             Err(e) => return ToolResult::error(format!("Failed to load task: {e}")),
         };
-        if let Err(e) = authorize_chat_access(&input, task.chat_id) {
+        if let Err(e) = authorize_scheduled_task_access(&input, &task) {
             return ToolResult::error(e);
         }
         if let Err(e) = enforce_channel_policy(self.db.clone(), &input, task.chat_id).await {
@@ -946,7 +1256,7 @@ mod tests {
         assert!(result.is_error);
         assert!(result
             .content
-            .contains("web chats cannot operate on other chats"));
+            .contains("web UI sessions cannot operate on other chats"));
         cleanup(&dir);
     }
 
@@ -991,6 +1301,212 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         let task = db.get_task_by_id(task_id).unwrap().unwrap();
         assert_eq!(task.status, "paused");
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_update_scheduled_task_prompt_and_schedule() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "hello", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+            .unwrap();
+        let tool = UpdateScheduledTaskTool::new(db.clone(), "UTC".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 100,
+                "task_id": id,
+                "prompt": "updated prompt",
+                "schedule_type": "cron",
+                "schedule_value": "0 0 * * * *"
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let t = db.get_task_by_id(id).unwrap().unwrap();
+        assert_eq!(t.prompt, "updated prompt");
+        assert_eq!(t.schedule_type, "cron");
+        assert_eq!(t.schedule_value, "0 0 * * * *");
+        assert!(t.next_run.contains("T"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_list_scheduled_tasks_persona_scoped() {
+        let (db, dir) = test_db();
+        let pid_a = db.get_or_create_default_persona(100).unwrap();
+        let pid_b = db.create_persona(100, "B", None).unwrap();
+        db.create_scheduled_task_for_persona(
+            100,
+            pid_a,
+            "task for A",
+            "cron",
+            "0 * * * * *",
+            "2024-01-01T00:00:00Z",
+        )
+        .unwrap();
+        db.create_scheduled_task_for_persona(
+            100,
+            pid_b,
+            "task for B",
+            "cron",
+            "0 * * * * *",
+            "2024-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        let tool = ListTasksTool::new(db);
+        let result = tool
+            .execute(json!({
+                "chat_id": 100,
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 100,
+                    "caller_persona_id": pid_a,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("task for A"));
+        assert!(!result.content.contains("task for B"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_list_scheduled_tasks_control_chat_sees_all_personas() {
+        let (db, dir) = test_db();
+        let pid_a = db.get_or_create_default_persona(100).unwrap();
+        let pid_b = db.create_persona(100, "B", None).unwrap();
+        db.create_scheduled_task_for_persona(
+            100,
+            pid_a,
+            "task for A",
+            "cron",
+            "0 * * * * *",
+            "2024-01-01T00:00:00Z",
+        )
+        .unwrap();
+        db.create_scheduled_task_for_persona(
+            100,
+            pid_b,
+            "task for B",
+            "cron",
+            "0 * * * * *",
+            "2024-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        let tool = ListTasksTool::new(db);
+        let result = tool
+            .execute(json!({
+                "chat_id": 100,
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 100,
+                    "caller_persona_id": pid_a,
+                    "control_chat_ids": [100]
+                }
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("task for A"));
+        assert!(result.content.contains("task for B"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pause_scheduled_task_other_persona_denied() {
+        let (db, dir) = test_db();
+        let pid_a = db.get_or_create_default_persona(100).unwrap();
+        let pid_b = db.create_persona(100, "B", None).unwrap();
+        let task_b = db
+            .create_scheduled_task_for_persona(
+                100,
+                pid_b,
+                "B only",
+                "cron",
+                "0 * * * * *",
+                "2024-01-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let tool = PauseTaskTool::new(db);
+        let result = tool
+            .execute(json!({
+                "task_id": task_b,
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 100,
+                    "caller_persona_id": pid_a,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_update_scheduled_task_persona_reassign_requires_control_chat() {
+        let (db, dir) = test_db();
+        let pid_a = db.get_or_create_default_persona(100).unwrap();
+        let pid_b = db.create_persona(100, "B", None).unwrap();
+        let task_id = db
+            .create_scheduled_task_for_persona(
+                100,
+                pid_a,
+                "owned by A",
+                "cron",
+                "0 * * * * *",
+                "2024-01-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let tool = UpdateScheduledTaskTool::new(db.clone(), "UTC".into());
+        let denied = tool
+            .execute(json!({
+                "task_id": task_id,
+                "persona_id": pid_b,
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 100,
+                    "caller_persona_id": pid_a,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(denied.is_error);
+        assert!(denied.content.contains("control chats"));
+
+        let allowed = tool
+            .execute(json!({
+                "task_id": task_id,
+                "persona_id": pid_b,
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 100,
+                    "caller_persona_id": pid_a,
+                    "control_chat_ids": [100]
+                }
+            }))
+            .await;
+        assert!(!allowed.is_error, "{}", allowed.content);
+        let t = db.get_task_by_id(task_id).unwrap().unwrap();
+        assert_eq!(t.persona_id, pid_b);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_update_scheduled_task_schedule_only_one_field_errors() {
+        let (db, dir) = test_db();
+        let id = db
+            .create_scheduled_task(100, "hello", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
+            .unwrap();
+        let tool = UpdateScheduledTaskTool::new(db, "UTC".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 100,
+                "task_id": id,
+                "schedule_type": "cron"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("both schedule_type"));
         cleanup(&dir);
     }
 }

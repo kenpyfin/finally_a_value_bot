@@ -2,7 +2,7 @@
 
 This document describes the core architecture of FinallyAValueBot: the agentic loop, tool system, skills, sub-agents, and how they connect.
 
-See also: [CLAUDE.md](CLAUDE.md) (overview and quick reference), [DEVELOP.md](DEVELOP.md) (development guide), [DOCKER.md](DOCKER.md) (deployment).
+See also: [CLAUDE.md](CLAUDE.md) (overview and quick reference), [DEVELOP.md](DEVELOP.md) (development guide), [DOCKER.md.bak](DOCKER.md.bak) (archived legacy deployment notes).
 
 ---
 
@@ -50,6 +50,12 @@ The central entry point is `process_with_agent` (and `process_with_agent_with_ev
 
 ### Agent Loop Flow
 
+Three engines are selectable in Settings → Runtime (`AGENT_ENGINE` in `app_settings`, default `classic`):
+
+- **Classic** — heuristic tool loop with optional Plan/Execute/Synthesize multi-model phases (`advance_phase` in `src/multimodel.rs`).
+- **Deterministic** — structured pipeline in `src/agent_pipeline/`: cloud intent JSON → clarification gate → vault SOP or ephemeral plan → per-step local execution (retry + cloud escalation) → cloud synthesis → shared PDQE delivery. Dispatched from `process_with_agent_with_events` when `runtime_toggles.agent_engine()` is `Deterministic`. Shared bootstrap: `prepare_agent_run` in `src/channels/agent_run_prep.rs`.
+- **Cursor** — delegates the full turn to a local **Cursor SDK sidecar** (`scripts/cursor-sdk-runner.py`), **auto-started on bot boot** on native installs (`CURSOR_SDK_AUTO_START`, default true). Rust flattens `prepare_agent_run` context into a prompt, streams assistant text from NDJSON, persists resume `agent_id` in `cursor_engine_agents`, and finishes via `pipeline_finish_turn`. Falls back to Classic when the sidecar is unreachable. Requires `CURSOR_API_KEY` in repo-root `.env` (passed to sidecar subprocess; not stored in SQLite).
+
 The main chat agent is the single orchestrator: it decides when to reply directly and when to call tools (including `sub_agent` for delegation). There is no separate plan-first layer.
 
 1. **Load session / history** from SQLite (`sessions`, `messages`). Only a **bounded recent window** is sent to the LLM: when the session exceeds `max_session_messages` (default 40), older messages are summarized and the last `compact_keep_recent` (default 20) are kept verbatim. So we do not stuff long history into context; the rest is retrieved on demand via **search_chat_history** (past messages) and **search_vault** (ORIGIN vault). The system prompt guarantees "at least 2 from you and 2 from the user" for coherence; the actual window is configurable.
@@ -57,9 +63,13 @@ The main chat agent is the single orchestrator: it decides when to reply directl
 3. **Main agent loop** (up to `max_tool_iterations`):
    - Call LLM via `state.llm.send_message(system_prompt, messages, Some(tool_defs))`.
    - Parse **stop_reason** from the response (see [Stop reason](#stop-reason) below):
-     - `end_turn` or `max_tokens` → extract text, save session, return response.
+     - `end_turn`, `max_tokens`, or derived `ask_clarification` → extract text, save session, return response (see below).
      - `tool_use` → for each `ResponseContentBlock::ToolUse`, call `tools.execute_with_auth(name, input, tool_auth)`, append `ContentBlock::ToolResult` to messages, continue loop.
 4. **Timeouts**: LLM round 180s, tool execution 120s.
+
+### Standard Operating Procedures (vault)
+
+Operating procedures live as markdown in the ORIGIN vault (e.g. `ORIGIN/Operations/SOPs/`). The agent loads them via `search_vault` / `read_file` and executes with skills (`run_skill_script`). See [`docs/sops.md`](docs/sops.md). Deterministic YAML workflows (`run_workflow`) and SQLite learned workflows were removed.
 
 ### Stop Reason
 
@@ -70,8 +80,15 @@ The main chat agent is the single orchestrator: it decides when to reply directl
 | `end_turn` | Model finished; raw: `stop`, `end_turn`, or missing |
 | `tool_use` | Model requested tool calls; raw: `tool_use`, `tool_calls` |
 | `max_tokens` | Hit token limit; raw: `max_tokens`, `length` |
+| `ask_clarification` | Derived when `end_turn`/`max_tokens` text genuinely asks the user (questions, “which do you prefer”, etc.); skips deferred-commitment nudge and pre-delivery PDQE |
 
-The agent loop branches only on these three; any other value is treated like a finished turn.
+The agent loop branches on these; any other value is treated like a finished turn.
+
+### Pre-delivery quality evaluation (PDQE)
+
+Before the user sees a reply, an optional synchronous gate may run inside the shared agent loop (`RESPONSE_QUALITY_EVALUATOR_ENABLED`, Perplexity via `PERPLEXITY_API_KEY`). It judges the candidate final text against the session goal in `[current_request]` (`src/agent_turn_context.rs`). On **fail** with sufficient confidence and retries remaining (`quality_eval_max_nudges_per_run`), the loop injects `[quality_eval_feedback]` and continues without emitting `FinalResponse` or delivering. When retries are exhausted or the evaluator errors, the last candidate is delivered anyway (fail-open). `AgentEvent::FinalResponse` and channel delivery happen only after pass, skip, or exhausted budget. Implementation: `src/response_quality_evaluator.rs`, `finish_turn_with_quality_gate` in `src/channels/telegram.rs`. The **post-tool evaluator** (PTE) uses the same Perplexity sidecar and session-goal framing between tool rounds (`src/post_tool_evaluator.rs`).
+
+The main agent no longer exposes a `send_message` tool; user-visible output is the final assistant message, with local file paths materialized at delivery (web `materialize_response_file_links`, Telegram workspace auto-images via `send_response_result`).
 
 ### Tool Registry and Execution
 
@@ -87,6 +104,14 @@ The agent loop branches only on these three; any other value is treated like a f
 - **cursor_agent_send**: sends keys to a running cursor-agent tmux session (session name must match the configured prefix).
 - **build_skill**: creates or updates a skill by running cursor-agent with a creation prompt; uses `detach: true` when tmux is available. Use this instead of writing files under the skills directory.
 
+### Background execution
+
+- **Agent background jobs** (`background_jobs` table, `job_kind=agent`): enqueued via web/scheduler handoff (`##BACKGROUND_JOB_HANDOFF##`); worker runs `process_with_agent_with_events` in a Tokio task; final reply via `deliver_agent_final_to_contact`.
+- **Shell background jobs** (`job_kind=shell`): core tool `spawn_background_command` runs the command in tmux (`background_shell_tmux_session_prefix`), logs under `runtime/background_jobs/{job_id}/`, and a monitor loop finalizes when the session ends and delivers results to the user. On success (default), an agent background job summarizes outputs; on failure, an agent job may diagnose and retry. Not available in Docker when tmux is disabled.
+- **Tracked external jobs** (`job_kind=tracked`): core tool `register_tracked_job` inserts the external system's id (e.g. ComfyUI `prompt_id`) into `background_jobs` so the cockpit queue matches user-visible job ids; does not count toward the one active shell/handoff slot per chat.
+- **Foreground agent queue** (`ChatRunQueue`): one FIFO worker per `(canonical chat_id, persona_id)` so different personas in the same contact can run agent turns in parallel; the same persona stays strictly serialized. Telegram, Discord, WhatsApp, web send, and scheduler due tasks all enqueue into this queue.
+- **Ops visibility**: `GET /api/queue_diagnostics` returns one lane row per `(chat_id, persona_id)` plus `background_by_chat`; `GET /api/background_jobs` lists job rows with heartbeats.
+
 ### Main vs Sub-Agent Tools
 
 | Main agent | Sub-agent |
@@ -94,7 +119,7 @@ The agent loop branches only on these three; any other value is treated like a f
 | bash, browser, read/write/edit file, glob, grep | bash, browser, read/write/edit file, glob, grep |
 | read/write memory, web_fetch, web_search | read_memory, web_fetch, web_search |
 | send_message, schedule_*, export_chat | *(none)* |
-| sub_agent, cursor_agent, cursor_agent_send, build_skill, activate_skill, sync_skills | *(none)* |
+| sub_agent, cursor_agent, cursor_agent_send, build_skill, activate_skill, sync_skills, spawn_background_command, register_tracked_job | *(none)* |
 | tiered_memory, search_history, search_vault | search_history |
 | MCP tools | *(none)* |
 
@@ -120,14 +145,14 @@ Skills are extensible instruction sets the LLM can load on demand. They are **on
 
 - **Location**: `workspace/skills/<name>/` and `workspace/shared/skills/<name>/`.
 - **Entry file**: `SKILL.md` or `skill.md` with YAML frontmatter.
-- **Frontmatter**: `name`, `description`, `platforms`, `deps`, `source`, `version`, `updated_at`.
-- **Body**: Markdown instructions the agent follows after loading.
+- **Frontmatter**: `name`, `description`, `when_to_use` (routing for the catalog), `platforms`, `deps`, `source`, `version`, `updated_at`, etc.
+- **Body**: Markdown instructions the agent follows **after** `activate_skill` loads the file (not injected into the catalog).
 
 ### Flow
 
 1. **Discovery**: `SkillManager::discover_skills()` scans dirs, parses frontmatter, filters by platform/deps.
-2. **Catalog in prompt**: `skills.build_skills_catalog()` produces `<available_skills>…</available_skills>` injected into the system prompt.
-3. **Activation**: The LLM calls the `activate_skill` tool with `skill_name`; the tool loads the full `SKILL.md` and returns metadata + instructions.
+2. **Catalog in prompt**: `skills.build_skills_catalog()` produces `<available_skills>…</available_skills>` from **YAML only** (description, `when_to_use`, compact meta). No SKILL.md body text.
+3. **Activation**: The LLM calls the `activate_skill` tool with `skill_name`; the tool loads the full `SKILL.md` and returns metadata + instructions body.
 4. **Usage**: The LLM uses the returned instructions to perform the task (e.g. API calls via bash, file ops).
 
 ### Key Files
@@ -190,6 +215,11 @@ Every entry path (Telegram, Discord, Web, Scheduler) **resolves** `(channel_type
 
 DB helpers: `resolve_canonical_chat_id(channel_type, channel_handle, create_with_canonical_id)`, `link_channel(canonical_chat_id, channel_type, channel_handle)`, `unlink_channel`, `list_bindings_for_contact`. Messages and sessions are keyed by `(chat_id, persona_id)` where `chat_id` is always the canonical one.
 
+Per-channel persona scope is stored in `channel_persona_policy`:
+
+- `mode=all` (default): channel can use all personas (current behavior).
+- `mode=single`: channel is locked to one persona id; inbound routing forces that persona, and cross-channel delivery skips that channel for other personas.
+
 ### Delivery (sync across channels)
 
 After the agent produces a reply, the handler does **not** store and send only to the requesting channel. It calls **`deliver_to_contact(state, canonical_chat_id, persona_id, text)`** (in `src/channel.rs`), which:
@@ -209,11 +239,23 @@ Web has no native identity. To sync with Telegram/Discord, the user **binds** th
 
 `AppState` (Arc-wrapped) holds:
 
-- `config`, `db`, `llm`, `tools`, `memory`, `skills`, `scheduler`, `mcp_manager`
-- `bot` (Telegram `Bot`) for sending to Telegram
-- `discord_http` (optional `Arc<serenity::http::Http>`) for sending to Discord from non-Discord code (e.g. when a reply is delivered to all bound channels)
+- `config`, `db`, `llm`, `tools`, `memory`, `skills`, `mcp` (via tools), `chat_queue`
+- `telegram_bots`: `HashMap<i64, Bot>` — one Telegram `Bot` per row in `channel_bot_instances` (platform `telegram`)
+- `discord_http`: `HashMap<i64, Arc<Http>>` — one Discord HTTP client per `channel_bot_instances` row (platform `discord`)
 
-It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which reads `bot` and `discord_http` from state.
+It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which picks the correct `Bot` / Discord client per binding’s `bot_instance_id`.
+
+## 8. Configuration and settings
+
+- **Effective config** is built from repo-root `.env` (or `FINALLY_A_VALUE_BOT_CONFIG`) plus process environment — see `Config::load` / `load_from_env` in `src/config.rs`.
+- **LLM and secrets** (e.g. `LLM_*`, API keys, primary bot tokens) are **env-only**, not merged from SQLite.
+- The legacy `app_settings` table may still contain old rows; it is **not** merged into the environment at startup. `PATCH /api/settings` is disabled (501); use `.env` for configuration.
+- **Bot instances** (including extra Telegram/Discord bots) are stored in `channel_bot_instances`, seeded from env for primary ids 1–3 and extended via `/api/channel_bot_instances`. **Restart** the process after adding instances so new dispatchers start.
+- **Restart hook:** set `FINALLY_A_VALUE_BOT_RESTART_COMMAND` to a fixed supervisor command; authenticated `POST /api/restart` runs it (optional one-click from Web UI).
+
+### Universal chat id (`997894126` / `UNIVERSAL_CHAT_ID`)
+
+Web resolves a single canonical `chat_id` (default placeholder `997894126` or `UNIVERSAL_CHAT_ID`). When `UNIVERSAL_CHAT_ID` is set, external channels can bind to that same contact for a unified inbox. **Future work:** multiple selectable contacts / sessions in web and clearer separation from “one magic id” defaults — see development journal.
 
 ---
 

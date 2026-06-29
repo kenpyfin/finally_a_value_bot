@@ -45,14 +45,14 @@ impl Tool for McpTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: self.qualified_name.clone(),
-            description: format!(
+        ToolDefinition::new(
+            self.qualified_name.clone(),
+            format!(
                 "[MCP:{}] {}",
                 self.tool_info.server_name, self.tool_info.description
             ),
-            input_schema: self.tool_info.input_schema.clone(),
-        }
+            self.tool_info.input_schema.clone(),
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

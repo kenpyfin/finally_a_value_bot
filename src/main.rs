@@ -2,8 +2,7 @@ use finally_a_value_bot::claude::{Message, MessageContent};
 use finally_a_value_bot::config::Config;
 use finally_a_value_bot::error::FinallyAValueBotError;
 use finally_a_value_bot::{
-    builtin_skills, config_wizard, db, doctor, gateway, logging, mcp, memory, setup, skills,
-    telegram,
+    builtin_skills, db, doctor, gateway, logging, mcp, memory, skills, telegram,
 };
 use std::path::Path;
 use tracing::info;
@@ -20,10 +19,10 @@ USAGE:
 COMMANDS:
     start       Start the bot (Telegram + optional WhatsApp/Discord)
     gateway     Manage gateway service (install/uninstall/start/stop/status/logs)
-    config      Run interactive Q&A config flow (recommended)
+    config      (retired) Use Web UI Settings instead
     doctor      Run preflight diagnostics (cross-platform)
     test-llm [--with-tools]   Test LLM connection (use --with-tools to send tools like Telegram)
-    setup       Run interactive setup wizard
+    setup       (retired) Use Web UI onboarding instead
     version     Show version information
     help        Show this help message
 
@@ -45,14 +44,12 @@ FEATURES:
     - Sensitive path blacklisting for file tools
 
 SETUP:
-    1. Run: finally_a_value_bot config
-       (or run finally_a_value_bot start and follow auto-config on first launch)
-    2. Copy .env.example to .env and fill in required values (or run finally_a_value_bot setup):
+    1. Copy .env.example to .env and set bootstrap values:
+       FINALLY_A_VALUE_BOT_WORKSPACE_DIR (or WORKSPACE_DIR), WEB_HOST/WEB_PORT, WEB_AUTH_TOKEN when exposing non-local.
+    2. Start the app: finally_a_value_bot start
+    3. Open Web UI: http://127.0.0.1:10961 and finish runtime settings there.
 
-       api_key               LLM API key (optional when llm_provider=ollama|llama|llamacpp)
-       At least one channel token must be set (Telegram or Discord)
-
-    3. Run: finally_a_value_bot start
+       Runtime channel/LLM settings are now managed from Web UI and persisted in SQLite.
 
 CONFIG FILE (.env):
     FinallyAValueBot reads configuration from .env in the current directory.
@@ -96,12 +93,12 @@ EXAMPLES:
     finally_a_value_bot gateway install     Install and enable gateway service
     finally_a_value_bot gateway status      Show gateway service status
     finally_a_value_bot gateway logs 100    Show last 100 lines of gateway logs
-    finally_a_value_bot config              Run interactive Q&A config flow
+    finally_a_value_bot config              Retired; use Web UI Settings
     finally_a_value_bot doctor              Run preflight diagnostics
     finally_a_value_bot doctor --json       Output diagnostics as JSON
     finally_a_value_bot test-llm            Test LLM API connection (no tools)
     finally_a_value_bot test-llm --with-tools   Test LLM with full tool list (like Telegram)
-    finally_a_value_bot setup               Run full-screen setup wizard
+    finally_a_value_bot setup               Retired; use Web UI onboarding
     finally_a_value_bot version             Show version
     finally_a_value_bot help                Show this message
 
@@ -115,7 +112,7 @@ fn print_version() {
 }
 
 async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(c) => c,
         Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config error: {e}");
@@ -127,27 +124,43 @@ async fn run_test_llm(with_tools: bool) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
+    let runtime_data_dir = config.runtime_data_dir();
+    let db = match db::Database::new(&runtime_data_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Database init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = config.merge_llm_selection_from_app_settings(&db) {
+        eprintln!("LLM config error: {e}");
+        std::process::exit(1);
+    }
     let provider = finally_a_value_bot::llm::create_provider(&config);
     let messages = vec![Message {
         role: "user".into(),
         content: MessageContent::Text("Reply with exactly: OK".into()),
     }];
     let tools_arg = if with_tools {
-        let runtime_data_dir = config.runtime_data_dir();
-        let db = match db::Database::new(&runtime_data_dir) {
-            Ok(d) => std::sync::Arc::new(d),
-            Err(e) => {
-                eprintln!("Database init failed (needed for --with-tools): {e}");
-                std::process::exit(1);
-            }
-        };
+        let db = std::sync::Arc::new(db);
         let token = if config.telegram_bot_token.is_empty() {
             "dummy"
         } else {
             &config.telegram_bot_token
         };
         let bot = teloxide::Bot::new(token);
-        let tools = finally_a_value_bot::tools::ToolRegistry::new(&config, bot, db.clone());
+        let runtime_toggles =
+            finally_a_value_bot::runtime_toggles::RuntimeToggles::new(config.tool_output_debug);
+        let env_redactor = std::sync::Arc::new(
+            finally_a_value_bot::safety_redaction::EnvSecretRedactor::discover(&config),
+        );
+        let tools = finally_a_value_bot::tools::ToolRegistry::new(
+            &config,
+            bot,
+            db.clone(),
+            runtime_toggles,
+            env_redactor,
+        );
         let defs = tools.definitions();
         println!("Testing with {} tools (same as Telegram).", defs.len());
         Some(defs)
@@ -229,6 +242,21 @@ fn ensure_workspace_shared_dir(data_root: &Path) {
         tracing::warn!(
             "Failed to create workspace shared dir: {}",
             shared.display()
+        );
+    }
+    warn_shadow_workspace_if_present(data_root);
+}
+
+/// Log when a mistaken nested workspace exists under `shared/workspace/`.
+fn warn_shadow_workspace_if_present(data_root: &Path) {
+    let shadow = finally_a_value_bot::tools::shadow_workspace_path(data_root);
+    if shadow.is_dir() {
+        tracing::warn!(
+            shadow = %shadow.display(),
+            data_root = %data_root.display(),
+            "Shadow workspace detected at shared/workspace/ (not WORKSPACE_DIR). \
+             Migrate unique data to the canonical layout and remove this directory; \
+             file writes into it are blocked."
         );
     }
 }
@@ -395,6 +423,18 @@ fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
     }
 }
 
+fn is_llm_ready(config: &Config) -> bool {
+    finally_a_value_bot::llm_catalog::any_provider_api_key_configured()
+        || matches!(
+            config.llm_provider.as_str(),
+            "ollama" | "llama" | "llamacpp"
+        )
+}
+
+fn has_any_realtime_channel(config: &Config) -> bool {
+    !config.telegram_bot_token.trim().is_empty() || config.discord_bot_token.is_some()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -407,21 +447,13 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("setup") => {
-            let saved = setup::run_setup_wizard()?;
-            if saved {
-                println!("Setup saved to .env");
-            } else {
-                println!("Setup canceled");
-            }
+            println!("`setup` is retired. Use Web UI onboarding instead.");
+            println!("Start the app, then open http://127.0.0.1:10961 and configure Settings.");
             return Ok(());
         }
         Some("config") => {
-            let saved = config_wizard::run_config_wizard()?;
-            if saved {
-                println!("Config saved");
-            } else {
-                println!("Config canceled");
-            }
+            println!("`config` is retired. Use Web UI onboarding instead.");
+            println!("Start the app, then open http://127.0.0.1:10961 and configure Settings.");
             return Ok(());
         }
         Some("doctor") => {
@@ -448,24 +480,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(c) => c,
         Err(FinallyAValueBotError::Config(e)) => {
             eprintln!("Config missing/invalid: {e}");
-            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                eprintln!("Launching interactive config...");
-                let saved = config_wizard::run_config_wizard()?;
-                if !saved {
-                    return Err(anyhow::anyhow!(
-                        "config canceled and config is still incomplete"
-                    ));
-                }
-                Config::load()?
-            } else {
-                eprintln!("Not running in a terminal (e.g. Docker). Create or fix .env instead of using interactive config.");
-                eprintln!("  cp .env.example .env && edit .env with TELEGRAM_BOT_TOKEN, BOT_USERNAME, LLM_API_KEY, etc.");
-                return Err(anyhow::anyhow!("config required: {e}"));
-            }
+            eprintln!("Create or fix .env (bootstrap values), then open Web UI to finish setup.");
+            eprintln!(
+                "Example: cp .env.example .env && finally_a_value_bot start (then visit Web UI)"
+            );
+            return Err(anyhow::anyhow!("config required: {e}"));
         }
         Err(e) => return Err(e.into()),
     };
@@ -473,14 +496,19 @@ async fn main() -> anyhow::Result<()> {
 
     let data_root_dir = config.data_root_dir();
     let runtime_data_dir = config.runtime_data_dir();
-    let workspace_root = config.workspace_root_absolute();
     migrate_legacy_runtime_layout(&data_root_dir, Path::new(&runtime_data_dir));
     migrate_repo_shared_into_workspace(Path::new(config.working_dir()));
     migrate_agents_md_to_workspace_root(
         Path::new(config.working_dir()),
         Path::new(&runtime_data_dir),
     );
-    builtin_skills::ensure_builtin_skills(&data_root_dir)?;
+
+    match builtin_skills::resolve_builtin_skills_dir(&config) {
+        Some(p) => info!("Built-in skills directory: {}", p.display()),
+        None => tracing::warn!(
+            "Built-in skills directory not found; set FINALLY_A_VALUE_BOT_BUILTIN_SKILLS or keep `builtin_skills/` next to the workspace data root. Only skills under the workspace will be available until then."
+        ),
+    }
 
     if std::env::var("FINALLY_A_VALUE_BOT_GATEWAY").is_ok() {
         logging::init_logging(&runtime_data_dir)?;
@@ -491,15 +519,52 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&runtime_data_dir)?;
     info!("Database initialized");
 
+    config.merge_llm_selection_from_app_settings(&db)?;
+    info!(
+        "LLM selection: provider={} model={}",
+        config.llm_provider, config.model
+    );
+
+    match finally_a_value_bot::persona_shared_migrate::maybe_run(&config, &db) {
+        Ok(stats) => {
+            if stats.moved_to_persona + stats.moved_to_skills + stats.moved_to_unmigrated > 0 {
+                info!(
+                    "Persona shared migration: moved_to_persona={}, moved_to_skills={}, moved_to_unmigrated={}",
+                    stats.moved_to_persona, stats.moved_to_skills, stats.moved_to_unmigrated
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Persona shared migration skipped: {}", e),
+    }
+
+    db.sync_channel_bot_instances_from_config(&config)?;
+    match db.provision_all_missing_sibling_bindings() {
+        Ok(n) if n > 0 => {
+            info!("Auto-provisioned {n} sibling channel binding(s) for bot instances")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Sibling channel binding provisioning skipped: {}", e),
+    }
+
     // Seed onboarding task for fresh installations
-    let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
-    let seed_persona_id = db.get_current_persona_id(seed_chat_id)?;
-    if let Err(e) = db.ensure_onboarding_task(
-        seed_chat_id,
-        seed_persona_id,
-        "Hello! I am FinallyAValueBot, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track."
-    ) {
-        tracing::warn!("Failed to seed onboarding task: {}", e);
+    if is_llm_ready(&config) && has_any_realtime_channel(&config) {
+        let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
+        let seed_persona_id = db.get_current_persona_id(seed_chat_id)?;
+        let intro_name = if config.agent_display_name.trim().is_empty() {
+            "your assistant".to_string()
+        } else {
+            config.agent_display_name.trim().to_string()
+        };
+        if let Err(e) = db.ensure_onboarding_task(
+            seed_chat_id,
+            seed_persona_id,
+            &format!(
+                "Hello! I am {}, your agentic assistant. I see this is a fresh installation. How can I help you get started? Please tell me about your projects or what you'd like me to track.",
+                intro_name
+            )
+        ) {
+            tracing::warn!("Failed to seed onboarding task: {}", e);
+        }
     }
 
     let principles_path = config
@@ -513,11 +578,8 @@ async fn main() -> anyhow::Result<()> {
     );
     info!("Memory manager initialized");
 
-    // Use absolute paths and include workspace/shared/skills so skills created by any
-    // persona (even if written to shared workspace) are discoverable by all personas.
-    let primary_skills = workspace_root.join("skills");
-    let shared_skills = workspace_root.join("shared").join("skills");
-    let skill_manager = skills::SkillManager::from_skills_dirs([&primary_skills, &shared_skills]);
+    // Workspace + shared skills first (override names); then repository `builtin_skills/` when resolved.
+    let skill_manager = skills::SkillManager::from_skills_dirs(config.skill_discovery_dirs());
     let discovered = skill_manager.discover_skills();
     info!(
         "Skill manager initialized ({} skills discovered)",

@@ -1,15 +1,15 @@
 ---
-
 name: index-vault
-description: Index ORIGIN vault markdown files into ChromaDB for semantic search.
+description: Index ORIGIN vault markdown into ChromaDB for semantic search (run before search_vault or after large vault edits).
+when_to_use: |
+  Use when the vault must be (re)indexed for search_vault, after bulk vault imports, or when embeddings/collection are stale. Requires python3 and the skill venv per setup_vault_env.sh; VAULT_EMBEDDING_SERVER_URL must be set (skill .env or process env).
 license: MIT
 compatibility:
   os:
     - darwin
     - linux
   deps:
-- python3
-
+    - python3
 ---
 
 # Index Vault
@@ -25,7 +25,7 @@ The bundled `index_vault.py` script walks the ORIGIN vault directory for `*.md` 
 Same as the search-vault skill — a Python venv with `chromadb` and `openai`:
 
 ```bash
-bash skills/index-vault/setup_vault_env.sh
+bash builtin_skills/index-vault/setup_vault_env.sh
 ```
 
 `index_vault.py` loads `.env` from **this skill directory** (`index-vault/.env`). Set `VAULT_EMBEDDING_SERVER_URL` there (**required**; no default). When spawned by the bot, existing process environment variables are not overridden by dotenv.
@@ -46,13 +46,13 @@ bash skills/index-vault/setup_vault_env.sh
 Run the indexing script directly:
 
 ```bash
-shared/.venv-vault/bin/python skills/index-vault/index_vault.py
+shared/.venv-vault/bin/python builtin_skills/index-vault/index_vault.py
 ```
 
 Or if the system Python has chromadb installed:
 
 ```bash
-python3 skills/index-vault/index_vault.py
+python3 builtin_skills/index-vault/index_vault.py
 ```
 
 ### Scheduling

@@ -1,16 +1,15 @@
 ---
-
 name: search-vault
-description: Semantically search the ORIGIN vault (Obsidian/markdown knowledge base) using vector similarity via ChromaDB.
+description: Semantic search over the ORIGIN vault via ChromaDB and the embedding server (query_vault.py).
+when_to_use: |
+  Use when the user wants meaning-based retrieval from their Obsidian/ORIGIN vault after indexing. Prefer the built-in search_vault tool path described in this skill; do not grep the vault for semantic questions. Requires python3 and VAULT_EMBEDDING_SERVER_URL.
 license: MIT
 compatibility:
   os:
     - darwin
     - linux
   deps:
-
-- python3
-
+    - python3
 ---
 
 # Search Vault
@@ -26,8 +25,8 @@ The `search_vault` tool is registered automatically when vault config is present
 A Python venv with `chromadb` and `openai` must exist. Run the bundled setup script to create it:
 
 ```bash
-# From the skill directory:
-bash skills/search-vault/setup_vault_env.sh
+# From repository root:
+bash builtin_skills/search-vault/setup_vault_env.sh
 ```
 
 This creates `shared/.venv-vault/` with the required packages.
@@ -57,7 +56,7 @@ search_vault(query="machine learning concepts", n_results=5)
 If the tool is not available, you can run the bundled script directly:
 
 ```bash
-shared/.venv-vault/bin/python skills/search-vault/query_vault.py "search terms" [n_results]
+shared/.venv-vault/bin/python builtin_skills/search-vault/query_vault.py "search terms" [n_results]
 ```
 
 ### Troubleshooting

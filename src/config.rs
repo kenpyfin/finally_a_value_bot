@@ -8,8 +8,11 @@ fn default_telegram_bot_token() -> String {
 fn default_bot_username() -> String {
     String::new()
 }
+fn default_agent_display_name() -> String {
+    String::new()
+}
 fn default_llm_provider() -> String {
-    "anthropic".into()
+    String::new()
 }
 fn default_api_key() -> String {
     String::new()
@@ -25,6 +28,12 @@ fn default_max_tool_iterations() -> usize {
 }
 fn default_max_history_messages() -> usize {
     50
+}
+fn default_recent_history_min_user_messages() -> usize {
+    2
+}
+fn default_recent_history_min_assistant_messages() -> usize {
+    2
 }
 fn default_max_document_size_mb() -> u64 {
     100
@@ -109,7 +118,27 @@ fn default_cursor_agent_model() -> String {
 }
 
 fn default_cursor_agent_timeout_secs() -> u64 {
-    1500
+    3600
+}
+
+pub(crate) fn default_cursor_sdk_model() -> String {
+    "composer-2.5".into()
+}
+
+fn default_cursor_sdk_runner_port() -> u16 {
+    3848
+}
+
+fn default_cursor_sdk_python() -> String {
+    "python3".into()
+}
+
+fn default_cursor_sdk_auto_start() -> bool {
+    true
+}
+
+fn default_cursor_sdk_auto_install() -> bool {
+    true
 }
 
 fn default_scheduler_task_timeout_secs() -> u64 {
@@ -128,20 +157,62 @@ fn default_scheduler_poll_interval_secs() -> u64 {
     60
 }
 
-fn default_runtime_reliability_profile() -> String {
-    "balanced".into()
+fn default_background_job_lease_ttl_secs() -> u64 {
+    // Must exceed longest expected gap between lease renewals (e.g. one bash/ComfyUI tool call).
+    1800
 }
 
-fn default_workflow_auto_learn() -> bool {
+fn default_background_job_lease_fallback_renew_secs() -> u64 {
+    // Renew periodically during long tool calls; must be well below lease TTL.
+    60
+}
+
+fn default_background_job_pending_start_timeout_secs() -> u64 {
+    300
+}
+
+fn default_background_job_notify_chat_progress() -> bool {
+    false
+}
+
+fn default_tool_output_debug() -> bool {
+    false
+}
+
+/// Parses truthy strings for bool settings (`1`, `true`, `yes`, `on`; case-insensitive).
+pub fn parse_bool_setting(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn default_background_shell_tmux_session_prefix() -> String {
+    "finally_a_value_bot-bg".into()
+}
+
+fn default_background_shell_tmux_enabled() -> bool {
     true
 }
 
-fn default_workflow_min_success_repetitions() -> usize {
-    2
+fn default_background_shell_monitor_poll_secs() -> u64 {
+    8
 }
 
-fn default_workflow_replay_strictness() -> String {
-    "adaptive".into()
+fn default_background_shell_auto_retry_on_failure() -> bool {
+    true
+}
+
+fn default_background_shell_auto_retry_max() -> u32 {
+    1
+}
+
+fn default_background_shell_auto_agent_on_success() -> bool {
+    true
+}
+
+fn default_runtime_reliability_profile() -> String {
+    "balanced".into()
 }
 
 fn default_project_auto_association_strictness() -> String {
@@ -156,20 +227,58 @@ fn default_orchestrator_model() -> String {
     String::new()
 }
 
-fn default_tool_skill_agent_enabled() -> bool {
-    false
-}
-
-fn default_tool_skill_agent_model() -> String {
-    String::new()
-}
-
 fn default_post_tool_evaluator_enabled() -> bool {
     false
 }
 
 fn default_post_tool_evaluator_model() -> String {
     String::new()
+}
+
+fn default_response_quality_evaluator_enabled() -> bool {
+    false
+}
+
+fn default_evaluator_model() -> String {
+    "sonar".into()
+}
+
+fn default_evaluator_base_url() -> String {
+    "https://api.perplexity.ai".into()
+}
+
+fn default_quality_eval_max_nudges_per_run() -> usize {
+    1
+}
+
+fn default_quality_eval_min_confidence() -> f64 {
+    0.7
+}
+
+fn default_quality_eval_channels() -> String {
+    "telegram,web".into()
+}
+
+fn default_hook_command_timeout_secs() -> u64 {
+    10
+}
+fn default_hook_prompt_timeout_secs() -> u64 {
+    15
+}
+fn default_hook_prompt_model() -> String {
+    String::new()
+}
+
+fn default_allow_fuzzy_search_replace() -> bool {
+    false
+}
+
+fn default_symbol_edit_enabled() -> bool {
+    false
+}
+
+fn default_post_edit_validation_enabled() -> bool {
+    true
 }
 
 fn default_cursor_agent_tmux_session_prefix() -> String {
@@ -183,6 +292,43 @@ fn default_cursor_agent_tmux_enabled() -> bool {
 fn is_local_web_host(host: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
     h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+/// Keys that configure LLM providers, models, and related limits. These must come from repo-root
+/// `.env` / process environment only — not from `app_settings` (Web UI persistence).
+///
+/// Exception: [`crate::llm_catalog::APP_SETTING_LLM_MODEL`], [`crate::llm_catalog::APP_SETTING_LLM_PROVIDER`],
+/// and [`crate::llm_catalog::APP_SETTING_LLM_BASE_URL`] (local servers only) may be stored in `app_settings`.
+pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
+    let u = key.trim().to_ascii_uppercase();
+    if u == crate::llm_catalog::APP_SETTING_LLM_MODEL
+        || u == crate::llm_catalog::APP_SETTING_LLM_PROVIDER
+        || u == crate::llm_catalog::APP_SETTING_LLM_BASE_URL
+    {
+        return false;
+    }
+    if u.starts_with("LLM_") {
+        return true;
+    }
+    matches!(
+        u.as_str(),
+        "OPENAI_API_KEY"
+            | "GEMINI_API_KEY"
+            | "GOOGLE_API_KEY"
+            | "ANTHROPIC_API_KEY"
+            | "XAI_API_KEY"
+            | "MAX_TOKENS"
+            | "MAX_TOOL_ITERATIONS"
+            | "MAX_HISTORY_MESSAGES"
+            | "RECENT_HISTORY_MIN_USER_MESSAGES"
+            | "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES"
+            | "MAX_DOCUMENT_SIZE_MB"
+            | "ORCHESTRATOR_MODEL"
+            | "ORCHESTRATOR_ENABLED"
+            | "POST_TOOL_EVALUATOR_MODEL"
+            | "POST_TOOL_EVALUATOR_ENABLED"
+            | "SHOW_THINKING"
+    )
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -263,6 +409,10 @@ pub struct Config {
     pub telegram_bot_token: String,
     #[serde(default = "default_bot_username")]
     pub bot_username: String,
+    /// Optional friendly identity label used in canonical persona memory identity seeding.
+    /// This is not hardcoded into static system prompt text.
+    #[serde(default = "default_agent_display_name")]
+    pub agent_display_name: String,
     #[serde(default = "default_llm_provider")]
     pub llm_provider: String,
     #[serde(default = "default_api_key")]
@@ -277,6 +427,12 @@ pub struct Config {
     pub max_tool_iterations: usize,
     #[serde(default = "default_max_history_messages")]
     pub max_history_messages: usize,
+    /// Default minimum user messages kept in the trimmed chat suffix when persona has no override.
+    #[serde(default = "default_recent_history_min_user_messages")]
+    pub recent_history_min_user_messages: usize,
+    /// Default minimum assistant messages in that suffix when persona has no override.
+    #[serde(default = "default_recent_history_min_assistant_messages")]
+    pub recent_history_min_assistant_messages: usize,
     #[serde(default = "default_max_document_size_mb")]
     pub max_document_size_mb: u64,
     /// Single root for runtime, skills, and tool workspace (shared). Layout: workspace_dir/runtime, workspace_dir/skills, workspace_dir/shared. Copy this folder to migrate.
@@ -284,6 +440,9 @@ pub struct Config {
     pub workspace_dir: String,
     #[serde(default)]
     pub openai_api_key: Option<String>,
+    /// Google Gemini API key (`GEMINI_API_KEY` or `GOOGLE_API_KEY`). Used when `llm_provider` is google/gemini.
+    #[serde(default)]
+    pub gemini_api_key: Option<String>,
     #[serde(default = "default_timezone")]
     pub timezone: String,
     #[serde(default)]
@@ -354,7 +513,10 @@ pub struct Config {
     /// Full path to the agent-browser CLI (npm). If set, the browser tool uses this instead of looking up "agent-browser" on PATH. Use when the process PATH doesn't include agent-browser (e.g. when run as a service).
     #[serde(default)]
     pub agent_browser_path: Option<String>,
-    /// Optional SearXNG instance URL for web_search (e.g. https://search.example.org). When set, web_search uses this instead of DuckDuckGo HTML. Env: SEARXNG_URL.
+    /// Optional Tavily API key for web_search. When set, web_search uses Tavily (https://api.tavily.com/search) instead of SearXNG or DuckDuckGo. Env: TAVILY_API_KEY.
+    #[serde(default)]
+    pub tavily_api_key: Option<String>,
+    /// Optional SearXNG instance URL for web_search (e.g. https://search.example.org). Used when Tavily is not configured. Env: SEARXNG_URL.
     #[serde(default)]
     pub web_search_searxng_url: Option<String>,
     /// Path to the cursor-agent CLI. Default: "cursor-agent" (or "cursor-agent.cmd" on Windows). Use when the process PATH doesn't include cursor-agent.
@@ -363,7 +525,7 @@ pub struct Config {
     /// Model for cursor-agent (e.g. "gpt-5"). Leave empty to omit --model (cursor-agent uses its default / "auto").
     #[serde(default = "default_cursor_agent_model")]
     pub cursor_agent_model: String,
-    /// Timeout in seconds for cursor-agent runs. Default: 1500.
+    /// Timeout in seconds for cursor-agent runs. Default: 3600.
     #[serde(default = "default_cursor_agent_timeout_secs")]
     pub cursor_agent_timeout_secs: u64,
     #[serde(default)]
@@ -377,18 +539,57 @@ pub struct Config {
     /// Optional model override for orchestrator (e.g. faster/cheaper). If empty, use main model.
     #[serde(default = "default_orchestrator_model")]
     pub orchestrator_model: String,
-    /// [Legacy] When true and orchestrator disabled, gate tool use via TSA. Default false; orchestrator-first flow does not use TSA.
-    #[serde(default = "default_tool_skill_agent_enabled")]
-    pub tool_skill_agent_enabled: bool,
-    /// Optional model for TSA (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
-    #[serde(default = "default_tool_skill_agent_model")]
-    pub tool_skill_agent_model: String,
     /// Post-Tool Evaluator (PTE): evaluate task completion after each tool iteration. Default false.
     #[serde(default = "default_post_tool_evaluator_enabled")]
     pub post_tool_evaluator_enabled: bool,
     /// Optional model for PTE (e.g. faster/cheaper). If empty, use orchestrator_model or main model.
     #[serde(default = "default_post_tool_evaluator_model")]
     pub post_tool_evaluator_model: String,
+    /// Post-delivery quality evaluator (PDQE): async QC after user receives the reply.
+    #[serde(default = "default_response_quality_evaluator_enabled")]
+    pub response_quality_evaluator_enabled: bool,
+    /// Perplexity API key for PTE/PDQE sidecar (never falls back to LLM_API_KEY).
+    #[serde(default)]
+    pub perplexity_api_key: Option<String>,
+    /// Perplexity model for evaluators (`sonar`, `sonar-pro`, …).
+    #[serde(default = "default_evaluator_model")]
+    pub evaluator_model: String,
+    /// OpenAI-compatible base URL for evaluators.
+    #[serde(default = "default_evaluator_base_url")]
+    pub evaluator_base_url: String,
+    /// Legacy alias: maps to evaluator_model when set.
+    #[serde(default = "default_post_tool_evaluator_model")]
+    pub response_quality_evaluator_model: String,
+    /// Max corrective agent runs per parent run_key after PDQE fail.
+    #[serde(default = "default_quality_eval_max_nudges_per_run")]
+    pub quality_eval_max_nudges_per_run: usize,
+    /// Minimum LLM confidence (0–1) to enqueue a corrective run on PDQE fail.
+    #[serde(default = "default_quality_eval_min_confidence")]
+    pub quality_eval_min_confidence: f64,
+    /// Comma-separated channels where PDQE runs (`telegram`, `web`, …).
+    #[serde(default = "default_quality_eval_channels")]
+    pub quality_eval_channels: String,
+    /// Default timeout in seconds for command hooks.
+    #[serde(default = "default_hook_command_timeout_secs")]
+    pub hook_command_timeout_secs: u64,
+    /// Default timeout in seconds for prompt hooks.
+    #[serde(default = "default_hook_prompt_timeout_secs")]
+    pub hook_prompt_timeout_secs: u64,
+    /// Optional model override for prompt hooks.
+    #[serde(default = "default_hook_prompt_model")]
+    pub hook_prompt_model: String,
+    /// Allow fuzzy fallback in apply_search_replace when input requests allow_fuzzy.
+    #[serde(default = "default_allow_fuzzy_search_replace")]
+    pub allow_fuzzy_search_replace: bool,
+    /// Enable symbol_edit tool for language-aware symbol anchoring.
+    #[serde(default = "default_symbol_edit_enabled")]
+    pub symbol_edit_enabled: bool,
+    /// Run post-edit validation automatically after successful code edits.
+    #[serde(default = "default_post_edit_validation_enabled")]
+    pub post_edit_validation_enabled: bool,
+    /// Optional override commands for post-edit validation, separated by `;;`.
+    #[serde(default)]
+    pub post_edit_validation_commands: Option<String>,
     /// Tmux session name prefix for cursor_agent when detach=true (e.g. finally_a_value_bot-cursor).
     #[serde(default = "default_cursor_agent_tmux_session_prefix")]
     pub cursor_agent_tmux_session_prefix: String,
@@ -398,6 +599,24 @@ pub struct Config {
     /// URL of a host runner that executes cursor-agent (e.g. http://host.docker.internal:3847). When set, the bot POSTs spawn requests instead of running cursor-agent locally.
     #[serde(default)]
     pub cursor_agent_runner_url: Option<String>,
+    /// URL of the Cursor SDK sidecar for the Cursor agent engine (e.g. http://127.0.0.1:3848).
+    #[serde(default)]
+    pub cursor_sdk_runner_url: Option<String>,
+    /// Model id for Cursor SDK engine runs (local runtime). Default: composer-2.5.
+    #[serde(default = "default_cursor_sdk_model")]
+    pub cursor_sdk_model: String,
+    /// When true (default), bot starts the local Cursor SDK sidecar on startup.
+    #[serde(default = "default_cursor_sdk_auto_start")]
+    pub cursor_sdk_auto_start: bool,
+    /// When true (default), bot creates a runtime venv and pip-installs cursor-sdk + aiohttp.
+    #[serde(default = "default_cursor_sdk_auto_install")]
+    pub cursor_sdk_auto_install: bool,
+    /// Local port for the auto-started Cursor SDK sidecar. Default: 3848.
+    #[serde(default = "default_cursor_sdk_runner_port")]
+    pub cursor_sdk_runner_port: u16,
+    /// Python executable used to launch the Cursor SDK sidecar. Default: python3.
+    #[serde(default = "default_cursor_sdk_python")]
+    pub cursor_sdk_python: String,
     /// Max wall-clock time (seconds) for a single scheduled-agent run. Default 3600.
     #[serde(default = "default_scheduler_task_timeout_secs")]
     pub scheduler_task_timeout_secs: u64,
@@ -410,18 +629,41 @@ pub struct Config {
     /// Seconds between scheduler ticks (reclaim + due-task scan). Default 60.
     #[serde(default = "default_scheduler_poll_interval_secs")]
     pub scheduler_poll_interval_secs: u64,
+    /// Lease TTL for active manual background jobs. Worker heartbeat/event flow renews this lease. Default 1800.
+    #[serde(default = "default_background_job_lease_ttl_secs")]
+    pub background_job_lease_ttl_secs: u64,
+    /// Fallback heartbeat lease renewal cadence when no events are emitted. Default 60 (must be < lease TTL).
+    #[serde(default = "default_background_job_lease_fallback_renew_secs")]
+    pub background_job_lease_fallback_renew_secs: u64,
+    /// Maximum age for a pending background job before stale reconciliation fails it. Default 300.
+    #[serde(default = "default_background_job_pending_start_timeout_secs")]
+    pub background_job_pending_start_timeout_secs: u64,
+    /// Post "Background update: …" chat messages during manual background jobs (very noisy). Default false.
+    #[serde(default = "default_background_job_notify_chat_progress")]
+    pub background_job_notify_chat_progress: bool,
+    /// When true, bash/background shell sets `TOOL_OUTPUT_DEBUG=1` so PZ/ComfyUI scripts emit WebSocket poll noise. Default false.
+    #[serde(default = "default_tool_output_debug")]
+    pub tool_output_debug: bool,
+    /// Allow spawning shell commands in tmux for `spawn_background_command`. Default true (false in Docker).
+    #[serde(default = "default_background_shell_tmux_enabled")]
+    pub background_shell_tmux_enabled: bool,
+    #[serde(default = "default_background_shell_tmux_session_prefix")]
+    pub background_shell_tmux_session_prefix: String,
+    /// Poll interval for tmux shell background job monitor. Default 8.
+    #[serde(default = "default_background_shell_monitor_poll_secs")]
+    pub background_shell_monitor_poll_secs: u64,
+    /// After a failed shell job, enqueue an agent run to diagnose and retry via `spawn_background_command`.
+    #[serde(default = "default_background_shell_auto_retry_on_failure")]
+    pub background_shell_auto_retry_on_failure: bool,
+    /// Max automatic agent retries per failed shell job. Default 1.
+    #[serde(default = "default_background_shell_auto_retry_max")]
+    pub background_shell_auto_retry_max: u32,
+    /// After a successful shell job, enqueue an agent run to summarize outputs for the user.
+    #[serde(default = "default_background_shell_auto_agent_on_success")]
+    pub background_shell_auto_agent_on_success: bool,
     /// Runtime reliability profile: balanced | aggressive_completion | safe_conservative.
     #[serde(default = "default_runtime_reliability_profile")]
     pub runtime_reliability_profile: String,
-    /// Enable auto-learning workflows from successful repeated runs.
-    #[serde(default = "default_workflow_auto_learn")]
-    pub workflow_auto_learn: bool,
-    /// Minimum repeated successful runs before workflow confidence is promoted.
-    #[serde(default = "default_workflow_min_success_repetitions")]
-    pub workflow_min_success_repetitions: usize,
-    /// Workflow replay mode: strict | adaptive | loose.
-    #[serde(default = "default_workflow_replay_strictness")]
-    pub workflow_replay_strictness: String,
     /// Project auto-linking mode: strict | balanced | loose.
     #[serde(default = "default_project_auto_association_strictness")]
     pub project_auto_association_strictness: String,
@@ -457,6 +699,17 @@ impl Config {
     /// Absolute path to the skills directory. Use this in the system prompt so the bot writes skill files to the real skills dir (file tools resolve relative paths from workspace_dir/shared).
     pub fn skills_data_dir_absolute(&self) -> std::path::PathBuf {
         self.workspace_root_absolute().join("skills")
+    }
+
+    /// Directories scanned for `SKILL.md` and skill resources, in merge order. The first path wins
+    /// when two skills share a name. Workspace and shared skills override built-ins with the same name.
+    pub fn skill_discovery_dirs(&self) -> Vec<PathBuf> {
+        let root = self.workspace_root_absolute();
+        let mut dirs = vec![root.join("skills"), root.join("shared").join("skills")];
+        if let Some(builtin) = crate::builtin_skills::resolve_builtin_skills_dir(self) {
+            dirs.push(builtin);
+        }
+        dirs
     }
 
     /// Absolute path to the workspace root (workspace_dir resolved to absolute).
@@ -588,7 +841,7 @@ impl Config {
     }
 
     /// Build Config from current environment (after dotenvy has loaded .env).
-    fn load_from_env() -> Self {
+    pub fn load_from_env() -> Self {
         let vault = {
             let has_vault = Self::env("VAULT_ORIGIN_VAULT_PATH").is_some()
                 || Self::env("VAULT_VECTOR_DB_PATH").is_some()
@@ -643,9 +896,10 @@ impl Config {
         Config {
             telegram_bot_token: Self::env("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
             bot_username: Self::env("BOT_USERNAME").unwrap_or_default(),
-            llm_provider: Self::env("LLM_PROVIDER").unwrap_or_else(default_llm_provider),
+            agent_display_name: Self::env("AGENT_DISPLAY_NAME").unwrap_or_default(),
+            llm_provider: default_llm_provider(),
             api_key: Self::env("LLM_API_KEY").unwrap_or_else(default_api_key),
-            model: Self::env("LLM_MODEL").unwrap_or_default(),
+            model: default_model(),
             llm_base_url: Self::env("LLM_BASE_URL"),
             max_tokens: Self::env_u32("MAX_TOKENS", default_max_tokens()),
             max_tool_iterations: Self::env_usize(
@@ -656,12 +910,21 @@ impl Config {
                 "MAX_HISTORY_MESSAGES",
                 default_max_history_messages(),
             ),
+            recent_history_min_user_messages: Self::env_usize(
+                "RECENT_HISTORY_MIN_USER_MESSAGES",
+                default_recent_history_min_user_messages(),
+            ),
+            recent_history_min_assistant_messages: Self::env_usize(
+                "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES",
+                default_recent_history_min_assistant_messages(),
+            ),
             max_document_size_mb: Self::env_u64(
                 "MAX_DOCUMENT_SIZE_MB",
                 default_max_document_size_mb(),
             ),
             workspace_dir: Self::env("WORKSPACE_DIR").unwrap_or_else(default_workspace_dir),
             openai_api_key: Self::env("OPENAI_API_KEY"),
+            gemini_api_key: Self::env("GEMINI_API_KEY").or_else(|| Self::env("GOOGLE_API_KEY")),
             timezone: Self::env("TIMEZONE").unwrap_or_else(default_timezone),
             allowed_groups: Self::env_vec_i64("ALLOWED_GROUPS"),
             control_chat_ids: Self::env_vec_i64("CONTROL_CHAT_IDS"),
@@ -730,6 +993,7 @@ impl Config {
                 }
             },
             agent_browser_path: Self::env("AGENT_BROWSER_PATH"),
+            tavily_api_key: Self::env("TAVILY_API_KEY"),
             web_search_searxng_url: Self::env("SEARXNG_URL"),
             cursor_agent_cli_path: Self::env("CURSOR_AGENT_CLI_PATH")
                 .unwrap_or_else(default_cursor_agent_cli_path),
@@ -745,16 +1009,52 @@ impl Config {
                 default_orchestrator_enabled(),
             ),
             orchestrator_model: Self::env("ORCHESTRATOR_MODEL").unwrap_or_default(),
-            tool_skill_agent_enabled: Self::env_bool(
-                "TOOL_SKILL_AGENT_ENABLED",
-                default_tool_skill_agent_enabled(),
-            ),
-            tool_skill_agent_model: Self::env("TOOL_SKILL_AGENT_MODEL").unwrap_or_default(),
             post_tool_evaluator_enabled: Self::env_bool(
                 "POST_TOOL_EVALUATOR_ENABLED",
                 default_post_tool_evaluator_enabled(),
             ),
             post_tool_evaluator_model: Self::env("POST_TOOL_EVALUATOR_MODEL").unwrap_or_default(),
+            response_quality_evaluator_enabled: Self::env_bool(
+                "RESPONSE_QUALITY_EVALUATOR_ENABLED",
+                default_response_quality_evaluator_enabled(),
+            ),
+            perplexity_api_key: Self::env("PERPLEXITY_API_KEY"),
+            evaluator_model: Self::env("EVALUATOR_MODEL").unwrap_or_else(default_evaluator_model),
+            evaluator_base_url: Self::env("EVALUATOR_BASE_URL")
+                .unwrap_or_else(default_evaluator_base_url),
+            response_quality_evaluator_model: Self::env("RESPONSE_QUALITY_EVALUATOR_MODEL")
+                .unwrap_or_default(),
+            quality_eval_max_nudges_per_run: Self::env_usize(
+                "QUALITY_EVAL_MAX_NUDGES_PER_RUN",
+                default_quality_eval_max_nudges_per_run(),
+            ),
+            quality_eval_min_confidence: Self::env("QUALITY_EVAL_MIN_CONFIDENCE")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_quality_eval_min_confidence),
+            quality_eval_channels: Self::env("QUALITY_EVAL_CHANNELS")
+                .unwrap_or_else(default_quality_eval_channels),
+            hook_command_timeout_secs: Self::env_u64(
+                "HOOK_COMMAND_TIMEOUT_SECS",
+                default_hook_command_timeout_secs(),
+            ),
+            hook_prompt_timeout_secs: Self::env_u64(
+                "HOOK_PROMPT_TIMEOUT_SECS",
+                default_hook_prompt_timeout_secs(),
+            ),
+            hook_prompt_model: Self::env("HOOK_PROMPT_MODEL").unwrap_or_default(),
+            allow_fuzzy_search_replace: Self::env_bool(
+                "ALLOW_FUZZY_SEARCH_REPLACE",
+                default_allow_fuzzy_search_replace(),
+            ),
+            symbol_edit_enabled: Self::env_bool(
+                "SYMBOL_EDIT_ENABLED",
+                default_symbol_edit_enabled(),
+            ),
+            post_edit_validation_enabled: Self::env_bool(
+                "POST_EDIT_VALIDATION_ENABLED",
+                default_post_edit_validation_enabled(),
+            ),
+            post_edit_validation_commands: Self::env("POST_EDIT_VALIDATION_COMMANDS"),
             cursor_agent_tmux_session_prefix: Self::env("CURSOR_AGENT_TMUX_SESSION_PREFIX")
                 .unwrap_or_else(default_cursor_agent_tmux_session_prefix),
             cursor_agent_tmux_enabled: Self::env_bool(
@@ -763,6 +1063,23 @@ impl Config {
             ),
             cursor_agent_runner_url: Self::env("CURSOR_AGENT_RUNNER_URL")
                 .filter(|s| !s.trim().is_empty()),
+            cursor_sdk_runner_url: Self::env("CURSOR_SDK_RUNNER_URL")
+                .filter(|s| !s.trim().is_empty()),
+            cursor_sdk_model: Self::env("CURSOR_SDK_MODEL")
+                .unwrap_or_else(default_cursor_sdk_model),
+            cursor_sdk_auto_start: Self::env_bool(
+                "CURSOR_SDK_AUTO_START",
+                default_cursor_sdk_auto_start(),
+            ),
+            cursor_sdk_auto_install: Self::env_bool(
+                "CURSOR_SDK_AUTO_INSTALL",
+                default_cursor_sdk_auto_install(),
+            ),
+            cursor_sdk_runner_port: Self::env("CURSOR_SDK_RUNNER_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_cursor_sdk_runner_port),
+            cursor_sdk_python: Self::env("CURSOR_SDK_PYTHON")
+                .unwrap_or_else(default_cursor_sdk_python),
             scheduler_task_timeout_secs: Self::env_u64(
                 "SCHEDULER_TASK_TIMEOUT_SECS",
                 default_scheduler_task_timeout_secs(),
@@ -779,32 +1096,212 @@ impl Config {
                 "SCHEDULER_POLL_INTERVAL_SECS",
                 default_scheduler_poll_interval_secs(),
             ),
+            background_job_lease_ttl_secs: Self::env_u64(
+                "BACKGROUND_JOB_LEASE_TTL_SECS",
+                default_background_job_lease_ttl_secs(),
+            ),
+            background_job_lease_fallback_renew_secs: Self::env_u64(
+                "BACKGROUND_JOB_LEASE_FALLBACK_RENEW_SECS",
+                default_background_job_lease_fallback_renew_secs(),
+            ),
+            background_job_pending_start_timeout_secs: Self::env_u64(
+                "BACKGROUND_JOB_PENDING_START_TIMEOUT_SECS",
+                default_background_job_pending_start_timeout_secs(),
+            ),
+            background_job_notify_chat_progress: Self::env_bool(
+                "BACKGROUND_JOB_NOTIFY_CHAT_PROGRESS",
+                default_background_job_notify_chat_progress(),
+            ),
+            tool_output_debug: Self::env_bool("TOOL_OUTPUT_DEBUG", default_tool_output_debug()),
+            background_shell_tmux_enabled: Self::env_bool(
+                "BACKGROUND_SHELL_TMUX_ENABLED",
+                default_background_shell_tmux_enabled(),
+            ),
+            background_shell_tmux_session_prefix: Self::env("BACKGROUND_SHELL_TMUX_SESSION_PREFIX")
+                .unwrap_or_else(default_background_shell_tmux_session_prefix),
+            background_shell_monitor_poll_secs: Self::env_u64(
+                "BACKGROUND_SHELL_MONITOR_POLL_SECS",
+                default_background_shell_monitor_poll_secs(),
+            ),
+            background_shell_auto_retry_on_failure: Self::env_bool(
+                "BACKGROUND_SHELL_AUTO_RETRY_ON_FAILURE",
+                default_background_shell_auto_retry_on_failure(),
+            ),
+            background_shell_auto_retry_max: Self::env_u64(
+                "BACKGROUND_SHELL_AUTO_RETRY_MAX",
+                default_background_shell_auto_retry_max() as u64,
+            ) as u32,
+            background_shell_auto_agent_on_success: Self::env_bool(
+                "BACKGROUND_SHELL_AUTO_AGENT_ON_SUCCESS",
+                default_background_shell_auto_agent_on_success(),
+            ),
             runtime_reliability_profile: Self::env("RUNTIME_RELIABILITY_PROFILE")
                 .unwrap_or_else(default_runtime_reliability_profile),
-            workflow_auto_learn: Self::env_bool(
-                "WORKFLOW_AUTO_LEARN",
-                default_workflow_auto_learn(),
-            ),
-            workflow_min_success_repetitions: Self::env_usize(
-                "WORKFLOW_MIN_SUCCESS_REPETITIONS",
-                default_workflow_min_success_repetitions(),
-            ),
-            workflow_replay_strictness: Self::env("WORKFLOW_REPLAY_STRICTNESS")
-                .unwrap_or_else(default_workflow_replay_strictness),
             project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
                 .unwrap_or_else(default_project_auto_association_strictness),
         }
     }
 
+    /// Apply Web UI `LLM_PROVIDER` / `LLM_MODEL` / local `LLM_BASE_URL` from `app_settings`.
+    pub fn merge_llm_selection_from_app_settings(
+        &mut self,
+        db: &crate::db::Database,
+    ) -> Result<(), FinallyAValueBotError> {
+        let settings: Vec<(String, String)> = db
+            .list_app_settings()?
+            .into_iter()
+            .map(|s| (s.key, s.value))
+            .collect();
+        let mut had_provider_setting = false;
+        let mut had_model_setting = false;
+        let mut had_base_url_setting = false;
+        for (key, value) in &settings {
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER) {
+                let v = value.trim();
+                if !v.is_empty() {
+                    self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(v);
+                    had_provider_setting = true;
+                }
+            }
+        }
+        for (key, value) in &settings {
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL) {
+                let v = value.trim();
+                if !v.is_empty() {
+                    self.model = v.to_string();
+                    had_model_setting = true;
+                }
+                break;
+            }
+        }
+
+        let mut persist_defaults = false;
+        if self.llm_provider.is_empty() {
+            if let Some(p) = crate::llm_catalog::first_provider_with_api_key() {
+                self.llm_provider = p.to_string();
+                persist_defaults = true;
+            } else {
+                return Err(FinallyAValueBotError::Config(
+                    "No LLM API keys in .env. Add provider keys (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY), then choose provider and model in Web UI → Settings → LLM.".into(),
+                ));
+            }
+        }
+        if self.model.is_empty() {
+            self.model = crate::llm_catalog::default_model_for_provider(&self.llm_provider).into();
+            persist_defaults = true;
+        }
+
+        self.sync_active_llm_provider_from_env()?;
+
+        if crate::llm_catalog::is_local_provider(&self.llm_provider) {
+            if let Some(url) =
+                crate::llm_catalog::local_base_url_from_app_settings(&settings, &self.llm_provider)
+            {
+                self.llm_base_url = Some(url);
+                had_base_url_setting = true;
+            } else {
+                let url = crate::llm_catalog::effective_local_base_url(&self.llm_provider, None);
+                self.llm_base_url = Some(url.clone());
+                persist_defaults = true;
+            }
+        }
+
+        if !crate::llm_catalog::is_local_provider(&self.llm_provider)
+            && crate::llm_catalog::resolve_api_key_for_provider_with_config(
+                &self.llm_provider,
+                Some(self),
+            )
+            .is_empty()
+        {
+            let hints =
+                crate::llm_catalog::provider_api_key_env_hints(&self.llm_provider).join(", ");
+            return Err(FinallyAValueBotError::Config(format!(
+                "No API key in .env for LLM provider {:?}. Set one of: {hints}",
+                self.llm_provider
+            )));
+        }
+
+        if persist_defaults || !had_provider_setting || !had_model_setting {
+            db.set_app_setting(
+                crate::llm_catalog::APP_SETTING_LLM_PROVIDER,
+                &self.llm_provider,
+            )?;
+            db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &self.model)?;
+        }
+        if crate::llm_catalog::is_local_provider(&self.llm_provider)
+            && (persist_defaults || !had_base_url_setting)
+        {
+            if let Some(ref url) = self.llm_base_url {
+                db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, url)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Backward-compatible alias.
+    pub fn merge_llm_model_from_app_settings(
+        &mut self,
+        db: &crate::db::Database,
+    ) -> Result<(), FinallyAValueBotError> {
+        self.merge_llm_selection_from_app_settings(db)
+    }
+
+    /// Apply API key and default base URL for the active `llm_provider` from environment / catalog.
+    pub fn sync_active_llm_provider_from_env(&mut self) -> Result<(), FinallyAValueBotError> {
+        self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(&self.llm_provider);
+        self.api_key = crate::llm_catalog::resolve_api_key_for_provider_with_config(
+            &self.llm_provider,
+            Some(self),
+        );
+        if crate::llm_catalog::is_local_provider(&self.llm_provider) {
+            // Local server URL is owned by Web UI `app_settings`, not `.env` LLM_BASE_URL.
+            return Ok(());
+        }
+        let base_empty = self
+            .llm_base_url
+            .as_ref()
+            .is_none_or(|u| u.trim().is_empty());
+        if base_empty {
+            if let Some(url) = crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+            {
+                self.llm_base_url = Some(url.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Web UI provider switch: refresh credentials and base URL for the new provider.
+    pub fn apply_llm_provider_switch(
+        &mut self,
+        provider_id: &str,
+        model: &str,
+        local_base_url: Option<&str>,
+    ) {
+        self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(provider_id);
+        self.model = model.trim().to_string();
+        self.api_key = crate::llm_catalog::resolve_api_key_for_provider_with_config(
+            &self.llm_provider,
+            Some(self),
+        );
+        if crate::llm_catalog::is_local_provider(&self.llm_provider) {
+            self.llm_base_url = Some(crate::llm_catalog::effective_local_base_url(
+                &self.llm_provider,
+                local_base_url,
+            ));
+        } else {
+            self.llm_base_url =
+                crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+                    .map(|s| s.to_string());
+        }
+    }
+
     /// Apply post-deserialization normalization and validation.
-    pub(crate) fn post_deserialize(&mut self) -> Result<(), FinallyAValueBotError> {
-        self.llm_provider = self.llm_provider.trim().to_lowercase();
+    pub fn post_deserialize(&mut self) -> Result<(), FinallyAValueBotError> {
+        self.llm_provider = crate::llm_catalog::resolve_catalog_provider_id(&self.llm_provider);
         self.safety_output_guard_mode = self.safety_output_guard_mode.trim().to_ascii_lowercase();
         self.safety_execution_mode = self.safety_execution_mode.trim().to_ascii_lowercase();
         self.runtime_reliability_profile =
             self.runtime_reliability_profile.trim().to_ascii_lowercase();
-        self.workflow_replay_strictness =
-            self.workflow_replay_strictness.trim().to_ascii_lowercase();
         self.project_auto_association_strictness = self
             .project_auto_association_strictness
             .trim()
@@ -816,15 +1313,8 @@ impl Config {
             .filter(|v| !v.is_empty())
             .collect();
 
-        // Apply provider-specific default model if empty
-        if self.model.is_empty() {
-            self.model = match self.llm_provider.as_str() {
-                "anthropic" => "claude-sonnet-4-5-20250929".into(),
-                "ollama" => "llama3.2".into(),
-                "llama" | "llamacpp" => "local".into(),
-                "google" => "gemini-2.5-flash".into(),
-                _ => "gpt-5.2".into(),
-            };
+        if !self.llm_provider.is_empty() && self.model.is_empty() {
+            self.model = crate::llm_catalog::default_model_for_provider(&self.llm_provider).into();
         }
 
         // Validate timezone
@@ -841,6 +1331,12 @@ impl Config {
         if self.llm_base_url.is_none() && matches!(self.llm_provider.as_str(), "llama" | "llamacpp")
         {
             self.llm_base_url = Some("http://127.0.0.1:8080/v1".into());
+        }
+        if !self.llm_provider.is_empty() && self.llm_base_url.is_none() {
+            if let Some(url) = crate::llm_catalog::default_base_url_for_provider(&self.llm_provider)
+            {
+                self.llm_base_url = Some(url.to_string());
+            }
         }
         if let Ok(dir) = std::env::var("FINALLY_A_VALUE_BOT_WORKSPACE_DIR") {
             let trimmed = dir.trim();
@@ -879,9 +1375,46 @@ impl Config {
         if self.web_session_idle_ttl_seconds == 0 {
             self.web_session_idle_ttl_seconds = default_web_session_idle_ttl_seconds();
         }
+        // Evaluator model aliases (legacy env names).
+        if !self.response_quality_evaluator_model.trim().is_empty() {
+            self.evaluator_model = self.response_quality_evaluator_model.trim().to_string();
+        }
+        if !self.post_tool_evaluator_model.trim().is_empty() {
+            self.evaluator_model = self.post_tool_evaluator_model.trim().to_string();
+        }
+        self.evaluator_model = self.evaluator_model.trim().to_string();
+        if self.evaluator_model.is_empty() {
+            self.evaluator_model = default_evaluator_model();
+        }
+        self.evaluator_base_url = self.evaluator_base_url.trim().to_string();
+        if self.evaluator_base_url.is_empty() {
+            self.evaluator_base_url = default_evaluator_base_url();
+        }
+        self.quality_eval_channels = self.quality_eval_channels.trim().to_string();
+        if self.quality_eval_channels.is_empty() {
+            self.quality_eval_channels = default_quality_eval_channels();
+        }
+        if self.quality_eval_min_confidence.is_nan()
+            || !(0.0..=1.0).contains(&self.quality_eval_min_confidence)
+        {
+            self.quality_eval_min_confidence = default_quality_eval_min_confidence();
+        }
         if self.max_document_size_mb == 0 {
             self.max_document_size_mb = default_max_document_size_mb();
         }
+        if self.max_history_messages == 0 {
+            self.max_history_messages = default_max_history_messages();
+        }
+        if self.recent_history_min_user_messages == 0 {
+            self.recent_history_min_user_messages = default_recent_history_min_user_messages();
+        }
+        if self.recent_history_min_assistant_messages == 0 {
+            self.recent_history_min_assistant_messages =
+                default_recent_history_min_assistant_messages();
+        }
+        self.recent_history_min_user_messages = self.recent_history_min_user_messages.min(25);
+        self.recent_history_min_assistant_messages =
+            self.recent_history_min_assistant_messages.min(25);
         if self.safety_max_emojis_per_response == 0 {
             self.safety_max_emojis_per_response = default_safety_max_emojis_per_response();
         }
@@ -929,17 +1462,16 @@ impl Config {
                 self.runtime_reliability_profile = "balanced".to_string();
             }
         }
-        if !["strict", "adaptive", "loose"].contains(&self.workflow_replay_strictness.as_str()) {
-            self.workflow_replay_strictness = default_workflow_replay_strictness();
-        }
         if !["strict", "balanced", "loose"]
             .contains(&self.project_auto_association_strictness.as_str())
         {
             self.project_auto_association_strictness =
                 default_project_auto_association_strictness();
         }
-        if self.workflow_min_success_repetitions == 0 {
-            self.workflow_min_success_repetitions = default_workflow_min_success_repetitions();
+        if let Some(cmds) = &self.post_edit_validation_commands {
+            if cmds.trim().is_empty() {
+                self.post_edit_validation_commands = None;
+            }
         }
         // Expand ~ in agent_browser_path if present
         if let Some(ref p) = self.agent_browser_path {
@@ -975,15 +1507,19 @@ impl Config {
         }
 
         // Validate required fields
-        if self.telegram_bot_token.is_empty() && self.discord_bot_token.is_none() {
+        let has_channel = !self.telegram_bot_token.is_empty() || self.discord_bot_token.is_some();
+        if !has_channel && !self.web_enabled {
             return Err(FinallyAValueBotError::Config(
-                "At least one of telegram_bot_token or discord_bot_token must be set".into(),
+                "At least one of telegram_bot_token or discord_bot_token must be set (unless web_enabled=true)".into(),
             ));
         }
-        if self.api_key.is_empty()
+        if !self.web_enabled
+            && !crate::llm_catalog::any_provider_api_key_configured()
             && !matches!(self.llm_provider.as_str(), "ollama" | "llama" | "llamacpp")
         {
-            return Err(FinallyAValueBotError::Config("api_key is required".into()));
+            return Err(FinallyAValueBotError::Config(
+                "At least one LLM API key is required in .env (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY). Provider and model are set in Web UI → Settings → LLM.".into(),
+            ));
         }
 
         Ok(())
@@ -1017,12 +1553,14 @@ impl Config {
             esc(&self.telegram_bot_token)
         ));
         lines.push(format!("BOT_USERNAME={}", esc(&self.bot_username)));
+        lines.push(format!(
+            "AGENT_DISPLAY_NAME={}",
+            esc(&self.agent_display_name)
+        ));
         lines.push("".into());
-        lines.push("# LLM".into());
-        lines.push(format!("LLM_PROVIDER={}", esc(&self.llm_provider)));
-        lines.push(format!("LLM_API_KEY={}", esc(&self.api_key)));
-        if !self.model.is_empty() {
-            lines.push(format!("LLM_MODEL={}", esc(&self.model)));
+        lines.push("# LLM (provider + model: Web UI → Settings → LLM; keys only in .env)".into());
+        if !self.api_key.is_empty() {
+            lines.push(format!("LLM_API_KEY={}", esc(&self.api_key)));
         }
         if let Some(ref u) = self.llm_base_url {
             if !u.is_empty() {
@@ -1036,29 +1574,50 @@ impl Config {
             self.max_history_messages
         ));
         lines.push(format!(
+            "RECENT_HISTORY_MIN_USER_MESSAGES={}",
+            self.recent_history_min_user_messages
+        ));
+        lines.push(format!(
+            "RECENT_HISTORY_MIN_ASSISTANT_MESSAGES={}",
+            self.recent_history_min_assistant_messages
+        ));
+        lines.push(format!(
             "RUNTIME_RELIABILITY_PROFILE={}",
             esc(&self.runtime_reliability_profile)
         ));
         lines.push(format!(
-            "WORKFLOW_AUTO_LEARN={}",
-            if self.workflow_auto_learn {
+            "PROJECT_AUTO_ASSOCIATION_STRICTNESS={}",
+            esc(&self.project_auto_association_strictness)
+        ));
+        lines.push(format!(
+            "ALLOW_FUZZY_SEARCH_REPLACE={}",
+            if self.allow_fuzzy_search_replace {
                 "true"
             } else {
                 "false"
             }
         ));
         lines.push(format!(
-            "WORKFLOW_MIN_SUCCESS_REPETITIONS={}",
-            self.workflow_min_success_repetitions
+            "SYMBOL_EDIT_ENABLED={}",
+            if self.symbol_edit_enabled {
+                "true"
+            } else {
+                "false"
+            }
         ));
         lines.push(format!(
-            "WORKFLOW_REPLAY_STRICTNESS={}",
-            esc(&self.workflow_replay_strictness)
+            "POST_EDIT_VALIDATION_ENABLED={}",
+            if self.post_edit_validation_enabled {
+                "true"
+            } else {
+                "false"
+            }
         ));
-        lines.push(format!(
-            "PROJECT_AUTO_ASSOCIATION_STRICTNESS={}",
-            esc(&self.project_auto_association_strictness)
-        ));
+        if let Some(cmds) = &self.post_edit_validation_commands {
+            if !cmds.trim().is_empty() {
+                lines.push(format!("POST_EDIT_VALIDATION_COMMANDS={}", esc(cmds)));
+            }
+        }
         lines.push(format!(
             "MAX_DOCUMENT_SIZE_MB={}",
             self.max_document_size_mb
@@ -1067,6 +1626,20 @@ impl Config {
             "SHOW_THINKING={}",
             if self.show_thinking { "true" } else { "false" }
         ));
+        lines.push(format!(
+            "HOOK_COMMAND_TIMEOUT_SECS={}",
+            self.hook_command_timeout_secs
+        ));
+        lines.push(format!(
+            "HOOK_PROMPT_TIMEOUT_SECS={}",
+            self.hook_prompt_timeout_secs
+        ));
+        if !self.hook_prompt_model.trim().is_empty() {
+            lines.push(format!(
+                "HOOK_PROMPT_MODEL={}",
+                esc(&self.hook_prompt_model)
+            ));
+        }
         lines.push("".into());
         lines.push("# Workspace".into());
         lines.push(format!("WORKSPACE_DIR={}", esc(&self.workspace_dir)));
@@ -1156,6 +1729,7 @@ pub fn test_config() -> Config {
     Config {
         telegram_bot_token: "tok".into(),
         bot_username: "bot".into(),
+        agent_display_name: "bot".into(),
         llm_provider: "anthropic".into(),
         api_key: "key".into(),
         model: "claude-sonnet-4-5-20250929".into(),
@@ -1163,9 +1737,12 @@ pub fn test_config() -> Config {
         max_tokens: 8192,
         max_tool_iterations: 100,
         max_history_messages: 50,
+        recent_history_min_user_messages: 2,
+        recent_history_min_assistant_messages: 2,
         max_document_size_mb: 100,
         workspace_dir: "./workspace".into(),
         openai_api_key: None,
+        gemini_api_key: None,
         timezone: "UTC".into(),
         allowed_groups: vec![],
         control_chat_ids: vec![],
@@ -1202,29 +1779,59 @@ pub fn test_config() -> Config {
             "package".into(),
         ],
         agent_browser_path: None,
+        tavily_api_key: None,
         web_search_searxng_url: None,
         cursor_agent_cli_path: default_cursor_agent_cli_path(),
         cursor_agent_model: String::new(),
-        cursor_agent_timeout_secs: 1500,
+        cursor_agent_timeout_secs: default_cursor_agent_timeout_secs(),
         social: None,
         vault: None,
         orchestrator_enabled: true,
         orchestrator_model: String::new(),
-        tool_skill_agent_enabled: true,
-        tool_skill_agent_model: String::new(),
         post_tool_evaluator_enabled: false,
         post_tool_evaluator_model: String::new(),
+        response_quality_evaluator_enabled: false,
+        perplexity_api_key: None,
+        evaluator_model: default_evaluator_model(),
+        evaluator_base_url: default_evaluator_base_url(),
+        response_quality_evaluator_model: String::new(),
+        quality_eval_max_nudges_per_run: default_quality_eval_max_nudges_per_run(),
+        quality_eval_min_confidence: default_quality_eval_min_confidence(),
+        quality_eval_channels: default_quality_eval_channels(),
+        hook_command_timeout_secs: default_hook_command_timeout_secs(),
+        hook_prompt_timeout_secs: default_hook_prompt_timeout_secs(),
+        hook_prompt_model: String::new(),
+        allow_fuzzy_search_replace: false,
+        symbol_edit_enabled: false,
+        post_edit_validation_enabled: true,
+        post_edit_validation_commands: None,
         cursor_agent_tmux_session_prefix: "finally_a_value_bot-cursor".into(),
         cursor_agent_tmux_enabled: true,
         cursor_agent_runner_url: None,
+        cursor_sdk_runner_url: None,
+        cursor_sdk_model: default_cursor_sdk_model(),
+        cursor_sdk_auto_start: default_cursor_sdk_auto_start(),
+        cursor_sdk_auto_install: default_cursor_sdk_auto_install(),
+        cursor_sdk_runner_port: default_cursor_sdk_runner_port(),
+        cursor_sdk_python: default_cursor_sdk_python(),
         scheduler_task_timeout_secs: default_scheduler_task_timeout_secs(),
         scheduler_stale_running_reclaim_secs: default_scheduler_stale_running_reclaim_secs(),
         scheduler_max_concurrent_tasks: default_scheduler_max_concurrent_tasks(),
         scheduler_poll_interval_secs: default_scheduler_poll_interval_secs(),
+        background_job_lease_ttl_secs: default_background_job_lease_ttl_secs(),
+        background_job_lease_fallback_renew_secs: default_background_job_lease_fallback_renew_secs(
+        ),
+        background_job_pending_start_timeout_secs:
+            default_background_job_pending_start_timeout_secs(),
+        background_job_notify_chat_progress: default_background_job_notify_chat_progress(),
+        tool_output_debug: default_tool_output_debug(),
+        background_shell_tmux_enabled: default_background_shell_tmux_enabled(),
+        background_shell_tmux_session_prefix: default_background_shell_tmux_session_prefix(),
+        background_shell_monitor_poll_secs: default_background_shell_monitor_poll_secs(),
+        background_shell_auto_retry_on_failure: default_background_shell_auto_retry_on_failure(),
+        background_shell_auto_retry_max: default_background_shell_auto_retry_max(),
+        background_shell_auto_agent_on_success: default_background_shell_auto_agent_on_success(),
         runtime_reliability_profile: default_runtime_reliability_profile(),
-        workflow_auto_learn: default_workflow_auto_learn(),
-        workflow_min_success_repetitions: default_workflow_min_success_repetitions(),
-        workflow_replay_strictness: default_workflow_replay_strictness(),
         project_auto_association_strictness: default_project_auto_association_strictness(),
     }
 }
@@ -1349,7 +1956,7 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         let err = config.post_deserialize().unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("api_key is required"));
+        assert!(msg.contains("At least one LLM API key"));
     }
 
     #[test]
@@ -1375,7 +1982,37 @@ mod tests {
             "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: openai\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.model, "gpt-5.2");
+        assert_eq!(config.model, "gpt-5.4");
+        assert_eq!(
+            config.llm_base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
+    fn test_post_deserialize_xai_default_model_and_base_url() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: xai\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.model, "grok-4.3");
+        assert_eq!(config.llm_base_url.as_deref(), Some("https://api.x.ai/v1"));
+    }
+
+    #[test]
+    fn test_post_deserialize_grok_normalizes_to_xai() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: grok\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.llm_provider, "xai");
+        assert_eq!(config.model, "grok-4.3");
+    }
+
+    #[test]
+    fn test_post_deserialize_openai_api_key_fallback() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: openai\nopenai_api_key: sk-openai-fallback\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(config.api_key, "sk-openai-fallback");
     }
 
     #[test]
@@ -1399,8 +2036,19 @@ mod tests {
     }
 
     #[test]
-    fn test_post_deserialize_empty_base_url_becomes_none() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_base_url: '  '\n";
+    fn test_post_deserialize_empty_base_url_fills_from_catalog_for_openai() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: openai\nllm_base_url: '  '\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert_eq!(
+            config.llm_base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
+    fn test_post_deserialize_empty_base_url_stays_none_for_anthropic() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: anthropic\nllm_base_url: '  '\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert!(config.llm_base_url.is_none());
@@ -1525,5 +2173,40 @@ discord_allowed_channels: [111, 222]
         assert!(content.contains("WEB_RUN_HISTORY_LIMIT=900"));
         assert!(content.contains("WEB_SESSION_IDLE_TTL_SECONDS=600"));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_config_new_framework_fields_from_yaml() {
+        let yaml = r#"
+telegram_bot_token: tok
+bot_username: bot
+api_key: key
+allow_fuzzy_search_replace: true
+symbol_edit_enabled: true
+post_edit_validation_enabled: false
+post_edit_validation_commands: "echo one ;; echo two"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert!(config.allow_fuzzy_search_replace);
+        assert!(config.symbol_edit_enabled);
+        assert!(!config.post_edit_validation_enabled);
+        assert_eq!(
+            config.post_edit_validation_commands.as_deref(),
+            Some("echo one ;; echo two")
+        );
+    }
+
+    #[test]
+    fn test_post_deserialize_empty_post_edit_validation_commands_none() {
+        let yaml = r#"
+telegram_bot_token: tok
+bot_username: bot
+api_key: key
+post_edit_validation_commands: "   "
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert!(config.post_edit_validation_commands.is_none());
     }
 }

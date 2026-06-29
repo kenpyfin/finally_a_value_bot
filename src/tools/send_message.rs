@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use teloxide::prelude::*;
 use teloxide::types::InputFile;
 
@@ -14,6 +15,42 @@ use crate::channel::{deliver_and_store_bot_message, enforce_channel_policy};
 use crate::claude::ToolDefinition;
 use crate::config::Config;
 use crate::db::{call_blocking, Database, StoredMessage};
+
+fn resolve_send_message_persona_id(
+    input: &serde_json::Value,
+    chat_id: i64,
+    override_id: Option<i64>,
+) -> Result<i64, String> {
+    if let Some(pid) = override_id {
+        if pid <= 0 {
+            return Err("persona_id must be a positive integer".into());
+        }
+        if let Some(auth) = auth_context_from_input(input) {
+            if !auth.is_control_chat() {
+                let allowed = default_persona_id_for_chat(input, chat_id)
+                    .filter(|id| *id > 0)
+                    .unwrap_or_else(|| {
+                        if auth.caller_chat_id == chat_id {
+                            auth.caller_persona_id
+                        } else {
+                            0
+                        }
+                    });
+                if allowed <= 0 || pid != allowed {
+                    return Err(
+                        "persona_id override must match the caller's run persona for this chat"
+                            .into(),
+                    );
+                }
+            }
+        }
+        return Ok(pid);
+    }
+    if let Some(pid) = default_persona_id_for_chat(input, chat_id) {
+        return Ok(pid);
+    }
+    Err("Missing auth context to resolve persona for send_message".into())
+}
 
 enum ActiveAttachmentTarget {
     Telegram(i64),
@@ -279,9 +316,8 @@ impl SendMessageTool {
         tokio::fs::create_dir_all(&uploads_dir)
             .await
             .map_err(|e| format!("Failed to create web uploads directory: {e}"))?;
-        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let safe_name = sanitize_upload_filename(&filename);
-        let stored_name = format!("{}-bot-{}", ts, safe_name);
+        let stored_name = stable_upload_filename(&safe_name, &bytes);
         let saved_path = uploads_dir.join(&stored_name);
         tokio::fs::write(&saved_path, &bytes)
             .await
@@ -374,6 +410,15 @@ fn sanitize_upload_filename(name: &str) -> String {
     }
 }
 
+fn stable_upload_filename(safe_name: &str, bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let hash = digest[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    format!("{hash}-{safe_name}")
+}
+
 fn is_image_file(path: &Path, bytes: &[u8]) -> bool {
     if bytes.len() >= 8 && bytes[0..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
         return true;
@@ -407,10 +452,10 @@ impl Tool for SendMessageTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "send_message".into(),
-            description: "Send a message mid-conversation. Supports text for all channels, and attachments for Telegram/Discord/WhatsApp/web via attachment_path. For attachments, use an absolute local file path so the tool can find the file reliably.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "send_message",
+            "Send a message mid-conversation. Supports text for all channels, and attachments for Telegram/Discord/WhatsApp/web via attachment_path. For attachments, use an absolute local file path so the tool can find the file reliably.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -435,7 +480,7 @@ impl Tool for SendMessageTool {
                 }),
                 &["chat_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -484,6 +529,9 @@ impl Tool for SendMessageTool {
         }
 
         if let Some(path) = attachment_path {
+            if let Err(e) = super::path_guard::check_path(&path) {
+                return ToolResult::error(e).with_error_type("path_blocked");
+            }
             let auth = match auth_context_from_input(&input) {
                 Some(a) => a,
                 None => {
@@ -538,19 +586,19 @@ impl Tool for SendMessageTool {
             match send_result {
                 Ok(content) => {
                     let db = self.db.clone();
-                    let pid_result = match persona_id_override {
-                        Some(id) => Ok(id),
-                        None => {
-                            if let Some(pid) = default_persona_id_for_chat(&input, chat_id) {
-                                Ok(pid)
-                            } else {
+                    let pid_result: Result<i64, String> =
+                        match resolve_send_message_persona_id(&input, chat_id, persona_id_override)
+                        {
+                            Ok(pid) => Ok(pid),
+                            Err(_) if persona_id_override.is_none() => {
                                 call_blocking(db.clone(), move |db| {
                                     db.get_or_create_default_persona(chat_id)
                                 })
                                 .await
+                                .map_err(|e| e.to_string())
                             }
-                        }
-                    };
+                            Err(e) => Err(e),
+                        };
                     let pid = match pid_result {
                         Ok(pid) => pid,
                         Err(e) => {
@@ -562,10 +610,12 @@ impl Tool for SendMessageTool {
                         id: uuid::Uuid::new_v4().to_string(),
                         chat_id,
                         persona_id: pid,
+                        session_id: None,
                         sender_name: self.bot_username.clone(),
                         content,
                         is_from_bot: true,
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        origin: crate::db::message_origin_interactive(),
                     };
                     if let Err(e) = call_blocking(db, move |db| db.store_message(&msg)).await {
                         return ToolResult::error(e.to_string());
@@ -576,19 +626,18 @@ impl Tool for SendMessageTool {
             }
         } else {
             let cid = chat_id;
-            let persona_id_result = match persona_id_override {
-                Some(id) => Ok(id),
-                None => {
-                    if let Some(pid) = default_persona_id_for_chat(&input, chat_id) {
-                        Ok(pid)
-                    } else {
+            let persona_id_result: Result<i64, String> =
+                match resolve_send_message_persona_id(&input, chat_id, persona_id_override) {
+                    Ok(pid) => Ok(pid),
+                    Err(_) if persona_id_override.is_none() => {
                         call_blocking(self.db.clone(), move |db| {
                             db.get_or_create_default_persona(cid)
                         })
                         .await
+                        .map_err(|e| e.to_string())
                     }
-                }
-            };
+                    Err(e) => Err(e),
+                };
             let persona_id = match persona_id_result {
                 Ok(pid) => pid,
                 Err(e) => return ToolResult::error(format!("Failed to resolve persona: {e}")),
@@ -616,6 +665,7 @@ impl Tool for SendMessageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_config;
     use serde_json::json;
 
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
@@ -730,7 +780,7 @@ mod tests {
         assert!(result.is_error);
         assert!(result
             .content
-            .contains("web chats cannot operate on other chats"));
+            .contains("web UI sessions cannot operate on other chats"));
         cleanup(&dir);
     }
 
@@ -748,6 +798,29 @@ mod tests {
         assert!(result
             .content
             .contains("Provide text and/or attachment_path"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_blocks_scheduled_same_chat() {
+        let (db, dir) = test_db();
+        let tool = SendMessageTool::new(Bot::new("123456:TEST_TOKEN"), db, "bot".into());
+        let result = tool
+            .execute(json!({
+                "chat_id": 999,
+                "text": "scheduled update",
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 999,
+                    "caller_channel": "scheduler",
+                    "is_scheduled_task": true,
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result
+            .content
+            .contains("Scheduled runs deliver the final reply automatically"));
         cleanup(&dir);
     }
 
@@ -870,6 +943,67 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("active channels"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_send_attachment_web_uploads_and_stores_message() {
+        let (db, dir) = test_db();
+        db.upsert_chat(999, Some("web-main"), "web").unwrap();
+
+        let workspace_dir = dir.join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("shared")).unwrap();
+        let attachment = workspace_dir.join("sample.pdf");
+        std::fs::write(&attachment, b"pdf-bytes").unwrap();
+
+        let mut cfg = test_config();
+        cfg.workspace_dir = workspace_dir.to_string_lossy().to_string();
+        let tool = SendMessageTool::new_with_config(
+            Bot::new("123456:TEST_TOKEN"),
+            db.clone(),
+            "bot".into(),
+            cfg,
+        );
+
+        let result = tool
+            .execute(json!({
+                "chat_id": 999,
+                "attachment_path": attachment.to_string_lossy(),
+                "caption": "Generated PDF",
+                "__finally_a_value_bot_auth": {
+                    "caller_chat_id": 999,
+                    "caller_channel": "web",
+                    "control_chat_ids": []
+                }
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let pid = db.get_or_create_default_persona(999).unwrap();
+        let msgs = db.get_all_messages(999, pid).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let content = &msgs[0].content;
+        assert!(content.contains("Generated PDF"));
+        assert!(content.contains("/api/uploads/web/999/"));
+
+        let url = content
+            .split('(')
+            .nth(1)
+            .and_then(|s| s.strip_suffix(')'))
+            .expect("expected markdown link URL");
+        let saved_name = url.rsplit('/').next().unwrap_or_default();
+        let saved_path = workspace_dir
+            .join("shared")
+            .join("upload")
+            .join("web")
+            .join("999")
+            .join(saved_name);
+        assert!(
+            saved_path.is_file(),
+            "expected saved upload at {}",
+            saved_path.display()
+        );
+
         cleanup(&dir);
     }
 }

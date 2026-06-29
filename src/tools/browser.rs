@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -9,8 +11,46 @@ use crate::tools::command_runner::agent_browser_program;
 
 use super::{auth_context_from_input, schema_object, Tool, ToolResult};
 
+static PROFILE_IGNORE_WARN_EMITTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn profile_ignore_warning_already_emitted(session_key: &str) -> bool {
+    let lock = PROFILE_IGNORE_WARN_EMITTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut set = lock
+        .lock()
+        .expect("browser profile-warn dedupe mutex poisoned");
+    !set.insert(session_key.to_string())
+}
+
+/// agent-browser keeps a long-lived daemon; `--profile` is only honored when the daemon starts.
+/// After that, the CLI prints a benign warning on every invocation. Strip duplicate noise from
+/// successful runs so agent logs stay readable (first occurrence is kept).
+fn filter_browser_stderr_for_output(stderr: &str, session_key: &str, exit_code: i32) -> String {
+    if exit_code != 0 || stderr.is_empty() {
+        return stderr.to_string();
+    }
+    let needle = "--profile ignored: daemon already running";
+    if !stderr.contains(needle) {
+        return stderr.to_string();
+    }
+    if profile_ignore_warning_already_emitted(session_key) {
+        let mut out = String::new();
+        for line in stderr.lines() {
+            if line.contains(needle) {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+        return out;
+    }
+    stderr.to_string()
+}
+
 pub struct BrowserTool {
     data_dir: PathBuf,
+    base_working_dir: PathBuf,
     /// If set, use this path for the agent-browser executable; otherwise use default from PATH.
     agent_browser_path: Option<String>,
 }
@@ -72,9 +112,10 @@ fn split_browser_command(command: &str) -> Result<Vec<String>, String> {
 
 impl BrowserTool {
     /// Create a browser tool. `agent_browser_path`: optional full path to agent-browser CLI from config.
-    pub fn new(data_dir: &str, agent_browser_path: Option<String>) -> Self {
+    pub fn new(data_dir: &str, working_dir: &str, agent_browser_path: Option<String>) -> Self {
         BrowserTool {
             data_dir: PathBuf::from(data_dir).join("groups"),
+            base_working_dir: PathBuf::from(working_dir),
             agent_browser_path,
         }
     }
@@ -93,6 +134,10 @@ impl BrowserTool {
         };
         format!("finally_a_value_bot-chat-{normalized}")
     }
+
+    fn command_working_dir(&self, auth: Option<&crate::tools::ToolAuthContext>) -> PathBuf {
+        super::resolve_tool_working_dir_for_auth(&self.base_working_dir, auth)
+    }
 }
 
 #[async_trait]
@@ -102,9 +147,11 @@ impl Tool for BrowserTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "browser".into(),
-            description: "Browser automation via the agent-browser CLI (npm package). Use this tool with a command string (e.g. open, snapshot, click, fill). Do not run agent-browser in the shell — use this tool only. Browser state (cookies, localStorage, login sessions) persists across calls.\n\n\
+        ToolDefinition::new(
+            "browser",
+            "Browser automation via the agent-browser CLI (npm package). Use this tool with a command string (e.g. open, snapshot, click, fill). Do not run agent-browser in the shell — use this tool only. Browser state (cookies, localStorage, login sessions) persists across calls.\n\n\
+                Public search sites and trade directories are often protected by Cloudflare/CAPTCHA. Prefer web_search + web_fetch for discovery/extraction and use browser when interaction is truly required.\n\
+                If stderr says profile was ignored because a daemon is already running, the current daemon session is reused until restarted.\n\n\
                 ## Basic workflow\n\
                 1. `open <url>` — navigate to a URL\n\
                 2. `snapshot -i` — get interactive elements with refs (@e1, @e2, ...)\n\
@@ -129,8 +176,8 @@ impl Tool for BrowserTool {
                 **Network**: network route <url> [--abort|--body <json>], network requests\n\
                 **Wait**: wait <sel|ms|--text|--url|--load|--fn>\n\
                 **Auth state**: state save <path>, state load <path>\n\
-                **Semantic find**: find role/text/label/placeholder <value> <action> [input]".into(),
-            input_schema: schema_object(
+                **Semantic find**: find role/text/label/placeholder <value> <action> [input]",
+            schema_object(
                 json!({
                     "command": {
                         "type": "string",
@@ -143,7 +190,7 @@ impl Tool for BrowserTool {
                 }),
                 &["command"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -167,7 +214,7 @@ impl Tool for BrowserTool {
             .unwrap_or_else(|| "finally_a_value_bot".to_string());
 
         args.push("--session".to_string());
-        args.push(session_name);
+        args.push(session_name.clone());
 
         if let Some(chat_id) = caller_chat_id {
             let path = self.profile_path(chat_id);
@@ -194,6 +241,9 @@ impl Tool for BrowserTool {
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&args);
+        let working_dir = self.command_working_dir(auth.as_ref());
+        let _ = tokio::fs::create_dir_all(&working_dir).await;
+        cmd.current_dir(&working_dir);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
@@ -204,16 +254,19 @@ impl Tool for BrowserTool {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let exit_code = output.status.code().unwrap_or(-1);
 
+                let stderr_filtered =
+                    filter_browser_stderr_for_output(&stderr, &session_name, exit_code);
+
                 let mut result_text = String::new();
                 if !stdout.is_empty() {
                     result_text.push_str(&stdout);
                 }
-                if !stderr.is_empty() {
+                if !stderr_filtered.is_empty() {
                     if !result_text.is_empty() {
                         result_text.push('\n');
                     }
                     result_text.push_str("STDERR:\n");
-                    result_text.push_str(&stderr);
+                    result_text.push_str(&stderr_filtered);
                 }
                 if result_text.is_empty() {
                     result_text = format!("Command completed with exit code {exit_code}");
@@ -287,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_browser_tool_name_and_definition() {
-        let tool = BrowserTool::new("/tmp/test-data", None);
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
         assert_eq!(tool.name(), "browser");
         let def = tool.definition();
         assert_eq!(def.name, "browser");
@@ -301,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_browser_profile_path() {
-        let tool = BrowserTool::new("/tmp/test-data", None);
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
         let path = tool.profile_path(12345);
         assert_eq!(
             path,
@@ -321,9 +374,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_browser_command_working_dir_uses_workspace_shared() {
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
+        assert_eq!(
+            tool.command_working_dir(None),
+            PathBuf::from("/tmp/workspace/shared")
+        );
+    }
+
+    #[test]
+    fn test_filter_browser_stderr_dedupes_profile_ignored_warning() {
+        let session = "finally_a_value_bot-chat-test-dedupe-1";
+        let warn = "⚠ --profile ignored: daemon already running. Use 'agent-browser close' first to restart with new options.\n";
+        let first = filter_browser_stderr_for_output(warn, session, 0);
+        assert!(first.contains("--profile ignored"));
+        let second = filter_browser_stderr_for_output(warn, session, 0);
+        assert!(!second.contains("--profile ignored"));
+    }
+
+    #[test]
+    fn test_filter_browser_stderr_keeps_other_lines_on_second_call() {
+        let session = "finally_a_value_bot-chat-test-dedupe-2";
+        let msg = "⚠ --profile ignored: daemon already running.\nother line\n";
+        assert!(filter_browser_stderr_for_output(msg, session, 0).contains("--profile ignored"));
+        let second = filter_browser_stderr_for_output(msg, session, 0);
+        assert!(!second.contains("--profile ignored"));
+        assert!(second.contains("other line"));
+    }
+
     #[tokio::test]
     async fn test_browser_missing_command() {
-        let tool = BrowserTool::new("/tmp/test-data", None);
+        let tool = BrowserTool::new("/tmp/test-data", "/tmp/workspace", None);
         let result = tool.execute(json!({})).await;
         assert!(result.is_error);
         assert!(result.content.contains("Missing 'command'"));

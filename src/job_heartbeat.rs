@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::warn;
 
-use crate::channel::deliver_to_contact;
+use crate::channel::{deliver_to_contact, DeliveryScope};
 use crate::db::call_blocking;
 use crate::telegram::{AgentEvent, AppState};
 
@@ -12,6 +12,8 @@ use crate::telegram::{AgentEvent, AppState};
 pub enum JobType {
     ManualBackground,
     Scheduled,
+    ShellBackground,
+    RunOptimize,
 }
 
 impl JobType {
@@ -19,11 +21,16 @@ impl JobType {
         match self {
             JobType::ManualBackground => "manual_background",
             JobType::Scheduled => "scheduled",
+            JobType::ShellBackground => "shell_background",
+            JobType::RunOptimize => "run_optimize",
         }
     }
 
     fn notify_user_periodically(self) -> bool {
-        matches!(self, JobType::ManualBackground)
+        matches!(
+            self,
+            JobType::ManualBackground | JobType::ShellBackground | JobType::RunOptimize
+        )
     }
 }
 
@@ -43,18 +50,24 @@ pub fn signal_from_agent_event(evt: &AgentEvent) -> Option<HeartbeatSignal> {
             "iteration {}",
             iteration
         ))),
-        AgentEvent::WorkflowSelected {
-            workflow_id,
-            confidence,
-        } => Some(HeartbeatSignal::Progress(format!(
-            "selected workflow {} (confidence {:.2})",
-            workflow_id, confidence
-        ))),
         AgentEvent::ToolStart { name, .. } => Some(HeartbeatSignal::ToolStart(name.clone())),
         AgentEvent::ToolResult { name, is_error, .. } => Some(HeartbeatSignal::ToolResult {
             tool: name.clone(),
             is_error: *is_error,
         }),
+        AgentEvent::Hook {
+            event_name,
+            tool_name,
+            matched_hook_ids,
+            blocked_reason,
+            ..
+        } => Some(HeartbeatSignal::Progress(format!(
+            "hook {} tool={} matched={} blocked={}",
+            event_name,
+            tool_name.as_deref().unwrap_or("-"),
+            matched_hook_ids.len(),
+            blocked_reason.as_deref().unwrap_or("-"),
+        ))),
         AgentEvent::TextDelta { .. } => None,
         AgentEvent::FinalResponse { .. } => None,
     }
@@ -66,10 +79,14 @@ pub fn spawn_shared_heartbeat(
     chat_id: i64,
     persona_id: i64,
     job_type: JobType,
+    _lease_owner: Option<String>,
+    notify_chat_progress: bool,
 ) -> UnboundedSender<HeartbeatSignal> {
     let (tx, mut rx) = mpsc::unbounded_channel::<HeartbeatSignal>();
     tokio::spawn(async move {
-        let heartbeat_period = Duration::from_secs(30);
+        let heartbeat_period =
+            Duration::from_secs(state.config.background_job_lease_fallback_renew_secs.max(1));
+        let lease_ttl_secs = state.config.background_job_lease_ttl_secs as i64;
         let mut ticker = tokio::time::interval(heartbeat_period);
         let mut stage = "queued".to_string();
         let mut message = "queued".to_string();
@@ -203,6 +220,16 @@ pub fn spawn_shared_heartbeat(
                         move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, active)
                     })
                     .await;
+                    if active && job_type == JobType::ManualBackground {
+                        let _ = call_blocking(state.db.clone(), {
+                            let run_key = run_key.clone();
+                            let stage = stage.clone();
+                            move |db| {
+                                db.renew_background_job_lease(&run_key, lease_ttl_secs, &stage)
+                            }
+                        })
+                        .await;
+                    }
                     let _ = call_blocking(state.db.clone(), {
                         let run_key = run_key.clone();
                         let stage = stage.clone();
@@ -212,16 +239,22 @@ pub fn spawn_shared_heartbeat(
                     })
                     .await;
 
-                    if job_type.notify_user_periodically() && stage != "completed" && stage != "failed" {
+                    if job_type.notify_user_periodically()
+                        && notify_chat_progress
+                        && stage != "completed"
+                        && stage != "failed"
+                    {
                         let _ = deliver_to_contact(
                             state.db.clone(),
-                            Some(&state.bot),
-                            state.discord_http.as_deref(),
+                            state.telegram_bots.as_ref(),
+                            state.discord_http.as_ref(),
                             &state.config.bot_username,
                             chat_id,
                             persona_id,
                             &format!("Background update: {}", message),
                             Some(state.config.workspace_root_absolute()),
+                            DeliveryScope::ContactWide,
+                            None,
                         )
                         .await;
                         last_user_notify = Instant::now();
@@ -239,28 +272,33 @@ pub fn spawn_shared_heartbeat(
                         let job_type = job_type.as_str().to_string();
                         move |db| db.upsert_job_heartbeat(&run_key, chat_id, persona_id, &job_type, &stage, &message, active)
                     }).await;
-                    let _ = call_blocking(state.db.clone(), {
-                        let run_key = run_key.clone();
-                        let stage = stage.clone();
-                        let message = message.clone();
-                        let payload = format!(r#"{{"stage":"{}","message":"{}"}}"#, stage, message.replace('"', "'"));
-                        move |db| db.append_run_timeline_event(&run_key, chat_id, persona_id, "heartbeat", Some(&payload))
-                    })
-                    .await;
+                    if active && job_type == JobType::ManualBackground {
+                        let _ = call_blocking(state.db.clone(), {
+                            let run_key = run_key.clone();
+                            let stage = stage.clone();
+                            move |db| {
+                                db.renew_background_job_lease(&run_key, lease_ttl_secs, &stage)
+                            }
+                        })
+                        .await;
+                    }
 
                     if active
                         && job_type.notify_user_periodically()
+                        && notify_chat_progress
                         && last_user_notify.elapsed() >= heartbeat_period
                     {
                         let _ = deliver_to_contact(
                             state.db.clone(),
-                            Some(&state.bot),
-                            state.discord_http.as_deref(),
+                            state.telegram_bots.as_ref(),
+                            state.discord_http.as_ref(),
                             &state.config.bot_username,
                             chat_id,
                             persona_id,
                             &format!("Background update: {}", message),
                             Some(state.config.workspace_root_absolute()),
+                            DeliveryScope::ContactWide,
+                            None,
                         )
                         .await;
                         last_user_notify = Instant::now();

@@ -1,32 +1,42 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use base64::Engine;
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::channel::deliver_to_contact;
-use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
+use crate::background_jobs::{
+    await_handoff_startup_ack, handoff_trigger_for_db, is_background_handoff_response,
+    try_enqueue_background_handoff, HandoffEnqueueOutcome,
+};
+use crate::channel::{deliver_agent_final_to_contact, deliver_to_contact, DeliveryScope};
+use crate::chat_queue::{QueueEnqueueMeta, QueueRemoveOutcome, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
-use crate::db::{call_blocking, JobHeartbeat, Persona, StoredMessage};
+use crate::db::{
+    call_blocking, ChannelBotInstance, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage,
+    BOT_INSTANCE_WEB,
+};
+use crate::hook_executor::validate_command_payload;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext,
-    AppState, BACKGROUND_JOB_HANDOFF_PREFIX,
+    archive_conversation, process_with_agent, process_with_agent_with_events, AgentEvent,
+    AgentRequestContext, AppState,
 };
 use std::time::SystemTime;
 
@@ -39,6 +49,9 @@ struct WebState {
     run_hub: RunHub,
     request_hub: RequestHub,
     limits: WebLimits,
+    /// Cache for `ensure_web_binding_for_universal` to avoid repeated DB writes on every
+    /// `/api/history` poll while this server process is alive.
+    web_binding_universal_done: Arc<Mutex<Option<i64>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +315,8 @@ struct HistoryQuery {
     persona_id: Option<i64>,
     limit: Option<usize>,
     day: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,6 +326,8 @@ struct SendRequest {
     sender_name: Option<String>,
     message: String,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
     attachments: Vec<SendAttachmentRequest>,
 }
 
@@ -318,7 +335,30 @@ struct SendRequest {
 struct SendAttachmentRequest {
     filename: Option<String>,
     media_type: Option<String>,
-    data_base64: String,
+    /// Inline base64 payload (legacy). Prefer `tool_path` + `url` from `POST /api/uploads`.
+    #[serde(default)]
+    data_base64: Option<String>,
+    /// Relative path under `shared/upload/` (e.g. `upload/web/{chat_id}/{persona_id}/{file}`).
+    #[serde(default)]
+    tool_path: Option<String>,
+    /// Public URL path (e.g. `/api/uploads/web/{chat_id}/{persona_id}/{file}`).
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadQueryParams {
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadResponse {
+    filename: String,
+    media_type: String,
+    bytes: u64,
+    tool_path: String,
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,11 +436,18 @@ struct ScheduleUpdateRequest {
     status: Option<String>, // "paused" | "active" | "cancelled"
     persona_id: Option<i64>,
     prompt: Option<String>,
+    /// When changing timing, send both `schedule_type` and `schedule_value` (same semantics as create).
+    schedule_type: Option<String>,
+    schedule_value: Option<String>,
+    timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RunStatusQuery {
     run_id: String,
+    /// When true, include `timeline_events` count in the response.
+    /// Defaults to `false` to keep polling cheap.
+    timeline_events: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -509,14 +556,25 @@ async fn ensure_web_binding_for_universal(
     state: &WebState,
     chat_id: i64,
 ) -> Result<(), (StatusCode, String)> {
+    // Web always resolves to the same universal chat id; cache to avoid repeated writes.
     let cid = chat_id;
+    {
+        let guard = state.web_binding_universal_done.lock().await;
+        if guard.is_some_and(|id| id == cid) {
+            return Ok(());
+        }
+    }
     call_blocking(state.app_state.db.clone(), move |db| {
         db.upsert_chat(cid, None, "web")?;
-        db.link_channel(cid, "web", "default")?;
+        db.link_channel(cid, BOT_INSTANCE_WEB, "web", "default")?;
         Ok(())
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        let mut guard = state.web_binding_universal_done.lock().await;
+        *guard = Some(cid);
+    }
     Ok(())
 }
 
@@ -543,30 +601,59 @@ async fn api_chat(
     })))
 }
 
+async fn resolve_history_persona_id(
+    state: &WebState,
+    chat_id: i64,
+    persona_id: Option<i64>,
+) -> Result<i64, (StatusCode, String)> {
+    let pid = match persona_id {
+        Some(id) if id > 0 => id,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "persona_id query parameter is required".into(),
+            ))
+        }
+    };
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Persona {pid} does not exist for this chat"),
+        ));
+    }
+    Ok(pid)
+}
+
 async fn api_history(
     headers: HeaderMap,
     State(state): State<WebState>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
+    let start = Instant::now();
+    let requested_day = query.day.clone();
+    let requested_limit = query.limit;
 
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
-    let cid = chat_id;
-    let persona_id = if let Some(pid) = query.persona_id {
-        pid
-    } else {
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(cid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let persona_id = resolve_history_persona_id(&state, chat_id, query.persona_id).await?;
     let cid2 = chat_id;
     let pid = persona_id;
 
-    let messages = if let Some(ref day) = query.day {
+    let messages = if let Some(ref sid) = query.session_id {
+        let session_id = sid.clone();
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_all_messages_for_session(&session_id)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else if let Some(ref day) = requested_day {
         let (from_date, to_date) = day_range(day);
         call_blocking(state.app_state.db.clone(), move |db| {
             db.get_messages_for_date_range(
@@ -580,17 +667,18 @@ async fn api_history(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        let mut msgs = call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_all_messages(cid2, pid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if let Some(limit) = query.limit {
-            if msgs.len() > limit {
-                msgs = msgs[msgs.len() - limit..].to_vec();
-            }
+        match requested_limit {
+            Some(limit) => call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_recent_messages(cid2, pid, limit, false)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            None => call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_all_messages(cid2, pid)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
         }
-        msgs
     };
 
     let items: Vec<HistoryItem> = messages
@@ -598,11 +686,23 @@ async fn api_history(
         .map(|m| HistoryItem {
             id: m.id,
             sender_name: m.sender_name,
-            content: m.content,
+            content: crate::agent_turn_context::strip_stored_dialogue_markup(&m.content),
             is_from_bot: m.is_from_bot,
             timestamp: m.timestamp,
         })
         .collect();
+
+    info!(
+        target: "web",
+        endpoint = "/api/history",
+        chat_id = chat_id,
+        persona_id = persona_id,
+        day = ?requested_day,
+        limit = ?requested_limit,
+        returned_messages = items.len(),
+        duration_ms = start.elapsed().as_millis(),
+        "History fetched"
+    );
 
     Ok(Json(json!({
         "ok": true,
@@ -638,16 +738,7 @@ async fn api_history_days(
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
 
-    let cid = chat_id;
-    let persona_id = if let Some(pid) = query.persona_id {
-        pid
-    } else {
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(cid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let persona_id = resolve_history_persona_id(&state, chat_id, query.persona_id).await?;
     let cid2 = chat_id;
     let pid = persona_id;
     let days = call_blocking(state.app_state.db.clone(), move |db| {
@@ -678,7 +769,8 @@ async fn list_chat_artifacts(
         .join("shared")
         .join("upload")
         .join("web")
-        .join(chat_id.to_string());
+        .join(chat_id.to_string())
+        .join(persona_id.to_string());
     let legacy_dir = FsPath::new(state.app_state.config.working_dir())
         .join("uploads")
         .join("web")
@@ -711,7 +803,7 @@ async fn list_chat_artifacts(
                     continue;
                 }
             }
-            let url = format!("/api/uploads/web/{chat_id}/{name}");
+            let url = format!("/api/uploads/web/{chat_id}/{persona_id}/{name}");
             let preview_url = format!("{url}?preview=1");
             let meta = std::fs::metadata(&path).ok();
             let created_at = meta
@@ -882,18 +974,41 @@ async fn api_send(
             .await
             {
                 Ok(resp) => {
-                    let response_text = resp
-                        .0
+                    let v = resp.0;
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            state_for_task
+                                .run_hub
+                                .publish(
+                                    &run_id_for_task,
+                                    "background_job",
+                                    json!({
+                                        "job_id": jid,
+                                        "message": "Task queued in background."
+                                    })
+                                    .to_string(),
+                                    limits.run_history_limit,
+                                )
+                                .await;
+                        }
+                    }
+                    let response_text = v
                         .get("response")
-                        .and_then(|v| v.as_str())
+                        .and_then(|x| x.as_str())
                         .unwrap_or_default()
                         .to_string();
+                    let mut done_payload = json!({ "response": response_text });
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            done_payload["background_job_id"] = json!(jid);
+                        }
+                    }
                     state_for_task
                         .run_hub
                         .publish(
                             &run_id_for_task,
                             "done",
-                            json!({"response": response_text}).to_string(),
+                            done_payload.to_string(),
                             limits.run_history_limit,
                         )
                         .await;
@@ -1006,249 +1121,209 @@ async fn api_send_stream(
         .app_state
         .chat_queue
         .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {
-        let run_start = Instant::now();
-        state_for_task
-            .run_hub
-            .publish(
-                &run_id_for_task,
-                "status",
-                json!({"message": "running"}).to_string(),
-                limits.run_history_limit,
-            )
-            .await;
+            let run_start = Instant::now();
+            state_for_task
+                .run_hub
+                .publish(
+                    &run_id_for_task,
+                    "status",
+                    json!({"message": "running"}).to_string(),
+                    limits.run_history_limit,
+                )
+                .await;
 
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let run_hub = state_for_task.run_hub.clone();
-        let run_id_for_events = run_id_for_task.clone();
-        let run_history_limit = limits.run_history_limit;
-        let forward = tokio::spawn(async move {
-            while let Some(evt) = evt_rx.recv().await {
-                match evt {
-                    AgentEvent::Iteration { iteration } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "status",
-                                json!({"message": format!("iteration {iteration}")}).to_string(),
-                                run_history_limit,
-                            )
-                            .await;
+            let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            let run_hub = state_for_task.run_hub.clone();
+            let run_id_for_events = run_id_for_task.clone();
+            let run_history_limit = limits.run_history_limit;
+            let forward = tokio::spawn(async move {
+                while let Some(evt) = evt_rx.recv().await {
+                    match evt {
+                        AgentEvent::Iteration { iteration } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "status",
+                                    json!({"message": format!("iteration {iteration}")})
+                                        .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::ToolStart {
+                            tool_use_id,
+                            name,
+                            input,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "tool_start",
+                                    json!({
+                                        "tool_use_id": tool_use_id,
+                                        "name": name,
+                                        "input": input
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::ToolResult {
+                            tool_use_id,
+                            name,
+                            is_error,
+                            output,
+                            duration_ms,
+                            status_code,
+                            bytes,
+                            error_type,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "tool_result",
+                                    json!({
+                                        "tool_use_id": tool_use_id,
+                                        "name": name,
+                                        "is_error": is_error,
+                                        "output": output,
+                                        "duration_ms": duration_ms,
+                                        "status_code": status_code,
+                                        "bytes": bytes,
+                                        "error_type": error_type
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::TextDelta { delta } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "delta",
+                                    json!({"delta": delta}).to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::Hook {
+                            event_name,
+                            tool_name,
+                            matched_hook_ids,
+                            blocked_reason,
+                            additional_context_count,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "hook",
+                                    json!({
+                                        "event_name": event_name,
+                                        "tool_name": tool_name,
+                                        "matched_hook_ids": matched_hook_ids,
+                                        "blocked_reason": blocked_reason,
+                                        "additional_context_count": additional_context_count,
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::FinalResponse { text } => {
+                            if !text.is_empty() {
+                                run_hub
+                                    .publish(
+                                        &run_id_for_events,
+                                        "delta",
+                                        json!({"delta": text}).to_string(),
+                                        run_history_limit,
+                                    )
+                                    .await;
+                            }
+                        }
                     }
-                    AgentEvent::WorkflowSelected {
-                        workflow_id,
-                        confidence,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "workflow_selected",
-                                json!({
-                                    "workflow_id": workflow_id,
-                                    "confidence": confidence
-                                })
-                                .to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::ToolStart {
-                        tool_use_id,
-                        name,
-                        input,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "tool_start",
-                                json!({
-                                    "tool_use_id": tool_use_id,
-                                    "name": name,
-                                    "input": input
-                                })
-                                .to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::ToolResult {
-                        tool_use_id,
-                        name,
-                        is_error,
-                        output,
-                        duration_ms,
-                        status_code,
-                        bytes,
-                        error_type,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "tool_result",
-                                json!({
-                                    "tool_use_id": tool_use_id,
-                                    "name": name,
-                                    "is_error": is_error,
-                                    "output": output,
-                                    "duration_ms": duration_ms,
-                                    "status_code": status_code,
-                                    "bytes": bytes,
-                                    "error_type": error_type
-                                })
-                                .to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::TextDelta { delta } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "delta",
-                                json!({"delta": delta}).to_string(),
-                                run_history_limit,
-                            )
-                            .await;
-                    }
-                    AgentEvent::FinalResponse { .. } => {}
                 }
-            }
-        });
+            });
 
-        match send_and_store_response_with_events(
-            state_for_task.clone(),
-            body,
-            Some(&evt_tx),
-            Some(&run_id_for_task),
-            Some(cancel),
-        )
-        .await
-        {
-            Ok(resp) => {
-                let response_text = resp
-                    .0
-                    .get("response")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-
-                if response_text.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
-                    let job_id = uuid::Uuid::new_v4().to_string();
-                    let prompt_text = resp
-                        .0
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
+            match send_and_store_response_with_events(
+                state_for_task.clone(),
+                body,
+                Some(&evt_tx),
+                Some(&run_id_for_task),
+                Some(cancel),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let v = resp.0;
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            state_for_task
+                                .run_hub
+                                .publish(
+                                    &run_id_for_task,
+                                    "background_job",
+                                    json!({
+                                        "job_id": jid,
+                                        "message": "Task queued in background."
+                                    })
+                                    .to_string(),
+                                    limits.run_history_limit,
+                                )
+                                .await;
+                        }
+                    }
+                    let response_text = v
+                        .get("response")
+                        .and_then(|x| x.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let persona_id = resp
-                        .0
-                        .get("persona_id")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-
-                    // Allow only one active background subagent per chat to avoid
-                    // result interleaving and ambiguous follow-up replies.
-                    let active_jobs = call_blocking(state_for_task.app_state.db.clone(), move |db| {
-                        db.count_active_background_jobs_for_chat(chat_id)
-                    })
-                    .await
-                    .unwrap_or(0);
-                    if active_jobs > 0 {
-                        state_for_task
-                            .run_hub
-                            .publish(
-                                &run_id_for_task,
-                                "done",
-                                json!({
-                                    "response": "A background task is already running for this chat. Please wait for it to finish before starting another long-running background task."
-                                })
-                                .to_string(),
-                                limits.run_history_limit,
-                            )
-                            .await;
-                    } else {
-                        let jid = job_id.clone();
-                        let prompt_for_db = prompt_text.clone();
-                        let _ = call_blocking(state_for_task.app_state.db.clone(), move |db| {
-                            db.create_background_job(&jid, chat_id, persona_id, &prompt_for_db, "timeout")
-                        })
-                        .await;
-
-                        crate::background_jobs::spawn_background_job(
-                            state_for_task.app_state.clone(),
-                            job_id.clone(),
-                            chat_id,
-                            persona_id,
-                            prompt_text,
-                        );
-
-                        state_for_task
-                            .run_hub
-                            .publish(
-                                &run_id_for_task,
-                                "background_job",
-                                json!({
-                                    "job_id": job_id,
-                                    "message": "Task moved to background due to timeout. You can keep chatting while it runs."
-                                })
-                                .to_string(),
-                                limits.run_history_limit,
-                            )
-                            .await;
-
-                        state_for_task
-                            .run_hub
-                            .publish(
-                                &run_id_for_task,
-                                "done",
-                                json!({
-                                    "response": "This task is now running as a background subagent. You can continue chatting; a separate reply will arrive when it finishes.",
-                                    "background_job_id": job_id
-                                })
-                                .to_string(),
-                                limits.run_history_limit,
-                            )
-                            .await;
+                    let mut done_payload = json!({ "response": response_text });
+                    if let Some(jid) = v.get("background_job_id").and_then(|x| x.as_str()) {
+                        if !jid.is_empty() {
+                            done_payload["background_job_id"] = json!(jid);
+                        }
                     }
-                } else {
                     state_for_task
                         .run_hub
                         .publish(
                             &run_id_for_task,
                             "done",
-                            json!({"response": response_text}).to_string(),
+                            done_payload.to_string(),
+                            limits.run_history_limit,
+                        )
+                        .await;
+                }
+                Err((_, err_msg)) => {
+                    state_for_task
+                        .run_hub
+                        .publish(
+                            &run_id_for_task,
+                            "error",
+                            json!({"error": err_msg}).to_string(),
                             limits.run_history_limit,
                         )
                         .await;
                 }
             }
-            Err((_, err_msg)) => {
-                state_for_task
-                    .run_hub
-                    .publish(
-                        &run_id_for_task,
-                        "error",
-                        json!({"error": err_msg}).to_string(),
-                        limits.run_history_limit,
-                    )
-                    .await;
-            }
-        }
-        drop(evt_tx);
-        let _ = forward.await;
-        info!(
-            target: "web",
-            endpoint = "/api/send_stream",
-            chat_id = chat_id,
-            run_id = %run_id_for_task,
-            latency_ms = run_start.elapsed().as_millis(),
-            "Stream run finished"
-        );
+            drop(evt_tx);
+            let _ = forward.await;
+            info!(
+                target: "web",
+                endpoint = "/api/send_stream",
+                chat_id = chat_id,
+                run_id = %run_id_for_task,
+                latency_ms = run_start.elapsed().as_millis(),
+                "Stream run finished"
+            );
 
-        state_for_task
-            .run_hub
-            .remove_later(run_id_for_task, 300)
-            .await;
-    })
+            state_for_task
+                .run_hub
+                .remove_later(run_id_for_task, 300)
+                .await;
+        })
         .await;
 
     state
@@ -1372,6 +1447,33 @@ async fn api_stream(
     ))
 }
 
+fn json_background_job(j: &crate::db::BackgroundJob) -> serde_json::Value {
+    json!({
+        "id": j.id,
+        "chat_id": j.chat_id,
+        "persona_id": j.persona_id,
+        "prompt": j.prompt,
+        "status": j.status,
+        "trigger_reason": j.trigger_reason,
+        "created_at": j.created_at,
+        "started_at": j.started_at,
+        "finished_at": j.finished_at,
+        "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
+        "error_text": j.error_text,
+        "lease_owner": j.lease_owner,
+        "lease_expires_at": j.lease_expires_at,
+        "last_progress_at": j.last_progress_at,
+        "last_stage": j.last_stage,
+        "job_kind": j.job_kind,
+        "shell_command": j.shell_command,
+        "workdir": j.workdir,
+        "tmux_session": j.tmux_session,
+        "output_path": j.output_path,
+        "exit_code": j.exit_code,
+        "label": j.label,
+    })
+}
+
 fn json_job_heartbeat(h: &JobHeartbeat) -> serde_json::Value {
     json!({
         "run_key": h.run_key,
@@ -1392,12 +1494,17 @@ async fn api_run_status(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let run_key = query.run_id.clone();
-    let timeline_count = call_blocking(state.app_state.db.clone(), {
-        let run_key = run_key.clone();
-        move |db| Ok(db.get_run_timeline_events(&run_key, 500)?.len() as i64)
-    })
-    .await
-    .unwrap_or(0);
+    let include_timeline_events = query.timeline_events.unwrap_or(false);
+    let timeline_count = if include_timeline_events {
+        call_blocking(state.app_state.db.clone(), {
+            let run_key = run_key.clone();
+            move |db| Ok(db.get_run_timeline_events(&run_key, 500)?.len() as i64)
+        })
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
 
     let hb_opt = call_blocking(state.app_state.db.clone(), {
         let run_key = run_key.clone();
@@ -1407,11 +1514,12 @@ async fn api_run_status(
     .ok()
     .flatten();
 
-    let bg_json = if hb_opt
-        .as_ref()
-        .map(|h| h.job_type.as_str() == "manual_background")
-        .unwrap_or(false)
-    {
+    let bg_json = if hb_opt.as_ref().is_some_and(|h| {
+        matches!(
+            h.job_type.as_str(),
+            "manual_background" | "shell_background"
+        )
+    }) {
         call_blocking(state.app_state.db.clone(), {
             let run_key = run_key.clone();
             move |db| db.get_background_job(&run_key)
@@ -1419,21 +1527,7 @@ async fn api_run_status(
         .await
         .ok()
         .flatten()
-        .map(|j| {
-            json!({
-                "id": j.id,
-                "chat_id": j.chat_id,
-                "persona_id": j.persona_id,
-                "prompt": j.prompt,
-                "status": j.status,
-                "trigger_reason": j.trigger_reason,
-                "created_at": j.created_at,
-                "started_at": j.started_at,
-                "finished_at": j.finished_at,
-                "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
-                "error_text": j.error_text,
-            })
-        })
+        .map(|j| json_background_job(&j))
     } else {
         None
     };
@@ -1475,11 +1569,17 @@ async fn api_queue_diagnostics(
     require_auth(&headers, state.auth_token.as_deref())?;
     let lanes = state.app_state.chat_queue.diagnostics().await;
     let db = state.app_state.db.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let pending_timeout_secs = state
+        .app_state
+        .config
+        .background_job_pending_start_timeout_secs as i64;
+    let mut background_by_chat: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
     let mut rows = Vec::new();
-    for lane in lanes {
+    for lane in &lanes {
         let chat_id = lane.chat_id;
         let mut items = Vec::new();
-        for it in lane.items {
+        for it in &lane.items {
             let cid = chat_id;
             let pid = it.persona_id;
             let persona_name = call_blocking(db.clone(), move |db| {
@@ -1505,6 +1605,7 @@ async fn api_queue_diagnostics(
         }
         rows.push(json!({
             "chat_id": lane.chat_id,
+            "persona_id": lane.persona_id,
             "pending": lane.pending,
             "active_for_ms": lane.active_for_ms,
             "oldest_wait_ms": lane.oldest_wait_ms,
@@ -1513,10 +1614,29 @@ async fn api_queue_diagnostics(
             "workflow_id": lane.workflow_id,
             "items": items,
         }));
+
+        let cid = lane.chat_id;
+        let now_bg = now.clone();
+        let timeout = pending_timeout_secs;
+        if let Ok(active) = call_blocking(db.clone(), move |database| {
+            database.list_active_background_jobs_for_chat(cid, &now_bg, timeout)
+        })
+        .await
+        {
+            let entries: Vec<serde_json::Value> = active.iter().map(json_background_job).collect();
+            if !entries.is_empty() {
+                background_by_chat.insert(lane.chat_id, entries);
+            }
+        }
     }
+    let bg_map: serde_json::Map<String, serde_json::Value> = background_by_chat
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::Array(v)))
+        .collect();
     Ok(Json(json!({
         "ok": true,
         "lanes": rows,
+        "background_by_chat": bg_map,
     })))
 }
 
@@ -1533,17 +1653,144 @@ async fn api_queue_cancel(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
-    if body.run_id.trim().is_empty() {
+    let run_id = body.run_id.trim();
+    if run_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "run_id is required".into()));
     }
+    info!(chat_id, run_id, "web queue cancel requested");
     let ok = state
         .app_state
         .chat_queue
-        .request_cancel(body.run_id.trim(), chat_id)
+        .request_cancel(run_id, chat_id)
         .await;
     if !ok {
+        warn!(chat_id, run_id, "web queue cancel target not found");
         return Err((StatusCode::NOT_FOUND, "run not found for this chat".into()));
     }
+    info!(chat_id, run_id, "web queue cancel accepted");
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct QueueRemoveRequest {
+    run_id: String,
+    chat_id: Option<i64>,
+}
+
+async fn api_queue_remove(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<QueueRemoveRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let run_id = body.run_id.trim();
+    if run_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "run_id is required".into()));
+    }
+    info!(chat_id, run_id, "web queue remove requested");
+    let outcome = state
+        .app_state
+        .chat_queue
+        .request_remove_queued(run_id, chat_id)
+        .await;
+    match outcome {
+        QueueRemoveOutcome::Removed => {
+            info!(chat_id, run_id, "web queue remove accepted");
+            Ok(Json(json!({ "ok": true })))
+        }
+        QueueRemoveOutcome::Running => {
+            warn!(
+                chat_id,
+                run_id, "web queue remove rejected because run is running"
+            );
+            Err((
+                StatusCode::CONFLICT,
+                "run is currently running; use Stop instead".into(),
+            ))
+        }
+        QueueRemoveOutcome::NotFound => {
+            warn!(chat_id, run_id, "web queue remove target not found");
+            Err((StatusCode::NOT_FOUND, "run not found for this chat".into()))
+        }
+    }
+}
+
+fn is_background_job_active_status(status: &str) -> bool {
+    matches!(
+        status,
+        "pending" | "running" | "completed_raw" | "main_agent_processing"
+    )
+}
+
+#[derive(Deserialize)]
+struct BackgroundJobCancelRequest {
+    job_id: String,
+    chat_id: Option<i64>,
+}
+
+async fn api_background_job_cancel(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<BackgroundJobCancelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let job_id = body.job_id.trim().to_string();
+    if job_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "job_id is required".into()));
+    }
+
+    let job = call_blocking(state.app_state.db.clone(), {
+        let job_id = job_id.clone();
+        move |db| db.get_background_job(&job_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(job) = job else {
+        return Err((StatusCode::NOT_FOUND, "background job not found".into()));
+    };
+    if job.chat_id != chat_id {
+        return Err((StatusCode::NOT_FOUND, "background job not found".into()));
+    }
+    if !is_background_job_active_status(job.status.as_str()) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("background job is not active (status: {})", job.status),
+        ));
+    }
+
+    info!(chat_id, job_id, "web background job cancel requested");
+
+    if job.job_kind == "shell" {
+        if let Err(e) = crate::background_shell::cancel_background_shell_job(
+            &state.app_state,
+            &job,
+            "Cancelled by user",
+        )
+        .await
+        {
+            return Err((StatusCode::CONFLICT, e));
+        }
+        return Ok(Json(json!({ "ok": true })));
+    }
+
+    let cancelled = state
+        .app_state
+        .background_job_control
+        .request_cancel(&job_id, chat_id)
+        .await;
+    if !cancelled {
+        warn!(
+            chat_id,
+            job_id, "web background job cancel target not found in runtime registry"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "background job is no longer cancellable".into(),
+        ));
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1559,8 +1806,24 @@ async fn send_and_store_response_with_events(
     let mut image_data: Option<(String, String)> = None;
 
     let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
-    let attachment_notes =
-        process_web_attachments(&state, chat_id, &body.attachments, &mut image_data).await?;
+    let persona_id = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        let cid = chat_id;
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let attachment_notes = process_web_attachments(
+        &state,
+        chat_id,
+        persona_id,
+        &body.attachments,
+        &mut image_data,
+    )
+    .await?;
     if !attachment_notes.is_empty() {
         let note_text = attachment_notes.join("\n");
         if text.trim().is_empty() {
@@ -1613,12 +1876,21 @@ async fn send_and_store_response_with_events(
                 .await
             }
             SlashCommand::Schedule => {
-                let tasks = call_blocking(state.app_state.db.clone(), |db| {
-                    db.get_all_scheduled_tasks_for_display()
-                })
-                .await;
+                let cid_sched = chat_id;
+                let pid_sched = persona_id;
+                let tasks = if pid_sched > 0 {
+                    call_blocking(state.app_state.db.clone(), move |db| {
+                        db.get_scheduled_tasks_for_chat_and_persona(cid_sched, pid_sched)
+                    })
+                    .await
+                } else {
+                    call_blocking(state.app_state.db.clone(), move |db| {
+                        db.get_scheduled_tasks_for_chat_for_display(cid_sched)
+                    })
+                    .await
+                };
                 match &tasks {
-                    Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
+                    Ok(t) => crate::tools::schedule::format_tasks_list(t),
                     Err(e) => format!("Error listing tasks: {e}"),
                 }
             }
@@ -1626,7 +1898,7 @@ async fn send_and_store_response_with_events(
                 let cid2 = chat_id;
                 let pid = persona_id;
                 let history = call_blocking(state.app_state.db.clone(), move |db| {
-                    db.get_recent_messages(cid2, pid, 500)
+                    db.get_recent_messages(cid2, pid, 500, false)
                 })
                 .await
                 .unwrap_or_default();
@@ -1652,13 +1924,15 @@ async fn send_and_store_response_with_events(
 
         deliver_to_contact(
             state.app_state.db.clone(),
-            Some(&state.app_state.bot),
-            state.app_state.discord_http.as_deref(),
+            state.app_state.telegram_bots.as_ref(),
+            state.app_state.discord_http.as_ref(),
             &state.app_state.config.bot_username,
             chat_id,
             persona_id,
             &resp,
             Some(state.app_state.config.workspace_root_absolute()),
+            DeliveryScope::ContactWide,
+            None,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1685,25 +1959,17 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let cid = chat_id;
-    let persona_id = if let Some(pid) = body.persona_id {
-        pid
-    } else {
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_current_persona_id(cid)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
-
+    let full_prompt_for_handoff = text.clone();
     let user_msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
         chat_id,
         persona_id,
+        session_id: body.session_id.clone(),
         sender_name: sender_name.clone(),
         content: text,
         is_from_bot: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        origin: crate::db::message_origin_interactive(),
     };
     call_blocking(state.app_state.db.clone(), move |db| {
         db.store_message(&user_msg)
@@ -1711,7 +1977,7 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let response = process_with_agent_with_events(
+    let agent_out = process_with_agent_with_events(
         &state.app_state,
         AgentRequestContext {
             caller_channel: "web",
@@ -1721,6 +1987,8 @@ async fn send_and_store_response_with_events(
             is_scheduled_task: false,
             is_background_job: false,
             run_key: run_key.map(|s| s.to_string()),
+            reply_bot_instance_id: None,
+            session_id: body.session_id.clone(),
         },
         None,
         image_data,
@@ -1730,33 +1998,354 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if !response.starts_with(BACKGROUND_JOB_HANDOFF_PREFIX) {
-        deliver_to_contact(
+    let mut response = agent_out.response;
+
+    let mut background_job_id: Option<String> = None;
+    let mut background_job_queued = false;
+
+    if is_background_handoff_response(&response) {
+        let trig = handoff_trigger_for_db(&response).unwrap_or("timeout");
+        match try_enqueue_background_handoff(
+            state.app_state.clone(),
+            chat_id,
+            persona_id,
+            full_prompt_for_handoff,
+            trig,
+            "web",
+        )
+        .await
+        {
+            HandoffEnqueueOutcome::Queued { job_id, start_ack } => {
+                background_job_id = Some(job_id.clone());
+                background_job_queued = true;
+                response = await_handoff_startup_ack(start_ack).await;
+            }
+            HandoffEnqueueOutcome::BlockedAlreadyRunning => {
+                response = "A background task is already running for this chat. Please wait for it to finish before starting another long-running background task.".into();
+            }
+            HandoffEnqueueOutcome::ActiveLookupFailed(msg) => {
+                response = format!("Failed to check active background jobs: {msg}");
+            }
+            HandoffEnqueueOutcome::DbCreateFailed(e) => {
+                response = format!("Failed to queue background task: {e}");
+            }
+        }
+    } else {
+        let ws_root = state.app_state.config.workspace_root_absolute();
+        response = crate::final_delivery_media::normalize_assistant_artifact_references(
+            &response, &ws_root, chat_id, persona_id,
+        );
+        response = materialize_response_file_links(&state, chat_id, persona_id, &response).await?;
+        let delivery = deliver_agent_final_to_contact(
             state.app_state.db.clone(),
-            Some(&state.app_state.bot),
-            state.app_state.discord_http.as_deref(),
+            state.app_state.telegram_bots.as_ref(),
+            state.app_state.discord_http.as_ref(),
             &state.app_state.config.bot_username,
             chat_id,
             persona_id,
             &response,
             Some(state.app_state.config.workspace_root_absolute()),
+            DeliveryScope::ContactWide,
+            body.session_id.clone(),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        response = delivery.response_for_client;
     }
 
-    Ok(Json(json!({
+    let mut out = json!({
         "ok": true,
         "chat_id": chat_id,
         "persona_id": persona_id,
         "prompt": raw_text,
         "response": response,
-    })))
+        "background_job_queued": background_job_queued,
+    });
+    if let Some(id) = background_job_id {
+        out["background_job_id"] = json!(id);
+    } else {
+        out["background_job_id"] = serde_json::Value::Null;
+    }
+    Ok(Json(out))
+}
+
+fn resolve_response_local_file_path(
+    state: &WebState,
+    chat_id: i64,
+    persona_id: i64,
+    raw: &str,
+) -> Option<PathBuf> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
+    if trimmed.starts_with('#') || trimmed.starts_with("mailto:") {
+        return None;
+    }
+    let workspace_root = state.app_state.config.workspace_root_absolute();
+    let kind = crate::final_delivery_media::ArtifactResolveKind::AnyFile;
+    if let Some(path) = crate::final_delivery_media::resolve_workspace_artifact_path(
+        &workspace_root,
+        Some(chat_id),
+        Some(persona_id),
+        trimmed,
+        kind,
+    ) {
+        return Some(path);
+    }
+    let basename = std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    for candidate in crate::final_delivery_media::artifact_basename_fallback_candidates(basename) {
+        if candidate == basename {
+            continue;
+        }
+        if let Some(path) = crate::final_delivery_media::resolve_workspace_artifact_path(
+            &workspace_root,
+            Some(chat_id),
+            Some(persona_id),
+            &candidate,
+            kind,
+        ) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn upload_rel_url_exists(state: &WebState, rel_url: &str) -> bool {
+    let Some(rel) = rel_url.strip_prefix("/api/uploads/") else {
+        return true;
+    };
+    let shared_path = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
+        .join(rel);
+    if shared_path.is_file() {
+        return true;
+    }
+    let legacy_path = FsPath::new(state.app_state.config.working_dir())
+        .join("uploads")
+        .join(rel);
+    legacy_path.is_file()
+}
+
+async fn persist_file_for_web_delivery(
+    state: &WebState,
+    chat_id: i64,
+    persona_id: i64,
+    source_path: &FsPath,
+) -> Result<String, (StatusCode, String)> {
+    let filename = source_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    let bytes = tokio::fs::read(source_path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let uploads_dir = web_upload_dir_for_persona(state, chat_id, persona_id);
+    tokio::fs::create_dir_all(&uploads_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let safe_name = sanitize_upload_filename(&filename);
+    let stored_name = format!("{}-bot-{}", ts, safe_name);
+    let saved_path = uploads_dir.join(&stored_name);
+    tokio::fs::write(&saved_path, &bytes)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(format!(
+        "/api/uploads/web/{chat_id}/{persona_id}/{stored_name}"
+    ))
+}
+
+async fn materialize_response_file_links(
+    state: &WebState,
+    chat_id: i64,
+    persona_id: i64,
+    response: &str,
+) -> Result<String, (StatusCode, String)> {
+    let Some(markdown_link_re) = regex::Regex::new(r#"\]\(([^)\n]+)\)"#).ok() else {
+        return Ok(response.to_string());
+    };
+    let Some(parenthesized_target_re) = regex::Regex::new(r#"\(([^()\n]+)\)"#).ok() else {
+        return Ok(response.to_string());
+    };
+    let mut rewrites: HashMap<String, String> = HashMap::new();
+    for caps in markdown_link_re.captures_iter(response) {
+        let Some(target) = caps.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        if rewrites.contains_key(&target) {
+            continue;
+        }
+        if let Some(local_path) =
+            resolve_response_local_file_path(state, chat_id, persona_id, &target)
+        {
+            let rel =
+                persist_file_for_web_delivery(state, chat_id, persona_id, &local_path).await?;
+            rewrites.insert(target, rel);
+        }
+    }
+    for caps in parenthesized_target_re.captures_iter(response) {
+        let Some(target) = caps.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        if rewrites.contains_key(&target) {
+            continue;
+        }
+        if let Some(local_path) =
+            resolve_response_local_file_path(state, chat_id, persona_id, &target)
+        {
+            let rel =
+                persist_file_for_web_delivery(state, chat_id, persona_id, &local_path).await?;
+            rewrites.insert(target, rel);
+        }
+    }
+
+    let mut updated = response.to_string();
+    for (target, rel) in &rewrites {
+        updated = updated.replace(&format!("({target})"), &format!("({rel})"));
+    }
+
+    let upload_urls = extract_upload_urls_from_text(&updated);
+    for url in upload_urls {
+        if upload_rel_url_exists(state, &url) {
+            continue;
+        }
+        let fallback_name = url.rsplit('/').next().unwrap_or_default();
+        if fallback_name.is_empty() {
+            warn!(target: "web", url = %url, "assistant response referenced missing upload URL");
+            continue;
+        }
+        if let Some(fallback_local) =
+            resolve_response_local_file_path(state, chat_id, persona_id, fallback_name)
+        {
+            let rel =
+                persist_file_for_web_delivery(state, chat_id, persona_id, &fallback_local).await?;
+            updated = updated.replace(&url, &rel);
+        } else {
+            warn!(target: "web", url = %url, "assistant response referenced missing upload URL");
+        }
+    }
+
+    Ok(updated)
+}
+
+fn web_max_document_bytes(config: &Config) -> u64 {
+    config
+        .max_document_size_mb
+        .saturating_mul(1024)
+        .saturating_mul(1024)
+}
+
+/// Axum default is 2 MB; allow inline JSON base64 payloads up to ~1.4× file limit + headroom.
+fn web_json_body_limit_bytes(config: &Config) -> usize {
+    let doc = web_max_document_bytes(config) as f64;
+    (doc * 1.45).ceil() as usize + 65_536
+}
+
+fn web_multipart_body_limit_bytes(config: &Config) -> usize {
+    web_max_document_bytes(config) as usize + 2 * 1024 * 1024
+}
+
+fn web_upload_dir(state: &WebState, chat_id: i64) -> PathBuf {
+    state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join("upload")
+        .join("web")
+        .join(chat_id.to_string())
+}
+
+fn web_upload_dir_for_persona(state: &WebState, chat_id: i64, persona_id: i64) -> PathBuf {
+    web_upload_dir(state, chat_id).join(persona_id.to_string())
+}
+
+fn resolve_upload_tool_path_on_disk(state: &WebState, tool_path: &str) -> Option<PathBuf> {
+    let clean = tool_path.trim().trim_start_matches('/');
+    if clean.is_empty() || clean.contains("..") {
+        return None;
+    }
+    let full = state
+        .app_state
+        .config
+        .workspace_root_absolute()
+        .join("shared")
+        .join(clean);
+    if full.is_file() {
+        Some(full)
+    } else {
+        None
+    }
+}
+
+fn fast_upload_filename(safe_name: &str) -> String {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    format!("{ts}-{safe_name}")
+}
+
+fn attachment_notes_for_saved(
+    filename: &str,
+    bytes_len: u64,
+    mime: &str,
+    tool_path: &str,
+    saved_path: &FsPath,
+    rel_url: &str,
+) -> Vec<String> {
+    let mut notes = vec![format!(
+        "[document] filename={} bytes={} mime={} tool_path={} saved_path={} url={}",
+        filename,
+        bytes_len,
+        mime,
+        tool_path,
+        saved_path.display(),
+        rel_url
+    )];
+    if mime.starts_with("image/") {
+        let alt = filename.replace(']', "_");
+        notes.push(format!("![{alt}]({rel_url})"));
+    } else {
+        notes.push(format!("[{filename}]({rel_url})"));
+    }
+    notes
+}
+
+async fn set_image_data_from_bytes(
+    image_data: &mut Option<(String, String)>,
+    bytes: &[u8],
+    mime: &str,
+) {
+    if image_data.is_none() && mime.starts_with("image/") {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        *image_data = Some((b64, mime.to_string()));
+    }
+}
+
+async fn set_image_data_from_path(
+    image_data: &mut Option<(String, String)>,
+    path: &FsPath,
+    mime: &str,
+) -> Result<(), (StatusCode, String)> {
+    if image_data.is_some() || !mime.starts_with("image/") {
+        return Ok(());
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    set_image_data_from_bytes(image_data, &bytes, mime).await;
+    Ok(())
 }
 
 async fn process_web_attachments(
     state: &WebState,
     chat_id: i64,
+    persona_id: i64,
     attachments: &[SendAttachmentRequest],
     image_data: &mut Option<(String, String)>,
 ) -> Result<Vec<String>, (StatusCode, String)> {
@@ -1764,32 +2353,14 @@ async fn process_web_attachments(
         return Ok(Vec::new());
     }
 
-    let max_bytes = state
-        .app_state
-        .config
-        .max_document_size_mb
-        .saturating_mul(1024)
-        .saturating_mul(1024);
-    let dir = state
-        .app_state
-        .config
-        .workspace_root_absolute()
-        .join("shared")
-        .join("upload")
-        .join("web")
-        .join(chat_id.to_string());
+    let max_bytes = web_max_document_bytes(&state.app_state.config);
+    let dir = web_upload_dir_for_persona(state, chat_id, persona_id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut notes = Vec::new();
     for (idx, att) in attachments.iter().enumerate() {
-        let bytes = decode_base64_payload(&att.data_base64).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid attachment base64: {e}"),
-            )
-        })?;
         let mime = att
             .media_type
             .clone()
@@ -1798,6 +2369,61 @@ async fn process_web_attachments(
             .filename
             .clone()
             .unwrap_or_else(|| format!("web-attachment-{}.bin", idx + 1));
+
+        if let Some(tool_path) = att.tool_path.as_deref().filter(|s| !s.trim().is_empty()) {
+            let expected_prefix = format!("upload/web/{chat_id}/{persona_id}/");
+            if !tool_path.starts_with(&expected_prefix) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("attachment path must start with {expected_prefix}"),
+                ));
+            }
+            let disk_path =
+                resolve_upload_tool_path_on_disk(state, tool_path).ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("attachment not found: {tool_path}"),
+                    )
+                })?;
+            let meta = tokio::fs::metadata(&disk_path)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let bytes_len = meta.len();
+            if bytes_len > max_bytes {
+                notes.push(format!(
+                    "[document] filename={} bytes={} mime={} skipped=too_large",
+                    filename, bytes_len, mime
+                ));
+                continue;
+            }
+            let rel_url = att.url.clone().unwrap_or_else(|| {
+                let saved_file = disk_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                format!("/api/uploads/web/{chat_id}/{persona_id}/{saved_file}")
+            });
+            set_image_data_from_path(image_data, &disk_path, &mime).await?;
+            notes.extend(attachment_notes_for_saved(
+                &filename, bytes_len, &mime, tool_path, &disk_path, &rel_url,
+            ));
+            continue;
+        }
+
+        let b64 = att.data_base64.as_deref().filter(|s| !s.trim().is_empty());
+        let Some(b64) = b64 else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "attachment must include tool_path or data_base64".into(),
+            ));
+        };
+
+        let bytes = decode_base64_payload(b64).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid attachment base64: {e}"),
+            )
+        })?;
 
         if (bytes.len() as u64) > max_bytes {
             notes.push(format!(
@@ -1809,41 +2435,127 @@ async fn process_web_attachments(
             continue;
         }
 
-        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let safe_name = sanitize_upload_filename(&filename);
-        let path = dir.join(format!("{}-{}-{}", ts, idx + 1, safe_name));
+        let stable_name = stable_upload_filename(&safe_name, &bytes, idx + 1);
+        let path = dir.join(stable_name);
         tokio::fs::write(&path, &bytes)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let saved_file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        let tool_path = format!("upload/web/{}/{}", chat_id, saved_file);
-        let rel_url = format!("/api/uploads/web/{chat_id}/{saved_file}");
+        let tool_path = format!("upload/web/{}/{}/{}", chat_id, persona_id, saved_file);
+        let rel_url = format!("/api/uploads/web/{chat_id}/{persona_id}/{saved_file}");
 
-        if image_data.is_none() && mime.starts_with("image/") {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_slice());
-            *image_data = Some((b64, mime.clone()));
-        }
+        set_image_data_from_bytes(image_data, &bytes, &mime).await;
 
-        notes.push(format!(
-            "[document] filename={} bytes={} mime={} tool_path={} saved_path={} url={}",
-            filename,
-            bytes.len(),
-            mime,
-            tool_path,
-            path.display(),
-            rel_url
+        notes.extend(attachment_notes_for_saved(
+            &filename,
+            bytes.len() as u64,
+            &mime,
+            &tool_path,
+            &path,
+            &rel_url,
         ));
-
-        if mime.starts_with("image/") {
-            let alt = filename.replace(']', "_");
-            notes.push(format!("![{alt}]({rel_url})"));
-        } else {
-            notes.push(format!("[{filename}]({rel_url})"));
-        }
     }
 
     Ok(notes)
+}
+
+async fn api_upload(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<UploadQueryParams>,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    let persona_id = if let Some(pid) = query.persona_id {
+        pid
+    } else {
+        let cid = chat_id;
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let max_bytes = web_max_document_bytes(&state.app_state.config);
+    let dir = web_upload_dir_for_persona(&state, chat_id, persona_id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut uploaded: Option<UploadResponse> = None;
+
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid multipart upload: {e}"),
+        )
+    })? {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let original_name = field
+            .file_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "web-upload.bin".to_string());
+        let mime = field
+            .content_type()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let safe_name = sanitize_upload_filename(&original_name);
+        let disk_name = fast_upload_filename(&safe_name);
+        let path = dir.join(&disk_name);
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut total: u64 = 0;
+        while let Some(chunk) = field.chunk().await.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read upload chunk: {e}"),
+            )
+        })? {
+            total = total.saturating_add(chunk.len() as u64);
+            if total > max_bytes {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "file exceeds maximum size of {} MB (MAX_DOCUMENT_SIZE_MB)",
+                        state.app_state.config.max_document_size_mb
+                    ),
+                ));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let saved_file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let tool_path = format!("upload/web/{}/{}/{}", chat_id, persona_id, saved_file);
+        let rel_url = format!("/api/uploads/web/{chat_id}/{persona_id}/{saved_file}");
+        uploaded = Some(UploadResponse {
+            filename: original_name,
+            media_type: mime,
+            bytes: total,
+            tool_path,
+            url: rel_url,
+        });
+        break;
+    }
+
+    uploaded.map(Json).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing file field in upload".into(),
+        )
+    })
 }
 
 fn decode_base64_payload(payload: &str) -> anyhow::Result<Vec<u8>> {
@@ -1870,6 +2582,20 @@ fn sanitize_upload_filename(name: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn stable_upload_filename(safe_name: &str, bytes: &[u8], fallback_index: usize) -> String {
+    let final_name = if safe_name.is_empty() {
+        format!("web-attachment-{}.bin", fallback_index)
+    } else {
+        safe_name.to_string()
+    };
+    let digest = Sha256::digest(bytes);
+    let hash = digest[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    format!("{hash}-{final_name}")
 }
 
 /// Clear context: delete only the current persona's session for this contact (per-persona reset).
@@ -2026,17 +2752,1265 @@ struct PersonaMemoryPathParams {
     persona_id: i64,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AgentHistoryOptimizeRequest {
+    #[serde(default)]
+    operator_notes: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PersonaBookmarkPathParams {
+    persona_id: i64,
+}
+
+#[derive(Deserialize)]
+struct PersonaBookmarkDeletePathParams {
+    persona_id: i64,
+    message_id: String,
+}
+
+#[derive(Deserialize)]
+struct PersonaMessagePathParams {
+    persona_id: i64,
+    message_id: String,
+}
+
+#[derive(Deserialize)]
+struct PersonaPolicyPathParams {
+    persona_id: i64,
+}
+
+#[derive(Deserialize)]
+struct HookDefinitionUpsertBody {
+    id: Option<i64>,
+    name: String,
+    event_name: String,
+    matcher: Option<String>,
+    action_type: String,
+    action_payload_json: Option<String>,
+    enabled: Option<bool>,
+    #[serde(default)]
+    scoped_persona_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    creating_persona_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct HookDefinitionDeletePathParams {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct SkillsQuery {
+    persona_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct HooksQuery {
+    persona_id: Option<i64>,
+}
+
+/// PATCH tri-state: absent = unchanged, JSON `null` = clear, value = set.
+/// Plain `Option<Option<T>>` treats JSON `null` as absent; this wrapper maps it to `Some(None)`.
+fn deserialize_patch_field<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PersonaPolicyPatchBody {
+    /// `null` => default allow-all. `[]` => explicit allow-none.
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    allowed_hook_ids: Option<Option<Vec<i64>>>,
+    /// `null` => default allow-all. `[]` => explicit allow-none.
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    allowed_skill_names: Option<Option<Vec<String>>>,
+}
+
+#[derive(Deserialize)]
+struct PersonaBookmarkUpsertBody {
+    message_id: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PersonaBulletinPatchBody {
+    /// `null` clears override (server defaults). Omitted = leave unchanged.
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    recent_history_min_user: Option<Option<i64>>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    recent_history_min_assistant: Option<Option<i64>>,
+    /// `null` clears memo. Omitted = leave unchanged.
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    operator_memo: Option<Option<String>>,
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() > max_chars {
+        format!("{}...", input.chars().take(max_chars).collect::<String>())
+    } else {
+        input.to_string()
+    }
+}
+
+fn normalize_persona_scope_ids(ids: &[i64]) -> Vec<i64> {
+    let mut out: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+// --- Chat Sessions ---
+
+#[derive(Debug, Deserialize)]
+struct ChatSessionsListQuery {
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+    #[serde(default)]
+    include_archived: Option<bool>,
+}
+
+async fn api_chat_sessions_list(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<ChatSessionsListQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = query.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let include_archived = query.include_archived.unwrap_or(false);
+    let sessions = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_chat_sessions(chat_id, persona_id, include_archived)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let items: Vec<serde_json::Value> = sessions
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "chat_id": s.chat_id,
+                "persona_id": s.persona_id,
+                "title": s.title,
+                "intent": s.intent,
+                "status": s.status,
+                "created_at": s.created_at,
+                "last_active_at": s.last_active_at,
+                "archived_at": s.archived_at,
+                "ttl_hours": s.ttl_hours,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "sessions": items })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChatSessionRequest {
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+    intent: String,
+    #[serde(default)]
+    ttl_hours: Option<i64>,
+}
+
+async fn api_chat_sessions_create(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<CreateChatSessionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    let intent = body.intent.trim().to_string();
+    if intent.is_empty() || intent.len() > 500 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "intent must be 1-500 characters".into(),
+        ));
+    }
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let title = intent.chars().take(60).collect::<String>();
+    let ttl_hours = body.ttl_hours.unwrap_or(72).max(0);
+
+    let sid = session_id.clone();
+    let t = title.clone();
+    let i = intent.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.create_chat_session(&sid, chat_id, persona_id, &t, &i, ttl_hours)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Run bootstrap agent turn: search vault/skills and produce compact context
+    let bootstrap_prompt = format!(
+        concat!(
+            "You are bootstrapping a new focused session. The user's intent is:\n\n",
+            "\"{}\"\n\n",
+            "Search the vault (using search_vault or mempalace search) for notes relevant to this intent. ",
+            "Also list which skills from the workspace are relevant.\n\n",
+            "Return ONLY a compact JSON object (no markdown fences) with this structure:\n",
+            "{{\"relevant_notes\": [\"note title or path\", ...], ",
+            "\"selected_skills\": [\"skill_name\", ...], ",
+            "\"key_context\": \"2-3 sentence summary of relevant background knowledge\"}}\n\n",
+            "If nothing relevant is found, return the JSON with empty arrays and a brief note in key_context. ",
+            "Do NOT ask the user anything. Do NOT include explanation outside the JSON."
+        ),
+        intent
+    );
+
+    let bootstrap_sid = session_id.clone();
+    let bootstrap_result = process_with_agent(
+        &state.app_state,
+        AgentRequestContext {
+            caller_channel: "web",
+            chat_id,
+            chat_type: "private",
+            persona_id,
+            is_scheduled_task: false,
+            is_background_job: false,
+            run_key: None,
+            reply_bot_instance_id: None,
+            session_id: Some(session_id.clone()),
+        },
+        Some(&bootstrap_prompt),
+        None,
+    )
+    .await;
+
+    let mut bootstrap_summary = String::new();
+    if let Ok(response) = bootstrap_result {
+        let trimmed = response.trim().to_string();
+        // Store as bootstrap_context_json
+        let ctx_sid = bootstrap_sid.clone();
+        let ctx_json = trimmed.clone();
+        let _ = call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_bootstrap_context(&ctx_sid, &ctx_json)
+        })
+        .await;
+
+        // Store the bootstrap response as an assistant message in the session
+        let bot_msg = crate::db::StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id,
+            persona_id,
+            session_id: Some(bootstrap_sid.clone()),
+            sender_name: state.app_state.config.bot_username.clone(),
+            content: format!("Session ready. Context loaded for: {}", intent),
+            is_from_bot: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            origin: crate::db::message_origin_interactive(),
+        };
+        let _ = call_blocking(state.app_state.db.clone(), move |db| {
+            db.store_message(&bot_msg)
+        })
+        .await;
+        bootstrap_summary = trimmed;
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_id": session_id,
+        "title": title,
+        "chat_id": chat_id,
+        "persona_id": persona_id,
+        "bootstrap_context": bootstrap_summary,
+    })))
+}
+
+async fn api_chat_sessions_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let session = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_chat_session(&session_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match session {
+        Some(s) => Ok(Json(serde_json::json!({
+            "id": s.id,
+            "chat_id": s.chat_id,
+            "persona_id": s.persona_id,
+            "title": s.title,
+            "intent": s.intent,
+            "status": s.status,
+            "created_at": s.created_at,
+            "last_active_at": s.last_active_at,
+            "archived_at": s.archived_at,
+            "ttl_hours": s.ttl_hours,
+            "bootstrap_context_json": s.bootstrap_context_json,
+        }))),
+        None => Err((StatusCode::NOT_FOUND, "session not found".into())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchChatSessionRequest {
+    title: Option<String>,
+    status: Option<String>,
+    ttl_hours: Option<i64>,
+}
+
+async fn api_chat_sessions_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<PatchChatSessionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    if let Some(ref title) = body.title {
+        let sid = session_id.clone();
+        let t = title.clone();
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_title(&sid, &t)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    if let Some(ref status) = body.status {
+        match status.as_str() {
+            "archived" => {
+                let sid = session_id.clone();
+                call_blocking(state.app_state.db.clone(), move |db| {
+                    db.archive_chat_session(&sid)
+                })
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+            "active" => {
+                let sid = session_id.clone();
+                call_blocking(state.app_state.db.clone(), move |db| {
+                    db.reopen_chat_session(&sid)
+                })
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "status must be 'active' or 'archived'".into(),
+                ));
+            }
+        }
+    }
+
+    if let Some(ttl) = body.ttl_hours {
+        let sid = session_id.clone();
+        let ttl_val = ttl.max(0);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_ttl(&sid, ttl_val)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn api_chat_sessions_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_chat_session(&session_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(Json(serde_json::json!({ "ok": true })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "session not found".into()))
+    }
+}
+
+// --- end Chat Sessions ---
+
+async fn api_skills_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<SkillsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let persona_skill_policy = if let Some(pid) = query.persona_id {
+        let exists = call_blocking(state.app_state.db.clone(), move |db| {
+            db.persona_exists(chat_id, pid)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !exists {
+            return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+        }
+        Some(
+            call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_persona_hook_skill_policy(chat_id, pid)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let skill_manager = &state.app_state.skills;
+    let all_skills = skill_manager.discover_all_skills();
+    let mut remote_count = 0usize;
+    let rows: Vec<serde_json::Value> = all_skills
+        .into_iter()
+        .map(|s| {
+            let remote = skill_manager.skill_is_remote(&s);
+            if remote {
+                remote_count += 1;
+            }
+            let allowed_for_persona = persona_skill_policy.as_ref().map(|policy| {
+                let Some(row) = policy else {
+                    return true;
+                };
+                let Some(allowed) = row.allowed_skill_names.as_ref() else {
+                    return true;
+                };
+                allowed.iter().any(|a| a.eq_ignore_ascii_case(&s.name))
+            });
+            json!({
+                "name": s.name,
+                "description": s.description,
+                "when_to_use": s.when_to_use,
+                "platforms": s.platforms,
+                "deps": s.deps,
+                "source": s.source,
+                "version": s.version,
+                "updated_at": s.updated_at,
+                "remote": remote,
+                "allowed_for_persona": allowed_for_persona,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "skills": rows,
+        "total": rows.len(),
+        "remote_count": remote_count,
+    })))
+}
+
+fn hook_definition_to_json(
+    h: crate::db::HookDefinitionRecord,
+    persona_status: Option<(bool, bool, bool)>,
+) -> serde_json::Value {
+    let payload = serde_json::from_str::<serde_json::Value>(&h.action_payload_json)
+        .unwrap_or_else(|_| json!({}));
+    let mut row = json!({
+        "id": h.id,
+        "name": h.name,
+        "event_name": h.event_name,
+        "matcher": h.matcher,
+        "action_type": h.action_type,
+        "action_payload_json": h.action_payload_json,
+        "action_payload": payload,
+        "scoped_persona_ids": h.scoped_persona_ids,
+        "is_global": h.scoped_persona_ids.is_none(),
+        "enabled": h.enabled,
+        "updated_at": h.updated_at,
+    });
+    if let Some((scoped_for_persona, allowed_for_persona, active_for_persona)) = persona_status {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("scoped_for_persona".into(), json!(scoped_for_persona));
+            obj.insert("allowed_for_persona".into(), json!(allowed_for_persona));
+            obj.insert("active_for_persona".into(), json!(active_for_persona));
+        }
+    }
+    row
+}
+
+async fn api_hooks_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<HooksQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let persona_id = query.persona_id;
+    let chat_id = if persona_id.is_some() {
+        let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+        ensure_web_binding_for_universal(&state, chat_id).await?;
+        if let Some(pid) = persona_id {
+            let exists = call_blocking(state.app_state.db.clone(), move |db| {
+                db.persona_exists(chat_id, pid)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if !exists {
+                return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+            }
+        }
+        Some(chat_id)
+    } else {
+        None
+    };
+
+    let db = state.app_state.db.clone();
+    let hooks_json = call_blocking(db, move |db| {
+        let hooks = db.list_hook_definitions()?;
+        let rows = if let (Some(chat_id), Some(pid)) = (chat_id, persona_id) {
+            hooks
+                .into_iter()
+                .map(|h| {
+                    let status = h.persona_status(db, chat_id, pid)?;
+                    Ok(hook_definition_to_json(h, Some(status)))
+                })
+                .collect::<Result<Vec<_>, crate::error::FinallyAValueBotError>>()?
+        } else {
+            hooks
+                .into_iter()
+                .map(|h| hook_definition_to_json(h, None))
+                .collect()
+        };
+        Ok::<Vec<serde_json::Value>, crate::error::FinallyAValueBotError>(rows)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true, "hooks": hooks_json })))
+}
+
+async fn api_hooks_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<HookDefinitionUpsertBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let payload_json = body
+        .action_payload_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("{}")
+        .to_string();
+    if body.action_type.trim().eq_ignore_ascii_case("command") {
+        validate_command_payload(&state.app_state.config, &payload_json)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+    let enabled = body.enabled.unwrap_or(true);
+    let scope_raw = body.scope.as_deref().map(str::trim).unwrap_or_default();
+    let scope_normalized = if scope_raw.is_empty() {
+        None
+    } else if scope_raw.eq_ignore_ascii_case("global") {
+        Some("global")
+    } else if scope_raw.eq_ignore_ascii_case("persona") {
+        Some("persona")
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scope must be 'global' or 'persona' when provided".to_string(),
+        ));
+    };
+    let scoped_from_body = body
+        .scoped_persona_ids
+        .as_ref()
+        .map(|ids| normalize_persona_scope_ids(ids));
+    let scoped_persona_ids: Option<Vec<i64>> = if let Some(scope) = scope_normalized {
+        match scope {
+            "global" => None,
+            "persona" => match scoped_from_body {
+                Some(ids) => Some(ids),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "scope=persona requires scoped_persona_ids".to_string(),
+                    ))
+                }
+            },
+            _ => None,
+        }
+    } else if body.id.is_some() {
+        if let Some(ids) = scoped_from_body {
+            Some(ids)
+        } else {
+            let existing_id = body.id.unwrap_or_default();
+            let existing = call_blocking(state.app_state.db.clone(), move |db| {
+                db.get_hook_definition(existing_id)
+            })
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            let Some(existing) = existing else {
+                return Err((StatusCode::NOT_FOUND, "hook not found".to_string()));
+            };
+            existing.scoped_persona_ids
+        }
+    } else if let Some(ids) = scoped_from_body {
+        Some(ids)
+    } else if let Some(creating_persona_id) = body.creating_persona_id {
+        if creating_persona_id <= 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "creating_persona_id must be positive".to_string(),
+            ));
+        }
+        let exists = call_blocking(state.app_state.db.clone(), move |db| {
+            db.persona_exists(chat_id, creating_persona_id)
+        })
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        if !exists {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("creating_persona_id {} not found", creating_persona_id),
+            ));
+        }
+        Some(vec![creating_persona_id])
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "persona scope required: provide scoped_persona_ids or creating_persona_id, or set scope=global"
+                .to_string(),
+        ));
+    };
+    let id = call_blocking(state.app_state.db.clone(), move |db| {
+        db.upsert_hook_definition(
+            body.id,
+            &body.name,
+            &body.event_name,
+            body.matcher.as_deref(),
+            &body.action_type,
+            &payload_json,
+            scoped_persona_ids.as_deref(),
+            enabled,
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn api_hooks_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<HookDefinitionDeletePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_hook_definition(path.id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "ok": true, "deleted": deleted })))
+}
+
+async fn api_persona_policy_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaPolicyPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let policy = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_persona_hook_skill_policy(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "persona_id": path.persona_id,
+        "allowed_hook_ids": policy.as_ref().and_then(|p| p.allowed_hook_ids.clone()),
+        "allowed_skill_names": policy.as_ref().and_then(|p| p.allowed_skill_names.clone()),
+        "uses_default_hooks": policy.as_ref().and_then(|p| p.allowed_hook_ids.as_ref()).is_none(),
+        "uses_default_skills": policy.as_ref().and_then(|p| p.allowed_skill_names.as_ref()).is_none(),
+        "updated_at": policy.as_ref().map(|p| p.updated_at.clone()),
+    })))
+}
+
+async fn api_persona_policy_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaPolicyPathParams>,
+    Json(body): Json<PersonaPolicyPatchBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let current = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_persona_hook_skill_policy(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut next_hooks = current.as_ref().and_then(|p| p.allowed_hook_ids.clone());
+    let mut next_skills = current.as_ref().and_then(|p| p.allowed_skill_names.clone());
+    if let Some(v) = body.allowed_hook_ids {
+        next_hooks = v;
+    }
+    if let Some(v) = body.allowed_skill_names {
+        next_skills = v;
+    }
+    if let Some(list) = next_hooks.as_mut() {
+        list.retain(|id| *id > 0);
+        list.sort_unstable();
+        list.dedup();
+    }
+    if let Some(list) = next_skills.as_mut() {
+        let mut norm = Vec::new();
+        for item in list.iter() {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() {
+                norm.push(trimmed.to_string());
+            }
+        }
+        norm.sort_by_key(|s| s.to_ascii_lowercase());
+        norm.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        *list = norm;
+    }
+
+    let next_hooks_for_db = next_hooks.clone();
+    let next_skills_for_db = next_skills.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_persona_hook_skill_policy(
+            chat_id,
+            pid,
+            next_hooks_for_db.as_deref(),
+            next_skills_for_db.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "persona_id": path.persona_id,
+        "allowed_hook_ids": next_hooks,
+        "allowed_skill_names": next_skills,
+    })))
+}
+
+async fn api_persona_bulletin_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let pid2 = path.persona_id;
+    let focus = call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_persona_bulletin_focus(chat_id, pid2)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let pid3 = path.persona_id;
+    let bookmarks = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_message_bookmarks(chat_id, pid3, 20)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let focus_json = focus.map(|f| {
+        json!({
+            "title": f.title,
+            "content": f.content,
+            "updated_at": f.updated_at,
+        })
+    });
+    let bookmarks_json: Vec<serde_json::Value> = bookmarks
+        .into_iter()
+        .map(|b| {
+            json!({
+                "message_id": b.message_id,
+                "role": b.role,
+                "content_preview": b.content_preview,
+                "note": b.note,
+                "created_at": b.created_at,
+                "updated_at": b.updated_at,
+            })
+        })
+        .collect();
+
+    let pid4 = path.persona_id;
+    let persona = call_blocking(state.app_state.db.clone(), move |db| {
+        let p = db.get_persona(pid4)?;
+        Ok(p.filter(|x| x.chat_id == chat_id))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let cfg = &state.app_state.config;
+    let def_u = cfg.recent_history_min_user_messages.clamp(1, 25) as i64;
+    let def_a = cfg.recent_history_min_assistant_messages.clamp(1, 25) as i64;
+    let hs_json = if let Some(ref p) = persona {
+        let o_u = p.recent_history_min_user;
+        let o_a = p.recent_history_min_assistant;
+        let e_u = o_u.unwrap_or(def_u).clamp(1, 25);
+        let e_a = o_a.unwrap_or(def_a).clamp(1, 25);
+        json!({
+            "min_user": {
+                "effective": e_u,
+                "persona_override": o_u,
+                "uses_default": o_u.is_none(),
+            },
+            "min_assistant": {
+                "effective": e_a,
+                "persona_override": o_a,
+                "uses_default": o_a.is_none(),
+            },
+            "defaults": { "min_user": def_u, "min_assistant": def_a },
+        })
+    } else {
+        json!({})
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "focus": focus_json,
+        "bookmarks": bookmarks_json,
+        "history_suffix": hs_json,
+        "operator_memo": persona.as_ref().and_then(|p| p.operator_memo.clone()),
+    })))
+}
+
+async fn api_persona_bulletin_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+    Json(body): Json<PersonaBulletinPatchBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    if body.recent_history_min_user.is_none()
+        && body.recent_history_min_assistant.is_none()
+        && body.operator_memo.is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "no fields to update (send recent_history_min_user, recent_history_min_assistant, and/or operator_memo)"
+                .into(),
+        ));
+    }
+
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let pid2 = path.persona_id;
+    let current = call_blocking(state.app_state.db.clone(), move |db| db.get_persona(pid2))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "persona not found".into()))?;
+    if current.chat_id != chat_id {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let mut nu = current.recent_history_min_user;
+    let mut na = current.recent_history_min_assistant;
+    let mut memo = current.operator_memo.clone();
+
+    if let Some(v) = body.recent_history_min_user {
+        if let Some(n) = v {
+            if !(1..=25).contains(&n) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "recent_history_min_user must be between 1 and 25".into(),
+                ));
+            }
+            nu = Some(n);
+        } else {
+            nu = None;
+        }
+    }
+    if let Some(v) = body.recent_history_min_assistant {
+        if let Some(n) = v {
+            if !(1..=25).contains(&n) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "recent_history_min_assistant must be between 1 and 25".into(),
+                ));
+            }
+            na = Some(n);
+        } else {
+            na = None;
+        }
+    }
+    if let Some(v) = body.operator_memo {
+        memo = match v {
+            None => None,
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else if t.chars().count() > crate::db::OPERATOR_MEMO_MAX_CHARS {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "operator_memo exceeds {} characters",
+                            crate::db::OPERATOR_MEMO_MAX_CHARS
+                        ),
+                    ));
+                } else {
+                    Some(s)
+                }
+            }
+        };
+    }
+
+    let ok = call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_persona_prompt_overrides(chat_id, pid, nu, na, memo.as_deref())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !ok {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to update persona".into(),
+        ));
+    }
+
+    Ok(Json(json!({ "ok": true, "persona_id": path.persona_id })))
+}
+
+async fn api_persona_bookmarks_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let pid2 = path.persona_id;
+    let bookmarks = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_message_bookmarks(chat_id, pid2, 50)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let bookmarks_json: Vec<serde_json::Value> = bookmarks
+        .into_iter()
+        .map(|b| {
+            json!({
+                "message_id": b.message_id,
+                "role": b.role,
+                "content_preview": b.content_preview,
+                "note": b.note,
+                "created_at": b.created_at,
+                "updated_at": b.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "bookmarks": bookmarks_json,
+    })))
+}
+
+async fn api_persona_bookmarks_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkPathParams>,
+    Json(body): Json<PersonaBookmarkUpsertBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    if body.message_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let message_id = body.message_id.trim().to_string();
+    let pid_lookup = path.persona_id;
+    let message = call_blocking(state.app_state.db.clone(), {
+        let message_id = message_id.clone();
+        move |db| db.get_message_for_persona(chat_id, pid_lookup, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(message) = message else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "message not found for persona".into(),
+        ));
+    };
+    let role = if message.is_from_bot {
+        "assistant"
+    } else {
+        "user"
+    };
+    let preview = truncate_chars(message.content.trim(), 280);
+    let note_clean = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 180));
+    let pid_upsert = path.persona_id;
+    call_blocking(state.app_state.db.clone(), {
+        let note_clean = note_clean.clone();
+        let message_id = message_id.clone();
+        let preview = preview.clone();
+        move |db| {
+            db.upsert_persona_message_bookmark(
+                chat_id,
+                pid_upsert,
+                &message_id,
+                role,
+                &preview,
+                note_clean.as_deref(),
+            )
+        }
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "bookmark": {
+            "message_id": message_id,
+            "role": role,
+            "content_preview": preview,
+            "note": note_clean,
+        }
+    })))
+}
+
+async fn api_persona_bookmarks_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaBookmarkDeletePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let message_id = path.message_id.trim().to_string();
+    if message_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+    let pid_delete = path.persona_id;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_persona_message_bookmark(chat_id, pid_delete, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "message_id": path.message_id,
+        "deleted": deleted,
+    })))
+}
+
+/// Full text of one message in the persona thread (used by web bookmark reader; bookmarks only store a short preview).
+async fn api_persona_message_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMessagePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let message_id = path.message_id.trim().to_string();
+    if message_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+
+    let pid_lookup = path.persona_id;
+    let cid = chat_id;
+    let message = call_blocking(state.app_state.db.clone(), {
+        let message_id = message_id.clone();
+        move |db| db.get_message_for_persona(cid, pid_lookup, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(m) = message else {
+        return Err((StatusCode::NOT_FOUND, "message not found".into()));
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "message": {
+            "id": m.id,
+            "sender_name": m.sender_name,
+            "content": m.content,
+            "is_from_bot": m.is_from_bot,
+            "timestamp": m.timestamp,
+        }
+    })))
+}
+
+async fn api_persona_message_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMessagePathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let message_id = path.message_id.trim().to_string();
+    if message_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+
+    let pid_delete = path.persona_id;
+    let deleted = call_blocking(state.app_state.db.clone(), {
+        let message_id = message_id.clone();
+        move |db| db.delete_message(chat_id, pid_delete, &message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "message not found".into()));
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "message_id": path.message_id,
+        "deleted": true,
+    })))
+}
+
 fn ensure_persona_memory_file_exists_for_web(state: &AppState, chat_id: i64, persona_id: i64) {
-    let path = state.memory.persona_memory_path(chat_id, persona_id);
+    let path = state.memory.persona_memory_state_path(chat_id, persona_id);
     if path.exists() {
         return;
     }
-    let template =
-        "# Memory\n\n## Tier 1 — Long term\n\n\n## Tier 2 — Mid term\n\n\n## Tier 3 — Short term\n";
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, template);
+    let display_name = if !state.config.agent_display_name.trim().is_empty() {
+        Some(state.config.agent_display_name.as_str())
+    } else {
+        None
+    };
+    let _ = state
+        .memory
+        .ensure_persona_memory_state_exists(chat_id, persona_id, display_name);
 }
 
 fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
@@ -2066,8 +4040,16 @@ async fn api_persona_memory_get(
     }
 
     ensure_persona_memory_file_exists_for_web(&state.app_state, chat_id, pid);
-    let mem_path = state.app_state.memory.persona_memory_path(chat_id, pid);
-    let content = std::fs::read_to_string(&mem_path).unwrap_or_default();
+    let mem_path = state
+        .app_state
+        .memory
+        .persona_memory_state_path(chat_id, pid);
+    let memory_state = state
+        .app_state
+        .memory
+        .read_or_migrate_persona_memory_state(chat_id, pid)
+        .unwrap_or_default();
+    let content = serde_json::to_string_pretty(&memory_state).unwrap_or_else(|_| "{}".to_string());
     let mtime_ms = file_mtime_ms(&mem_path).unwrap_or(0);
     Ok(Json(json!({
         "ok": true,
@@ -2112,7 +4094,10 @@ async fn api_persona_memory_put(
     }
 
     ensure_persona_memory_file_exists_for_web(&state.app_state, chat_id, pid);
-    let mem_path = state.app_state.memory.persona_memory_path(chat_id, pid);
+    let mem_path = state
+        .app_state
+        .memory
+        .persona_memory_state_path(chat_id, pid);
     let current_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
     if let Some(expected) = body.if_match_mtime_ms {
         if expected != current_mtime {
@@ -2123,12 +4108,31 @@ async fn api_persona_memory_put(
         }
     }
 
-    if let Some(parent) = mem_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    std::fs::write(&mem_path, body.content)
+    let mut state_payload: crate::memory::PersonaMemoryState = serde_json::from_str(&body.content)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid memory_state JSON: {e}"),
+            )
+        })?;
+    state_payload.normalize();
+    state
+        .app_state
+        .memory
+        .validate_memory_state(&state_payload)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    state
+        .app_state
+        .memory
+        .write_persona_memory_state(chat_id, pid, state_payload)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = state.app_state.memory.append_persona_memory_event(
+        chat_id,
+        pid,
+        "web_memory_state_put",
+        "user_manual",
+        json!({"path": mem_path.to_string_lossy().to_string()}),
+    );
 
     let new_mtime = file_mtime_ms(&mem_path).unwrap_or(0);
     Ok(Json(json!({
@@ -2249,6 +4253,97 @@ async fn api_persona_agent_history_latest(
         }
     }
 }
+
+async fn api_persona_agent_history_optimize(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMemoryPathParams>,
+    body: Option<Json<AgentHistoryOptimizeRequest>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let mm = state.app_state.llm.multimodel_config();
+    if mm.tier2_base_url.trim().is_empty() || mm.tier2_model.trim().is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Tier 2 (Knowledge) base URL and model must be configured in Settings → Multi-model."
+                .into(),
+        ));
+    }
+
+    let data_dir = state.app_state.config.runtime_data_dir();
+    let history = match crate::agent_history::read_latest_agent_history(&data_dir, chat_id, pid) {
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no agent history for this persona".into(),
+            ))
+        }
+        Ok(Some(r)) => r,
+        Err(crate::agent_history::ReadLatestAgentHistoryError::FileTooLarge(_)) => {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "agent history file too large".into(),
+            ))
+        }
+        Err(crate::agent_history::ReadLatestAgentHistoryError::Io(e)) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    };
+
+    let operator_notes = body
+        .and_then(|Json(req)| req.operator_notes)
+        .and_then(|notes| {
+            let trimmed = notes.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+
+    let app_state = state.app_state.clone();
+    match crate::run_optimizer::try_enqueue_run_optimize(
+        app_state,
+        chat_id,
+        pid,
+        history.filename.clone(),
+        history.content,
+        operator_notes,
+    )
+    .await
+    {
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::Queued { job_id } => Ok(Json(json!({
+            "ok": true,
+            "job_id": job_id,
+            "filename": history.filename,
+            "message": "Queued. Track progress in Background jobs.",
+        }))),
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::BlockedAlreadyRunning => Err((
+            StatusCode::CONFLICT,
+            "another background job is already active for this chat".into(),
+        )),
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::ActiveLookupFailed(e) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+        crate::run_optimizer::RunOptimizeEnqueueOutcome::DbCreateFailed(e) => {
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+    }
+}
+
 async fn api_personas_create(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -2270,6 +4365,12 @@ async fn api_personas_create(
         db.create_persona(chat_id, &name_owned, None)
     })
     .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::tools::ensure_persona_shared_dir(
+        std::path::Path::new(state.app_state.config.working_dir()),
+        chat_id,
+        persona_id,
+    )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
@@ -2311,7 +4412,7 @@ async fn api_contacts_bind(
 
     let contact_chat_id = body.contact_chat_id;
     call_blocking(state.app_state.db.clone(), move |db| {
-        db.link_channel(contact_chat_id, "web", "default")
+        db.link_channel(contact_chat_id, BOT_INSTANCE_WEB, "web", "default")
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2331,7 +4432,7 @@ async fn api_contacts_unlink(
     require_auth(&headers, state.auth_token.as_deref())?;
 
     let removed = call_blocking(state.app_state.db.clone(), move |db| {
-        db.unlink_channel("web", "default")
+        db.unlink_channel(BOT_INSTANCE_WEB, "web", "default")
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2474,10 +4575,20 @@ async fn api_schedules_update(
     };
     let persona_id = body.persona_id;
     let prompt_update = body.prompt.as_ref().map(|p| p.trim().to_string());
-    if status.is_none() && persona_id.is_none() && prompt_update.is_none() {
+    let schedule_type_in = body.schedule_type.as_ref().map(|s| s.trim().to_string());
+    let schedule_value_in = body.schedule_value.as_ref().map(|s| s.trim().to_string());
+    let has_schedule_pair = schedule_type_in.is_some() && schedule_value_in.is_some();
+    let schedule_partial = schedule_type_in.is_some() ^ schedule_value_in.is_some();
+    if schedule_partial {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Provide at least one field to update: status, persona_id, or prompt".into(),
+            "Provide both schedule_type and schedule_value to change the schedule".into(),
+        ));
+    }
+    if status.is_none() && persona_id.is_none() && prompt_update.is_none() && !has_schedule_pair {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide at least one field to update: status, persona_id, prompt, or schedule_type+schedule_value".into(),
         ));
     }
     if let Some(pid) = persona_id {
@@ -2521,6 +4632,25 @@ async fn api_schedules_update(
         }
     }
 
+    let schedule_preflight = if has_schedule_pair {
+        let st = schedule_type_in.as_ref().unwrap().as_str();
+        let sv = schedule_value_in.as_ref().unwrap().as_str();
+        let effective_tz = body.timezone.as_deref().or_else(|| {
+            let default = state.app_state.config.timezone.trim();
+            if default.is_empty() {
+                None
+            } else {
+                Some(default)
+            }
+        });
+        Some(
+            crate::tools::schedule::preflight_schedule_request(st, sv, effective_tz)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        )
+    } else {
+        None
+    };
+
     if let Some(next_status) = status {
         let ok = call_blocking(state.app_state.db.clone(), move |db| {
             db.update_task_status(task_id, next_status)
@@ -2552,10 +4682,40 @@ async fn api_schedules_update(
         }
     }
 
-    Ok(Json(json!({
+    if let Some(pref) = &schedule_preflight {
+        let schedule_type_owned = schedule_type_in.as_ref().unwrap().clone();
+        let schedule_value_owned = pref.schedule_value.clone();
+        let next_run_owned = pref.next_run.clone();
+        let ok = call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_task_schedule(
+                task_id,
+                &schedule_type_owned,
+                &schedule_value_owned,
+                &next_run_owned,
+            )
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !ok {
+            return Err((StatusCode::NOT_FOUND, "Task not found".into()));
+        }
+    }
+
+    let mut response = json!({
         "ok": true,
         "message": "Task updated",
-    })))
+    });
+    if let Some(pref) = schedule_preflight {
+        response["next_run"] = json!(pref.next_run);
+        response["timezone"] = json!(pref.timezone_used);
+        response["timezone_assumption"] = json!(if pref.timezone_defaulted_to_utc {
+            "Timezone not provided. UTC was assumed."
+        } else {
+            "Timezone provided by request."
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // --- Background jobs API ---
@@ -2596,25 +4756,30 @@ async fn api_background_jobs_list(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let pending_timeout_secs = state
+        .app_state
+        .config
+        .background_job_pending_start_timeout_secs as i64;
+    let active_count = call_blocking(state.app_state.db.clone(), move |db| {
+        db.count_active_background_jobs_for_chat(chat_id, &now, pending_timeout_secs)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<serde_json::Value> = jobs
         .into_iter()
         .map(|j| {
             let hb = hb_by_key.get(&j.id);
-            json!({
-                "id": j.id,
-                "chat_id": j.chat_id,
-                "persona_id": j.persona_id,
-                "prompt": j.prompt,
-                "status": j.status,
-                "trigger_reason": j.trigger_reason,
-                "created_at": j.created_at,
-                "started_at": j.started_at,
-                "finished_at": j.finished_at,
-                "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
-                "error_text": j.error_text,
-                "heartbeat": hb.map(json_job_heartbeat),
-            })
+            let mut row = json_background_job(&j);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "heartbeat".into(),
+                    hb.map(json_job_heartbeat)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            row
         })
         .collect();
 
@@ -2625,6 +4790,7 @@ async fn api_background_jobs_list(
         "ok": true,
         "chat_id": chat_id,
         "jobs": items,
+        "active_count": active_count,
         "active_heartbeats": active_hb_json,
     })))
 }
@@ -2678,21 +4844,16 @@ async fn api_background_job_get(
         })
         .collect();
 
+    let mut job_json = json_background_job(&job);
+    if let Some(obj) = job_json.as_object_mut() {
+        if let Some(rt) = job.result_text {
+            obj.insert("result_text".into(), json!(rt));
+        }
+    }
+
     Ok(Json(json!({
         "ok": true,
-        "job": {
-            "id": job.id,
-            "chat_id": job.chat_id,
-            "persona_id": job.persona_id,
-            "prompt": job.prompt,
-            "status": job.status,
-            "trigger_reason": job.trigger_reason,
-            "created_at": job.created_at,
-            "started_at": job.started_at,
-            "finished_at": job.finished_at,
-            "result_text": job.result_text,
-            "error_text": job.error_text,
-        },
+        "job": job_json,
         "heartbeat": hb.as_ref().map(json_job_heartbeat),
         "timeline_events_recent": timeline_json,
     })))
@@ -2701,6 +4862,55 @@ async fn api_background_job_get(
 #[derive(Debug, Deserialize)]
 struct ContactsBindingsQuery {
     chat_id: Option<i64>,
+}
+
+/// Accepted for API compatibility; [`api_settings_patch`] always returns 501.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SettingsPatchRequest {
+    upsert: Option<HashMap<String, String>>,
+    remove: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelPersonaPolicyUpsertRequest {
+    chat_id: Option<i64>,
+    bot_instance_id: i64,
+    mode: String, // "all" | "single"
+    persona_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelPersonaPolicyDeleteRequest {
+    chat_id: Option<i64>,
+    bot_instance_id: i64,
+}
+
+fn setting_is_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("API_KEY")
+        || upper.ends_with("_KEY")
+        || upper.contains("PASSWORD")
+}
+
+fn mask_setting_value(value: &str) -> String {
+    if value.len() <= 6 {
+        return "***".to_string();
+    }
+    let prefix = &value[..3];
+    let suffix = &value[value.len().saturating_sub(2)..];
+    format!("{prefix}***{suffix}")
+}
+
+fn is_llm_ready(cfg: &Config) -> bool {
+    crate::llm_catalog::is_api_key_configured_for_provider(&cfg.llm_provider)
+        || crate::llm_catalog::any_provider_api_key_configured()
+}
+
+fn is_channel_ready(cfg: &Config) -> bool {
+    !cfg.telegram_bot_token.trim().is_empty() || cfg.discord_bot_token.is_some()
 }
 
 async fn api_contacts_bindings(
@@ -2712,21 +4922,1052 @@ async fn api_contacts_bindings(
 
     let chat_id = resolve_chat_id_for_web(query.chat_id, &state.app_state.config)?;
     ensure_web_binding_for_universal(&state, chat_id).await?;
-    let bindings = call_blocking(state.app_state.db.clone(), move |db| {
-        db.list_bindings_for_contact(chat_id)
+    let rows = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_contact_channel_integration_rows(chat_id)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let items: Vec<serde_json::Value> = bindings
+    let items: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|b| json!({ "channel_type": b.channel_type, "channel_handle": b.channel_handle }))
+        .map(|r| {
+            let (persona_mode, persona_id) = match r.persona_mode {
+                ChannelPersonaMode::All => ("all", None),
+                ChannelPersonaMode::Single => ("single", r.persona_id),
+            };
+            json!({
+                "bot_instance_id": r.bot_instance_id,
+                "platform": r.platform,
+                "label": r.label,
+                "channel_type": r.platform,
+                "channel_handle": r.channel_handle,
+                "linked": r.linked,
+                "persona_mode": persona_mode,
+                "persona_id": persona_id
+            })
+        })
         .collect();
 
     Ok(Json(json!({
         "ok": true,
         "chat_id": chat_id,
         "bindings": items,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmModelPatchRequest {
+    model: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    custom: bool,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimePatchRequest {
+    #[serde(default)]
+    tool_output_debug: Option<bool>,
+    #[serde(default)]
+    post_tool_evaluator_enabled: Option<bool>,
+    #[serde(default)]
+    response_quality_evaluator_enabled: Option<bool>,
+    #[serde(default)]
+    agent_engine: Option<String>,
+}
+
+async fn api_runtime_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let sources = call_blocking(state.app_state.db.clone(), |db| {
+        Ok::<_, crate::error::FinallyAValueBotError>((
+            crate::runtime_toggles::RuntimeToggles::tool_output_debug_from_app_settings(db)?,
+            crate::runtime_toggles::RuntimeToggles::post_tool_evaluator_from_app_settings(db)?,
+            crate::runtime_toggles::RuntimeToggles::response_quality_evaluator_from_app_settings(
+                db,
+            )?,
+            crate::runtime_toggles::RuntimeToggles::agent_engine_from_app_settings(db)?,
+        ))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let toggles = &state.app_state.runtime_toggles;
+    Ok(Json(json!({
+        "ok": true,
+        "tool_output_debug": toggles.tool_output_debug(),
+        "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
+        "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
+        "agent_engine": toggles.agent_engine().as_str(),
+        "sources": {
+            "tool_output_debug": if sources.0 { "app_settings" } else { "env" },
+            "post_tool_evaluator_enabled": if sources.1 { "app_settings" } else { "env" },
+            "response_quality_evaluator_enabled": if sources.2 { "app_settings" } else { "env" },
+            "agent_engine": if sources.3.is_some() { "app_settings" } else { "env" },
+        },
+        "description": "When enabled, verbose shell output is shown in chat (including background-job completion). When off, full logs are agent-only.",
+    })))
+}
+
+async fn api_runtime_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<RuntimePatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let toggles = &state.app_state.runtime_toggles;
+    let mut messages: Vec<&str> = Vec::new();
+
+    if let Some(enabled) = body.tool_output_debug {
+        toggles.set_tool_output_debug(enabled);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_tool_output_debug(db, enabled)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(if enabled {
+            "Verbose pipeline logging enabled."
+        } else {
+            "Verbose pipeline logging disabled."
+        });
+    }
+    if let Some(enabled) = body.post_tool_evaluator_enabled {
+        toggles.set_post_tool_evaluator_enabled(enabled);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_post_tool_evaluator_enabled(db, enabled)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(if enabled {
+            "Post-tool evaluator (PTE) enabled."
+        } else {
+            "Post-tool evaluator (PTE) disabled."
+        });
+    }
+    if let Some(enabled) = body.response_quality_evaluator_enabled {
+        toggles.set_response_quality_evaluator_enabled(enabled);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_response_quality_evaluator_enabled(
+                db, enabled,
+            )
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(if enabled {
+            "Pre-delivery quality evaluator (PDQE) enabled."
+        } else {
+            "Pre-delivery quality evaluator (PDQE) disabled."
+        });
+    }
+    if let Some(ref engine_raw) = body.agent_engine {
+        let engine = crate::runtime_toggles::AgentEngine::parse(engine_raw);
+        toggles.set_agent_engine(engine);
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::runtime_toggles::RuntimeToggles::persist_agent_engine(db, engine)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        messages.push(match engine {
+            crate::runtime_toggles::AgentEngine::Deterministic => {
+                "Agent engine set to deterministic pipeline."
+            }
+            crate::runtime_toggles::AgentEngine::Cursor => {
+                "Agent engine set to Cursor SDK (local sidecar)."
+            }
+            crate::runtime_toggles::AgentEngine::Classic => "Agent engine set to classic loop.",
+        });
+    }
+
+    if messages.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No runtime toggle fields provided".to_string(),
+        ));
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "tool_output_debug": toggles.tool_output_debug(),
+        "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
+        "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
+        "agent_engine": toggles.agent_engine().as_str(),
+        "source": "app_settings",
+        "message": messages.join(" "),
+    })))
+}
+
+async fn api_llm_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let provider_id =
+        crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
+    let preset = crate::llm_catalog::find_provider(&provider_id);
+    let current_model = state.app_state.llm.current_model();
+    let (model_source, provider_source, base_url_source) =
+        call_blocking(state.app_state.db.clone(), |db| {
+            let settings = db.list_app_settings()?;
+            let model_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
+                    && !s.value.trim().is_empty()
+            });
+            let provider_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
+                    && !s.value.trim().is_empty()
+            });
+            let base_url_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_BASE_URL)
+                    && !s.value.trim().is_empty()
+            });
+            Ok((model_source, provider_source, base_url_source))
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let is_local = crate::llm_catalog::is_local_provider(&provider_id);
+    let default_base_url = if is_local {
+        crate::llm_catalog::default_base_url_for_provider(&provider_id).map(|s| s.to_string())
+    } else {
+        None
+    };
+    let base_url = state.app_state.llm.current_base_url();
+
+    let catalog_models = crate::llm_catalog::catalog_models_json(&provider_id, &current_model);
+    let catalog: Vec<serde_json::Value> = catalog_models
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+
+    let in_catalog = catalog_models
+        .iter()
+        .any(|m| m.id == current_model && !m.from_active_config);
+
+    let providers: Vec<serde_json::Value> =
+        crate::llm_catalog::providers_catalog_json(&provider_id, &current_model)
+            .into_iter()
+            .filter_map(|p| serde_json::to_value(p).ok())
+            .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "provider": {
+            "id": provider_id,
+            "label": preset.map(|p| p.label).unwrap_or("Unknown provider"),
+        },
+        "provider_source": if provider_source { "app_settings" } else { "default" },
+        "api_key_configured": crate::llm_catalog::is_api_key_configured_for_provider(&provider_id),
+        "model": current_model,
+        "model_in_catalog": in_catalog,
+        "model_source": if model_source { "app_settings" } else { "default" },
+        "is_local_provider": is_local,
+        "base_url": base_url,
+        "default_base_url": default_base_url,
+        "base_url_source": if is_local {
+            if base_url_source { "app_settings" } else { "default" }
+        } else {
+            "n/a"
+        },
+        "catalog": catalog,
+        "providers": providers,
+        "catalog_source": "static_curated",
+        "cost_reference_note": "Curated catalog (not live from provider APIs). Put API keys in repo-root .env only (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or LLM_API_KEY). Approximate USD per 1M tokens — verify on your provider billing page.",
+        "custom_model_allowed": true,
+    })))
+}
+
+async fn api_llm_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<LlmModelPatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let model = body.model.trim().to_string();
+    if model.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "model is required".into()));
+    }
+    let provider_id = body
+        .provider
+        .as_deref()
+        .map(crate::llm_catalog::resolve_catalog_provider_id)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| state.app_state.llm.current_provider());
+    if !body.custom && !crate::llm_catalog::model_allowed_for_provider(&provider_id, &model, false)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Model {:?} is not in the catalog for provider {:?}. Pick a listed model or set custom=true.",
+                model, provider_id
+            ),
+        ));
+    }
+
+    let (provider_saved, model_saved) = state
+        .app_state
+        .llm
+        .apply_selection(
+            provider_id.clone(),
+            model.clone(),
+            if crate::llm_catalog::is_local_provider(&provider_id) {
+                Some(
+                    body.base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .ok_or((
+                            StatusCode::BAD_REQUEST,
+                            "base_url is required for Ollama and llama.cpp providers".into(),
+                        ))?
+                        .to_string(),
+                )
+            } else {
+                None
+            },
+        )
+        .map_err(|e| {
+            if e.contains("No API key") || e.contains("base_url") {
+                (StatusCode::BAD_REQUEST, e)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e)
+            }
+        })?;
+
+    let provider_db = provider_saved.clone();
+    let model_db = model_saved.clone();
+    let base_url_db = if crate::llm_catalog::is_local_provider(&provider_saved) {
+        state
+            .app_state
+            .llm
+            .current_base_url()
+            .map(|url| crate::llm_catalog::normalize_local_base_url(&url, &provider_saved))
+    } else {
+        None
+    };
+    let base_url_response = base_url_db.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_PROVIDER, &provider_db)?;
+        db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_db)?;
+        if let Some(ref url) = base_url_db {
+            db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, url)?;
+        } else {
+            db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, "")?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "provider": {
+            "id": provider_saved,
+        },
+        "model": model_saved,
+        "base_url": base_url_response,
+        "provider_source": "app_settings",
+        "model_source": "app_settings",
+        "base_url_source": if base_url_response.is_some() {
+            "app_settings"
+        } else {
+            "n/a"
+        },
+        "message": "Provider and model updated. New agent runs use this selection immediately.",
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MultimodelTestRequest {
+    tier: String,
+    base_url: String,
+    model: String,
+}
+
+async fn api_multimodel_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let cfg = state.app_state.llm.multimodel_config();
+    let strategy_provider =
+        crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
+    let strategy_model = state.app_state.llm.current_model();
+    Ok(Json(json!({
+        "ok": true,
+        "enabled": cfg.enabled,
+        "local_base_url": cfg.local_base_url,
+        "local_model": cfg.local_model,
+        "local_tools_ok": cfg.local_tools_ok,
+        "tier1_base_url": cfg.tier1_base_url,
+        "tier1_model": cfg.tier1_model,
+        "tier2_base_url": cfg.tier2_base_url,
+        "tier2_model": cfg.tier2_model,
+        "tier1_tools_ok": cfg.tier1_tools_ok,
+        "tier2_tools_ok": cfg.tier2_tools_ok,
+        "strategy_provider": strategy_provider,
+        "strategy_model": strategy_model,
+        "description": "Local model handles tool execution. Strategy (cloud) handles planning and synthesis.",
+    })))
+}
+
+async fn api_multimodel_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<crate::multimodel::MultimodelPatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let old = state.app_state.llm.multimodel_config();
+    let mut cfg = old.clone();
+    if let Some(enabled) = body.enabled {
+        cfg.enabled = enabled;
+    }
+    // New unified local fields
+    if let Some(ref url) = body.local_base_url {
+        cfg.local_base_url = url.trim().to_string();
+    }
+    if let Some(ref model) = body.local_model {
+        cfg.local_model = model.trim().to_string();
+    }
+    // Legacy fields (accepted for backward compat)
+    if let Some(ref url) = body.tier1_base_url {
+        cfg.tier1_base_url = url.trim().to_string();
+    }
+    if let Some(ref model) = body.tier1_model {
+        cfg.tier1_model = model.trim().to_string();
+    }
+    if let Some(ref url) = body.tier2_base_url {
+        cfg.tier2_base_url = url.trim().to_string();
+    }
+    if let Some(ref model) = body.tier2_model {
+        cfg.tier2_model = model.trim().to_string();
+    }
+    // Invalidate tools_ok if local config changed
+    let local_changed = body.local_base_url.is_some() || body.local_model.is_some();
+    if local_changed
+        && (old.local_base_url != cfg.local_base_url || old.local_model != cfg.local_model)
+    {
+        cfg.local_tools_ok = false;
+    }
+    cfg = cfg.normalize();
+    if cfg.enabled && !cfg.local_configured() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Local model base URL and model are required to enable multi-model routing.".into(),
+        ));
+    }
+    if cfg.enabled && !cfg.local_tools_ok {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Run the tool-calling test for the local model before enabling multi-model routing."
+                .into(),
+        ));
+    }
+    call_blocking(state.app_state.db.clone(), {
+        let cfg_db = cfg.clone();
+        move |db| crate::multimodel::persist_to_db(db, &cfg_db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .app_state
+        .llm
+        .apply_multimodel_config(cfg.clone())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "enabled": cfg.enabled,
+        "local_base_url": cfg.local_base_url,
+        "local_model": cfg.local_model,
+        "local_tools_ok": cfg.local_tools_ok,
+        "message": if cfg.enabled {
+            "Multi-model routing enabled. Execute phase routes to local model."
+        } else {
+            "Multi-model routing disabled. All iterations use the strategy LLM."
+        },
+    })))
+}
+
+async fn api_multimodel_test_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<MultimodelTestRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let tier = match body.tier.trim().to_ascii_lowercase().as_str() {
+        "local" | "technical" | "tier1" | "1" => crate::multimodel::ModelTier::Local,
+        "knowledge" | "tier2" | "2" => crate::multimodel::ModelTier::Local,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown tier {:?}. Use 'local'.", other),
+            ))
+        }
+    };
+    let model = body.model.trim();
+    let base_url_raw = body.base_url.trim();
+    if model.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "model is required".into()));
+    }
+    if base_url_raw.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "base_url is required".into()));
+    }
+    let label = "local";
+    let fallback_base = "";
+    let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, fallback_base);
+    let base = state.app_state.config.clone();
+    let mut test_cfg = base;
+    test_cfg.llm_provider = "llama".into();
+    test_cfg.api_key = String::new();
+    test_cfg.model = model.to_string();
+    test_cfg.llm_base_url = Some(base_url.clone());
+    match crate::llm::test_model(&test_cfg, model).await {
+        Ok(()) => {}
+        Err(e) => return Err((StatusCode::BAD_GATEWAY, e)),
+    }
+    match crate::llm::test_multimodel_tools(&test_cfg, model, tier).await {
+        Ok(()) => {
+            call_blocking(state.app_state.db.clone(), move |db| {
+                crate::multimodel::persist_tier_tools_ok(db, tier, true)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if let Ok(cfg) = call_blocking(state.app_state.db.clone(), |db| {
+                crate::multimodel::load_from_db(db)
+            })
+            .await
+            {
+                let _ = state.app_state.llm.apply_multimodel_config(cfg);
+            }
+            Ok(Json(json!({
+                "ok": true,
+                "tier": label,
+                "model": model,
+                "base_url": base_url,
+                "tools_ok": true,
+                "message": format!("{label} tier reachable and tool-calling verified at {base_url}."),
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Server reachable but tool-calling probe failed: {e}"),
+        )),
+    }
+}
+
+fn cursor_engine_json(
+    cfg: &crate::cursor_engine_config::CursorEngineSettings,
+    health: &crate::cursor_engine_config::SidecarHealth,
+    agent_engine: &str,
+    sidecar_managed: bool,
+) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "sdk_runner_url": cfg.sdk_runner_url,
+        "sdk_model": cfg.sdk_model,
+        "sdk_runner_ok": cfg.sdk_runner_ok,
+        "sidecar_reachable": health.reachable,
+        "api_key_configured": health.api_key_configured,
+        "engine_ready": cfg.engine_ready(health),
+        "sidecar_managed": sidecar_managed,
+        "agent_engine": agent_engine,
+        "cli_path": cfg.cli_path,
+        "cli_model": cfg.cli_model,
+        "cli_runner_url": cfg.cli_runner_url,
+        "cli_on_path": crate::cursor_engine_config::cli_on_path(&cfg.cli_path),
+        "timeout_secs": cfg.timeout_secs,
+        "tmux_enabled": cfg.tmux_enabled,
+        "install_steps": [
+            "Set CURSOR_API_KEY in repo-root .env (Cursor Dashboard → Integrations)",
+            "Restart the bot — it auto-creates a runtime venv and installs cursor-sdk + aiohttp",
+            "Optional: CURSOR_SDK_AUTO_INSTALL=false to manage Python deps yourself",
+        ],
+        "sidecar_error": health.error,
+    })
+}
+
+async fn api_cursor_engine_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
+    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    Ok(Json(cursor_engine_json(
+        &cfg,
+        &health,
+        agent_engine,
+        state.app_state.cursor_sidecar.managed_locally,
+    )))
+}
+
+async fn api_cursor_engine_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<crate::cursor_engine_config::CursorEnginePatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let mut cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+
+    if let Some(ref url) = body.sdk_runner_url {
+        let trimmed = url.trim().to_string();
+        if !trimmed.is_empty() {
+            crate::cursor_engine_config::validate_runner_url(&trimmed)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+        if trimmed != cfg.sdk_runner_url {
+            cfg.sdk_runner_ok = false;
+        }
+        cfg.sdk_runner_url = trimmed;
+    }
+    if let Some(ref model) = body.sdk_model {
+        cfg.sdk_model = model.trim().to_string();
+    }
+    if let Some(ref path) = body.cli_path {
+        cfg.cli_path = path.trim().to_string();
+    }
+    if let Some(ref model) = body.cli_model {
+        cfg.cli_model = model.trim().to_string();
+    }
+    if let Some(ref url) = body.cli_runner_url {
+        let trimmed = url.trim().to_string();
+        if !trimmed.is_empty() {
+            crate::cursor_engine_config::validate_runner_url(&trimmed)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+        cfg.cli_runner_url = trimmed;
+    }
+    if let Some(secs) = body.timeout_secs {
+        cfg.timeout_secs = secs.clamp(60, 86_400);
+    }
+    if let Some(enabled) = body.tmux_enabled {
+        cfg.tmux_enabled = enabled;
+    }
+
+    if cfg.sdk_model.trim().is_empty() {
+        cfg.sdk_model = crate::config::default_cursor_sdk_model();
+    }
+    if cfg.cli_path.trim().is_empty() {
+        cfg.cli_path = crate::config::default_cursor_agent_cli_path();
+    }
+
+    call_blocking(state.app_state.db.clone(), {
+        let cfg_db = cfg.clone();
+        move |db| crate::cursor_engine_config::persist_to_db(db, &cfg_db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    {
+        let mut guard = state
+            .app_state
+            .cursor_settings
+            .write()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        *guard = cfg.clone();
+    }
+
+    let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
+    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    let mut out = cursor_engine_json(
+        &cfg,
+        &health,
+        agent_engine,
+        state.app_state.cursor_sidecar.managed_locally,
+    );
+    if let serde_json::Value::Object(ref mut map) = out {
+        map.insert(
+            "message".into(),
+            serde_json::Value::String("Cursor settings saved.".into()),
+        );
+    }
+    Ok(Json(out))
+}
+
+async fn api_cursor_engine_health_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let mut cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
+
+    let ok = health.reachable && health.api_key_configured;
+    if ok {
+        cfg.sdk_runner_ok = true;
+        call_blocking(state.app_state.db.clone(), {
+            let cfg_db = cfg.clone();
+            move |db| crate::cursor_engine_config::persist_to_db(db, &cfg_db)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Ok(mut guard) = state.app_state.cursor_settings.write() {
+            *guard = cfg.clone();
+        }
+    }
+
+    let message = if ok {
+        "Sidecar reachable and CURSOR_API_KEY is configured on the host.".to_string()
+    } else if !health.reachable {
+        health
+            .error
+            .clone()
+            .unwrap_or_else(|| "Sidecar is not reachable.".into())
+    } else {
+        "Sidecar is up but CURSOR_API_KEY is not set on the host.".into()
+    };
+
+    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    let mut out = cursor_engine_json(
+        &cfg,
+        &health,
+        agent_engine,
+        state.app_state.cursor_sidecar.managed_locally,
+    );
+    if let serde_json::Value::Object(ref mut map) = out {
+        map.insert("message".into(), serde_json::Value::String(message));
+        map.insert("health_ok".into(), serde_json::Value::Bool(ok));
+    }
+    Ok(Json(out))
+}
+
+async fn api_cursor_engine_models_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    match crate::cursor_engine_config::fetch_sidecar_models(&cfg.sdk_runner_url).await {
+        Ok(models) => Ok(Json(json!({
+            "ok": true,
+            "models": models,
+        }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
+}
+
+async fn api_settings_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let settings = call_blocking(state.app_state.db.clone(), move |db| db.list_app_settings())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut items: Vec<serde_json::Value> = settings
+        .into_iter()
+        .filter(|s| !crate::config::is_llm_related_runtime_setting_key(&s.key))
+        .filter(|s| {
+            !s.key
+                .eq_ignore_ascii_case(crate::runtime_toggles::APP_SETTING_TOOL_OUTPUT_DEBUG)
+        })
+        .filter(|s| {
+            !s.key.eq_ignore_ascii_case(
+                crate::runtime_toggles::APP_SETTING_POST_TOOL_EVALUATOR_ENABLED,
+            )
+        })
+        .filter(|s| {
+            !s.key.eq_ignore_ascii_case(
+                crate::runtime_toggles::APP_SETTING_RESPONSE_QUALITY_EVALUATOR_ENABLED,
+            )
+        })
+        .map(|s| {
+            let secret = setting_is_secret(&s.key);
+            json!({
+                "key": s.key,
+                "value": if secret { mask_setting_value(&s.value) } else { s.value.clone() },
+                "raw_value": s.value,
+                "is_secret": secret,
+                "updated_at": s.updated_at,
+                "source": "runtime_db",
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        let ak = a
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let bk = b
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        ak.cmp(&bk)
+    });
+
+    let cfg = &state.app_state.config;
+    let cursor_cfg = state
+        .app_state
+        .cursor_settings
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .clone();
+    let cursor_engine_ready = cursor_cfg.sdk_configured() && cursor_cfg.sdk_runner_ok;
+    Ok(Json(json!({
+        "ok": true,
+        "settings": items,
+        "bootstrap": {
+            "workspace_dir": cfg.workspace_dir,
+            "web_enabled": cfg.web_enabled,
+            "web_host": cfg.web_host,
+            "web_port": cfg.web_port,
+            "web_auth_token_set": cfg.web_auth_token.as_ref().is_some_and(|v| !v.trim().is_empty()),
+        },
+        "installation_status": {
+            "llm_ready": is_llm_ready(cfg),
+            "channel_ready": is_channel_ready(cfg),
+            "cursor_engine_ready": cursor_engine_ready,
+            "web_enabled": cfg.web_enabled,
+            // PATCH /api/settings is disabled; no in-app "pending restart" until we track real diffs.
+            "requires_restart_for_env_changes": false,
+            "runtime_env_merge_from_app_settings": true,
+            "llm_model_from_app_settings": true,
+            "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
+            "post_tool_evaluator_enabled": state.app_state.runtime_toggles.post_tool_evaluator_enabled(),
+            "response_quality_evaluator_enabled": state.app_state.runtime_toggles.response_quality_evaluator_enabled(),
+        }
+    })))
+}
+
+async fn api_settings_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(_): Json<SettingsPatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        "Persisting generic key/value settings to SQLite is disabled. Configure the process via repo-root .env (or process environment). The app_settings table is legacy and not merged at startup.".to_string(),
+    ))
+}
+
+/// Restarts the user-level gateway service installed via `finally_a_value_bot gateway install` (systemd user unit or launchd).
+async fn api_restart_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "Gateway restart is only supported on Linux and macOS.".to_string(),
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if !crate::gateway::user_gateway_service_installed() {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "message": "Gateway service is not installed for this user. Run: finally_a_value_bot gateway install"
+                })),
+            ));
+        }
+        crate::gateway::schedule_user_gateway_restart();
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "ok": true,
+                "message": "Gateway restart scheduled. The page may disconnect briefly."
+            })),
+        ))
+    }
+}
+
+fn json_channel_bot_instance_redacted(inst: &ChannelBotInstance) -> serde_json::Value {
+    let masked = mask_setting_value(&inst.token);
+    json!({
+        "id": inst.id,
+        "platform": inst.platform,
+        "label": inst.label,
+        "token_redacted": masked,
+        "created_at": inst.created_at,
+        "env_primary": (1..=3).contains(&inst.id),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelBotInstanceCreateRequest {
+    platform: String,
+    label: String,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelBotInstanceUpdateRequest {
+    label: String,
+    token: String,
+}
+
+async fn api_channel_bot_instances_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let list = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_all_channel_bot_instances()
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(json_channel_bot_instance_redacted)
+        .collect();
+    Ok(Json(json!({ "ok": true, "instances": items })))
+}
+
+async fn api_channel_bot_instances_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ChannelBotInstanceCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let platform = body.platform;
+    let platform_for_provision = platform.clone();
+    let label = body.label;
+    let token = body.token;
+    let db = state.app_state.db.clone();
+    let id = call_blocking(db.clone(), move |db| {
+        db.create_channel_bot_instance(&platform, &label, &token)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let linked = call_blocking(db, move |db| {
+        db.provision_bindings_for_instance(&platform_for_provision, id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "bindings_provisioned": linked,
+        "message": "Bot instance created. Restart the process to run dispatchers for new instances. Existing contacts were auto-linked where possible."
+    })))
+}
+
+async fn api_channel_bot_instances_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ChannelBotInstanceUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let label = body.label;
+    let token = body.token;
+    let updated = call_blocking(state.app_state.db.clone(), move |db| {
+        db.update_channel_bot_instance(id, &label, &token)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "Unknown bot instance id".into()));
+    }
+    Ok(Json(
+        json!({ "ok": true, "message": "Updated. Restart the process to apply token changes to dispatchers." }),
+    ))
+}
+
+async fn api_channel_bot_instances_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_channel_bot_instance(id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Not found or cannot delete".into()));
+    }
+    Ok(Json(json!({ "ok": true, "removed": true })))
+}
+
+async fn api_channel_persona_policy_upsert(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ChannelPersonaPolicyUpsertRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let mode = match body.mode.as_str() {
+        "all" => ChannelPersonaMode::All,
+        "single" => ChannelPersonaMode::Single,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "mode must be 'all' or 'single'".to_string(),
+            ))
+        }
+    };
+    let persona_id = body.persona_id.filter(|id| *id > 0);
+    let bot_instance_id = body.bot_instance_id;
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.set_channel_persona_policy(chat_id, bot_instance_id, mode, persona_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "bot_instance_id": bot_instance_id,
+        "mode": body.mode,
+        "persona_id": persona_id,
+    })))
+}
+
+async fn api_channel_persona_policy_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<ChannelPersonaPolicyDeleteRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let removed = call_blocking(state.app_state.db.clone(), move |db| {
+        db.clear_channel_persona_policy(chat_id, body.bot_instance_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "removed": removed,
     })))
 }
 
@@ -2738,6 +5979,7 @@ pub async fn start_web_server(state: Arc<AppState>) {
         run_hub: RunHub::default(),
         request_hub: RequestHub::default(),
         limits,
+        web_binding_universal_done: Arc::new(Mutex::new(None)),
     };
 
     let router = build_router(web_state);
@@ -3077,6 +6319,8 @@ async fn api_oauth_callback(
 }
 
 fn build_router(web_state: WebState) -> Router {
+    let json_limit = web_json_body_limit_bytes(&web_state.app_state.config);
+    let multipart_limit = web_multipart_body_limit_bytes(&web_state.app_state.config);
     Router::new()
         .route("/", get(index))
         .route("/assets/*file", get(asset_file))
@@ -3089,27 +6333,111 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/contacts/unlink", post(api_contacts_unlink))
         .route("/api/contacts/bindings", get(api_contacts_bindings))
         .route(
+            "/api/settings",
+            get(api_settings_get).patch(api_settings_patch),
+        )
+        .route("/api/llm", get(api_llm_get).patch(api_llm_patch))
+        .route(
+            "/api/multimodel",
+            get(api_multimodel_get).patch(api_multimodel_patch),
+        )
+        .route("/api/multimodel/test", post(api_multimodel_test_post))
+        .route(
+            "/api/cursor-engine",
+            get(api_cursor_engine_get).patch(api_cursor_engine_patch),
+        )
+        .route(
+            "/api/cursor-engine/health",
+            post(api_cursor_engine_health_post),
+        )
+        .route(
+            "/api/cursor-engine/models",
+            get(api_cursor_engine_models_get),
+        )
+        .route(
+            "/api/runtime",
+            get(api_runtime_get).patch(api_runtime_patch),
+        )
+        .route("/api/restart", post(api_restart_post))
+        .route(
+            "/api/channel_bot_instances",
+            get(api_channel_bot_instances_get).post(api_channel_bot_instances_post),
+        )
+        .route(
+            "/api/channel_bot_instances/:id",
+            patch(api_channel_bot_instances_patch).delete(api_channel_bot_instances_delete),
+        )
+        .route(
+            "/api/channel_persona_policy",
+            post(api_channel_persona_policy_upsert).delete(api_channel_persona_policy_delete),
+        )
+        .route(
             "/api/schedules",
             get(api_schedules_list).post(api_schedules_create),
         )
         .route("/api/schedules/:id", patch(api_schedules_update))
         .route("/api/background_jobs", get(api_background_jobs_list))
         .route("/api/background_jobs/:job_id", get(api_background_job_get))
+        .route(
+            "/api/background_jobs/cancel",
+            post(api_background_job_cancel),
+        )
         .route("/api/history", get(api_history))
         .route("/api/history/days", get(api_history_days))
         .route("/api/artifacts", get(api_artifacts))
+        .route(
+            "/api/uploads",
+            post(api_upload).layer(DefaultBodyLimit::max(multipart_limit)),
+        )
         .route("/api/send", post(api_send))
-        .route("/api/send_stream", post(api_send_stream))
+        .route(
+            "/api/send_stream",
+            post(api_send_stream).layer(DefaultBodyLimit::max(json_limit)),
+        )
         .route("/api/stream", get(api_stream))
         .route("/api/run_status", get(api_run_status))
         .route("/api/queue_diagnostics", get(api_queue_diagnostics))
         .route("/api/queue/cancel", post(api_queue_cancel))
+        .route("/api/queue/remove", post(api_queue_remove))
         .route("/api/reset", post(api_reset))
         .route("/api/delete_session", post(api_delete_session))
         .route("/api/personas", get(api_personas))
         .route("/api/personas/switch", post(api_personas_switch))
         .route("/api/personas/create", post(api_personas_create))
         .route("/api/personas/delete", post(api_personas_delete))
+        .route(
+            "/api/chat_sessions",
+            get(api_chat_sessions_list).post(api_chat_sessions_create),
+        )
+        .route(
+            "/api/chat_sessions/:session_id",
+            get(api_chat_sessions_get)
+                .patch(api_chat_sessions_patch)
+                .delete(api_chat_sessions_delete),
+        )
+        .route("/api/skills", get(api_skills_get))
+        .route("/api/hooks", get(api_hooks_get).post(api_hooks_post))
+        .route("/api/hooks/:id", delete(api_hooks_delete))
+        .route(
+            "/api/personas/:persona_id/bulletin",
+            get(api_persona_bulletin_get).patch(api_persona_bulletin_patch),
+        )
+        .route(
+            "/api/personas/:persona_id/policy",
+            get(api_persona_policy_get).patch(api_persona_policy_patch),
+        )
+        .route(
+            "/api/personas/:persona_id/bookmarks",
+            get(api_persona_bookmarks_get).post(api_persona_bookmarks_post),
+        )
+        .route(
+            "/api/personas/:persona_id/bookmarks/:message_id",
+            delete(api_persona_bookmarks_delete),
+        )
+        .route(
+            "/api/personas/:persona_id/messages/:message_id",
+            get(api_persona_message_get).delete(api_persona_message_delete),
+        )
         .route(
             "/api/personas/:persona_id/memory",
             get(api_persona_memory_get).put(api_persona_memory_put),
@@ -3119,11 +6447,16 @@ fn build_router(web_state: WebState) -> Router {
             get(api_persona_agent_history_latest),
         )
         .route(
+            "/api/personas/:persona_id/agent_history/latest/optimize",
+            post(api_persona_agent_history_optimize),
+        )
+        .route(
             "/api/workspace/agents_md",
             get(api_workspace_agents_md_get).put(api_workspace_agents_md_put),
         )
         .route("/api/oauth/authorize/:platform", get(api_oauth_authorize))
         .route("/api/oauth/callback/:platform", get(api_oauth_callback))
+        .layer(DefaultBodyLimit::max(json_limit))
         .with_state(web_state)
 }
 
@@ -3177,6 +6510,150 @@ mod tests {
         let urls = extract_upload_urls_from_text(text);
         assert!(urls.iter().any(|u| u == "/api/uploads/web/1/file.md"));
         assert!(urls.iter().any(|u| u == "/api/uploads/web/1/img.png"));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_response_file_links_rewrites_local_markdown_target() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = 997894126_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let shared_dir = workspace_root.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        let local = shared_dir.join("report.pdf");
+        std::fs::write(&local, b"pdf").unwrap();
+
+        let input = "[Download](shared/report.pdf)";
+        let output = materialize_response_file_links(&web_state, chat_id, 1, input)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/"));
+        assert!(!output.contains("(shared/report.pdf)"));
+
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_response_file_links_repairs_missing_upload_url() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = 997894126_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let shared_dir = workspace_root.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        std::fs::write(shared_dir.join("report.pdf"), b"pdf").unwrap();
+
+        let input = "[Download](/api/uploads/web/997894126/report.pdf)";
+        let output = materialize_response_file_links(&web_state, chat_id, 1, input)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/"));
+        assert_ne!(input, output);
+
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_repairs_fabricated_bot_copy_upload_url() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = 997894126_i64;
+        let persona_id = 24_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let persona_dir = workspace_root
+            .join("shared")
+            .join("personas")
+            .join(chat_id.to_string())
+            .join(persona_id.to_string());
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        std::fs::write(
+            persona_dir.join("PZ-20260608-PARK-HOTIFY-MEDIUM.png"),
+            [137u8, 80, 78, 71, 13, 10, 26, 10],
+        )
+        .unwrap();
+
+        let input = "![preview](/api/uploads/web/997894126/24/20260604-045735-bot-PZ-20260608-PARK-HOTIFY-MEDIUM.png)";
+        let output = materialize_response_file_links(&web_state, chat_id, persona_id, input)
+            .await
+            .unwrap();
+        assert_ne!(input, output);
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_after_bare_normalize_persona_scoped_image() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = 997894126_i64;
+        let persona_id = 24_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let persona_dir = workspace_root
+            .join("shared")
+            .join("personas")
+            .join(chat_id.to_string())
+            .join(persona_id.to_string());
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        let img = persona_dir.join("PZ-foo.png");
+        std::fs::write(&img, [137u8, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+
+        let raw = "Preview:\n\nPZ-foo.png\n\nOK?";
+        let normalized = crate::final_delivery_media::normalize_assistant_artifact_references(
+            &raw,
+            &workspace_root,
+            chat_id,
+            persona_id,
+        );
+        let output = materialize_response_file_links(&web_state, chat_id, persona_id, &normalized)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/24/"));
+        assert!(output.contains("![PZ-foo.png]"));
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
+    }
+
+    #[tokio::test]
+    async fn test_materialize_response_file_links_rewrites_parenthesized_local_path() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = 997894126_i64;
+        let workspace_root = web_state.app_state.config.workspace_root_absolute();
+        let shared_dir = workspace_root.join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        std::fs::write(shared_dir.join("report.pdf"), b"pdf").unwrap();
+
+        let input = "(shared/report.pdf)";
+        let output = materialize_response_file_links(&web_state, chat_id, 1, input)
+            .await
+            .unwrap();
+        assert!(output.contains("/api/uploads/web/997894126/"));
+        assert!(!output.contains("(shared/report.pdf)"));
+
+        let urls = extract_upload_urls_from_text(&output);
+        assert_eq!(urls.len(), 1);
+        assert!(upload_rel_url_exists(&web_state, &urls[0]));
     }
 
     struct DummyLlm;
@@ -3272,7 +6749,12 @@ mod tests {
         }
     }
 
-    fn test_state(llm: Arc<dyn LlmProvider>) -> Arc<AppState> {
+    fn test_llm_from_provider(provider: Arc<dyn LlmProvider>) -> Arc<crate::llm::LlmHandle> {
+        let cfg = crate::config::test_config();
+        crate::llm::LlmHandle::from_provider(&cfg, provider)
+    }
+
+    fn test_state(llm: Arc<crate::llm::LlmHandle>) -> Arc<AppState> {
         let mut cfg = crate::config::test_config();
         cfg.web_port = 3900;
         cfg.universal_chat_id = Some(997894126);
@@ -3286,28 +6768,36 @@ mod tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let db = Arc::new(Database::new(&runtime_dir).unwrap());
         let bot = Bot::new("123456:TEST_TOKEN");
+        let mut telegram_bots = std::collections::HashMap::new();
+        telegram_bots.insert(crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY, bot.clone());
+        let runtime_toggles = crate::runtime_toggles::RuntimeToggles::new(cfg.tool_output_debug);
+        let env_redactor =
+            std::sync::Arc::new(crate::safety_redaction::EnvSecretRedactor::discover(&cfg));
+        let cursor_settings = Arc::new(std::sync::RwLock::new(
+            crate::cursor_engine_config::CursorEngineSettings::from_env(&cfg),
+        ));
+        let cursor_sidecar = crate::cursor_sdk_sidecar::SidecarHandle::inactive();
         let state = AppState {
             config: cfg.clone(),
-            bot: bot.clone(),
+            env_redactor: env_redactor.clone(),
+            runtime_toggles: runtime_toggles.clone(),
+            cursor_settings,
+            cursor_sidecar,
+            telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),
-            skills: {
-                let root = cfg.workspace_root_absolute();
-                SkillManager::from_skills_dirs([
-                    root.join("skills"),
-                    root.join("shared").join("skills"),
-                ])
-            },
+            skills: SkillManager::from_skills_dirs(cfg.skill_discovery_dirs()),
             llm,
-            tools: ToolRegistry::new(&cfg, bot, db),
-            discord_http: None,
+            tools: ToolRegistry::new(&cfg, bot, db, runtime_toggles, env_redactor),
+            discord_http: Arc::new(std::collections::HashMap::new()),
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
+            background_job_control: crate::background_jobs::BackgroundJobControl::default(),
         };
         Arc::new(state)
     }
 
     fn test_web_state(
-        llm: Arc<dyn LlmProvider>,
+        llm: Arc<crate::llm::LlmHandle>,
         auth_token: Option<String>,
         limits: WebLimits,
     ) -> WebState {
@@ -3318,12 +6808,333 @@ mod tests {
             run_hub: RunHub::default(),
             request_hub: RequestHub::default(),
             limits,
+            web_binding_universal_done: Arc::new(Mutex::new(None)),
         }
     }
 
     #[tokio::test]
+    async fn test_api_hooks_get_persona_fields() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = web_state
+            .app_state
+            .config
+            .universal_chat_id
+            .unwrap_or(997894126_i64);
+        let db = web_state.app_state.db.clone();
+
+        let owner_persona_id = db
+            .create_persona(chat_id, "owner", None)
+            .expect("create owner persona");
+        let other_persona_id = db
+            .create_persona(chat_id, "other", None)
+            .expect("create other persona");
+
+        let global_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "global-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"global"}"#,
+                None,
+                true,
+            )
+            .expect("upsert global hook");
+        let scoped_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "scoped-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"scoped"}"#,
+                Some(&[owner_persona_id]),
+                true,
+            )
+            .expect("upsert scoped hook");
+        let disabled_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "disabled-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"disabled"}"#,
+                None,
+                false,
+            )
+            .expect("upsert disabled hook");
+
+        let res_owner = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(owner_persona_id),
+            }),
+        )
+        .await;
+        let body_owner = res_owner.expect("owner ok").0;
+        let hooks_owner = body_owner
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .expect("hooks array");
+
+        let find_hook = |id: i64| {
+            hooks_owner
+                .iter()
+                .find(|h| h.get("id").and_then(|v| v.as_i64()) == Some(id))
+                .expect("hook exists")
+        };
+
+        let global_hook = find_hook(global_hook_id);
+        assert_eq!(
+            global_hook
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            global_hook
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            global_hook
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let scoped_hook = find_hook(scoped_hook_id);
+        assert_eq!(
+            scoped_hook
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let disabled_hook = find_hook(disabled_hook_id);
+        assert_eq!(
+            disabled_hook
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let res_other = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(other_persona_id),
+            }),
+        )
+        .await;
+        let body_other = res_other.expect("other ok").0;
+        let hooks_other = body_other
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .expect("hooks array");
+        let find_hook_other = |id: i64| {
+            hooks_other
+                .iter()
+                .find(|h| h.get("id").and_then(|v| v.as_i64()) == Some(id))
+                .expect("hook exists")
+        };
+
+        let scoped_hook_other = find_hook_other(scoped_hook_id);
+        assert_eq!(
+            scoped_hook_other
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            scoped_hook_other
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook_other
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let res_missing = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(99999),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(res_missing, Err((StatusCode::NOT_FOUND, _))),
+            "expected 404 for missing persona"
+        );
+
+        db.set_persona_hook_skill_policy(chat_id, owner_persona_id, Some(&[]), None)
+            .expect("block all hooks for owner");
+        let res_owner_blocked = api_hooks_get(
+            HeaderMap::new(),
+            State(web_state.clone()),
+            Query(HooksQuery {
+                persona_id: Some(owner_persona_id),
+            }),
+        )
+        .await;
+        let body_owner_blocked = res_owner_blocked.expect("owner ok").0;
+        let hooks_owner_blocked = body_owner_blocked
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .expect("hooks array");
+        let find_hook_blocked = |id: i64| {
+            hooks_owner_blocked
+                .iter()
+                .find(|h| h.get("id").and_then(|v| v.as_i64()) == Some(id))
+                .expect("hook exists")
+        };
+
+        let global_hook_blocked = find_hook_blocked(global_hook_id);
+        assert_eq!(
+            global_hook_blocked
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            global_hook_blocked
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            global_hook_blocked
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let scoped_hook_blocked = find_hook_blocked(scoped_hook_id);
+        assert_eq!(
+            scoped_hook_blocked
+                .get("scoped_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            scoped_hook_blocked
+                .get("allowed_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            scoped_hook_blocked
+                .get("active_for_persona")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multipart_upload_then_send_with_ref() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let chat_id = web_state
+            .app_state
+            .config
+            .universal_chat_id
+            .unwrap_or(997894126);
+        let app = build_router(web_state);
+
+        let boundary = "----testboundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--{boundary}--\r\n"
+        );
+        let upload_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/uploads?chat_id={chat_id}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let upload_resp = app.clone().oneshot(upload_req).await.unwrap();
+        assert_eq!(upload_resp.status(), StatusCode::OK);
+        let upload_bytes = axum::body::to_bytes(upload_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let upload_json: serde_json::Value = serde_json::from_slice(&upload_bytes).unwrap();
+        let tool_path = upload_json
+            .get("tool_path")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let url = upload_json
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let send_body = json!({
+            "chat_id": chat_id,
+            "sender_name": "u",
+            "message": "see image",
+            "attachments": [{
+                "filename": "photo.png",
+                "media_type": "image/png",
+                "tool_path": tool_path,
+                "url": url,
+            }]
+        });
+        let send_req = Request::builder()
+            .method("POST")
+            .uri("/api/send_stream")
+            .header("content-type", "application/json")
+            .body(Body::from(send_body.to_string()))
+            .unwrap();
+        let send_resp = app.oneshot(send_req).await.unwrap();
+        assert_eq!(send_resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_web_body_limit_helpers() {
+        let mut cfg = crate::config::test_config();
+        cfg.max_document_size_mb = 10;
+        assert!(web_json_body_limit_bytes(&cfg) > 10 * 1024 * 1024);
+        assert!(web_multipart_body_limit_bytes(&cfg) >= 10 * 1024 * 1024);
+    }
+
+    #[tokio::test]
     async fn test_send_stream_then_stream_done() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -3363,7 +7174,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_slash_command_via_send_stream_returns_done_with_response() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -3409,7 +7224,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_failure_requires_header() {
         let web_state = test_web_state(
-            Arc::new(DummyLlm),
+            test_llm_from_provider(Arc::new(DummyLlm)),
             Some("secret-token".into()),
             WebLimits::default(),
         );
@@ -3435,7 +7250,7 @@ mod tests {
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Arc::new(DummyLlm), None, limits);
+        let web_state = test_web_state(test_llm_from_provider(Arc::new(DummyLlm)), None, limits);
         let app = build_router(web_state);
 
         let req1 = Request::builder()
@@ -3460,9 +7275,9 @@ mod tests {
     #[tokio::test]
     async fn test_stream_includes_tool_events_and_replay() {
         let web_state = test_web_state(
-            Arc::new(ToolFlowLlm {
+            test_llm_from_provider(Arc::new(ToolFlowLlm {
                 calls: AtomicUsize::new(0),
-            }),
+            })),
             None,
             WebLimits::default(),
         );
@@ -3535,7 +7350,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconnect_from_last_event_id_gets_non_empty_replay() {
-        let web_state = test_web_state(Arc::new(DummyLlm), None, WebLimits::default());
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(DummyLlm)),
+            None,
+            WebLimits::default(),
+        );
         let app = build_router(web_state);
 
         let req = Request::builder()
@@ -3600,7 +7419,7 @@ mod tests {
             run_history_limit: 128,
             session_idle_ttl: Duration::from_secs(60),
         };
-        let web_state = test_web_state(Arc::new(DummyLlm), None, limits);
+        let web_state = test_web_state(test_llm_from_provider(Arc::new(DummyLlm)), None, limits);
         let app = build_router(web_state);
 
         let mk_req = |msg: &str| {
@@ -3628,7 +7447,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_db_paths_use_call_blocking_in_web_flow() {
-        let state = test_state(Arc::new(DummyLlm));
+        let state = test_state(test_llm_from_provider(Arc::new(DummyLlm)));
         let chat_id = 12345_i64;
         let cid = chat_id;
         let pid = call_blocking(state.db.clone(), move |db| db.get_current_persona_id(cid))

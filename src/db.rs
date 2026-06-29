@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -22,15 +23,64 @@ where
         .map_err(|e| FinallyAValueBotError::ToolExecution(format!("DB task join error: {e}")))?
 }
 
+pub const MESSAGE_ORIGIN_INTERACTIVE: &str = "interactive";
+pub const MESSAGE_ORIGIN_SCHEDULED: &str = "scheduled";
+
+pub fn message_origin_interactive() -> String {
+    MESSAGE_ORIGIN_INTERACTIVE.to_string()
+}
+
+pub fn message_origin_scheduled() -> String {
+    MESSAGE_ORIGIN_SCHEDULED.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
     pub id: String,
     pub chat_id: i64,
     pub persona_id: i64,
+    pub session_id: Option<String>,
     pub sender_name: String,
     pub content: String,
     pub is_from_bot: bool,
     pub timestamp: String,
+    /// `interactive` (default) or `scheduled` (scheduler final delivery).
+    pub origin: String,
+}
+
+fn stored_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
+    Ok(StoredMessage {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        persona_id: row.get(2)?,
+        session_id: row.get(3)?,
+        sender_name: row.get(4)?,
+        content: row.get(5)?,
+        is_from_bot: row.get::<_, i32>(6)? != 0,
+        timestamp: row.get(7)?,
+        origin: row
+            .get::<_, Option<String>>(8)?
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(message_origin_interactive),
+    })
+}
+
+const MESSAGE_SELECT_COLS: &str =
+    "id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp, origin";
+
+#[derive(Debug, Clone)]
+pub struct ChatSession {
+    pub id: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub title: String,
+    pub intent: String,
+    pub status: String,
+    pub created_at: String,
+    pub last_active_at: String,
+    pub archived_at: Option<String>,
+    pub ttl_hours: i64,
+    pub bootstrap_context_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +89,16 @@ pub struct Persona {
     pub chat_id: i64,
     pub name: String,
     pub model_override: Option<String>,
+    /// When set, overrides global default for `trim_to_recent_balanced` minimum user messages.
+    pub recent_history_min_user: Option<i64>,
+    /// When set, overrides global default for `trim_to_recent_balanced` minimum assistant messages.
+    pub recent_history_min_assistant: Option<i64>,
+    /// Operator-authored steering note injected into the system prompt (web cockpit).
+    pub operator_memo: Option<String>,
 }
+
+/// Maximum `operator_memo` length (characters) for storage and prompt injection.
+pub const OPERATOR_MEMO_MAX_CHARS: usize = 4000;
 
 #[derive(Debug, Clone)]
 pub struct ChatSummary {
@@ -87,11 +146,129 @@ pub struct ScheduledTask {
     pub created_at: String,
 }
 
+/// External channel identity for delivery and persona policy. `0` = web (no bot token).
+pub const BOT_INSTANCE_WEB: i64 = 0;
+pub const BOT_INSTANCE_TELEGRAM_PRIMARY: i64 = 1;
+pub const BOT_INSTANCE_DISCORD_PRIMARY: i64 = 2;
+pub const BOT_INSTANCE_WHATSAPP_PRIMARY: i64 = 3;
+
+#[derive(Debug, Clone)]
+pub struct ChannelBotInstance {
+    pub id: i64,
+    pub platform: String,
+    pub label: String,
+    pub token: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelBinding {
     pub canonical_chat_id: i64,
+    pub bot_instance_id: i64,
     pub channel_type: String,
     pub channel_handle: String,
+}
+
+/// Merged bot instance + per-contact binding/policy for Settings → Channels.
+#[derive(Debug, Clone)]
+pub struct ContactChannelIntegrationRow {
+    pub bot_instance_id: i64,
+    pub platform: String,
+    pub label: String,
+    pub channel_handle: Option<String>,
+    pub linked: bool,
+    pub persona_mode: ChannelPersonaMode,
+    pub persona_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppSetting {
+    pub key: String,
+    pub value: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HookDefinitionRecord {
+    pub id: i64,
+    pub name: String,
+    pub event_name: String,
+    pub matcher: Option<String>,
+    pub action_type: String,
+    pub action_payload_json: String,
+    /// `None` means global hook scope; `Some(vec![...])` means explicit persona allowlist.
+    pub scoped_persona_ids: Option<Vec<i64>>,
+    pub enabled: bool,
+    pub updated_at: String,
+}
+
+impl HookDefinitionRecord {
+    pub fn scoped_for_persona(&self, persona_id: i64) -> bool {
+        self.scoped_persona_ids
+            .as_ref()
+            .map_or(true, |ids| ids.contains(&persona_id))
+    }
+
+    pub fn persona_status(
+        &self,
+        db: &Database,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<(bool, bool, bool), FinallyAValueBotError> {
+        let scoped_for_persona = self.scoped_for_persona(persona_id);
+        let allowed_for_persona = db.is_hook_allowed_for_persona(chat_id, persona_id, self.id)?;
+        let active_for_persona = self.enabled && scoped_for_persona && allowed_for_persona;
+        Ok((scoped_for_persona, allowed_for_persona, active_for_persona))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonaHookSkillPolicy {
+    pub chat_id: i64,
+    pub persona_id: i64,
+    /// `None` means default allow-all. `Some(vec![])` means explicit allow-none.
+    pub allowed_hook_ids: Option<Vec<i64>>,
+    /// `None` means default allow-all. `Some(vec![])` means explicit allow-none.
+    pub allowed_skill_names: Option<Vec<String>>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPersonaMode {
+    All,
+    Single,
+}
+
+impl ChannelPersonaMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Single => "single",
+        }
+    }
+}
+
+impl TryFrom<&str> for ChannelPersonaMode {
+    type Error = FinallyAValueBotError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "all" => Ok(Self::All),
+            "single" => Ok(Self::Single),
+            other => Err(FinallyAValueBotError::ToolExecution(format!(
+                "Invalid channel persona mode: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelPersonaPolicy {
+    pub canonical_chat_id: i64,
+    pub bot_instance_id: i64,
+    pub mode: ChannelPersonaMode,
+    pub persona_id: Option<i64>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -100,13 +277,56 @@ pub struct BackgroundJob {
     pub chat_id: i64,
     pub persona_id: i64,
     pub prompt: String,
-    pub status: String, // "pending", "running", "completed_raw", "main_agent_processing", "done", "failed"
+    pub status: String, // "pending", "running", "completed_raw", "main_agent_processing", "done", "failed", "cancelled"
     pub trigger_reason: String,
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub result_text: Option<String>,
     pub error_text: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub last_progress_at: Option<String>,
+    pub last_stage: Option<String>,
+    /// `agent` (default) or `shell`.
+    pub job_kind: String,
+    pub shell_command: Option<String>,
+    pub workdir: Option<String>,
+    pub tmux_session: Option<String>,
+    pub output_path: Option<String>,
+    pub exit_code: Option<i32>,
+    pub label: Option<String>,
+}
+
+const BG_JOB_SELECT: &str = "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage, job_kind, shell_command, workdir, tmux_session, output_path, exit_code, label";
+
+fn map_background_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundJob> {
+    Ok(BackgroundJob {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        persona_id: row.get(2)?,
+        prompt: row.get(3)?,
+        status: row.get(4)?,
+        trigger_reason: row.get(5)?,
+        created_at: row.get(6)?,
+        started_at: row.get(7)?,
+        finished_at: row.get(8)?,
+        result_text: row.get(9)?,
+        error_text: row.get(10)?,
+        lease_owner: row.get(11)?,
+        lease_expires_at: row.get(12)?,
+        last_progress_at: row.get(13)?,
+        last_stage: row.get(14)?,
+        job_kind: row
+            .get::<_, Option<String>>(15)?
+            .unwrap_or_else(|| "agent".into()),
+        shell_command: row.get(16)?,
+        workdir: row.get(17)?,
+        tmux_session: row.get(18)?,
+        output_path: row.get(19)?,
+        exit_code: row.get(20)?,
+        label: row.get(21)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -134,20 +354,6 @@ pub struct ProjectRecord {
 }
 
 #[derive(Debug, Clone)]
-pub struct WorkflowRecord {
-    pub id: i64,
-    pub owner_chat_id: i64,
-    pub intent_signature: String,
-    pub steps_json: String,
-    pub confidence: f64,
-    pub version: i64,
-    pub success_count: i64,
-    pub failure_count: i64,
-    pub last_used_at: Option<String>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct RunTimelineEvent {
     pub id: i64,
     pub run_key: String,
@@ -156,6 +362,39 @@ pub struct RunTimelineEvent {
     pub event_type: String,
     pub payload_json: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonaBulletinEvent {
+    pub id: i64,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub run_key: Option<String>,
+    pub event_type: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonaBulletinFocus {
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub title: Option<String>,
+    pub content: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonaMessageBookmark {
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub message_id: String,
+    pub role: String,
+    pub content_preview: String,
+    pub note: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +451,7 @@ impl Database {
                 content TEXT NOT NULL,
                 is_from_bot INTEGER NOT NULL DEFAULT 0,
                 timestamp TEXT NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'interactive',
                 PRIMARY KEY (id, chat_id, persona_id)
             );
 
@@ -302,7 +542,11 @@ impl Database {
                 started_at TEXT,
                 finished_at TEXT,
                 result_text TEXT,
-                error_text TEXT
+                error_text TEXT,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                last_progress_at TEXT,
+                last_stage TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_background_jobs_chat_id
                 ON background_jobs(chat_id);
@@ -338,18 +582,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_projects_owner_updated
                 ON projects(owner_chat_id, updated_at DESC);
 
-            CREATE TABLE IF NOT EXISTS project_artifacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER NOT NULL,
-                artifact_type TEXT NOT NULL,
-                artifact_ref TEXT NOT NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL,
-                UNIQUE(project_id, artifact_type, artifact_ref)
-            );
-            CREATE INDEX IF NOT EXISTS idx_project_artifacts_project
-                ON project_artifacts(project_id, updated_at DESC);
-
             CREATE TABLE IF NOT EXISTS project_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -365,6 +597,11 @@ impl Database {
                 owner_chat_id INTEGER NOT NULL,
                 intent_signature TEXT NOT NULL,
                 steps_json TEXT NOT NULL,
+                step_trace_json TEXT NOT NULL DEFAULT '[]',
+                approach_summary TEXT NOT NULL DEFAULT '',
+                last_outcome TEXT NOT NULL DEFAULT 'unknown',
+                failure_reason TEXT,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.0,
                 version INTEGER NOT NULL DEFAULT 1,
                 success_count INTEGER NOT NULL DEFAULT 0,
@@ -409,18 +646,259 @@ impl Database {
                 FOREIGN KEY (canonical_chat_id) REFERENCES chats(chat_id)
             );
             CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
-                ON channel_bindings(canonical_chat_id);",
+                ON channel_bindings(canonical_chat_id);
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS hook_definitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                event_name TEXT NOT NULL,
+                matcher TEXT,
+                action_type TEXT NOT NULL,
+                action_payload_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hook_definitions_event_enabled
+                ON hook_definitions(event_name, enabled, id);
+
+            CREATE TABLE IF NOT EXISTS persona_hook_skill_policy (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                allowed_hook_ids_json TEXT,
+                allowed_skill_names_json TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_hook_skill_policy_chat
+                ON persona_hook_skill_policy(chat_id);
+
+            CREATE TABLE IF NOT EXISTS channel_persona_policy (
+                canonical_chat_id INTEGER NOT NULL,
+                channel_type TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'all',
+                persona_id INTEGER,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (canonical_chat_id, channel_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_persona_policy_chat
+                ON channel_persona_policy(canonical_chat_id);",
         )?;
 
         Self::migrate_persona_schema(&conn)?;
         Self::migrate_scheduled_tasks_persona_schema(&conn)?;
         Self::migrate_channel_bindings(&conn)?;
+        Self::migrate_channel_bot_instances_and_policy(&conn)?;
         Self::migrate_fts(&conn)?;
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
+        Self::migrate_drop_project_artifacts(&conn)?;
+        Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
+        Self::migrate_workflow_learning_schema(&conn)?;
+        Self::migrate_background_jobs_lease_schema(&conn)?;
+        Self::migrate_background_jobs_shell_schema(&conn)?;
+        Self::migrate_personas_prompt_context(&conn)?;
+        Self::migrate_hook_policy_schema(&conn)?;
+        Self::ensure_builtin_hook_definitions(&conn)?;
+        Self::migrate_chat_sessions_schema(&conn)?;
+        Self::migrate_messages_origin(&conn)?;
+        Self::migrate_cursor_engine_agents(&conn)?;
 
         Ok(Database {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn column_exists(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut stmt = conn
+            .prepare(&pragma)
+            .map_err(|e| FinallyAValueBotError::ToolExecution(format!("pragma {table}: {e}")))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for r in rows {
+            if r? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn migrate_channel_bot_instances_and_policy(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_bot_instances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                token TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_bot_instances_platform
+                ON channel_bot_instances(platform);",
+        )?;
+
+        let has_bi = Self::column_exists(conn, "channel_bindings", "bot_instance_id")?;
+        if !has_bi {
+            conn.execute_batch(
+                "CREATE TABLE channel_bindings_new (
+                    bot_instance_id INTEGER NOT NULL,
+                    canonical_chat_id INTEGER NOT NULL,
+                    channel_type TEXT NOT NULL,
+                    channel_handle TEXT NOT NULL,
+                    PRIMARY KEY (bot_instance_id, channel_type, channel_handle)
+                );
+                CREATE INDEX IF NOT EXISTS idx_channel_bindings_new_canonical
+                    ON channel_bindings_new(canonical_chat_id);",
+            )?;
+            conn.execute(
+                "INSERT INTO channel_bindings_new (bot_instance_id, canonical_chat_id, channel_type, channel_handle)
+                 SELECT
+                    CASE channel_type
+                        WHEN 'web' THEN 0
+                        WHEN 'telegram' THEN 1
+                        WHEN 'discord' THEN 2
+                        WHEN 'whatsapp' THEN 3
+                        ELSE 1
+                    END,
+                    canonical_chat_id, channel_type, channel_handle
+                 FROM channel_bindings",
+                [],
+            )?;
+            conn.execute_batch(
+                "DROP TABLE channel_bindings;
+                 ALTER TABLE channel_bindings_new RENAME TO channel_bindings;
+                 CREATE INDEX IF NOT EXISTS idx_channel_bindings_canonical
+                     ON channel_bindings(canonical_chat_id);",
+            )?;
+        }
+
+        let policy_has_bot =
+            Self::column_exists(conn, "channel_persona_policy", "bot_instance_id")?;
+        if !policy_has_bot {
+            let has_channel_type =
+                Self::column_exists(conn, "channel_persona_policy", "channel_type")?;
+            if has_channel_type {
+                conn.execute_batch(
+                    "CREATE TABLE channel_persona_policy_new (
+                        canonical_chat_id INTEGER NOT NULL,
+                        bot_instance_id INTEGER NOT NULL,
+                        mode TEXT NOT NULL DEFAULT 'all',
+                        persona_id INTEGER,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (canonical_chat_id, bot_instance_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_channel_persona_policy_new_chat
+                        ON channel_persona_policy_new(canonical_chat_id);",
+                )?;
+                conn.execute(
+                    "INSERT INTO channel_persona_policy_new (canonical_chat_id, bot_instance_id, mode, persona_id, updated_at)
+                     SELECT canonical_chat_id,
+                        CASE channel_type
+                            WHEN 'telegram' THEN 1
+                            WHEN 'discord' THEN 2
+                            WHEN 'whatsapp' THEN 3
+                            ELSE 0
+                        END,
+                        mode, persona_id, updated_at
+                     FROM channel_persona_policy
+                     WHERE channel_type IN ('telegram', 'discord', 'whatsapp')",
+                    [],
+                )?;
+                conn.execute_batch(
+                    "DROP TABLE channel_persona_policy;
+                     ALTER TABLE channel_persona_policy_new RENAME TO channel_persona_policy;
+                     CREATE INDEX IF NOT EXISTS idx_channel_persona_policy_chat
+                         ON channel_persona_policy(canonical_chat_id);",
+                )?;
+            }
+        }
+
+        Self::migrate_misplaced_channel_bot_instance_ids(conn)?;
+
+        Ok(())
+    }
+
+    /// Reassign extra bot rows that occupy reserved primary ids 2 (Discord) or 3 (WhatsApp).
+    fn migrate_misplaced_channel_bot_instance_ids(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        let expected: [(i64, &str); 2] = [
+            (BOT_INSTANCE_DISCORD_PRIMARY, "discord"),
+            (BOT_INSTANCE_WHATSAPP_PRIMARY, "whatsapp"),
+        ];
+        for (reserved_id, expected_platform) in expected {
+            let platform: Option<String> = conn
+                .query_row(
+                    "SELECT platform FROM channel_bot_instances WHERE id = ?1",
+                    params![reserved_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let Some(actual) = platform else {
+                continue;
+            };
+            if actual == expected_platform {
+                continue;
+            }
+            let new_id = Self::next_extra_bot_instance_id_conn(conn)?;
+            Self::reassign_channel_bot_instance_id_conn(conn, reserved_id, new_id)?;
+            tracing::info!(
+                "Migrated channel_bot_instances id {} ({}) -> id {} (reserved for {})",
+                reserved_id,
+                actual,
+                new_id,
+                expected_platform
+            );
+        }
+        Ok(())
+    }
+
+    fn next_extra_bot_instance_id_conn(conn: &Connection) -> Result<i64, FinallyAValueBotError> {
+        let max_id: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM channel_bot_instances",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(max_id.max(BOT_INSTANCE_WHATSAPP_PRIMARY) + 1)
+    }
+
+    fn reassign_channel_bot_instance_id_conn(
+        conn: &Connection,
+        old_id: i64,
+        new_id: i64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let row: (String, String, String, String) = conn.query_row(
+            "SELECT platform, label, token, created_at FROM channel_bot_instances WHERE id = ?1",
+            params![old_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        conn.execute(
+            "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_id, row.0, row.1, row.2, row.3],
+        )?;
+        conn.execute(
+            "UPDATE channel_bindings SET bot_instance_id = ?1 WHERE bot_instance_id = ?2",
+            params![new_id, old_id],
+        )?;
+        conn.execute(
+            "UPDATE channel_persona_policy SET bot_instance_id = ?1 WHERE bot_instance_id = ?2",
+            params![new_id, old_id],
+        )?;
+        conn.execute(
+            "DELETE FROM channel_bot_instances WHERE id = ?1",
+            params![old_id],
+        )?;
+        Ok(())
     }
 
     fn migrate_persona_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
@@ -689,6 +1167,292 @@ impl Database {
         Ok(())
     }
 
+    /// Removes unused `project_artifacts` (never read by the app; only written).
+    fn migrate_drop_project_artifacts(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_project_artifacts_project;
+             DROP TABLE IF EXISTS project_artifacts;",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_workflow_learning_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "workflows", "step_trace_json")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN step_trace_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "workflows", "approach_summary")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN approach_summary TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "workflows", "last_outcome")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN last_outcome TEXT NOT NULL DEFAULT 'unknown'",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "workflows", "failure_reason")? {
+            conn.execute("ALTER TABLE workflows ADD COLUMN failure_reason TEXT", [])?;
+        }
+        if !Self::column_exists(conn, "workflows", "evidence_json")? {
+            conn.execute(
+                "ALTER TABLE workflows ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_personas_prompt_context(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "personas", "recent_history_min_user")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN recent_history_min_user INTEGER",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "recent_history_min_assistant")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN recent_history_min_assistant INTEGER",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "operator_memo")? {
+            conn.execute("ALTER TABLE personas ADD COLUMN operator_memo TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn migrate_hook_policy_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hook_definitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                event_name TEXT NOT NULL,
+                matcher TEXT,
+                action_type TEXT NOT NULL,
+                action_payload_json TEXT NOT NULL DEFAULT '{}',
+                scoped_persona_ids_json TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hook_definitions_event_enabled
+                ON hook_definitions(event_name, enabled, id);
+            CREATE TABLE IF NOT EXISTS persona_hook_skill_policy (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                allowed_hook_ids_json TEXT,
+                allowed_skill_names_json TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_hook_skill_policy_chat
+                ON persona_hook_skill_policy(chat_id);",
+        )?;
+        if !Self::column_exists(conn, "hook_definitions", "scoped_persona_ids_json")? {
+            conn.execute(
+                "ALTER TABLE hook_definitions ADD COLUMN scoped_persona_ids_json TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Sync shipped hooks from repository `builtin_hooks/*.hook.json` into SQLite.
+    ///
+    /// PZ and other optional command hooks are not shipped; operators add those under
+    /// `{WORKSPACE_DIR}/hooks/`.
+    fn ensure_builtin_hook_definitions(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute(
+            "DELETE FROM hook_definitions WHERE name LIKE 'template-%'",
+            [],
+        )?;
+        let dir = crate::builtin_hooks::resolve_builtin_hooks_dir_fallback().ok_or_else(|| {
+            FinallyAValueBotError::ToolExecution(
+                "builtin_hooks catalog not found: expected repository builtin_hooks/ with *.hook.json manifests".into(),
+            )
+        })?;
+        let synced = crate::builtin_hooks::sync_shipped_hook_definitions(conn, &dir)?;
+        if synced == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "no shipped hook manifests in '{}'",
+                dir.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn migrate_chat_sessions_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chat_sessions (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                intent TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                last_active_at TEXT NOT NULL,
+                archived_at TEXT,
+                ttl_hours INTEGER NOT NULL DEFAULT 72,
+                bootstrap_context_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_persona
+                ON chat_sessions(chat_id, persona_id, status);
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_last_active
+                ON chat_sessions(last_active_at DESC);",
+        )?;
+        if !Self::column_exists(conn, "messages", "session_id")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN session_id TEXT", [])?;
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session
+                    ON messages(session_id, timestamp ASC);",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_messages_origin(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "messages", "origin")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN origin TEXT NOT NULL DEFAULT 'interactive'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_cursor_engine_agents(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cursor_engine_agents (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                session_scope TEXT NOT NULL DEFAULT '',
+                agent_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id, session_scope)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cursor_engine_agents_updated
+                ON cursor_engine_agents(updated_at DESC);",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_background_jobs_lease_schema(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "background_jobs", "lease_owner")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN lease_owner TEXT",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "background_jobs", "lease_expires_at")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN lease_expires_at TEXT",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "background_jobs", "last_progress_at")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN last_progress_at TEXT",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "background_jobs", "last_stage")? {
+            conn.execute("ALTER TABLE background_jobs ADD COLUMN last_stage TEXT", [])?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_background_jobs_lease_expires_at
+             ON background_jobs(lease_expires_at)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_background_jobs_shell_schema(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "background_jobs", "job_kind")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'agent'",
+                [],
+            )?;
+        }
+        for col in [
+            "shell_command",
+            "workdir",
+            "tmux_session",
+            "output_path",
+            "label",
+        ] {
+            if !Self::column_exists(conn, "background_jobs", col)? {
+                conn.execute(
+                    &format!("ALTER TABLE background_jobs ADD COLUMN {col} TEXT"),
+                    [],
+                )?;
+            }
+        }
+        if !Self::column_exists(conn, "background_jobs", "exit_code")? {
+            conn.execute(
+                "ALTER TABLE background_jobs ADD COLUMN exit_code INTEGER",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_background_jobs_job_kind_status
+             ON background_jobs(job_kind, status)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_persona_bulletin_and_bookmarks(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS persona_bulletin_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                run_key TEXT,
+                event_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_bulletin_events_persona_time
+                ON persona_bulletin_events(chat_id, persona_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS persona_bulletin_focus (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                title TEXT,
+                content TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS persona_message_bookmarks (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content_preview TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_message_bookmarks_persona_time
+                ON persona_message_bookmarks(chat_id, persona_id, updated_at DESC);",
+        )?;
+        Ok(())
+    }
+
     fn migrate_channel_bindings(conn: &Connection) -> Result<(), FinallyAValueBotError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channel_bindings (
@@ -747,20 +1511,46 @@ impl Database {
 
     pub fn store_message(&self, msg: &StoredMessage) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
+        let origin = if msg.origin.trim().is_empty() {
+            MESSAGE_ORIGIN_INTERACTIVE
+        } else {
+            msg.origin.as_str()
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO messages (id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 msg.id,
                 msg.chat_id,
                 msg.persona_id,
+                msg.session_id,
                 msg.sender_name,
                 msg.content,
                 msg.is_from_bot as i32,
                 msg.timestamp,
+                origin,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn delete_message(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM persona_message_bookmarks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND message_id = ?3",
+            params![chat_id, persona_id, message_id],
+        )?;
+        let rows = conn.execute(
+            "DELETE FROM messages WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3",
+            params![chat_id, persona_id, message_id],
+        )?;
+        Ok(rows > 0)
     }
 
     /// True when the **latest** row for this chat is a bot message with the same body as `content`
@@ -811,32 +1601,38 @@ impl Database {
         chat_id: i64,
         persona_id: i64,
         limit: usize,
+        exclude_scheduled: bool,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
-             FROM messages
-             WHERE chat_id = ?1 AND persona_id = ?2
-             ORDER BY timestamp DESC
-             LIMIT ?3",
-        )?;
-
-        let messages = stmt
-            .query_map(params![chat_id, persona_id, limit as i64], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    content: row.get(4)?,
-                    is_from_bot: row.get::<_, i32>(5)? != 0,
-                    timestamp: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut messages = if exclude_scheduled {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND origin != ?4
+                 ORDER BY timestamp DESC
+                 LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, limit as i64, MESSAGE_ORIGIN_SCHEDULED],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                 ORDER BY timestamp DESC
+                 LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, limit as i64],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
 
         // Reverse so oldest first
-        let mut messages = messages;
         messages.reverse();
         Ok(messages)
     }
@@ -847,24 +1643,14 @@ impl Database {
         persona_id: i64,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
-             ORDER BY timestamp ASC",
-        )?;
+             ORDER BY timestamp ASC"
+        ))?;
         let messages = stmt
-            .query_map(params![chat_id, persona_id], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    content: row.get(4)?,
-                    is_from_bot: row.get::<_, i32>(5)? != 0,
-                    timestamp: row.get(6)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id], stored_message_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
     }
@@ -878,29 +1664,19 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
                AND (?3 IS NULL OR timestamp >= ?3)
                AND (?4 IS NULL OR timestamp <= ?4)
              ORDER BY timestamp ASC
-             LIMIT ?5",
-        )?;
+             LIMIT ?5"
+        ))?;
         let messages = stmt
             .query_map(
                 params![chat_id, persona_id, from_date, to_date, limit as i64],
-                |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
-                    })
-                },
+                stored_message_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
@@ -1013,11 +1789,12 @@ impl Database {
 
     // --- Channel bindings (unified contact) ---
 
-    /// Resolve (channel_type, channel_handle) to canonical_chat_id. If no binding exists, creates one:
+    /// Resolve (`bot_instance_id`, `channel_type`, `channel_handle`) to canonical_chat_id. If no binding exists, creates one:
     /// - telegram/discord: use handle (as i64) as canonical_chat_id, ensure chat exists, insert binding.
     /// - web: use create_with_canonical_id as the new canonical (caller provides e.g. hash-based id), ensure chat exists, insert binding.
     pub fn resolve_canonical_chat_id(
         &self,
+        bot_instance_id: i64,
         channel_type: &str,
         channel_handle: &str,
         create_with_canonical_id: Option<i64>,
@@ -1025,8 +1802,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         if let Some(canonical) = conn
             .query_row(
-                "SELECT canonical_chat_id FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
-                params![channel_type, channel_handle],
+                "SELECT canonical_chat_id FROM channel_bindings WHERE bot_instance_id = ?1 AND channel_type = ?2 AND channel_handle = ?3",
+                params![bot_instance_id, channel_type, channel_handle],
                 |row| row.get::<_, i64>(0),
             )
             .ok()
@@ -1058,37 +1835,39 @@ impl Database {
             params![canonical, channel_type, now],
         )?;
         conn.execute(
-            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
-            params![canonical, channel_type, channel_handle],
+            "INSERT OR REPLACE INTO channel_bindings (bot_instance_id, canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3, ?4)",
+            params![bot_instance_id, canonical, channel_type, channel_handle],
         )?;
         Ok(canonical)
     }
 
-    /// Add a binding from (channel_type, channel_handle) to canonical_chat_id. If that (type, handle) already exists, updates to this contact.
+    /// Add a binding from (`bot_instance_id`, `channel_type`, `channel_handle`) to canonical_chat_id.
     pub fn link_channel(
         &self,
         canonical_chat_id: i64,
+        bot_instance_id: i64,
         channel_type: &str,
         channel_handle: &str,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO channel_bindings (canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3)",
-            params![canonical_chat_id, channel_type, channel_handle],
+            "INSERT OR REPLACE INTO channel_bindings (bot_instance_id, canonical_chat_id, channel_type, channel_handle) VALUES (?1, ?2, ?3, ?4)",
+            params![bot_instance_id, canonical_chat_id, channel_type, channel_handle],
         )?;
         Ok(())
     }
 
-    /// Remove the binding for (channel_type, channel_handle).
+    /// Remove the binding for (`bot_instance_id`, `channel_type`, `channel_handle`).
     pub fn unlink_channel(
         &self,
+        bot_instance_id: i64,
         channel_type: &str,
         channel_handle: &str,
     ) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
-            "DELETE FROM channel_bindings WHERE channel_type = ?1 AND channel_handle = ?2",
-            params![channel_type, channel_handle],
+            "DELETE FROM channel_bindings WHERE bot_instance_id = ?1 AND channel_type = ?2 AND channel_handle = ?3",
+            params![bot_instance_id, channel_type, channel_handle],
         )?;
         Ok(rows > 0)
     }
@@ -1100,16 +1879,865 @@ impl Database {
     ) -> Result<Vec<ChannelBinding>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT canonical_chat_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
+            "SELECT canonical_chat_id, bot_instance_id, channel_type, channel_handle FROM channel_bindings WHERE canonical_chat_id = ?1",
         )?;
         let rows = stmt.query_map(params![canonical_chat_id], |row| {
             Ok(ChannelBinding {
                 canonical_chat_id: row.get(0)?,
-                channel_type: row.get(1)?,
-                channel_handle: row.get(2)?,
+                bot_instance_id: row.get(1)?,
+                channel_type: row.get(2)?,
+                channel_handle: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Upsert primary bot rows from `.env` so Telegram/Discord/WhatsApp dispatchers can list tokens.
+    pub fn sync_channel_bot_instances_from_config(
+        &self,
+        config: &crate::config::Config,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        if !config.telegram_bot_token.trim().is_empty() {
+            conn.execute(
+                "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+                 VALUES (1, 'telegram', 'Primary (TELEGRAM_BOT_TOKEN)', ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    platform=excluded.platform,
+                    label=excluded.label,
+                    token=excluded.token,
+                    created_at=excluded.created_at",
+                params![config.telegram_bot_token.trim(), now],
+            )?;
+        }
+        if let Some(ref t) = config.discord_bot_token {
+            if !t.trim().is_empty() {
+                conn.execute(
+                    "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+                     VALUES (2, 'discord', 'Primary (DISCORD_BOT_TOKEN)', ?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET
+                        platform=excluded.platform,
+                        label=excluded.label,
+                        token=excluded.token,
+                        created_at=excluded.created_at",
+                    params![t.trim(), now],
+                )?;
+            }
+        }
+        let wa = config.whatsapp_access_token.as_deref().unwrap_or("").trim();
+        if !wa.is_empty() {
+            conn.execute(
+                "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+                 VALUES (3, 'whatsapp', 'Primary (WHATSAPP_ACCESS_TOKEN)', ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    platform=excluded.platform,
+                    label=excluded.label,
+                    token=excluded.token,
+                    created_at=excluded.created_at",
+                params![wa, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_channel_bot_instances_by_platform(
+        &self,
+        platform: &str,
+    ) -> Result<Vec<ChannelBotInstance>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, platform, label, token, created_at FROM channel_bot_instances
+             WHERE platform = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![platform], |row| {
+            Ok(ChannelBotInstance {
+                id: row.get(0)?,
+                platform: row.get(1)?,
+                label: row.get(2)?,
+                token: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_channel_bot_instance(
+        &self,
+        id: i64,
+    ) -> Result<Option<ChannelBotInstance>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT id, platform, label, token, created_at FROM channel_bot_instances WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(ChannelBotInstance {
+                    id: row.get(0)?,
+                    platform: row.get(1)?,
+                    label: row.get(2)?,
+                    token: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            },
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// All bot instances (Telegram, Discord, WhatsApp, etc.), ordered by id.
+    pub fn list_all_channel_bot_instances(
+        &self,
+    ) -> Result<Vec<ChannelBotInstance>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, platform, label, token, created_at FROM channel_bot_instances ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ChannelBotInstance {
+                id: row.get(0)?,
+                platform: row.get(1)?,
+                label: row.get(2)?,
+                token: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Insert a non-primary bot instance. Ids 1–3 are reserved for env sync; extras use id >= 4.
+    pub fn create_channel_bot_instance(
+        &self,
+        platform: &str,
+        label: &str,
+        token: &str,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let p = platform.trim().to_ascii_lowercase();
+        if !matches!(p.as_str(), "telegram" | "discord") {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "platform must be telegram or discord".into(),
+            ));
+        }
+        if token.trim().is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "token cannot be empty".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let new_id = Self::next_extra_bot_instance_id_conn(&conn)?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO channel_bot_instances (id, platform, label, token, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_id, p, label.trim(), token.trim(), now],
+        )?;
+        Ok(new_id)
+    }
+
+    pub fn get_channel_bot_instance_platform(
+        &self,
+        bot_instance_id: i64,
+    ) -> Result<Option<String>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT platform FROM channel_bot_instances WHERE id = ?1",
+            params![bot_instance_id],
+            |r| r.get::<_, String>(0),
+        );
+        match row {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Copy channel handles from sibling bindings on the same platform to `new_bot_instance_id`.
+    pub fn provision_bindings_for_instance(
+        &self,
+        platform: &str,
+        new_bot_instance_id: i64,
+    ) -> Result<u32, FinallyAValueBotError> {
+        let platform = platform.trim().to_ascii_lowercase();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT canonical_chat_id, channel_handle
+             FROM channel_bindings
+             WHERE channel_type = ?1 AND bot_instance_id != ?2",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![platform, new_bot_instance_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut linked = 0u32;
+        for (canonical_chat_id, handle) in rows {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM channel_bindings
+                     WHERE bot_instance_id = ?1 AND channel_type = ?2 AND channel_handle = ?3",
+                    params![new_bot_instance_id, platform, handle],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if exists {
+                continue;
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO channel_bindings (bot_instance_id, canonical_chat_id, channel_type, channel_handle)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![new_bot_instance_id, canonical_chat_id, platform, handle],
+            )?;
+            linked += 1;
+        }
+        Ok(linked)
+    }
+
+    /// Idempotent: ensure every bot instance has sibling bindings for contacts already linked on that platform.
+    pub fn provision_all_missing_sibling_bindings(&self) -> Result<u32, FinallyAValueBotError> {
+        let instances = self.list_all_channel_bot_instances()?;
+        let mut total = 0u32;
+        for inst in instances {
+            if !matches!(inst.platform.as_str(), "telegram" | "discord") {
+                continue;
+            }
+            total += self.provision_bindings_for_instance(&inst.platform, inst.id)?;
+        }
+        Ok(total)
+    }
+
+    /// Rows for Settings → Channels: every telegram/discord instance plus binding/policy state for a contact.
+    pub fn list_contact_channel_integration_rows(
+        &self,
+        canonical_chat_id: i64,
+    ) -> Result<Vec<ContactChannelIntegrationRow>, FinallyAValueBotError> {
+        let bindings = self.list_bindings_for_contact(canonical_chat_id)?;
+        let policies = self.list_channel_persona_policies(canonical_chat_id)?;
+        let mut policy_by_instance: HashMap<i64, ChannelPersonaPolicy> = HashMap::new();
+        for p in policies {
+            policy_by_instance.insert(p.bot_instance_id, p);
+        }
+        let mut binding_by_instance: HashMap<i64, ChannelBinding> = HashMap::new();
+        for b in bindings {
+            if b.channel_type == "web" {
+                continue;
+            }
+            binding_by_instance.insert(b.bot_instance_id, b);
+        }
+        let mut rows = Vec::new();
+        for platform in ["telegram", "discord"] {
+            for inst in self.list_channel_bot_instances_by_platform(platform)? {
+                let binding = binding_by_instance.get(&inst.id);
+                let (persona_mode, persona_id) = policy_by_instance
+                    .get(&inst.id)
+                    .map(|p| (p.mode, p.persona_id))
+                    .unwrap_or((ChannelPersonaMode::All, None));
+                rows.push(ContactChannelIntegrationRow {
+                    bot_instance_id: inst.id,
+                    platform: inst.platform.clone(),
+                    label: inst.label.clone(),
+                    channel_handle: binding.map(|b| b.channel_handle.clone()),
+                    linked: binding.is_some(),
+                    persona_mode,
+                    persona_id,
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    fn another_all_persona_bot_on_platform(
+        &self,
+        canonical_chat_id: i64,
+        platform: &str,
+        exclude_bot_instance_id: i64,
+    ) -> Result<Option<i64>, FinallyAValueBotError> {
+        let instances = self.list_channel_bot_instances_by_platform(platform)?;
+        for inst in instances {
+            if inst.id == exclude_bot_instance_id {
+                continue;
+            }
+            let effective_all = match self.get_channel_persona_policy(canonical_chat_id, inst.id)? {
+                None => true,
+                Some(p) => p.mode == ChannelPersonaMode::All,
+            };
+            if effective_all {
+                return Ok(Some(inst.id));
+            }
+        }
+        Ok(None)
+    }
+
+    fn validate_all_persona_slot(
+        &self,
+        canonical_chat_id: i64,
+        bot_instance_id: i64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let platform = self
+            .get_channel_bot_instance_platform(bot_instance_id)?
+            .ok_or_else(|| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "unknown bot_instance_id {bot_instance_id}"
+                ))
+            })?;
+        if let Some(other) =
+            self.another_all_persona_bot_on_platform(canonical_chat_id, &platform, bot_instance_id)?
+        {
+            let label = self
+                .get_channel_bot_instance(other)?
+                .map(|i| i.label)
+                .unwrap_or_else(|| format!("#{other}"));
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "Only one {platform} bot can use 'all personas' for this contact (already set on {label}). Lock the other bot to a single persona first."
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn update_channel_bot_instance(
+        &self,
+        id: i64,
+        label: &str,
+        token: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        if token.trim().is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "token cannot be empty".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE channel_bot_instances SET label = ?1, token = ?2 WHERE id = ?3",
+            params![label.trim(), token.trim(), id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Deletes a bot instance. Ids 1–3 are reserved for primary env-backed rows and cannot be deleted here.
+    pub fn delete_channel_bot_instance(&self, id: i64) -> Result<bool, FinallyAValueBotError> {
+        if (1..=3).contains(&id) {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Cannot delete primary bot instances (ids 1–3) managed from .env".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM channel_bot_instances WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn list_app_settings(&self) -> Result<Vec<AppSetting>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT key, value, updated_at FROM app_settings ORDER BY key COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AppSetting {
+                key: row.get(0)?,
+                value: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_app_setting(&self, key: &str, value: &str) -> Result<(), FinallyAValueBotError> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "App setting key cannot be empty".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![key, value, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_app_setting(&self, key: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+        Ok(rows > 0)
+    }
+
+    fn parse_i64_array_json(
+        raw: Option<String>,
+    ) -> Result<Option<Vec<i64>>, FinallyAValueBotError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+            FinallyAValueBotError::ToolExecution(format!("Invalid allowed_hook_ids_json: {e}"))
+        })?;
+        let arr = parsed.as_array().ok_or_else(|| {
+            FinallyAValueBotError::ToolExecution(
+                "Invalid allowed_hook_ids_json: expected JSON array".to_string(),
+            )
+        })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let Some(id) = v.as_i64() else {
+                return Err(FinallyAValueBotError::ToolExecution(
+                    "Invalid allowed_hook_ids_json: array must contain integers".to_string(),
+                ));
+            };
+            out.push(id);
+        }
+        Ok(Some(out))
+    }
+
+    fn parse_string_array_json(
+        raw: Option<String>,
+    ) -> Result<Option<Vec<String>>, FinallyAValueBotError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+            FinallyAValueBotError::ToolExecution(format!("Invalid allowed_skill_names_json: {e}"))
+        })?;
+        let arr = parsed.as_array().ok_or_else(|| {
+            FinallyAValueBotError::ToolExecution(
+                "Invalid allowed_skill_names_json: expected JSON array".to_string(),
+            )
+        })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let Some(name) = v.as_str() else {
+                return Err(FinallyAValueBotError::ToolExecution(
+                    "Invalid allowed_skill_names_json: array must contain strings".to_string(),
+                ));
+            };
+            out.push(name.trim().to_string());
+        }
+        Ok(Some(out))
+    }
+
+    pub fn list_hook_definitions(
+        &self,
+    ) -> Result<Vec<HookDefinitionRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, event_name, matcher, action_type, action_payload_json, scoped_persona_ids_json, enabled, updated_at
+             FROM hook_definitions
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let scoped_persona_ids_raw: Option<String> = row.get(6)?;
+            let scoped_persona_ids =
+                Self::parse_i64_array_json(scoped_persona_ids_raw).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+            Ok(HookDefinitionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                event_name: row.get(2)?,
+                matcher: row.get(3)?,
+                action_type: row.get(4)?,
+                action_payload_json: row.get(5)?,
+                scoped_persona_ids,
+                enabled: row.get::<_, i64>(7)? != 0,
+                updated_at: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_hook_definition(
+        &self,
+        id: i64,
+    ) -> Result<Option<HookDefinitionRecord>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, event_name, matcher, action_type, action_payload_json, scoped_persona_ids_json, enabled, updated_at
+             FROM hook_definitions
+             WHERE id = ?1",
+        )?;
+        let row = stmt.query_row(params![id], |row| {
+            let scoped_persona_ids_raw: Option<String> = row.get(6)?;
+            let scoped_persona_ids =
+                Self::parse_i64_array_json(scoped_persona_ids_raw).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+            Ok(HookDefinitionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                event_name: row.get(2)?,
+                matcher: row.get(3)?,
+                action_type: row.get(4)?,
+                action_payload_json: row.get(5)?,
+                scoped_persona_ids,
+                enabled: row.get::<_, i64>(7)? != 0,
+                updated_at: row.get(8)?,
+            })
+        });
+        match row {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn upsert_hook_definition(
+        &self,
+        id: Option<i64>,
+        name: &str,
+        event_name: &str,
+        matcher: Option<&str>,
+        action_type: &str,
+        action_payload_json: &str,
+        scoped_persona_ids: Option<&[i64]>,
+        enabled: bool,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let name = name.trim();
+        let event_name = event_name.trim();
+        let action_type = action_type.trim().to_ascii_lowercase();
+        if name.is_empty() || event_name.is_empty() || action_type.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "name, event_name, and action_type are required".to_string(),
+            ));
+        }
+        let valid_action_type = matches!(
+            action_type.as_str(),
+            "block"
+                | "add_context"
+                | "command"
+                | "prompt"
+                | "builtin_persona_focus_sync"
+                | "builtin_scheduler_policy_context"
+                | "builtin_turn_skill_gate"
+                | "builtin_deferred_commitment_guard"
+                | "builtin_loop_guard"
+        );
+        if !valid_action_type {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard",
+                action_type
+            )));
+        }
+        // Validate payload JSON eagerly.
+        let _: serde_json::Value = serde_json::from_str(action_payload_json).map_err(|e| {
+            FinallyAValueBotError::ToolExecution(format!("Invalid action_payload_json: {e}"))
+        })?;
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let enabled_i = if enabled { 1 } else { 0 };
+        let matcher_norm = matcher.map(|m| m.trim()).filter(|m| !m.is_empty());
+        let scoped_persona_ids_json = if let Some(ids) = scoped_persona_ids {
+            let mut normalized: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
+            normalized.sort_unstable();
+            normalized.dedup();
+            Some(serde_json::to_string(&normalized).map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "Invalid scoped_persona_ids payload: {e}"
+                ))
+            })?)
+        } else {
+            None
+        };
+        if let Some(id) = id {
+            let rows = conn.execute(
+                "UPDATE hook_definitions
+                 SET name = ?1,
+                     event_name = ?2,
+                     matcher = ?3,
+                     action_type = ?4,
+                     action_payload_json = ?5,
+                     scoped_persona_ids_json = ?6,
+                     enabled = ?7,
+                     updated_at = ?8
+                 WHERE id = ?9",
+                params![
+                    name,
+                    event_name,
+                    matcher_norm,
+                    action_type.as_str(),
+                    action_payload_json,
+                    scoped_persona_ids_json,
+                    enabled_i,
+                    now,
+                    id
+                ],
+            )?;
+            if rows == 0 {
+                return Err(FinallyAValueBotError::ToolExecution(format!(
+                    "Hook definition {id} not found"
+                )));
+            }
+            Ok(id)
+        } else {
+            conn.execute(
+                "INSERT INTO hook_definitions
+                 (name, event_name, matcher, action_type, action_payload_json, scoped_persona_ids_json, enabled, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    name,
+                    event_name,
+                    matcher_norm,
+                    action_type.as_str(),
+                    action_payload_json,
+                    scoped_persona_ids_json,
+                    enabled_i,
+                    now
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+
+    pub fn delete_hook_definition(&self, id: i64) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute("DELETE FROM hook_definitions WHERE id = ?1", params![id])?;
+        Ok(rows > 0)
+    }
+
+    pub fn get_persona_hook_skill_policy(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Option<PersonaHookSkillPolicy>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chat_id, persona_id, allowed_hook_ids_json, allowed_skill_names_json, updated_at
+             FROM persona_hook_skill_policy
+             WHERE chat_id = ?1 AND persona_id = ?2",
+        )?;
+        let row = stmt.query_row(params![chat_id, persona_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        });
+        let (chat_id, persona_id, hooks_raw, skills_raw, updated_at) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let allowed_hook_ids = Self::parse_i64_array_json(hooks_raw)?;
+        let allowed_skill_names = Self::parse_string_array_json(skills_raw)?;
+        Ok(Some(PersonaHookSkillPolicy {
+            chat_id,
+            persona_id,
+            allowed_hook_ids,
+            allowed_skill_names,
+            updated_at,
+        }))
+    }
+
+    pub fn set_persona_hook_skill_policy(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        allowed_hook_ids: Option<&[i64]>,
+        allowed_skill_names: Option<&[String]>,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !self.persona_exists(chat_id, persona_id)? {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "persona_id {persona_id} does not exist for chat {chat_id}"
+            )));
+        }
+        let hooks_json = allowed_hook_ids
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "Failed to serialize allowed_hook_ids: {e}"
+                ))
+            })?;
+        let skills_json = allowed_skill_names
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "Failed to serialize allowed_skill_names: {e}"
+                ))
+            })?;
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_hook_skill_policy
+             (chat_id, persona_id, allowed_hook_ids_json, allowed_skill_names_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, persona_id) DO UPDATE SET
+               allowed_hook_ids_json = excluded.allowed_hook_ids_json,
+               allowed_skill_names_json = excluded.allowed_skill_names_json,
+               updated_at = excluded.updated_at",
+            params![chat_id, persona_id, hooks_json, skills_json, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_skill_allowed_for_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        skill_name: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let Some(policy) = self.get_persona_hook_skill_policy(chat_id, persona_id)? else {
+            return Ok(true);
+        };
+        let Some(allowed) = policy.allowed_skill_names else {
+            return Ok(true);
+        };
+        Ok(allowed.iter().any(|s| s.eq_ignore_ascii_case(skill_name)))
+    }
+
+    pub fn is_hook_allowed_for_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        hook_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let Some(policy) = self.get_persona_hook_skill_policy(chat_id, persona_id)? else {
+            return Ok(true);
+        };
+        let Some(allowed) = policy.allowed_hook_ids else {
+            return Ok(true);
+        };
+        Ok(allowed.contains(&hook_id))
+    }
+
+    pub fn list_channel_persona_policies(
+        &self,
+        canonical_chat_id: i64,
+    ) -> Result<Vec<ChannelPersonaPolicy>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_chat_id, bot_instance_id, mode, persona_id, updated_at
+             FROM channel_persona_policy
+             WHERE canonical_chat_id = ?1
+             ORDER BY bot_instance_id ASC",
+        )?;
+        let rows = stmt.query_map(params![canonical_chat_id], |row| {
+            let mode_raw: String = row.get(2)?;
+            let mode = ChannelPersonaMode::try_from(mode_raw.as_str()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(ChannelPersonaPolicy {
+                canonical_chat_id: row.get(0)?,
+                bot_instance_id: row.get(1)?,
+                mode,
+                persona_id: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_channel_persona_policy(
+        &self,
+        canonical_chat_id: i64,
+        bot_instance_id: i64,
+    ) -> Result<Option<ChannelPersonaPolicy>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_chat_id, bot_instance_id, mode, persona_id, updated_at
+             FROM channel_persona_policy
+             WHERE canonical_chat_id = ?1 AND bot_instance_id = ?2",
+        )?;
+        let row = stmt.query_row(params![canonical_chat_id, bot_instance_id], |row| {
+            let mode_raw: String = row.get(2)?;
+            let mode = ChannelPersonaMode::try_from(mode_raw.as_str()).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(ChannelPersonaPolicy {
+                canonical_chat_id: row.get(0)?,
+                bot_instance_id: row.get(1)?,
+                mode,
+                persona_id: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        });
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_channel_persona_policy(
+        &self,
+        canonical_chat_id: i64,
+        bot_instance_id: i64,
+        mode: ChannelPersonaMode,
+        persona_id: Option<i64>,
+    ) -> Result<(), FinallyAValueBotError> {
+        if bot_instance_id == BOT_INSTANCE_WEB {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Persona scope policy does not apply to web chat; the Web UI selects persona."
+                    .into(),
+            ));
+        }
+        if mode == ChannelPersonaMode::All {
+            self.validate_all_persona_slot(canonical_chat_id, bot_instance_id)?;
+        }
+        if mode == ChannelPersonaMode::Single {
+            let pid = persona_id.ok_or_else(|| {
+                FinallyAValueBotError::ToolExecution(
+                    "persona_id is required for single persona mode".to_string(),
+                )
+            })?;
+            if !self.persona_exists(canonical_chat_id, pid)? {
+                return Err(FinallyAValueBotError::ToolExecution(format!(
+                    "persona_id {pid} does not exist for chat {canonical_chat_id}"
+                )));
+            }
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let pid = if mode == ChannelPersonaMode::Single {
+            persona_id
+        } else {
+            None
+        };
+        conn.execute(
+            "INSERT INTO channel_persona_policy (canonical_chat_id, bot_instance_id, mode, persona_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(canonical_chat_id, bot_instance_id)
+             DO UPDATE SET mode=excluded.mode, persona_id=excluded.persona_id, updated_at=excluded.updated_at",
+            params![canonical_chat_id, bot_instance_id, mode.as_str(), pid, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_channel_persona_policy(
+        &self,
+        canonical_chat_id: i64,
+        bot_instance_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        self.validate_all_persona_slot(canonical_chat_id, bot_instance_id)?;
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM channel_persona_policy WHERE canonical_chat_id = ?1 AND bot_instance_id = ?2",
+            params![canonical_chat_id, bot_instance_id],
+        )?;
+        Ok(rows > 0)
     }
 
     /// Get messages since the bot's last response in this chat/persona.
@@ -1120,64 +2748,90 @@ impl Database {
         persona_id: i64,
         max: usize,
         fallback: usize,
+        exclude_scheduled: bool,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
 
-        // Find timestamp of last bot message
-        let last_bot_ts: Option<String> = conn
-            .query_row(
+        let last_bot_ts: Option<String> = if exclude_scheduled {
+            conn.query_row(
+                "SELECT timestamp FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
+                   AND origin != ?3
+                 ORDER BY timestamp DESC LIMIT 1",
+                params![chat_id, persona_id, MESSAGE_ORIGIN_SCHEDULED],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            conn.query_row(
                 "SELECT timestamp FROM messages
                  WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
                  ORDER BY timestamp DESC LIMIT 1",
                 params![chat_id, persona_id],
                 |row| row.get(0),
             )
-            .ok();
+            .ok()
+        };
+
+        let origin_filter = if exclude_scheduled {
+            " AND origin != ?5"
+        } else {
+            ""
+        };
 
         let mut messages = if let Some(ts) = last_bot_ts {
-            let mut stmt = conn.prepare(
-                "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+            let sql = format!(
+                "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3{origin_filter}
                  ORDER BY timestamp DESC
-                 LIMIT ?4",
-            )?;
-            let rows = stmt
-                .query_map(params![chat_id, persona_id, ts, max as i64], |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
+                 LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = if exclude_scheduled {
+                stmt.query_map(
+                    params![
+                        chat_id,
+                        persona_id,
+                        ts,
+                        max as i64,
+                        MESSAGE_ORIGIN_SCHEDULED
+                    ],
+                    stored_message_from_row,
+                )?
+            } else {
+                stmt.query_map(
+                    params![chat_id, persona_id, ts, max as i64],
+                    stored_message_from_row,
+                )?
+            };
+            rows.collect::<Result<Vec<_>, _>>()?
         } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+            let sql = format!(
+                "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2
+                 WHERE chat_id = ?1 AND persona_id = ?2{origin_filter}
                  ORDER BY timestamp DESC
-                 LIMIT ?3",
-            )?;
-            let rows = stmt
-                .query_map(params![chat_id, persona_id, fallback as i64], |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
+                 LIMIT ?3"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = if exclude_scheduled {
+                stmt.query_map(
+                    params![
+                        chat_id,
+                        persona_id,
+                        fallback as i64,
+                        MESSAGE_ORIGIN_SCHEDULED
+                    ],
+                    stored_message_from_row,
+                )?
+            } else {
+                stmt.query_map(
+                    params![chat_id, persona_id, fallback as i64],
+                    stored_message_from_row,
+                )?
+            };
+            rows.collect::<Result<Vec<_>, _>>()?
         };
 
         messages.reverse();
@@ -1427,6 +3081,70 @@ impl Database {
         Ok(tasks)
     }
 
+    /// All scheduled tasks for display filtered by chat:
+    /// active, running, paused, and completed.
+    pub fn get_scheduled_tasks_for_chat_for_display(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE chat_id = ?1 AND status IN ('active', 'running', 'paused', 'completed')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    /// Scheduled tasks for display filtered by chat and persona (active, running, paused, completed).
+    pub fn get_scheduled_tasks_for_chat_and_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND status IN ('active', 'running', 'paused', 'completed')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map(params![chat_id, persona_id], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
     pub fn get_tasks_for_chat(
         &self,
         chat_id: i64,
@@ -1440,6 +3158,38 @@ impl Database {
         )?;
         let tasks = stmt
             .query_map(params![chat_id], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    prompt: row.get(3)?,
+                    schedule_type: row.get(4)?,
+                    schedule_value: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    /// Active/running/paused scheduled tasks for one persona in a chat.
+    pub fn get_tasks_for_chat_and_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Vec<ScheduledTask>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, prompt, schedule_type, schedule_value, next_run, last_run, status, created_at
+             FROM scheduled_tasks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND status IN ('active', 'running', 'paused')
+             ORDER BY id",
+        )?;
+        let tasks = stmt
+            .query_map(params![chat_id, persona_id], |row| {
                 Ok(ScheduledTask {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,
@@ -1524,6 +3274,22 @@ impl Database {
         let rows = conn.execute(
             "UPDATE scheduled_tasks SET prompt = ?1 WHERE id = ?2",
             params![prompt, task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Update cron/once schedule fields and next run (after preflight). Does not clear `last_run`.
+    pub fn update_task_schedule(
+        &self,
+        task_id: i64,
+        schedule_type: &str,
+        schedule_value: &str,
+        next_run: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE scheduled_tasks SET schedule_type = ?1, schedule_value = ?2, next_run = ?3 WHERE id = ?4",
+            params![schedule_type, schedule_value, next_run, task_id],
         )?;
         Ok(rows > 0)
     }
@@ -1744,6 +3510,64 @@ impl Database {
 
     // --- Cursor agent runs ---
 
+    pub fn get_cursor_engine_agent_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        session_scope: &str,
+    ) -> Result<Option<String>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM cursor_engine_agents
+             WHERE chat_id = ?1 AND persona_id = ?2 AND session_scope = ?3",
+        )?;
+        let mut rows = stmt.query(params![chat_id, persona_id, session_scope])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            if id.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(id))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_cursor_engine_agent_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        session_scope: &str,
+        agent_id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO cursor_engine_agents (chat_id, persona_id, session_scope, agent_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, persona_id, session_scope)
+             DO UPDATE SET agent_id = excluded.agent_id, updated_at = excluded.updated_at",
+            params![chat_id, persona_id, session_scope, agent_id, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_cursor_engine_agent_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        session_scope: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM cursor_engine_agents
+             WHERE chat_id = ?1 AND persona_id = ?2 AND session_scope = ?3",
+            params![chat_id, persona_id, session_scope],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_cursor_agent_run(
         &self,
         chat_id: i64,
@@ -1923,32 +3747,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn upsert_project_artifact(
-        &self,
-        project_id: i64,
-        artifact_type: &str,
-        artifact_ref: &str,
-        metadata_json: Option<&str>,
-    ) -> Result<(), FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO project_artifacts (project_id, artifact_type, artifact_ref, metadata_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(project_id, artifact_type, artifact_ref) DO UPDATE SET
-               metadata_json = excluded.metadata_json,
-               updated_at = excluded.updated_at",
-            params![
-                project_id,
-                artifact_type,
-                artifact_ref,
-                metadata_json.unwrap_or("{}"),
-                now
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn link_project_run(
         &self,
         project_id: i64,
@@ -1959,107 +3757,6 @@ impl Database {
         conn.execute(
             "INSERT OR IGNORE INTO project_runs (project_id, run_key, created_at) VALUES (?1, ?2, ?3)",
             params![project_id, run_key, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_best_workflow_for_intent(
-        &self,
-        owner_chat_id: i64,
-        intent_signature: &str,
-        min_confidence: f64,
-    ) -> Result<Option<WorkflowRecord>, FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let result = conn.query_row(
-            "SELECT id, owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
-             FROM workflows
-             WHERE owner_chat_id = ?1
-               AND intent_signature = ?2
-               AND confidence >= ?3
-             ORDER BY confidence DESC, updated_at DESC
-             LIMIT 1",
-            params![owner_chat_id, intent_signature, min_confidence],
-            |row| {
-                Ok(WorkflowRecord {
-                    id: row.get(0)?,
-                    owner_chat_id: row.get(1)?,
-                    intent_signature: row.get(2)?,
-                    steps_json: row.get(3)?,
-                    confidence: row.get(4)?,
-                    version: row.get(5)?,
-                    success_count: row.get(6)?,
-                    failure_count: row.get(7)?,
-                    last_used_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            },
-        );
-        match result {
-            Ok(wf) => Ok(Some(wf)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub fn upsert_workflow_learning(
-        &self,
-        owner_chat_id: i64,
-        intent_signature: &str,
-        steps_json: &str,
-        success: bool,
-        score: f64,
-    ) -> Result<i64, FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO workflows (
-                owner_chat_id, intent_signature, steps_json, confidence, version, success_count, failure_count, last_used_at, updated_at
-             ) VALUES (
-                ?1, ?2, ?3, CASE WHEN ?4 THEN ?5 ELSE 0.0 END, 1,
-                CASE WHEN ?4 THEN 1 ELSE 0 END,
-                CASE WHEN ?4 THEN 0 ELSE 1 END,
-                ?6, ?6
-             )
-             ON CONFLICT(owner_chat_id, intent_signature) DO UPDATE SET
-               steps_json = excluded.steps_json,
-               success_count = workflows.success_count + CASE WHEN ?4 THEN 1 ELSE 0 END,
-               failure_count = workflows.failure_count + CASE WHEN ?4 THEN 0 ELSE 1 END,
-               confidence = MIN(
-                   1.0,
-                   MAX(
-                       0.0,
-                       (workflows.confidence * 0.7) + (CASE WHEN ?4 THEN ?5 ELSE 0.0 END * 0.3)
-                   )
-               ),
-               version = workflows.version + 1,
-               updated_at = excluded.updated_at",
-            params![owner_chat_id, intent_signature, steps_json, success, score, now],
-        )?;
-        let id = conn.query_row(
-            "SELECT id FROM workflows WHERE owner_chat_id = ?1 AND intent_signature = ?2",
-            params![owner_chat_id, intent_signature],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok(id)
-    }
-
-    pub fn log_workflow_execution(
-        &self,
-        workflow_id: i64,
-        run_key: &str,
-        outcome: &str,
-        score: f64,
-    ) -> Result<(), FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO workflow_executions (workflow_id, run_key, outcome, score, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![workflow_id, run_key, outcome, score, now],
-        )?;
-        conn.execute(
-            "UPDATE workflows SET last_used_at = ?1 WHERE id = ?2",
-            params![now, workflow_id],
         )?;
         Ok(())
     }
@@ -2118,6 +3815,227 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn append_persona_bulletin_event(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        run_key: Option<&str>,
+        event_type: &str,
+        title: &str,
+        detail: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_bulletin_events (chat_id, persona_id, run_key, event_type, title, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![chat_id, persona_id, run_key, event_type, title, detail, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_persona_bulletin_focus(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        title: Option<&str>,
+        content: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_bulletin_focus (chat_id, persona_id, title, content, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, persona_id) DO UPDATE SET
+               title = excluded.title,
+               content = excluded.content,
+               updated_at = excluded.updated_at",
+            params![chat_id, persona_id, title, content, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_persona_bulletin_focus(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<Option<PersonaBulletinFocus>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT chat_id, persona_id, title, content, updated_at
+             FROM persona_bulletin_focus
+             WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+            |row| {
+                Ok(PersonaBulletinFocus {
+                    chat_id: row.get(0)?,
+                    persona_id: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        );
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_persona_bulletin_events(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PersonaBulletinEvent>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, run_key, event_type, title, detail, created_at
+             FROM persona_bulletin_events
+             WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let items = stmt
+            .query_map(params![chat_id, persona_id, limit as i64], |row| {
+                Ok(PersonaBulletinEvent {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    run_key: row.get(3)?,
+                    event_type: row.get(4)?,
+                    title: row.get(5)?,
+                    detail: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    pub fn upsert_persona_message_bookmark(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        role: &str,
+        content_preview: &str,
+        note: Option<&str>,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_message_bookmarks (
+                chat_id, persona_id, message_id, role, content_preview, note, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(chat_id, persona_id, message_id) DO UPDATE SET
+                role = excluded.role,
+                content_preview = excluded.content_preview,
+                note = excluded.note,
+                updated_at = excluded.updated_at",
+            params![
+                chat_id,
+                persona_id,
+                message_id,
+                role,
+                content_preview,
+                note,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_persona_message_bookmark(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM persona_message_bookmarks
+             WHERE chat_id = ?1 AND persona_id = ?2 AND message_id = ?3",
+            params![chat_id, persona_id, message_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn list_persona_message_bookmarks(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PersonaMessageBookmark>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chat_id, persona_id, message_id, role, content_preview, note, created_at, updated_at
+             FROM persona_message_bookmarks
+             WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY updated_at DESC
+             LIMIT ?3",
+        )?;
+        let items = stmt
+            .query_map(params![chat_id, persona_id, limit as i64], |row| {
+                Ok(PersonaMessageBookmark {
+                    chat_id: row.get(0)?,
+                    persona_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    role: row.get(3)?,
+                    content_preview: row.get(4)?,
+                    note: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    pub fn message_exists_in_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM messages
+                WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3
+            )",
+            params![chat_id, persona_id, message_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn get_message_for_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+    ) -> Result<Option<StoredMessage>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            &format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+             FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3
+             LIMIT 1"
+            ),
+            params![chat_id, persona_id, message_id],
+            stored_message_from_row,
+        );
+        match result {
+            Ok(msg) => Ok(Some(msg)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // --- Background jobs ---
 
     pub fn create_background_job(
@@ -2131,24 +4049,110 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage, job_kind)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'agent')",
             params![id, chat_id, persona_id, prompt, trigger_reason, now],
         )?;
         Ok(())
     }
 
-    pub fn mark_background_job_running(&self, id: &str) -> Result<(), FinallyAValueBotError> {
+    pub fn create_background_run_optimize_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        history_filename: &str,
+    ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
+        let label = "Learn & optimize";
         conn.execute(
-            "UPDATE background_jobs SET status = 'running', started_at = ?1 WHERE id = ?2",
-            params![now, id],
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage, job_kind, label)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 'run_optimize', ?5, ?5, 'pending', 'run_optimize', ?6)",
+            params![id, chat_id, persona_id, history_filename, now, label],
         )?;
         Ok(())
     }
 
-    pub fn mark_background_job_completed_raw(
+    pub fn create_background_shell_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        label: &str,
+        shell_command: &str,
+        workdir: &str,
+        tmux_session: &str,
+        output_path: &str,
+        trigger_reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO background_jobs (
+                id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage,
+                job_kind, shell_command, workdir, tmux_session, output_path, label
+             ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'shell', ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                chat_id,
+                persona_id,
+                label,
+                trigger_reason,
+                now,
+                shell_command,
+                workdir,
+                tmux_session,
+                output_path,
+                label,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// External system id only (ComfyUI `prompt_id`, etc.): visible in queue, does not block handoff/shell slots.
+    pub fn create_background_tracked_job(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        prompt: &str,
+        label: Option<&str>,
+        trigger_reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO background_jobs (
+                id, chat_id, persona_id, prompt, status, trigger_reason,
+                created_at, started_at, last_progress_at, last_stage, job_kind, label
+             ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?6, ?6, 'external_queue', 'tracked', ?7)",
+            params![id, chat_id, persona_id, prompt, trigger_reason, now, label],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_background_shell_paths(
+        &self,
+        id: &str,
+        tmux_session: &str,
+        output_path: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE background_jobs SET tmux_session = ?1, output_path = ?2 WHERE id = ?3",
+            params![tmux_session, output_path, id],
+        )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "set_background_shell_paths: no job row for id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that the user was notified about a terminal shell job (e.g. after silent reconcile).
+    pub fn record_background_shell_user_notification(
         &self,
         id: &str,
         result_text: &str,
@@ -2157,31 +4161,359 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE background_jobs
-             SET status = 'completed_raw', finished_at = ?1, result_text = ?2
+             SET result_text = ?1,
+                 last_progress_at = ?2,
+                 last_stage = 'user_notified'
              WHERE id = ?3",
-            params![now, result_text, id],
+            params![result_text, now, id],
         )?;
+        Ok(())
+    }
+
+    /// Agent background jobs enqueued after a successful shell job (`shell_success_followup:{parent_id}:N`).
+    pub fn count_shell_success_agent_followups(
+        &self,
+        parent_shell_job_id: &str,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("shell_success_followup:{parent_shell_job_id}:%");
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             WHERE job_kind = 'agent' AND trigger_reason LIKE ?1",
+            params![pattern],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn mark_background_shell_agent_success_followup_enqueued(
+        &self,
+        id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs
+             SET last_progress_at = ?1, last_stage = 'agent_success_followup_enqueued'
+             WHERE id = ?2 AND job_kind = 'shell'",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Agent background jobs enqueued after a shell failure (`shell_failure_retry:{parent_id}:N`).
+    pub fn count_shell_failure_agent_retries(
+        &self,
+        parent_shell_job_id: &str,
+    ) -> Result<i64, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("shell_failure_retry:{parent_shell_job_id}:%");
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             WHERE job_kind = 'agent' AND trigger_reason LIKE ?1",
+            params![pattern],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn mark_background_shell_agent_retry_enqueued(
+        &self,
+        id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE background_jobs
+             SET last_progress_at = ?1, last_stage = 'agent_retry_enqueued'
+             WHERE id = ?2 AND job_kind = 'shell'",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_background_shell_finished(
+        &self,
+        id: &str,
+        exit_code: i32,
+        result_text: &str,
+        success: bool,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        if success {
+            conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'done',
+                     finished_at = ?1,
+                     result_text = ?2,
+                     exit_code = ?3,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'done'
+                 WHERE id = ?4",
+                params![now, result_text, exit_code, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     result_text = ?2,
+                     exit_code = ?3,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
+                 WHERE id = ?4",
+                params![now, result_text, exit_code, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_shell_jobs_needing_notification(
+        &self,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell'
+               AND status = 'failed'
+               AND (result_text IS NULL OR TRIM(result_text) = '')"
+        ))?;
+        let jobs = stmt
+            .query_map([], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn list_running_shell_background_jobs(
+        &self,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell' AND status = 'running' AND tmux_session IS NOT NULL"
+        ))?;
+        let jobs = stmt
+            .query_map([], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    /// Running shell jobs plus prematurely-failed rows still awaiting user notification.
+    pub fn list_shell_jobs_for_monitor(&self) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell'
+               AND tmux_session IS NOT NULL
+               AND (
+                    status = 'running'
+                    OR (
+                        status = 'failed'
+                        AND (result_text IS NULL OR TRIM(result_text) = '')
+                    )
+               )"
+        ))?;
+        let jobs = stmt
+            .query_map([], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn list_shell_jobs_with_expired_lease(
+        &self,
+        now_rfc3339: &str,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE job_kind = 'shell'
+               AND status = 'running'
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < ?1"
+        ))?;
+        let jobs = stmt
+            .query_map(params![now_rfc3339], map_background_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn list_active_background_jobs_for_chat(
+        &self,
+        chat_id: i64,
+        now_rfc3339: &str,
+        pending_timeout_secs: i64,
+    ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "list_active_background_jobs_for_chat: invalid now timestamp: {e}"
+                ))
+            })?;
+        let pending_cutoff =
+            (now - chrono::Duration::seconds(pending_timeout_secs.max(1))).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
+             FROM background_jobs
+             WHERE chat_id = ?1
+               AND (
+                    (job_kind IS NULL OR job_kind NOT IN ('tracked'))
+                    AND (
+                         (status = 'pending' AND created_at >= ?2)
+                         OR (
+                             status IN ('running', 'completed_raw', 'main_agent_processing')
+                             AND COALESCE(lease_expires_at, '9999-12-31T23:59:59+00:00') >= ?3
+                         )
+                    )
+                    OR (job_kind = 'tracked' AND status = 'running')
+               )
+             ORDER BY created_at ASC"
+        ))?;
+        let jobs = stmt
+            .query_map(
+                params![chat_id, pending_cutoff, now_rfc3339],
+                map_background_job_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    pub fn claim_background_job_running(
+        &self,
+        id: &str,
+        lease_owner: &str,
+        lease_ttl_secs: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires =
+            (now_dt + chrono::Duration::seconds(lease_ttl_secs.max(1))).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'running',
+                 started_at = COALESCE(started_at, ?1),
+                 lease_owner = ?2,
+                 lease_expires_at = ?3,
+                 last_progress_at = ?1,
+                 last_stage = 'running'
+             WHERE id = ?4 AND status = 'pending'",
+            params![now, lease_owner, lease_expires, id],
+        )?;
+        Ok(rows == 1)
+    }
+
+    pub fn renew_background_job_lease(
+        &self,
+        id: &str,
+        lease_ttl_secs: i64,
+        stage: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires =
+            (now_dt + chrono::Duration::seconds(lease_ttl_secs.max(1))).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET lease_expires_at = ?1,
+                 last_progress_at = ?2,
+                 last_stage = ?3
+             WHERE id = ?4
+               AND status IN ('running', 'completed_raw', 'main_agent_processing')",
+            params![lease_expires, now, stage, id],
+        )?;
+        if rows == 0 {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub fn mark_background_job_completed_raw(
+        &self,
+        id: &str,
+        result_text: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires = (now_dt + chrono::Duration::seconds(120)).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'completed_raw',
+                 finished_at = ?1,
+                 result_text = ?2,
+                 lease_expires_at = ?3,
+                 last_progress_at = ?1,
+                 last_stage = 'completed_raw'
+             WHERE id = ?4",
+            params![now, result_text, lease_expires, id],
+        )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_completed_raw: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
     pub fn mark_background_job_main_agent_processing(
         &self,
         id: &str,
+        lease_ttl_secs: i64,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'main_agent_processing' WHERE id = ?1",
-            params![id],
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
+        let lease_expires =
+            (now_dt + chrono::Duration::seconds(lease_ttl_secs.max(1))).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'main_agent_processing',
+                 lease_expires_at = ?1,
+                 last_progress_at = ?2,
+                 last_stage = 'main_agent_processing'
+             WHERE id = ?3",
+            params![lease_expires, now, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_main_agent_processing: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
     pub fn mark_background_job_done(&self, id: &str) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'done' WHERE id = ?1",
-            params![id],
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'done',
+                 finished_at = COALESCE(finished_at, ?1),
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_progress_at = ?1,
+                 last_stage = 'done'
+             WHERE id = ?2",
+            params![now, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_done: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
@@ -2192,23 +4524,81 @@ impl Database {
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE background_jobs SET status = 'failed', finished_at = ?1, error_text = ?2 WHERE id = ?3",
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'failed',
+                 finished_at = ?1,
+                 error_text = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_progress_at = ?1,
+                 last_stage = 'failed'
+             WHERE id = ?3",
             params![now, error_text, id],
         )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "fail_background_job: no job row for id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn mark_background_job_cancelled(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE background_jobs
+             SET status = 'cancelled',
+                 finished_at = ?1,
+                 error_text = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_progress_at = ?1,
+                 last_stage = 'cancelled'
+             WHERE id = ?3",
+            params![now, reason, id],
+        )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "mark_background_job_cancelled: no job row for id {id}"
+            )));
+        }
         Ok(())
     }
 
     pub fn count_active_background_jobs_for_chat(
         &self,
         chat_id: i64,
+        now_rfc3339: &str,
+        pending_timeout_secs: i64,
     ) -> Result<i64, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "count_active_background_jobs_for_chat: invalid now timestamp: {e}"
+                ))
+            })?;
+        let pending_cutoff =
+            (now - chrono::Duration::seconds(pending_timeout_secs.max(1))).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         let count = conn.query_row(
             "SELECT COUNT(*) FROM background_jobs
              WHERE chat_id = ?1
-               AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
-            params![chat_id],
+               AND (job_kind IS NULL OR job_kind NOT IN ('tracked'))
+               AND (
+                    (status = 'pending' AND created_at >= ?2)
+                    OR (
+                        status IN ('running', 'completed_raw', 'main_agent_processing')
+                        AND COALESCE(lease_expires_at, '9999-12-31T23:59:59+00:00') >= ?3
+                    )
+               )",
+            params![chat_id, pending_cutoff, now_rfc3339],
             |row| row.get::<_, i64>(0),
         )?;
         Ok(count)
@@ -2220,29 +4610,15 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<BackgroundJob>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
+        let mut stmt = conn.prepare(&format!(
+            "{BG_JOB_SELECT}
              FROM background_jobs
              WHERE chat_id = ?1
              ORDER BY created_at DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        ))?;
         let jobs = stmt
-            .query_map(params![chat_id, limit as i64], |row| {
-                Ok(BackgroundJob {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    status: row.get(4)?,
-                    trigger_reason: row.get(5)?,
-                    created_at: row.get(6)?,
-                    started_at: row.get(7)?,
-                    finished_at: row.get(8)?,
-                    result_text: row.get(9)?,
-                    error_text: row.get(10)?,
-                })
-            })?
+            .query_map(params![chat_id, limit as i64], map_background_job_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(jobs)
     }
@@ -2253,24 +4629,9 @@ impl Database {
     ) -> Result<Option<BackgroundJob>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text
-             FROM background_jobs WHERE id = ?1",
+            &format!("{BG_JOB_SELECT} FROM background_jobs WHERE id = ?1"),
             params![id],
-            |row| {
-                Ok(BackgroundJob {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    status: row.get(4)?,
-                    trigger_reason: row.get(5)?,
-                    created_at: row.get(6)?,
-                    started_at: row.get(7)?,
-                    finished_at: row.get(8)?,
-                    result_text: row.get(9)?,
-                    error_text: row.get(10)?,
-                })
-            },
+            map_background_job_row,
         );
         match result {
             Ok(job) => Ok(Some(job)),
@@ -2474,7 +4835,13 @@ impl Database {
             if job_type == "manual_background" {
                 let _ = conn.execute(
                     "UPDATE background_jobs
-                     SET status = 'failed', finished_at = ?1, error_text = ?2
+                     SET status = 'failed',
+                         finished_at = ?1,
+                         error_text = ?2,
+                         lease_owner = NULL,
+                         lease_expires_at = NULL,
+                         last_progress_at = ?1,
+                         last_stage = 'failed'
                      WHERE id = ?3
                        AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
                     params![now_str, stale_msg, run_key],
@@ -2484,6 +4851,107 @@ impl Database {
         }
 
         Ok(reconciled)
+    }
+
+    /// Fail web background jobs that are still pending and never started within the allowed age.
+    pub fn reconcile_stale_pending_background_jobs(
+        &self,
+        now_rfc3339: &str,
+        max_pending_secs: i64,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339(now_rfc3339)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| {
+                FinallyAValueBotError::ToolExecution(format!(
+                    "reconcile_stale_pending_background_jobs: invalid now timestamp: {e}"
+                ))
+            })?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at
+             FROM background_jobs
+             WHERE status = 'pending'
+               AND started_at IS NULL",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let stale_msg = "stale pending job — worker never confirmed start";
+        let now_str = now.to_rfc3339();
+        let mut out = Vec::new();
+
+        for (id, created_at) in rows {
+            let Ok(created) = DateTime::parse_from_rfc3339(&created_at) else {
+                continue;
+            };
+            let created = created.with_timezone(&Utc);
+            if now.signed_duration_since(created).num_seconds() <= max_pending_secs {
+                continue;
+            }
+            let n = conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
+                 WHERE id = ?3
+                   AND status = 'pending'
+                   AND started_at IS NULL",
+                params![now_str, stale_msg, id],
+            )?;
+            if n > 0 {
+                out.push(id);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Fail active web background jobs with expired leases.
+    pub fn reconcile_expired_background_job_leases(
+        &self,
+        now_rfc3339: &str,
+    ) -> Result<Vec<String>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let stale_msg = "stale lease expired — worker heartbeat not renewed";
+        let mut stmt = conn.prepare(
+            "SELECT id
+             FROM background_jobs
+             WHERE status IN ('running', 'completed_raw', 'main_agent_processing')
+               AND COALESCE(job_kind, 'agent') != 'shell'
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < ?1",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![now_rfc3339], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut out = Vec::new();
+        for id in rows {
+            let n = conn.execute(
+                "UPDATE background_jobs
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
+                 WHERE id = ?3
+                   AND status IN ('running', 'completed_raw', 'main_agent_processing')
+                   AND COALESCE(job_kind, 'agent') != 'shell'",
+                params![now_rfc3339, stale_msg, id],
+            )?;
+            if n > 0 {
+                out.push(id);
+            }
+        }
+        Ok(out)
     }
 
     /// Fail web `background_jobs` rows that never got a heartbeat row but stayed active too long.
@@ -2530,7 +4998,13 @@ impl Database {
             }
             let n = conn.execute(
                 "UPDATE background_jobs
-                 SET status = 'failed', finished_at = ?1, error_text = ?2
+                 SET status = 'failed',
+                     finished_at = ?1,
+                     error_text = ?2,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     last_progress_at = ?1,
+                     last_stage = 'failed'
                  WHERE id = ?3
                    AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
                 params![now_str, stale_msg, id],
@@ -2746,24 +5220,14 @@ impl Database {
         since: &str,
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, sender_name, content, is_from_bot, timestamp
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp > ?3 AND is_from_bot = 0
-             ORDER BY timestamp ASC",
-        )?;
+             ORDER BY timestamp ASC"
+        ))?;
         let messages = stmt
-            .query_map(params![chat_id, persona_id, since], |row| {
-                Ok(StoredMessage {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    content: row.get(4)?,
-                    is_from_bot: row.get::<_, i32>(5)? != 0,
-                    timestamp: row.get(6)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id, since], stored_message_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
     }
@@ -2866,7 +5330,7 @@ impl Database {
     pub fn list_personas(&self, chat_id: i64) -> Result<Vec<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 ORDER BY id",
+            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE chat_id = ?1 ORDER BY id",
         )?;
         let personas = stmt
             .query_map(params![chat_id], |row| {
@@ -2875,6 +5339,9 @@ impl Database {
                     chat_id: row.get(1)?,
                     name: row.get(2)?,
                     model_override: row.get(3)?,
+                    recent_history_min_user: row.get(4)?,
+                    recent_history_min_assistant: row.get(5)?,
+                    operator_memo: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2921,7 +5388,7 @@ impl Database {
     ) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, name, model_override FROM personas WHERE chat_id = ?1 AND name = ?2",
+            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE chat_id = ?1 AND name = ?2",
             params![chat_id, name],
             |row| {
                 Ok(Persona {
@@ -2929,6 +5396,9 @@ impl Database {
                     chat_id: row.get(1)?,
                     name: row.get(2)?,
                     model_override: row.get(3)?,
+                    recent_history_min_user: row.get(4)?,
+                    recent_history_min_assistant: row.get(5)?,
+                    operator_memo: row.get(6)?,
                 })
             },
         );
@@ -2942,7 +5412,7 @@ impl Database {
     pub fn get_persona(&self, id: i64) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, name, model_override FROM personas WHERE id = ?1",
+            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Persona {
@@ -2950,6 +5420,9 @@ impl Database {
                     chat_id: row.get(1)?,
                     name: row.get(2)?,
                     model_override: row.get(3)?,
+                    recent_history_min_user: row.get(4)?,
+                    recent_history_min_assistant: row.get(5)?,
+                    operator_memo: row.get(6)?,
                 })
             },
         );
@@ -2987,6 +5460,18 @@ impl Database {
             "DELETE FROM messages WHERE chat_id = ?1 AND persona_id = ?2",
             params![chat_id, persona_id],
         )?;
+        let _ = tx.execute(
+            "DELETE FROM persona_bulletin_events WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let _ = tx.execute(
+            "DELETE FROM persona_bulletin_focus WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let _ = tx.execute(
+            "DELETE FROM persona_message_bookmarks WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
         let rows = tx.execute(
             "DELETE FROM personas WHERE id = ?1 AND chat_id = ?2",
             params![persona_id, chat_id],
@@ -3013,6 +5498,35 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Sets per-persona prompt controls. `None` for min fields writes SQL NULL (use server defaults).
+    /// `operator_memo` `None` clears memo to NULL; `Some("")` also clears.
+    pub fn set_persona_prompt_overrides(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        recent_history_min_user: Option<i64>,
+        recent_history_min_assistant: Option<i64>,
+        operator_memo: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let memo_db: Option<String> = match operator_memo {
+            None => None,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.to_string()),
+        };
+        let rows = conn.execute(
+            "UPDATE personas SET recent_history_min_user = ?1, recent_history_min_assistant = ?2, operator_memo = ?3 WHERE id = ?4 AND chat_id = ?5",
+            params![
+                recent_history_min_user,
+                recent_history_min_assistant,
+                memo_db,
+                persona_id,
+                chat_id
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Full-text search over message history for a specific chat/persona.
     /// Returns messages ranked by relevance (FTS5 rank).
     pub fn search_messages(
@@ -3026,7 +5540,7 @@ impl Database {
     ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.chat_id, m.persona_id, m.sender_name, m.content, m.is_from_bot, m.timestamp
+            "SELECT m.id, m.chat_id, m.persona_id, m.session_id, m.sender_name, m.content, m.is_from_bot, m.timestamp, m.origin
              FROM messages_fts
              JOIN messages m ON m.rowid = messages_fts.rowid
              WHERE messages_fts MATCH ?1
@@ -3040,20 +5554,230 @@ impl Database {
         let messages = stmt
             .query_map(
                 params![query, chat_id, persona_id, from_date, to_date, limit as i64],
-                |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        sender_name: row.get(3)?,
-                        content: row.get(4)?,
-                        is_from_bot: row.get::<_, i32>(5)? != 0,
-                        timestamp: row.get(6)?,
-                    })
-                },
+                stored_message_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
+    }
+
+    // --- Chat Sessions ---
+
+    pub fn create_chat_session(
+        &self,
+        id: &str,
+        chat_id: i64,
+        persona_id: i64,
+        title: &str,
+        intent: &str,
+        ttl_hours: i64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO chat_sessions (id, chat_id, persona_id, title, intent, status, created_at, last_active_at, ttl_hours)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)",
+            params![id, chat_id, persona_id, title, intent, now, ttl_hours],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_chat_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ChatSession>, FinallyAValueBotError> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().unwrap();
+        let result = conn
+            .query_row(
+                "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+                 FROM chat_sessions WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(ChatSession {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        persona_id: row.get(2)?,
+                        title: row.get(3)?,
+                        intent: row.get(4)?,
+                        status: row.get(5)?,
+                        created_at: row.get(6)?,
+                        last_active_at: row.get(7)?,
+                        archived_at: row.get(8)?,
+                        ttl_hours: row.get(9)?,
+                        bootstrap_context_json: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn list_chat_sessions(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        include_archived: bool,
+    ) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let query = if include_archived {
+            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+             FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2
+             ORDER BY last_active_at DESC"
+        } else {
+            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+             FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2 AND status = 'active'
+             ORDER BY last_active_at DESC"
+        };
+        let mut stmt = conn.prepare(query)?;
+        let sessions = stmt
+            .query_map(params![chat_id, persona_id], |row| {
+                Ok(ChatSession {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    intent: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_active_at: row.get(7)?,
+                    archived_at: row.get(8)?,
+                    ttl_hours: row.get(9)?,
+                    bootstrap_context_json: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(sessions)
+    }
+
+    pub fn update_chat_session_last_active(
+        &self,
+        session_id: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE chat_sessions SET last_active_at = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_chat_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE chat_sessions SET title = ?1 WHERE id = ?2",
+            params![title, session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn update_chat_session_ttl(
+        &self,
+        session_id: &str,
+        ttl_hours: i64,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_sessions SET ttl_hours = ?1 WHERE id = ?2",
+            params![ttl_hours, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_chat_session_bootstrap_context(
+        &self,
+        session_id: &str,
+        bootstrap_context_json: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_sessions SET bootstrap_context_json = ?1 WHERE id = ?2",
+            params![bootstrap_context_json, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE chat_sessions SET status = 'archived', archived_at = ?1 WHERE id = ?2 AND status = 'active'",
+            params![now, session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn reopen_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE chat_sessions SET status = 'active', archived_at = NULL, last_active_at = ?1 WHERE id = ?2 AND status = 'archived'",
+            params![now, session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn delete_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let rows = conn.execute(
+            "DELETE FROM chat_sessions WHERE id = ?1",
+            params![session_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn get_all_messages_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
+             FROM messages
+             WHERE session_id = ?1
+             ORDER BY timestamp ASC"
+        ))?;
+        let messages = stmt
+            .query_map(params![session_id], stored_message_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
+    pub fn get_expired_chat_sessions(&self) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+             FROM chat_sessions
+             WHERE status = 'active'
+               AND ttl_hours > 0
+               AND datetime(last_active_at, '+' || ttl_hours || ' hours') < datetime('now')",
+        )?;
+        let sessions = stmt
+            .query_map([], |row| {
+                Ok(ChatSession {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    intent: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_active_at: row.get(7)?,
+                    archived_at: row.get(8)?,
+                    ttl_hours: row.get(9)?,
+                    bootstrap_context_json: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(sessions)
     }
 }
 
@@ -3081,7 +5805,7 @@ mod tests {
     fn test_new_database_creates_tables() {
         let (db, dir) = test_db();
         let pid = test_persona(&db, 1);
-        let msgs = db.get_recent_messages(1, pid, 10).unwrap();
+        let msgs = db.get_recent_messages(1, pid, 10, false).unwrap();
         assert!(msgs.is_empty());
         let tasks = db.get_due_tasks("2099-01-01T00:00:00Z").unwrap();
         assert!(tasks.is_empty());
@@ -3107,14 +5831,16 @@ mod tests {
             id: "msg1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".into(),
+            origin: crate::db::message_origin_interactive(),
         };
         db.store_message(&msg).unwrap();
 
-        let messages = db.get_recent_messages(100, pid, 10).unwrap();
+        let messages = db.get_recent_messages(100, pid, 10, false).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, "msg1");
         assert_eq!(messages[0].sender_name, "alice");
@@ -3131,10 +5857,12 @@ mod tests {
             id: "msg1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "original".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:00Z".into(),
+            origin: crate::db::message_origin_interactive(),
         };
         db.store_message(&msg).unwrap();
 
@@ -3143,14 +5871,16 @@ mod tests {
             id: "msg1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "updated".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         };
         db.store_message(&msg2).unwrap();
 
-        let messages = db.get_recent_messages(100, pid, 10).unwrap();
+        let messages = db.get_recent_messages(100, pid, 10, false).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "updated");
         cleanup(&dir);
@@ -3169,12 +5899,13 @@ mod tests {
                 content: format!("message {i}"),
                 is_from_bot: false,
                 timestamp: format!("2024-01-01T00:00:0{i}Z"),
+                origin: crate::db::message_origin_interactive(),
             };
             db.store_message(&msg).unwrap();
         }
 
         // Limit to 3 - should get the 3 most recent, but reversed to oldest-first
-        let messages = db.get_recent_messages(100, pid, 3).unwrap();
+        let messages = db.get_recent_messages(100, pid, 3, false).unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "message 2"); // oldest of the 3 most recent
         assert_eq!(messages[1].content, "message 3");
@@ -3182,7 +5913,7 @@ mod tests {
 
         // Different chat_id should be empty
         let pid2 = test_persona(&db, 200);
-        let messages = db.get_recent_messages(200, pid2, 10).unwrap();
+        let messages = db.get_recent_messages(200, pid2, 10, false).unwrap();
         assert!(messages.is_empty());
         cleanup(&dir);
     }
@@ -3197,10 +5928,12 @@ mod tests {
             id: "m1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "hi".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3209,10 +5942,12 @@ mod tests {
             id: "m2".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bot".into(),
             content: "hello!".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:02Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3221,10 +5956,12 @@ mod tests {
             id: "m3".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "how are you?".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:03Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3233,15 +5970,17 @@ mod tests {
             id: "m4".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bob".into(),
             content: "me too".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:04Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
         let messages = db
-            .get_messages_since_last_bot_response(100, pid, 50, 10)
+            .get_messages_since_last_bot_response(100, pid, 50, 10, false)
             .unwrap();
         // Should include the bot message and everything after it
         assert!(messages.len() >= 2);
@@ -3266,13 +6005,14 @@ mod tests {
                 content: format!("msg {i}"),
                 is_from_bot: false,
                 timestamp: format!("2024-01-01T00:00:0{i}Z"),
+                origin: crate::db::message_origin_interactive(),
             })
             .unwrap();
         }
 
         // Fallback to last 3
         let messages = db
-            .get_messages_since_last_bot_response(100, pid, 50, 3)
+            .get_messages_since_last_bot_response(100, pid, 50, 3, false)
             .unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "msg 2");
@@ -3472,6 +6212,7 @@ mod tests {
                 content: format!("message {i}"),
                 is_from_bot: false,
                 timestamp: format!("2024-01-01T00:00:0{i}Z"),
+                origin: crate::db::message_origin_interactive(),
             })
             .unwrap();
         }
@@ -3597,10 +6338,12 @@ mod tests {
             id: "m1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "old msg".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3609,10 +6352,12 @@ mod tests {
             id: "m2".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bot".into(),
             content: "response".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:02Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3621,10 +6366,12 @@ mod tests {
             id: "m3".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "new msg 1".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:03Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3632,10 +6379,12 @@ mod tests {
             id: "m4".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bob".into(),
             content: "new msg 2".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:04Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3644,10 +6393,12 @@ mod tests {
             id: "m5".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bot".into(),
             content: "bot again".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:05Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -3657,6 +6408,273 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "new msg 1");
         assert_eq!(msgs[1].content, "new msg 2");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_bulletin_events_latest_first() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
+        db.append_persona_bulletin_event(
+            100,
+            pid,
+            Some("run:1"),
+            "memory_update",
+            "Updated memory",
+            Some("Tiered memory written"),
+        )
+        .unwrap();
+        db.append_persona_bulletin_event(
+            100,
+            pid,
+            Some("run:2"),
+            "file_update",
+            "Updated file",
+            Some("Edited src/main.rs"),
+        )
+        .unwrap();
+
+        let items = db.list_persona_bulletin_events(100, pid, 1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].event_type, "file_update");
+        assert_eq!(items[0].title, "Updated file");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_bulletin_focus_upsert_and_get() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
+        db.upsert_persona_bulletin_focus(
+            100,
+            pid,
+            Some("Current focus"),
+            "Wing: origin\nRooms: 19",
+        )
+        .unwrap();
+        db.upsert_persona_bulletin_focus(100, pid, None, "Updated focus content")
+            .unwrap();
+        let focus = db.get_persona_bulletin_focus(100, pid).unwrap().unwrap();
+        assert_eq!(focus.chat_id, 100);
+        assert_eq!(focus.persona_id, pid);
+        assert_eq!(focus.title, None);
+        assert_eq!(focus.content, "Updated focus content");
+        assert!(!focus.updated_at.is_empty());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_message_bookmark_crud() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
+        db.store_message(&StoredMessage {
+            id: "m-bookmark-1".into(),
+            chat_id: 100,
+            persona_id: pid,
+            session_id: None,
+            sender_name: "alice".into(),
+            content: "bookmark me".into(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
+        })
+        .unwrap();
+        assert!(db
+            .message_exists_in_persona(100, pid, "m-bookmark-1")
+            .unwrap());
+        assert!(!db.message_exists_in_persona(100, pid, "missing").unwrap());
+
+        db.upsert_persona_message_bookmark(
+            100,
+            pid,
+            "m-bookmark-1",
+            "user",
+            "bookmark me",
+            Some("important"),
+        )
+        .unwrap();
+        db.upsert_persona_message_bookmark(
+            100,
+            pid,
+            "m-bookmark-1",
+            "user",
+            "bookmark me updated",
+            Some("still important"),
+        )
+        .unwrap();
+
+        let items = db.list_persona_message_bookmarks(100, pid, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message_id, "m-bookmark-1");
+        assert_eq!(items[0].content_preview, "bookmark me updated");
+        assert_eq!(items[0].note.as_deref(), Some("still important"));
+
+        assert!(db
+            .delete_persona_message_bookmark(100, pid, "m-bookmark-1")
+            .unwrap());
+        assert!(!db
+            .delete_persona_message_bookmark(100, pid, "m-bookmark-1")
+            .unwrap());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_builtin_postdelivery_focus_sync_hook_seeded() {
+        let (db, dir) = test_db();
+        let hooks = db.list_hook_definitions().unwrap();
+        let focus_hook = hooks
+            .iter()
+            .find(|h| h.name == "postdelivery-persona-focus-sync")
+            .expect("focus sync hook must be seeded");
+        assert_eq!(focus_hook.event_name, "PostDelivery");
+        assert_eq!(focus_hook.action_type, "builtin_persona_focus_sync");
+        assert!(focus_hook.enabled);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_shipped_hooks_loaded_from_builtin_hooks_catalog() {
+        let (db, dir) = test_db();
+        let hooks = db.list_hook_definitions().unwrap();
+        assert!(
+            !hooks.iter().any(|h| h.name.starts_with("template-")),
+            "template example hooks must not be seeded"
+        );
+        assert!(
+            !hooks
+                .iter()
+                .any(|h| h.name == "posttool-pz-terminal-cleanup"),
+            "PZ hook must not be shipped in builtin catalog"
+        );
+
+        let builtin_names = [
+            "postdelivery-persona-focus-sync",
+            "beforeturn-scheduler-policy-context",
+            "pretool-turn-skill-gate",
+            "prestop-deferred-commitment-guard",
+            "postbatch-loop-guard",
+        ];
+        for name in builtin_names {
+            let hook = hooks
+                .iter()
+                .find(|h| h.name == name)
+                .unwrap_or_else(|| panic!("missing shipped builtin hook {name}"));
+            assert!(
+                hook.action_type.starts_with("builtin_"),
+                "{} must use builtin_* action_type, got {}",
+                name,
+                hook.action_type
+            );
+            assert!(hook.enabled, "{name} should be enabled by default");
+            assert!(
+                hook.scoped_persona_ids.is_none(),
+                "{name} should be globally scoped"
+            );
+        }
+        assert_eq!(
+            hooks.len(),
+            builtin_names.len(),
+            "fresh DB should contain only the five shipped catalog hooks: {:?}",
+            hooks.iter().map(|h| &h.name).collect::<Vec<_>>()
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_hook_persona_status_fields() {
+        let (db, dir) = test_db();
+        let chat_id = 9007;
+        let owner_persona_id = db
+            .create_persona(chat_id, "owner", None)
+            .expect("create owner persona");
+        let other_persona_id = db
+            .create_persona(chat_id, "other", None)
+            .expect("create other persona");
+        let global_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "global-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"global"}"#,
+                None,
+                true,
+            )
+            .expect("upsert global hook");
+        let scoped_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "scoped-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"scoped"}"#,
+                Some(&[owner_persona_id]),
+                true,
+            )
+            .expect("upsert scoped hook");
+        let disabled_hook_id = db
+            .upsert_hook_definition(
+                None,
+                "disabled-hook",
+                "BeforeTurn",
+                None,
+                "add_context",
+                r#"{"additional_context":"disabled"}"#,
+                None,
+                false,
+            )
+            .expect("upsert disabled hook");
+
+        let hooks = db.list_hook_definitions().expect("list hooks");
+        let global_hook = hooks
+            .iter()
+            .find(|h| h.id == global_hook_id)
+            .expect("global hook");
+        let scoped_hook = hooks
+            .iter()
+            .find(|h| h.id == scoped_hook_id)
+            .expect("scoped hook");
+        let disabled_hook = hooks
+            .iter()
+            .find(|h| h.id == disabled_hook_id)
+            .expect("disabled hook");
+
+        let (scoped, allowed, active) = global_hook
+            .persona_status(&db, chat_id, owner_persona_id)
+            .expect("global owner status");
+        assert!(scoped);
+        assert!(allowed);
+        assert!(active);
+
+        let (scoped, allowed, active) = scoped_hook
+            .persona_status(&db, chat_id, owner_persona_id)
+            .expect("scoped owner status");
+        assert!(scoped);
+        assert!(allowed);
+        assert!(active);
+
+        let (scoped, allowed, active) = scoped_hook
+            .persona_status(&db, chat_id, other_persona_id)
+            .expect("scoped other status");
+        assert!(!scoped);
+        assert!(allowed);
+        assert!(!active);
+
+        db.set_persona_hook_skill_policy(chat_id, owner_persona_id, Some(&[]), None)
+            .expect("block all hooks for owner");
+        let (_, allowed, active) = global_hook
+            .persona_status(&db, chat_id, owner_persona_id)
+            .expect("global owner blocked status");
+        assert!(!allowed);
+        assert!(!active);
+
+        let (_, _, active) = disabled_hook
+            .persona_status(&db, chat_id, other_persona_id)
+            .expect("disabled status");
+        assert!(!active);
 
         cleanup(&dir);
     }

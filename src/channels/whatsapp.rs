@@ -10,7 +10,7 @@ use base64::Engine;
 use serde::Deserialize;
 use tracing::{error, info};
 
-use crate::channel::with_persona_indicator;
+use crate::channel::{deliver_agent_final_to_contact, DeliveryScope};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
@@ -182,7 +182,12 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 let chat_id = match call_blocking(state.app_state.db.clone(), move |db| {
                     if let Some(cid) = universal_chat_id {
                         db.upsert_chat(cid, None, "whatsapp")?;
-                        db.link_channel(cid, "whatsapp", &wa_handle)?;
+                        db.link_channel(
+                            cid,
+                            crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
+                            "whatsapp",
+                            &wa_handle,
+                        )?;
                         Ok(cid)
                     } else {
                         Ok(parsed_phone_chat_id)
@@ -250,12 +255,24 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             .await;
                         }
                         SlashCommand::Schedule => {
-                            let tasks = call_blocking(state.app_state.db.clone(), |db| {
-                                db.get_all_scheduled_tasks_for_display()
+                            let pid = call_blocking(state.app_state.db.clone(), move |db| {
+                                db.get_current_persona_id(chat_id)
                             })
-                            .await;
+                            .await
+                            .unwrap_or(0);
+                            let tasks = if pid > 0 {
+                                call_blocking(state.app_state.db.clone(), move |db| {
+                                    db.get_scheduled_tasks_for_chat_and_persona(chat_id, pid)
+                                })
+                                .await
+                            } else {
+                                call_blocking(state.app_state.db.clone(), move |db| {
+                                    db.get_scheduled_tasks_for_chat_for_display(chat_id)
+                                })
+                                .await
+                            };
                             let text = match &tasks {
-                                Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
+                                Ok(t) => crate::tools::schedule::format_tasks_list(t),
                                 Err(e) => format!("Error listing tasks: {e}"),
                             };
                             send_whatsapp_message(
@@ -286,7 +303,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 let pid_f = pid;
                                 let history =
                                     call_blocking(state.app_state.db.clone(), move |db| {
-                                        db.get_recent_messages(chat_id, pid_f, 500)
+                                        db.get_recent_messages(chat_id, pid_f, 500, false)
                                     })
                                     .await
                                     .unwrap_or_default();
@@ -454,9 +471,11 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 let (persona_id, text) = match call_blocking(
                     state.app_state.db.clone(),
                     move |db| {
-                        crate::persona::resolve_incoming_run_persona(
+                        crate::persona::resolve_incoming_run_persona_for_channel(
                             &db,
                             chat_id,
+                            "whatsapp",
+                            crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
                             &text_for_resolve,
                         )
                     },
@@ -492,10 +511,12 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     id: message.id.clone(),
                     chat_id,
                     persona_id,
+                    session_id: None,
                     sender_name: sender_name.clone(),
                     content: text.clone(),
                     is_from_bot: false,
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    origin: crate::db::message_origin_interactive(),
                 };
                 let _ = call_blocking(state.app_state.db.clone(), move |db| {
                     db.store_message(&stored)
@@ -538,6 +559,10 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                 is_scheduled_task: false,
                                 is_background_job: false,
                                 run_key: None,
+                                reply_bot_instance_id: Some(
+                                    crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
+                                ),
+                                session_id: None,
                             },
                             None,
                             image_data,
@@ -546,38 +571,51 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                         )
                         .await
                         {
-                            Ok(response) => {
-                                if !response.is_empty() {
-                                    let response = with_persona_indicator(
-                                        app_state.db.clone(),
-                                        persona_id,
-                                        &response,
-                                    )
-                                    .await;
-                                    send_whatsapp_message(
-                                        &http_client,
-                                        &access_token,
-                                        &phone_number_id,
-                                        &to_phone,
-                                        &response,
-                                    )
-                                    .await;
-
-                                    // Store bot response
-                                    let bot_msg = StoredMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        chat_id,
-                                        persona_id,
-                                        sender_name: app_state.config.bot_username.clone(),
-                                        content: response,
-                                        is_from_bot: true,
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                    };
-                                    let _ = call_blocking(app_state.db.clone(), move |db| {
-                                        db.store_message(&bot_msg)
-                                    })
-                                    .await;
+                            Ok(agent_out) => {
+                                if agent_out.response.trim().is_empty() {
+                                    return;
                                 }
+
+                                let delivery = deliver_agent_final_to_contact(
+                                    app_state.db.clone(),
+                                    app_state.telegram_bots.as_ref(),
+                                    app_state.discord_http.as_ref(),
+                                    &app_state.config.bot_username,
+                                    chat_id,
+                                    persona_id,
+                                    &agent_out.response,
+                                    Some(app_state.config.workspace_root_absolute()),
+                                    DeliveryScope::PlatformInstance {
+                                        channel_type: "whatsapp",
+                                        bot_instance_id: crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
+                                    },
+                                    None,
+                                )
+                                .await;
+
+                                let text_for_whatsapp = match delivery {
+                                    Ok(outcome) if !outcome.response_for_client.is_empty() => {
+                                        outcome.response_for_client
+                                    }
+                                    Ok(_) => return,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target: "channel",
+                                            error = %e,
+                                            "deliver_agent_final_to_contact failed for WhatsApp"
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                send_whatsapp_message(
+                                    &http_client,
+                                    &access_token,
+                                    &phone_number_id,
+                                    &to_phone,
+                                    &text_for_whatsapp,
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 error!("Error processing WhatsApp message: {e}");

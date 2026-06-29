@@ -30,10 +30,10 @@ impl Tool for AddVaultItemTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "add_vault_item".into(),
-            description: "Add a new item to the vault (long-term memory). Use this to store successful solutions, learned patterns, or important facts for future retrieval. The item will be embedded and stored in the vector database.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "add_vault_item",
+            "Add a new item to the vault (long-term memory). Use this to store successful solutions, learned patterns, or important facts for future retrieval. The item will be embedded and stored in the vector database.",
+            schema_object(
                 json!({
                     "content": {
                         "type": "string",
@@ -46,7 +46,7 @@ impl Tool for AddVaultItemTool {
                 }),
                 &["content", "source"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {

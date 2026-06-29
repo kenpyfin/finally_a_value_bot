@@ -1,7 +1,10 @@
 pub mod activate_skill;
 pub mod agent_history;
+pub mod apply_search_replace;
 pub mod bash;
+pub mod bash_safety;
 pub mod browser;
+pub mod bulletin;
 pub mod command_runner;
 pub mod cursor_agent;
 pub mod edit_file;
@@ -10,13 +13,20 @@ pub mod glob;
 pub mod grep;
 pub mod mcp;
 pub mod memory;
+pub mod memory_state;
 pub mod path_guard;
 pub mod read_file;
+pub mod read_repo_map;
+pub mod register_hook;
+pub mod register_tracked_job;
+pub mod run_skill_script;
 pub mod schedule;
 pub mod search_history;
 pub mod search_vault;
 pub mod send_message;
 pub mod social_feed;
+pub mod spawn_background_command;
+pub mod symbol_edit;
 pub mod sync_skills;
 pub mod tiered_memory;
 pub mod vault_add;
@@ -35,6 +45,7 @@ use teloxide::prelude::*;
 use crate::claude::ToolDefinition;
 use crate::config::Config;
 use crate::db::Database;
+use crate::safety_redaction::EnvSecretRedactor;
 
 pub struct ToolResult {
     pub content: String,
@@ -100,16 +111,23 @@ impl ToolRisk {
 
 pub fn tool_risk(name: &str) -> ToolRisk {
     match name {
-        "bash" => ToolRisk::High,
+        "register_tracked_job" => ToolRisk::Low,
+        "bash" | "spawn_background_command" => ToolRisk::High,
         "cursor_agent"
         | "write_file"
         | "edit_file"
+        | "apply_search_replace"
+        | "symbol_edit"
         | "write_memory"
         | "write_tiered_memory"
+        | "write_memory_state"
+        | "patch_memory_state"
+        | "update_bulletin_focus"
         | "add_vault_item"
-        | "send_message"
         | "sync_skills"
+        | "register_hook"
         | "schedule_task"
+        | "update_scheduled_task"
         | "pause_scheduled_task"
         | "resume_scheduled_task"
         | "cancel_scheduled_task" => ToolRisk::Medium,
@@ -216,7 +234,7 @@ pub fn authorize_chat_persona_access(
     Ok(())
 }
 
-fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serde_json::Value {
+pub fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> serde_json::Value {
     let mut obj = match input {
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),
@@ -243,34 +261,285 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    env_redactor: Arc<EnvSecretRedactor>,
 }
 
-pub fn resolve_tool_path(working_dir: &Path, path: &str) -> PathBuf {
+/// Path to the mistaken nested copy agents sometimes create under tool cwd (`shared/workspace/`).
+pub fn shadow_workspace_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("shared").join("workspace")
+}
+
+/// Returns true if `path` lies under `{workspace_root}/shared/workspace/`.
+pub fn is_under_shadow_workspace(workspace_root: &Path, path: &Path) -> bool {
+    let shadow = shadow_workspace_path(workspace_root);
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shadow_resolved = std::fs::canonicalize(&shadow).unwrap_or(shadow);
+    resolved.starts_with(&shadow_resolved)
+}
+
+/// Reject writes into the shadow workspace tree (see `shadow_workspace_path`).
+pub fn check_shadow_workspace_write(workspace_root: &Path, resolved: &Path) -> Result<(), String> {
+    if is_under_shadow_workspace(workspace_root, resolved) {
+        Err(
+            "Path is under shadow workspace `shared/workspace/`; use paths relative to tool cwd \
+             (`shared/`) without a `workspace/` prefix."
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+pub fn shared_global_prefixes() -> [&'static str; 3] {
+    ["ORIGIN", "vault_db", ".venv-vault"]
+}
+
+pub fn workspace_shared_root(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("shared")
+}
+
+pub fn persona_shared_dir(workspace_root: &Path, chat_id: i64, persona_id: i64) -> PathBuf {
+    workspace_shared_root(workspace_root)
+        .join("personas")
+        .join(chat_id.to_string())
+        .join(persona_id.to_string())
+}
+
+pub fn ensure_persona_shared_dir(
+    workspace_root: &Path,
+    chat_id: i64,
+    persona_id: i64,
+) -> Result<PathBuf, String> {
+    let dir = persona_shared_dir(workspace_root, chat_id, persona_id);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "Failed to create persona shared directory '{}': {e}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+fn has_persona_scope(auth: Option<&ToolAuthContext>) -> bool {
+    auth.is_some_and(|a| a.caller_chat_id > 0 && a.caller_persona_id > 0)
+}
+
+fn is_under(path: &Path, root: &Path) -> bool {
+    let resolved_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    resolved_path.starts_with(resolved_root)
+}
+
+/// Strip redundant prefixes when tool cwd is under `.../shared`.
+pub fn normalize_tool_relative_path(working_dir: &Path, path: &str) -> String {
+    let mut s = path.trim().to_string();
+    if s.is_empty() {
+        return s;
+    }
+    while s.starts_with("./") {
+        s = s[2..].to_string();
+    }
+
+    let cwd_is_shared_tree = working_dir.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(name) if name.to_str().is_some_and(|s| s.eq_ignore_ascii_case("shared"))
+        )
+    });
+
+    if !cwd_is_shared_tree {
+        return s;
+    }
+
+    for prefix in ["workspace/shared/", "workspace/"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_prefix("shared/") {
+        s = rest.to_string();
+    }
+
+    if let Some(parent_name) = working_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    {
+        use std::path::Component;
+        let rel = Path::new(&s);
+        if let Some(Component::Normal(first)) = rel.components().next() {
+            if first == parent_name {
+                s = rel
+                    .components()
+                    .skip(1)
+                    .collect::<PathBuf>()
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+    }
+
+    s
+}
+
+fn resolves_under_workspace_data_root(_tool_shared_dir: &Path, normalized: &str) -> bool {
+    let rel = Path::new(normalized);
+    rel.components().next().is_some_and(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(name)
+                if name == "runtime" || name == "skills"
+        )
+    })
+}
+
+pub fn resolve_tool_path(workspace_root: &Path, tool_working_dir: &Path, path: &str) -> PathBuf {
     let candidate = PathBuf::from(path);
     if candidate.is_absolute() {
-        candidate
-    } else {
-        working_dir.join(candidate)
+        return candidate;
     }
+
+    let normalized = normalize_tool_relative_path(tool_working_dir, path);
+    if normalized.is_empty() {
+        return tool_working_dir.join(path);
+    }
+
+    let shared_root = workspace_shared_root(workspace_root);
+
+    if let Some(rest) = normalized.strip_prefix("shared/skills/") {
+        return shared_root.join("skills").join(rest);
+    }
+    if let Some(rest) = normalized.strip_prefix("shared/") {
+        let first = std::path::Path::new(rest)
+            .components()
+            .next()
+            .and_then(|c| match c {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if shared_global_prefixes().contains(&first) || first == "skills" {
+            return shared_root.join(rest);
+        }
+        return tool_working_dir.join(rest);
+    }
+
+    let first = std::path::Path::new(&normalized)
+        .components()
+        .next()
+        .and_then(|c| match c {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if shared_global_prefixes().contains(&first) {
+        return shared_root.join(&normalized);
+    }
+
+    if resolves_under_workspace_data_root(tool_working_dir, &normalized) {
+        return workspace_root.join(&normalized);
+    }
+
+    tool_working_dir.join(&normalized)
 }
 
 /// Resolve the tool working directory. Always uses the shared workspace (base/shared).
 pub fn resolve_tool_working_dir(base_working_dir: &Path) -> PathBuf {
-    let resolved = base_working_dir.join("shared");
+    let resolved = workspace_shared_root(base_working_dir);
     let _ = std::fs::create_dir_all(&resolved);
     resolved
 }
 
-/// Auto-detect the vault search command from the built-in search-vault skill.
-/// Looks for `query_vault.py` in the skills directory and a Python venv at `shared/.venv-vault`.
+pub fn resolve_tool_working_dir_for_auth(
+    base_working_dir: &Path,
+    auth: Option<&ToolAuthContext>,
+) -> PathBuf {
+    if has_persona_scope(auth) {
+        let auth = auth.expect("checked above");
+        if let Ok(dir) = ensure_persona_shared_dir(
+            base_working_dir,
+            auth.caller_chat_id,
+            auth.caller_persona_id,
+        ) {
+            return dir;
+        }
+    }
+    resolve_tool_working_dir(base_working_dir)
+}
+
+pub fn assert_persona_tool_path_allowed(
+    workspace_root: &Path,
+    resolved_path: &Path,
+    auth: Option<&ToolAuthContext>,
+    is_write: bool,
+) -> Result<(), String> {
+    if !has_persona_scope(auth) {
+        return Ok(());
+    }
+    let auth = auth.expect("checked above");
+    let shared_root = workspace_shared_root(workspace_root);
+    let persona_root =
+        persona_shared_dir(workspace_root, auth.caller_chat_id, auth.caller_persona_id);
+
+    if is_under(resolved_path, &persona_root)
+        || is_under(resolved_path, &workspace_root.join("runtime"))
+        || is_under(resolved_path, &workspace_root.join("skills"))
+        || is_under(resolved_path, &shared_root.join("skills"))
+    {
+        return Ok(());
+    }
+
+    for prefix in shared_global_prefixes() {
+        if is_under(resolved_path, &shared_root.join(prefix)) {
+            return Ok(());
+        }
+    }
+
+    if auth.is_control_chat() {
+        let chat_personas_root = shared_root
+            .join("personas")
+            .join(auth.caller_chat_id.to_string());
+        if is_under(resolved_path, &chat_personas_root) {
+            return Ok(());
+        }
+    }
+
+    if is_write
+        && (is_under(resolved_path, &shared_root.join("scripts"))
+            || is_under(resolved_path, &shared_root.join("parking")))
+    {
+        return Err(
+            "Write blocked: flat shared paths like `shared/scripts/` and `shared/parking/` are \
+             deprecated. Use `skills/<skill-name>/` (or `shared/skills/<skill-name>/`) for reusable \
+             scripts, or write persona files under `shared/personas/{chat_id}/{persona_id}/`."
+                .to_string(),
+        );
+    }
+
+    Err(format!(
+        "Permission denied: path '{}' is outside the allowed persona scope. Allowed roots: \
+persona folder, shared ORIGIN/vault paths, workspace runtime/skills, and shared/skills.",
+        resolved_path.display()
+    ))
+}
+
+/// Auto-detect the vault search command from the search-vault skill.
+/// Prefers `workspace/skills/`; falls back to repository `builtin_skills/search-vault/`.
+/// Expects a Python venv at `shared/.venv-vault` when present.
 fn detect_vault_search_command(config: &Config) -> Option<String> {
     let workspace = config.workspace_root_absolute();
-    let skills_dir = workspace.join("skills");
-
-    let script = skills_dir.join("search-vault").join("query_vault.py");
-    if !script.exists() {
-        return None;
-    }
+    let ws_script = workspace
+        .join("skills")
+        .join("search-vault")
+        .join("query_vault.py");
+    let script = if ws_script.exists() {
+        ws_script
+    } else {
+        crate::builtin_skills::resolve_builtin_skills_dir(config)
+            .map(|b| b.join("search-vault").join("query_vault.py"))
+            .filter(|p| p.exists())?
+    };
 
     let venv_python = workspace
         .join("shared")
@@ -287,7 +556,13 @@ fn detect_vault_search_command(config: &Config) -> Option<String> {
 }
 
 impl ToolRegistry {
-    pub fn new(config: &Config, bot: Bot, db: Arc<Database>) -> Self {
+    pub fn new(
+        config: &Config,
+        _bot: Bot,
+        db: Arc<Database>,
+        runtime_toggles: std::sync::Arc<crate::runtime_toggles::RuntimeToggles>,
+        env_redactor: Arc<EnvSecretRedactor>,
+    ) -> Self {
         let working_dir = PathBuf::from(config.working_dir());
         if let Err(e) = std::fs::create_dir_all(&working_dir) {
             tracing::warn!(
@@ -297,22 +572,31 @@ impl ToolRegistry {
             );
         }
         let skills_data_dir = config.skills_data_dir();
-        let workspace_root = config.workspace_root_absolute();
-        let primary_skills = workspace_root.join("skills");
-        let shared_skills = workspace_root.join("shared").join("skills");
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::BashTool::new_with_safety(
                 config.working_dir(),
                 config.safety_execution_mode.clone(),
                 config.safety_risky_categories.clone(),
+                runtime_toggles.clone(),
+                env_redactor.clone(),
             )),
             Box::new(browser::BrowserTool::new(
                 &config.runtime_data_dir(),
+                config.working_dir(),
                 config.agent_browser_path.clone(),
             )),
             Box::new(read_file::ReadFileTool::new(config.working_dir())),
+            Box::new(read_repo_map::ReadRepoMapTool::new(config.working_dir())),
             Box::new(write_file::WriteFileTool::new(config.working_dir())),
             Box::new(edit_file::EditFileTool::new(config.working_dir())),
+            Box::new(apply_search_replace::ApplySearchReplaceTool::new(
+                config.working_dir(),
+                config.allow_fuzzy_search_replace,
+            )),
+            Box::new(symbol_edit::SymbolEditTool::new(
+                config.working_dir(),
+                config.symbol_edit_enabled,
+            )),
             Box::new(glob::GlobTool::new(config.working_dir())),
             Box::new(grep::GrepTool::new(config.working_dir())),
             Box::new(memory::ReadMemoryTool::new(
@@ -323,17 +607,36 @@ impl ToolRegistry {
                 &config.runtime_data_dir(),
                 config.working_dir(),
             )),
+            Box::new(memory_state::ReadMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
+            Box::new(memory_state::ValidateMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
+            Box::new(memory_state::WriteMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
+            Box::new(memory_state::PatchMemoryStateTool::new(
+                &config.runtime_data_dir(),
+                config.working_dir(),
+            )),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool::new(
+                config.tavily_api_key.clone(),
                 config.web_search_searxng_url.clone(),
             )),
-            Box::new(send_message::SendMessageTool::new_with_config(
-                bot,
+            Box::new(register_tracked_job::RegisterTrackedJobTool::new(
                 db.clone(),
-                config.bot_username.clone(),
-                config.clone(),
             )),
+            Box::new(register_hook::RegisterHookTool::new(db.clone(), config)),
             Box::new(schedule::ScheduleTaskTool::new(
+                db.clone(),
+                config.timezone.clone(),
+            )),
+            Box::new(schedule::UpdateScheduledTaskTool::new(
                 db.clone(),
                 config.timezone.clone(),
             )),
@@ -350,10 +653,15 @@ impl ToolRegistry {
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
             Box::new(cursor_agent::CursorAgentSendTool::new(config)),
             Box::new(cursor_agent::BuildSkillTool::new(config, db.clone())),
-            Box::new(activate_skill::ActivateSkillTool::new_with_dirs([
-                &primary_skills,
-                &shared_skills,
-            ])),
+            Box::new(activate_skill::ActivateSkillTool::new_with_dirs_and_db(
+                config.skill_discovery_dirs(),
+                db.clone(),
+            )),
+            Box::new(run_skill_script::RunSkillScriptTool::new_with_dirs_and_db(
+                config.skill_discovery_dirs(),
+                db.clone(),
+                runtime_toggles.clone(),
+            )),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(tiered_memory::ReadTieredMemoryTool::new(
                 &config.runtime_data_dir(),
@@ -361,6 +669,7 @@ impl ToolRegistry {
             Box::new(tiered_memory::WriteTieredMemoryTool::new(
                 &config.runtime_data_dir(),
             )),
+            Box::new(bulletin::UpdateBulletinFocusTool::new(db.clone())),
             Box::new(search_history::SearchHistoryTool::new(db.clone())),
             Box::new(agent_history::ReadAgentHistoryTool::new(
                 &config.runtime_data_dir(),
@@ -438,7 +747,14 @@ impl ToolRegistry {
         if !social_added.is_empty() {
             tracing::info!("Social feed tools registered: {}", social_added.join(", "));
         }
-        ToolRegistry { tools }
+        ToolRegistry {
+            tools,
+            env_redactor,
+        }
+    }
+
+    pub fn env_redactor(&self) -> &EnvSecretRedactor {
+        &self.env_redactor
     }
 
     pub fn add_tool(&mut self, tool: Box<dyn Tool>) {
@@ -460,9 +776,12 @@ impl ToolRegistry {
                 let allowed = matches!(
                     name,
                     "read_file"
+                        | "read_repo_map"
                         | "glob"
                         | "grep"
                         | "read_memory"
+                        | "read_memory_state"
+                        | "validate_memory_state"
                         | "read_tiered_memory"
                         | "search_chat_history"
                         | "search_vault"
@@ -486,6 +805,7 @@ impl ToolRegistry {
             if tool.name() == name {
                 let started = Instant::now();
                 let mut result = tool.execute(input).await;
+                result.content = self.env_redactor.redact(&result.content);
                 result.duration_ms = Some(started.elapsed().as_millis());
                 result.bytes = result.content.len();
                 if result.is_error && result.error_type.is_none() {
@@ -613,9 +933,136 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_tool_relative_path_strips_redundant_prefixes() {
+        let shared = std::path::PathBuf::from("/proj/workspace/shared");
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "workspace/shared/foo.txt"),
+            "foo.txt"
+        );
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "workspace/runtime/groups/1/x"),
+            "runtime/groups/1/x"
+        );
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "shared/ORIGIN/x.md"),
+            "ORIGIN/x.md"
+        );
+        assert_eq!(
+            normalize_tool_relative_path(&shared, "./foo.txt"),
+            "foo.txt"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tool_path_from_shared_cwd() {
+        let root = std::path::PathBuf::from("/proj/workspace");
+        let shared = root.join("shared");
+        assert_eq!(
+            resolve_tool_path(&root, &shared, "foo.txt"),
+            std::path::PathBuf::from("/proj/workspace/shared/foo.txt")
+        );
+        assert_eq!(
+            resolve_tool_path(&root, &shared, "workspace/shared/foo.txt"),
+            std::path::PathBuf::from("/proj/workspace/shared/foo.txt")
+        );
+        assert_eq!(
+            resolve_tool_path(&root, &shared, "workspace/runtime/groups/1/x"),
+            std::path::PathBuf::from("/proj/workspace/runtime/groups/1/x")
+        );
+        assert_eq!(
+            resolve_tool_path(&root, &shared, "shared/ORIGIN/x.md"),
+            std::path::PathBuf::from("/proj/workspace/shared/ORIGIN/x.md")
+        );
+    }
+
+    #[test]
+    fn test_check_shadow_workspace_write_blocks_nested_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_shadow_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shadow_file = root.join("shared").join("workspace").join("nested.txt");
+        std::fs::create_dir_all(shadow_file.parent().unwrap()).unwrap();
+        std::fs::write(&shadow_file, "x").unwrap();
+        assert!(is_under_shadow_workspace(&root, &shadow_file));
+        let err = check_shadow_workspace_write(&root, &shadow_file).unwrap_err();
+        assert!(err.contains("shadow workspace"));
+        let ok_path = root.join("shared").join("ok.txt");
+        assert!(!is_under_shadow_workspace(&root, &ok_path));
+        assert!(check_shadow_workspace_write(&root, &ok_path).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_resolve_tool_working_dir_shared() {
         let dir = resolve_tool_working_dir(std::path::Path::new("/tmp/work"));
         assert_eq!(dir, std::path::PathBuf::from("/tmp/work/shared"));
+    }
+
+    #[test]
+    fn test_resolve_tool_working_dir_for_auth_persona() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_tool_cwd_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+        };
+        let cwd = resolve_tool_working_dir_for_auth(&root, Some(&auth));
+        assert_eq!(
+            cwd,
+            root.join("shared").join("personas").join("10").join("2")
+        );
+        assert!(cwd.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_assert_persona_tool_path_allowed_rejects_other_persona() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_tool_scope_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+        };
+        let mine = persona_shared_dir(&root, 10, 2).join("x.txt");
+        let other = persona_shared_dir(&root, 10, 3).join("x.txt");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&mine, "ok").unwrap();
+        std::fs::write(&other, "no").unwrap();
+        assert!(assert_persona_tool_path_allowed(&root, &mine, Some(&auth), false).is_ok());
+        assert!(assert_persona_tool_path_allowed(&root, &other, Some(&auth), false).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_assert_persona_tool_path_allowed_rejects_flat_shared_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_tool_scope2_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+        };
+        let flat = root.join("shared").join("scripts").join("a.py");
+        std::fs::create_dir_all(flat.parent().unwrap()).unwrap();
+        let err = assert_persona_tool_path_allowed(&root, &flat, Some(&auth), true).unwrap_err();
+        assert!(err.contains("flat shared paths"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[allow(dead_code)]
@@ -630,11 +1077,11 @@ mod tests {
         }
 
         fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: self.tool_name.clone(),
-                description: "dummy".into(),
-                input_schema: schema_object(json!({}), &[]),
-            }
+            ToolDefinition::new(
+                self.tool_name.clone(),
+                "dummy",
+                schema_object(json!({}), &[]),
+            )
         }
 
         async fn execute(&self, _input: serde_json::Value) -> ToolResult {
@@ -646,6 +1093,8 @@ mod tests {
     fn test_tool_risk_levels() {
         assert_eq!(tool_risk("bash"), ToolRisk::High);
         assert_eq!(tool_risk("write_file"), ToolRisk::Medium);
+        assert_eq!(tool_risk("apply_search_replace"), ToolRisk::Medium);
+        assert_eq!(tool_risk("symbol_edit"), ToolRisk::Medium);
         assert_eq!(tool_risk("pause_scheduled_task"), ToolRisk::Medium);
         assert_eq!(tool_risk("sync_skills"), ToolRisk::Medium);
         assert_eq!(tool_risk("read_file"), ToolRisk::Low);

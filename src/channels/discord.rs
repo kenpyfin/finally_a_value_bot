@@ -20,6 +20,7 @@ use crate::telegram::{
 
 struct Handler {
     app_state: Arc<AppState>,
+    discord_bot_instance_id: i64,
 }
 
 #[async_trait]
@@ -134,13 +135,14 @@ impl EventHandler for Handler {
         // Resolve to unified contact (canonical_chat_id).
         // When UNIVERSAL_CHAT_ID is configured, bind this Discord handle to that canonical contact.
         let universal_chat_id = self.app_state.config.universal_chat_id;
+        let inst_id = self.discord_bot_instance_id;
         let canonical_chat_id = match call_blocking(self.app_state.db.clone(), move |db| {
             if let Some(cid) = universal_chat_id {
                 db.upsert_chat(cid, None, "discord")?;
-                db.link_channel(cid, "discord", &channel_handle)?;
+                db.link_channel(cid, inst_id, "discord", &channel_handle)?;
                 Ok(cid)
             } else {
-                db.resolve_canonical_chat_id("discord", &channel_handle, None)
+                db.resolve_canonical_chat_id(inst_id, "discord", &channel_handle, None)
             }
         })
         .await
@@ -201,12 +203,24 @@ impl EventHandler for Handler {
                     let _ = msg.channel_id.say(&ctx.http, resp).await;
                 }
                 SlashCommand::Schedule => {
-                    let tasks = call_blocking(self.app_state.db.clone(), |db| {
-                        db.get_all_scheduled_tasks_for_display()
+                    let pid = call_blocking(self.app_state.db.clone(), move |db| {
+                        db.get_current_persona_id(canonical_chat_id)
                     })
-                    .await;
+                    .await
+                    .unwrap_or(0);
+                    let tasks = if pid > 0 {
+                        call_blocking(self.app_state.db.clone(), move |db| {
+                            db.get_scheduled_tasks_for_chat_and_persona(canonical_chat_id, pid)
+                        })
+                        .await
+                    } else {
+                        call_blocking(self.app_state.db.clone(), move |db| {
+                            db.get_scheduled_tasks_for_chat_for_display(canonical_chat_id)
+                        })
+                        .await
+                    };
                     let text = match &tasks {
-                        Ok(t) => crate::tools::schedule::format_tasks_list_all(t),
+                        Ok(t) => crate::tools::schedule::format_tasks_list(t),
                         Err(e) => format!("Error listing tasks: {e}"),
                     };
                     let _ = msg.channel_id.say(&ctx.http, &text).await;
@@ -225,7 +239,7 @@ impl EventHandler for Handler {
                     } else {
                         let pid_f = pid;
                         let history = call_blocking(self.app_state.db.clone(), move |db| {
-                            db.get_recent_messages(canonical_chat_id, pid_f, 500)
+                            db.get_recent_messages(canonical_chat_id, pid_f, 500, false)
                         })
                         .await
                         .unwrap_or_default();
@@ -264,8 +278,15 @@ impl EventHandler for Handler {
 
         // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
         let text_for_resolve = text.clone();
+        let inst_id = self.discord_bot_instance_id;
         let (persona_id, text) = match call_blocking(self.app_state.db.clone(), move |db| {
-            crate::persona::resolve_incoming_run_persona(&db, canonical_chat_id, &text_for_resolve)
+            crate::persona::resolve_incoming_run_persona_for_channel(
+                &db,
+                canonical_chat_id,
+                "discord",
+                inst_id,
+                &text_for_resolve,
+            )
         })
         .await
         {
@@ -299,10 +320,12 @@ impl EventHandler for Handler {
             id: msg.id.get().to_string(),
             chat_id: canonical_chat_id,
             persona_id,
+            session_id: None,
             sender_name: sender_name.clone(),
             content: text.clone(),
             is_from_bot: false,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            origin: crate::db::message_origin_interactive(),
         };
         let _ = call_blocking(self.app_state.db.clone(), move |db| {
             db.store_message(&stored)
@@ -332,6 +355,7 @@ impl EventHandler for Handler {
         );
 
         let app_state = self.app_state.clone();
+        let discord_bot_instance_id = self.discord_bot_instance_id;
         let chat_queue = app_state.chat_queue.clone();
         let channel_id_for_send = msg.channel_id;
         let is_guild = msg.guild_id.is_some();
@@ -361,6 +385,8 @@ impl EventHandler for Handler {
                         is_scheduled_task: false,
                         is_background_job: false,
                         run_key: None,
+                        reply_bot_instance_id: Some(discord_bot_instance_id),
+                        session_id: None,
                     },
                     None,
                     image_data,
@@ -369,23 +395,35 @@ impl EventHandler for Handler {
                 )
                 .await
                 {
-                    Ok(response) => {
+                    Ok(agent_out) => {
                         drop(typing);
-                        if !response.is_empty() {
-                            if let Err(e) = crate::channel::deliver_to_contact(
+                        let to_send = if agent_out.response.trim().is_empty() {
+                            "Done.".to_string()
+                        } else {
+                            agent_out.response.clone()
+                        };
+                        if !to_send.is_empty() {
+                            let delivery_scope = crate::channel::DeliveryScope::PlatformInstance {
+                                channel_type: "discord",
+                                bot_instance_id: discord_bot_instance_id,
+                            };
+                            if let Err(e) = crate::channel::deliver_agent_final_to_contact(
                                 app_state.db.clone(),
-                                Some(&app_state.bot),
-                                app_state.discord_http.as_deref(),
+                                app_state.telegram_bots.as_ref(),
+                                app_state.discord_http.as_ref(),
                                 &app_state.config.bot_username,
                                 canonical_chat_id,
                                 persona_id,
-                                &response,
+                                &to_send,
                                 Some(app_state.config.workspace_root_absolute()),
+                                delivery_scope,
+                                None,
                             )
                             .await
                             {
-                                tracing::warn!(target: "channel", error = %e, "deliver_to_contact failed; sending to Discord only");
-                                send_discord_response_to_http(&http, channel_id_for_send, &response).await;
+                                tracing::warn!(target: "channel", error = %e, "deliver_agent_final_to_contact failed; sending to Discord only");
+                                send_discord_response_to_http(&http, channel_id_for_send, &to_send)
+                                    .await;
                             }
                         }
                     }
@@ -455,13 +493,20 @@ async fn send_discord_response_to_http(
     }
 }
 
-/// Start the Discord bot. Called from run_bot() if discord_bot_token is configured.
-pub async fn start_discord_bot(app_state: Arc<AppState>, token: &str) {
+/// Start one Discord bot instance. `discord_bot_instance_id` matches `channel_bot_instances.id`.
+pub async fn start_discord_bot(
+    app_state: Arc<AppState>,
+    token: &str,
+    discord_bot_instance_id: i64,
+) {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let handler = Handler { app_state };
+    let handler = Handler {
+        app_state,
+        discord_bot_instance_id,
+    };
 
     let mut client = match Client::builder(token, intents).event_handler(handler).await {
         Ok(c) => c,

@@ -1,10 +1,33 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub control_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl ToolDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            cache_control: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,10 +77,38 @@ pub enum MessageContent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum SystemContent {
+    Text(String),
+    Blocks(Vec<SystemBlock>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl From<String> for SystemContent {
+    fn from(s: String) -> Self {
+        SystemContent::Text(s)
+    }
+}
+
+impl From<&str> for SystemContent {
+    fn from(s: &str) -> Self {
+        SystemContent::Text(s.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: u32,
-    pub system: String,
+    pub system: SystemContent,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
@@ -94,6 +145,10 @@ pub enum ResponseContentBlock {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
 }
 
 #[cfg(test)]
@@ -227,7 +282,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".into(),
             max_tokens: 4096,
-            system: "You are helpful.".into(),
+            system: SystemContent::Text("You are helpful.".into()),
             messages: vec![Message {
                 role: "user".into(),
                 content: MessageContent::Text("hi".into()),
@@ -246,13 +301,13 @@ mod tests {
         let req = MessagesRequest {
             model: "test".into(),
             max_tokens: 100,
-            system: "sys".into(),
+            system: SystemContent::Text("sys".into()),
             messages: vec![],
-            tools: Some(vec![ToolDefinition {
-                name: "bash".into(),
-                description: "Run bash".into(),
-                input_schema: json!({"type": "object"}),
-            }]),
+            tools: Some(vec![ToolDefinition::new(
+                "bash",
+                "Run bash",
+                json!({"type": "object"}),
+            )]),
             stream: None,
         };
         let json = serde_json::to_value(&req).unwrap();

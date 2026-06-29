@@ -289,10 +289,10 @@ impl Tool for CursorAgentTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "cursor_agent".into(),
-            description: "Run the Cursor CLI agent (cursor-agent) with a prompt. Use for research, code generation, or analysis that benefits from Cursor's native agent. For long tasks, prefer detach: true to run in background via tmux and avoid request timeouts. Optional: timeout_secs, model override. Working directory is the shared tool workspace.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "cursor_agent",
+            "Run the Cursor CLI agent (cursor-agent) with a prompt. Use for research, code generation, or analysis that benefits from Cursor's native agent. For long tasks, prefer detach: true to run in background via tmux and avoid request timeouts. Optional: timeout_secs, model override. Working directory is the shared tool workspace.",
+            schema_object(
                 json!({
                     "prompt": {
                         "type": "string",
@@ -313,7 +313,7 @@ impl Tool for CursorAgentTool {
                 }),
                 &["prompt"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -331,8 +331,17 @@ impl Tool for CursorAgentTool {
 
         let auth = auth_context_from_input(&input);
         let started_at = chrono::Utc::now().to_rfc3339();
-        let working_dir =
-            super::resolve_tool_working_dir(PathBuf::from(self.config.working_dir()).as_path());
+        let config = self.config.clone();
+        let live = match crate::db::call_blocking(self.db.clone(), move |db| {
+            crate::cursor_engine_config::load_from_db(db, &config)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => crate::cursor_engine_config::CursorEngineSettings::from_env(&self.config),
+        };
+        let workspace_root = PathBuf::from(self.config.working_dir());
+        let working_dir = super::resolve_tool_working_dir_for_auth(&workspace_root, auth.as_ref());
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
             return ToolResult::error(format!(
                 "Failed to create working directory {}: {e}",
@@ -347,13 +356,13 @@ impl Tool for CursorAgentTool {
         let timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(self.config.cursor_agent_timeout_secs);
+            .unwrap_or(live.timeout_secs);
         let model_override = input
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
         let model = model_override
-            .unwrap_or_else(|| self.config.cursor_agent_model.as_str())
+            .unwrap_or_else(|| live.cli_model.as_str())
             .trim();
 
         let detach = input
@@ -362,8 +371,8 @@ impl Tool for CursorAgentTool {
             .unwrap_or(false);
 
         // When runner URL is set (e.g. Docker), POST to host instead of running locally
-        if let Some(ref runner_url) = self.config.cursor_agent_runner_url {
-            let url = runner_url.trim().trim_end_matches('/').to_string() + "/spawn";
+        if !live.cli_runner_url.trim().is_empty() {
+            let url = live.cli_runner_url.trim().trim_end_matches('/').to_string() + "/spawn";
             return self
                 .execute_via_runner(
                     &url,
@@ -376,7 +385,7 @@ impl Tool for CursorAgentTool {
                 .await;
         }
 
-        let cli_path = self.config.cursor_agent_cli_path.trim();
+        let cli_path = live.cli_path.trim();
         if cli_path.is_empty() {
             return ToolResult::error("cursor_agent_cli_path is not configured".into());
         }
@@ -516,10 +525,10 @@ impl Tool for ListCursorAgentRunsTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "list_cursor_agent_runs".into(),
-            description: "List recent cursor-agent runs to monitor project status. By default returns runs for the current chat; use this to see last run outcome, success/failure, and output preview.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "list_cursor_agent_runs",
+            "List recent cursor-agent runs to monitor project status. By default returns runs for the current chat; use this to see last run outcome, success/failure, and output preview. For post-mortems on a finished run, use read_agent_history (iterations and tool traces) or read_file on output_path when present; if the tmux session is still alive, tmux capture-pane via bash can show scrollback.",
+            schema_object(
                 json!({
                     "limit": {
                         "type": "integer",
@@ -532,7 +541,7 @@ impl Tool for ListCursorAgentRunsTool {
                 }),
                 &[],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -621,6 +630,9 @@ impl Tool for ListCursorAgentRunsTool {
                         err
                     ));
                 }
+                out.push_str(
+                    "\nPost-mortem: use read_agent_history for full run traces; if a run has output_path, read_file that path; for a still-running tmux session, bash: tmux capture-pane -t <session> -p\n",
+                );
                 ToolResult::success(out)
             }
             Err(e) => ToolResult::error(format!("Failed to list cursor-agent runs: {e}")),
@@ -649,10 +661,10 @@ impl Tool for CursorAgentSendTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "cursor_agent_send".into(),
-            description: "Send keys to a running cursor-agent tmux session (from a run with detach: true). Use to redirect the agent mid-task (e.g. 'Focus on the API first').".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "cursor_agent_send",
+            "Send keys to a running cursor-agent tmux session (from a run with detach: true). Use to redirect the agent mid-task (e.g. 'Focus on the API first').",
+            schema_object(
                 json!({
                     "tmux_session": {
                         "type": "string",
@@ -665,7 +677,7 @@ impl Tool for CursorAgentSendTool {
                 }),
                 &["tmux_session", "keys"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -734,10 +746,10 @@ impl Tool for BuildSkillTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "build_skill".into(),
-            description: "Create or update a FinallyAValueBot skill by running cursor-agent. Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "build_skill",
+            "Create or update a FinallyAValueBot skill by running cursor-agent. For new skills activate `create-skill` first; for changes to an existing skill activate `modify-skill` first (enforced when the skill folder already exists). Use this (not write_file under skills/) when the user asks to add or change a skill. Runs in tmux when available so the bot does not block.",
+            schema_object(
                 json!({
                     "name": {
                         "type": "string",
@@ -754,7 +766,7 @@ impl Tool for BuildSkillTool {
                 }),
                 &["name", "description", "instructions"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -787,11 +799,13 @@ Create (or update) the skill at: {}/{}/
 Requirements:
 1. Create the folder {}/{} if it does not exist.
 2. Create or overwrite SKILL.md with YAML frontmatter (name, description, platforms, deps, source) and a body.
+3. Put reusable helper scripts/files for this capability inside the same skill folder (or shared/skills/<skill-name>/ only when truly shared).
+4. Do NOT place skill scripts in persona folders or flat shared paths like shared/scripts/.
 
 Description for this skill: {}
 Instructions (markdown body): {}
 
-Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{} so they are available to all personas. Follow the existing skill format (see other skills in the same directory for examples)."#,
+Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{} so they are available to all personas. Follow the existing skill format (see other skills in the same directory for examples).{}"#,
             skills_dir_display,
             skills_dir_display,
             name,
@@ -801,6 +815,10 @@ Put any credentials or config (e.g. .env, API keys) inside the skill folder {}/{
             instructions,
             skills_dir_display,
             name,
+            crate::agent_path_discipline::build_skill_path_discipline_footer(
+                &skills_dir_display,
+                name,
+            ),
         );
         let cursor_tool = CursorAgentTool::new(&self.config, self.db.clone());
         let mut cursor_input = serde_json::json!({ "prompt": prompt });

@@ -28,10 +28,10 @@ impl Tool for ExportChatTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "export_chat".into(),
-            description: "Export chat history to a markdown file. Returns the file path.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "export_chat",
+            "Export chat history to a markdown file. Returns the file path.",
+            schema_object(
                 json!({
                     "chat_id": {
                         "type": "integer",
@@ -44,7 +44,7 @@ impl Tool for ExportChatTool {
                 }),
                 &["chat_id"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -162,20 +162,24 @@ mod tests {
             id: "m1".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
         db.store_message(&StoredMessage {
             id: "m2".into(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: "bot".into(),
             content: "hi there!".into(),
             is_from_bot: true,
             timestamp: "2024-01-01T00:00:02Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -203,10 +207,12 @@ mod tests {
             id: "m1".into(),
             chat_id: 200,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
 
@@ -233,10 +239,12 @@ mod tests {
             id: "m1".into(),
             chat_id: 200,
             persona_id: pid,
+            session_id: None,
             sender_name: "alice".into(),
             content: "hello".into(),
             is_from_bot: false,
             timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
         let out_path = dir.join("control_export.md");

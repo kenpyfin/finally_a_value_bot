@@ -26,10 +26,10 @@ impl Tool for EditFileTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "edit_file".into(),
-            description: "Edit a file by replacing an exact string match with new content. The old_string must be unique in the file.".into(),
-            input_schema: schema_object(
+        ToolDefinition::new(
+            "edit_file",
+            "Edit a file by replacing an exact string match with new content. The old_string must be unique in the file.",
+            schema_object(
                 json!({
                     "path": {
                         "type": "string",
@@ -46,7 +46,7 @@ impl Tool for EditFileTool {
                 }),
                 &["path", "old_string", "new_string"],
             ),
-        }
+        )
     }
 
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
@@ -54,11 +54,26 @@ impl Tool for EditFileTool {
             Some(p) => p,
             None => return ToolResult::error("Missing 'path' parameter".into()),
         };
-        let working_dir = super::resolve_tool_working_dir(&self.working_dir);
-        let resolved_path = super::resolve_tool_path(&working_dir, path);
+        let auth = super::auth_context_from_input(&input);
+        let working_dir =
+            super::resolve_tool_working_dir_for_auth(&self.working_dir, auth.as_ref());
+        let resolved_path = super::resolve_tool_path(&self.working_dir, &working_dir, path);
         let resolved_path_str = resolved_path.to_string_lossy().to_string();
 
         if let Err(msg) = crate::tools::path_guard::check_path(&resolved_path_str) {
+            return ToolResult::error(msg);
+        }
+        if let Err(msg) =
+            super::check_shadow_workspace_write(self.working_dir.as_path(), &resolved_path)
+        {
+            return ToolResult::error(msg);
+        }
+        if let Err(msg) = super::assert_persona_tool_path_allowed(
+            &self.working_dir,
+            &resolved_path,
+            auth.as_ref(),
+            true,
+        ) {
             return ToolResult::error(msg);
         }
 

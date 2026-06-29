@@ -5,9 +5,16 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::channel::deliver_to_contact;
+use crate::background_jobs::{
+    await_handoff_startup_ack, is_background_handoff_response, try_enqueue_background_handoff,
+    HandoffEnqueueOutcome,
+};
+use crate::channel::{
+    deliver_agent_final_to_contact_with_origin, deliver_to_contact, DeliveryScope,
+    MessageStoreOrigin,
+};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::{call_blocking, ScheduledTask};
 use crate::error::FinallyAValueBotError;
@@ -42,6 +49,27 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
     let task_timeout_secs = state.config.scheduler_task_timeout_secs;
     let stale_reclaim_secs = state.config.scheduler_stale_running_reclaim_secs as i64;
     let poll_interval_secs = state.config.scheduler_poll_interval_secs.max(1);
+
+    // Session TTL sweep (every 15 minutes)
+    let db_for_ttl = state.db.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+            match call_blocking(db_for_ttl.clone(), |db| db.get_expired_chat_sessions()).await {
+                Ok(expired) => {
+                    for session in expired {
+                        let id = session.id.clone();
+                        let _ = call_blocking(db_for_ttl.clone(), move |db| {
+                            db.archive_chat_session(&id)
+                        })
+                        .await;
+                        info!("Session TTL: auto-archived session {}", session.id);
+                    }
+                }
+                Err(e) => warn!("Session TTL sweep error: {e}"),
+            }
+        }
+    });
 
     tokio::spawn(async move {
         info!(
@@ -102,7 +130,52 @@ async fn run_due_tasks(
         _ => {}
     }
 
-    match call_blocking(state.db.clone(), {
+    let pending_timeout_secs = state.config.background_job_pending_start_timeout_secs as i64;
+    let pending_ids = match call_blocking(state.db.clone(), {
+        let now = now.clone();
+        move |db| db.reconcile_stale_pending_background_jobs(&now, pending_timeout_secs)
+    })
+    .await
+    {
+        Ok(ids) if !ids.is_empty() => {
+            info!(
+                "Scheduler: reconciled {} stale pending background job(s): {:?}",
+                ids.len(),
+                ids
+            );
+            ids
+        }
+        Err(e) => {
+            error!("Scheduler: failed to reconcile stale pending background jobs: {e}");
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    crate::background_shell::notify_shell_jobs_by_ids(state.clone(), &pending_ids).await;
+
+    let expired_ids = match call_blocking(state.db.clone(), {
+        let now = now.clone();
+        move |db| db.reconcile_expired_background_job_leases(&now)
+    })
+    .await
+    {
+        Ok(ids) if !ids.is_empty() => {
+            info!(
+                "Scheduler: reconciled {} expired background job lease(s): {:?}",
+                ids.len(),
+                ids
+            );
+            ids
+        }
+        Err(e) => {
+            error!("Scheduler: failed to reconcile expired background leases: {e}");
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    crate::background_shell::notify_shell_jobs_by_ids(state.clone(), &expired_ids).await;
+
+    let orphan_ids = match call_blocking(state.db.clone(), {
         let now = now.clone();
         move |db| db.reconcile_orphan_stale_background_jobs(&now, stale_reclaim_secs)
     })
@@ -114,9 +187,24 @@ async fn run_due_tasks(
                 ids.len(),
                 ids
             );
+            ids
         }
-        Err(e) => error!("Scheduler: failed to reconcile orphan background jobs: {e}"),
-        _ => {}
+        Err(e) => {
+            error!("Scheduler: failed to reconcile orphan background jobs: {e}");
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    crate::background_shell::notify_shell_jobs_by_ids(state.clone(), &orphan_ids).await;
+
+    let shell_stale =
+        crate::background_shell::reconcile_stale_shell_background_jobs(state.clone()).await;
+    if !shell_stale.is_empty() {
+        info!(
+            "Scheduler: reconciled {} stale shell background job(s): {:?}",
+            shell_stale.len(),
+            shell_stale
+        );
     }
 
     let tasks = match call_blocking(state.db.clone(), {
@@ -349,6 +437,8 @@ async fn run_scheduled_agent_and_finalize(
         chat_id,
         persona_id,
         JobType::Scheduled,
+        None,
+        false,
     );
     let _ = hb_tx.send(HeartbeatSignal::Started(format!(
         "scheduled task #{} started",
@@ -376,6 +466,8 @@ async fn run_scheduled_agent_and_finalize(
             is_scheduled_task: true,
             is_background_job: false,
             run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
+            reply_bot_instance_id: None,
+            session_id: None,
         },
         Some(&prompt),
         None,
@@ -406,13 +498,15 @@ async fn run_scheduled_agent_and_finalize(
             );
             let delivery_ok = deliver_to_contact(
                 state.db.clone(),
-                Some(&state.bot),
-                state.discord_http.as_deref(),
+                state.telegram_bots.as_ref(),
+                state.discord_http.as_ref(),
                 &state.config.bot_username,
                 chat_id,
                 persona_id,
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
+                DeliveryScope::ContactWide,
+                None,
             )
             .await
             .is_ok();
@@ -425,124 +519,149 @@ async fn run_scheduled_agent_and_finalize(
             };
             (false, summary)
         }
-        Ok(Ok(response)) => {
+        Ok(Ok(agent_out)) => {
             drop(evt_tx);
             let _ = hb_forward.await;
-            let response_text = if response.trim().is_empty() {
+            let mut response_text = if agent_out.response.trim().is_empty() {
                 format!("Scheduled task #{} completed.", task_id)
             } else {
-                response
+                agent_out.response
             };
-            const DEDUPE_WINDOW_SECS: i64 = 120;
-            let dedupe_text = crate::channel::with_persona_indicator(
-                state.db.clone(),
-                persona_id,
-                &response_text,
-            )
-            .await;
-            let skip_dup = match call_blocking(state.db.clone(), {
-                let text = dedupe_text;
-                move |db| {
-                    db.should_skip_duplicate_final_delivery(chat_id, &text, DEDUPE_WINDOW_SECS)
-                }
-            })
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "scheduler",
-                        task_id = task_id,
-                        error = %e,
-                        "duplicate-final check failed; delivering anyway"
-                    );
-                    false
-                }
-            };
-            if skip_dup {
-                info!(
-                    target: "scheduler",
-                    task_id = task_id,
-                    chat_id = chat_id,
-                    "Skipping duplicate scheduled delivery: latest stored message already matches"
-                );
-                let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
-                    "scheduled task #{} completed (duplicate delivery skipped)",
-                    task_id
-                )));
-                (true, Some("Skipped duplicate final delivery".to_string()))
-            } else {
-                match deliver_to_contact(
-                    state.db.clone(),
-                    Some(&state.bot),
-                    state.discord_http.as_deref(),
-                    &state.config.bot_username,
+
+            if is_background_handoff_response(&response_text) {
+                response_text = match try_enqueue_background_handoff(
+                    state.clone(),
                     chat_id,
                     persona_id,
-                    &response_text,
-                    Some(state.config.workspace_root_absolute()),
+                    prompt.clone(),
+                    "scheduler",
+                    channel,
                 )
                 .await
                 {
-                    Ok(()) => {
+                    HandoffEnqueueOutcome::Queued { job_id, start_ack } => {
+                        let base = await_handoff_startup_ack(start_ack).await;
+                        format!("{base} (scheduled task #{task_id}, background job {job_id})")
+                    }
+                    HandoffEnqueueOutcome::BlockedAlreadyRunning => {
+                        "A background task is already running for this chat. Please wait for it to finish before starting another long-running background task.".into()
+                    }
+                    HandoffEnqueueOutcome::ActiveLookupFailed(msg) => {
+                        format!("Failed to check active background jobs: {msg}")
+                    }
+                    HandoffEnqueueOutcome::DbCreateFailed(e) => {
+                        format!("Failed to queue background task: {e}")
+                    }
+                };
+            }
+
+            let response_text = state.env_redactor.redact(&response_text);
+            match deliver_agent_final_to_contact_with_origin(
+                state.db.clone(),
+                state.telegram_bots.as_ref(),
+                state.discord_http.as_ref(),
+                &state.config.bot_username,
+                chat_id,
+                persona_id,
+                &response_text,
+                Some(state.config.workspace_root_absolute()),
+                DeliveryScope::ContactWide,
+                None,
+                MessageStoreOrigin::Scheduled,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    if outcome.response_for_client.is_empty() {
+                        info!(
+                            target: "scheduler",
+                            task_id = task_id,
+                            chat_id = chat_id,
+                            "Skipping scheduled delivery: empty final body"
+                        );
+                        let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
+                            "scheduled task #{} completed (duplicate delivery skipped)",
+                            task_id
+                        )));
+                        (true, Some("Skipped duplicate final delivery".to_string()))
+                    } else {
                         let _ = hb_tx.send(HeartbeatSignal::Finished(format!(
                             "scheduled task #{} completed",
                             task_id
                         )));
-                        let summary = if response_text.len() > 200 {
+                        let summary_text = outcome.response_for_client;
+                        let summary = if summary_text.len() > 200 {
                             format!(
                                 "{}...",
-                                &response_text[..response_text.floor_char_boundary(200)]
+                                &summary_text[..summary_text.floor_char_boundary(200)]
                             )
                         } else {
-                            response_text
+                            summary_text
                         };
                         (true, Some(summary))
                     }
-                    Err(e) => {
-                        let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
-                            "scheduled task #{} delivery failed: {}",
-                            task_id, e
-                        )));
-                        error!(
-                            "Scheduler: task #{} produced a response but delivery failed: {}",
-                            task_id, e
-                        );
-                        (
-                            false,
-                            Some(format!("Delivery error after successful execution: {e}")),
-                        )
-                    }
+                }
+                Err(e) => {
+                    let redacted_error = state.env_redactor.redact(&e.to_string());
+                    let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
+                        "scheduled task #{} delivery failed: {}",
+                        task_id, redacted_error
+                    )));
+                    error!(
+                        "Scheduler: task #{} produced a response but delivery failed: {}",
+                        task_id, redacted_error
+                    );
+                    (
+                        false,
+                        Some(format!(
+                            "Delivery error after successful execution: {}",
+                            redacted_error
+                        )),
+                    )
                 }
             }
         }
         Ok(Err(e)) => {
             drop(evt_tx);
             let _ = hb_forward.await;
-            error!("Scheduler: task #{} failed: {e}", task_id);
+            let raw_error = e.to_string();
+            let redacted_error_internal = state.env_redactor.redact(&raw_error);
+            let redacted_error_user = state.env_redactor.redact(&raw_error);
+            error!(
+                "Scheduler: task #{} failed: {}",
+                task_id, redacted_error_internal
+            );
             let _ = hb_tx.send(HeartbeatSignal::Failed(format!(
                 "scheduled task #{} failed: {}",
-                task_id, e
+                task_id, redacted_error_internal
             )));
-            let err_text = format!("Scheduled task #{} failed: {e}", task_id);
+            let err_text = format!(
+                "Scheduled task #{} failed: {}",
+                task_id, redacted_error_user
+            );
             let delivery_ok = deliver_to_contact(
                 state.db.clone(),
-                Some(&state.bot),
-                state.discord_http.as_deref(),
+                state.telegram_bots.as_ref(),
+                state.discord_http.as_ref(),
                 &state.config.bot_username,
                 chat_id,
                 persona_id,
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
+                DeliveryScope::ContactWide,
+                None,
             )
             .await
             .is_ok();
             if delivery_ok {
-                (false, Some(format!("Error: {e}")))
+                (false, Some(format!("Error: {}", redacted_error_internal)))
             } else {
                 (
                     false,
-                    Some(format!("Error: {e} (and failed to deliver error message)")),
+                    Some(format!(
+                        "Error: {} (and failed to deliver error message)",
+                        redacted_error_internal
+                    )),
                 )
             }
         }
