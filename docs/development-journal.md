@@ -4,6 +4,12 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-28 — Agent harness research doc (Classic / Deterministic / Cursor vs industry)
+
+- **Area:** architecture / agent engines / docs
+- **Summary:** Added `docs/agent-harness-research.md` — consolidated research on the harness principle (model decides, harness enforces), six harness subsystems, FinallyAValueBot's three engines, Cursor SDK five-layer blackbox, Claude Code v2.1.88 leak analyses, OSS harness landscape, gap assessment, and upgrade priorities.
+- **Key files / symbols:** `docs/agent-harness-research.md`; cross-refs to `src/channels/telegram.rs`, `src/agent_pipeline/`, `src/cursor_engine.rs`, `scripts/cursor-sdk-runner.py`.
+
 ### 2026-06-28 — Cursor SDK sidecar auto-start on bot boot
 
 - **Area:** cursor integration / startup
