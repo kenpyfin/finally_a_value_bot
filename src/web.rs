@@ -4964,6 +4964,10 @@ struct LlmModelPatchRequest {
     custom: bool,
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    thinking_enabled: Option<bool>,
+    #[serde(default)]
+    show_thinking: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5100,6 +5104,103 @@ async fn api_runtime_patch(
     })))
 }
 
+async fn api_deterministic_pipeline_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let profile = state
+        .app_state
+        .pipeline_profile
+        .read()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pipeline profile lock poisoned".into(),
+            )
+        })?
+        .clone();
+    let defaults = crate::agent_pipeline::profile::PipelineProfile::default_profile();
+    let builtin_prompts: serde_json::Map<String, serde_json::Value> =
+        crate::agent_pipeline::profile::PhaseKind::all()
+            .iter()
+            .map(|kind| {
+                (
+                    kind.label().to_string(),
+                    serde_json::Value::String(
+                        crate::agent_pipeline::profile::builtin_prompt_for_kind(*kind).to_string(),
+                    ),
+                )
+            })
+            .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "schema_version": crate::agent_pipeline::profile::SCHEMA_VERSION,
+        "profile": profile,
+        "defaults": defaults,
+        "builtin_prompts": builtin_prompts,
+        "agent_engine": state.app_state.runtime_toggles.agent_engine().as_str(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeterministicPipelinePatchRequest {
+    #[serde(default)]
+    reset_defaults: bool,
+    #[serde(default)]
+    profile: Option<crate::agent_pipeline::profile::PipelineProfile>,
+}
+
+async fn api_deterministic_pipeline_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<DeterministicPipelinePatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let new_profile = if body.reset_defaults {
+        crate::agent_pipeline::profile::PipelineProfile::default_profile()
+    } else if let Some(p) = body.profile {
+        p
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide profile or reset_defaults=true".into(),
+        ));
+    };
+    let new_profile = new_profile.migrate();
+    if let Err(errs) = new_profile.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::to_string(&json!({ "ok": false, "errors": errs }))
+                .unwrap_or_else(|_| "validation failed".into()),
+        ));
+    }
+    call_blocking(state.app_state.db.clone(), {
+        let profile_db = new_profile.clone();
+        move |db| crate::agent_pipeline::profile::persist_to_db(db, &profile_db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        let mut guard = state.app_state.pipeline_profile.write().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pipeline profile lock poisoned".into(),
+            )
+        })?;
+        *guard = new_profile.clone();
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "profile": new_profile,
+        "message": if body.reset_defaults {
+            "Deterministic pipeline profile reset to defaults."
+        } else {
+            "Deterministic pipeline profile saved."
+        },
+    })))
+}
+
 async fn api_llm_get(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -5109,7 +5210,7 @@ async fn api_llm_get(
         crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
     let preset = crate::llm_catalog::find_provider(&provider_id);
     let current_model = state.app_state.llm.current_model();
-    let (model_source, provider_source, base_url_source) =
+    let (model_source, provider_source, base_url_source, thinking_source, show_thinking_source) =
         call_blocking(state.app_state.db.clone(), |db| {
             let settings = db.list_app_settings()?;
             let model_source = settings.iter().any(|s| {
@@ -5127,7 +5228,23 @@ async fn api_llm_get(
                     .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_BASE_URL)
                     && !s.value.trim().is_empty()
             });
-            Ok((model_source, provider_source, base_url_source))
+            let thinking_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED)
+                    && !s.value.trim().is_empty()
+            });
+            let show_thinking_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_SHOW_THINKING)
+                    && !s.value.trim().is_empty()
+            });
+            Ok((
+                model_source,
+                provider_source,
+                base_url_source,
+                thinking_source,
+                show_thinking_source,
+            ))
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -5180,6 +5297,21 @@ async fn api_llm_get(
         "catalog_source": "static_curated",
         "cost_reference_note": "Curated catalog (not live from provider APIs). Put API keys in repo-root .env only (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or LLM_API_KEY). Approximate USD per 1M tokens — verify on your provider billing page.",
         "custom_model_allowed": true,
+        "thinking_enabled": state.app_state.llm.thinking_enabled(),
+        "thinking_source": if thinking_source {
+            "app_settings"
+        } else {
+            "default"
+        },
+        "show_thinking": state.app_state.llm.show_thinking(),
+        "show_thinking_source": if show_thinking_source {
+            "app_settings"
+        } else if std::env::var("SHOW_THINKING").is_ok() {
+            "env"
+        } else {
+            "default"
+        },
+        "thinking_supported": provider_id == "google" || provider_id == "gemini",
     })))
 }
 
@@ -5252,6 +5384,12 @@ async fn api_llm_patch(
         None
     };
     let base_url_response = base_url_db.clone();
+    let thinking_enabled = body
+        .thinking_enabled
+        .unwrap_or_else(|| state.app_state.llm.thinking_enabled());
+    let show_thinking = body
+        .show_thinking
+        .unwrap_or_else(|| state.app_state.llm.show_thinking());
     call_blocking(state.app_state.db.clone(), move |db| {
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_PROVIDER, &provider_db)?;
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_db)?;
@@ -5260,10 +5398,24 @@ async fn api_llm_patch(
         } else {
             db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, "")?;
         }
+        db.set_app_setting(
+            crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED,
+            if thinking_enabled { "true" } else { "false" },
+        )?;
+        db.set_app_setting(
+            crate::llm_catalog::APP_SETTING_SHOW_THINKING,
+            if show_thinking { "true" } else { "false" },
+        )?;
         Ok(())
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state
+        .app_state
+        .llm
+        .apply_thinking_settings(thinking_enabled, show_thinking)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({
         "ok": true,
@@ -5272,6 +5424,8 @@ async fn api_llm_patch(
         },
         "model": model_saved,
         "base_url": base_url_response,
+        "thinking_enabled": thinking_enabled,
+        "show_thinking": show_thinking,
         "provider_source": "app_settings",
         "model_source": "app_settings",
         "base_url_source": if base_url_response.is_some() {
@@ -5288,6 +5442,41 @@ struct MultimodelTestRequest {
     tier: String,
     base_url: String,
     model: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MultimodelModelsQuery {
+    base_url: String,
+}
+
+async fn api_multimodel_models_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<MultimodelModelsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let base_url_raw = query.base_url.trim();
+    if base_url_raw.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_url query parameter is required".into(),
+        ));
+    }
+    let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, "");
+    if base_url.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_url query parameter is required".into(),
+        ));
+    }
+    match crate::llm::fetch_openai_compatible_models(&base_url).await {
+        Ok(models) => Ok(Json(json!({
+            "ok": true,
+            "models": models,
+            "base_url": base_url,
+        }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
 }
 
 async fn api_multimodel_get(
@@ -5472,6 +5661,7 @@ fn cursor_engine_json(
         "ok": true,
         "sdk_runner_url": cfg.sdk_runner_url,
         "sdk_model": cfg.sdk_model,
+        "sdk_model_params": cfg.sdk_model_params,
         "sdk_runner_ok": cfg.sdk_runner_ok,
         "sidecar_reachable": health.reachable,
         "api_key_configured": health.api_key_configured,
@@ -5540,6 +5730,12 @@ async fn api_cursor_engine_patch(
     }
     if let Some(ref model) = body.sdk_model {
         cfg.sdk_model = model.trim().to_string();
+    }
+    if let Some(params) = body.sdk_model_params {
+        cfg.sdk_model_params = params
+            .into_iter()
+            .filter(|p| !p.id.trim().is_empty() && !p.value.trim().is_empty())
+            .collect();
     }
     if let Some(ref path) = body.cli_path {
         cfg.cli_path = path.trim().to_string();
@@ -5665,7 +5861,7 @@ async fn api_cursor_engine_models_get(
         .read()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .clone();
-    match crate::cursor_engine_config::fetch_sidecar_models(&cfg.sdk_runner_url).await {
+    match crate::cursor_engine_config::fetch_sidecar_model_catalog(&cfg.sdk_runner_url).await {
         Ok(models) => Ok(Json(json!({
             "ok": true,
             "models": models,
@@ -6342,6 +6538,7 @@ fn build_router(web_state: WebState) -> Router {
             get(api_multimodel_get).patch(api_multimodel_patch),
         )
         .route("/api/multimodel/test", post(api_multimodel_test_post))
+        .route("/api/multimodel/models", get(api_multimodel_models_get))
         .route(
             "/api/cursor-engine",
             get(api_cursor_engine_get).patch(api_cursor_engine_patch),
@@ -6357,6 +6554,10 @@ fn build_router(web_state: WebState) -> Router {
         .route(
             "/api/runtime",
             get(api_runtime_get).patch(api_runtime_patch),
+        )
+        .route(
+            "/api/deterministic-pipeline",
+            get(api_deterministic_pipeline_get).patch(api_deterministic_pipeline_patch),
         )
         .route("/api/restart", post(api_restart_post))
         .route(
@@ -6776,12 +6977,16 @@ mod tests {
         let cursor_settings = Arc::new(std::sync::RwLock::new(
             crate::cursor_engine_config::CursorEngineSettings::from_env(&cfg),
         ));
+        let pipeline_profile = Arc::new(std::sync::RwLock::new(
+            crate::agent_pipeline::profile::PipelineProfile::default_profile(),
+        ));
         let cursor_sidecar = crate::cursor_sdk_sidecar::SidecarHandle::inactive();
         let state = AppState {
             config: cfg.clone(),
             env_redactor: env_redactor.clone(),
             runtime_toggles: runtime_toggles.clone(),
             cursor_settings,
+            pipeline_profile,
             cursor_sidecar,
             telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),

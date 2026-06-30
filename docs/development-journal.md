@@ -4,6 +4,92 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-06-29 — Deterministic pipeline: drop legacy technical/knowledge model routes
+
+- **Area:** agent pipeline / web
+- **Summary:** Settings → Deterministic model route picker now offers only `inherit_global`, `strategy`, and `local` (multi-model is single local tier today). Stored profiles with `technical` or `knowledge` migrate to `local` (schema v6). `resolve_model_tier` maps legacy route values to the same local-or-strategy fallback as `local`.
+- **Key files / symbols:** `ModelRoute` in `profile.rs`; `MODEL_ROUTES` in `settings-deterministic-pipeline.tsx`.
+
+### 2026-06-29 — Scheduled jobs: Cursor engine (no silent classic fallback)
+
+- **Area:** scheduler / cursor engine
+- **Summary:** Scheduled tasks already route through `process_with_agent_with_events` (same as chat). Hardened Cursor path for scheduler runs: isolated Cursor session scope per `run_key`, scheduled-task preamble in sidecar prompt, **no silent fallback to classic** when the sidecar is unavailable (fail with actionable error). Agent history now records `agent_engine: cursor` correctly. Scheduler logs selected engine at task start.
+- **Key files / symbols:** `run_scheduled_agent_and_finalize` in `scheduler.rs`; `cursor_session_scope`, `cursor_engine_classic_fallback` in `cursor_engine.rs`; `PipelineFinishExtras.agent_engine` in `agent_history.rs`.
+
+### 2026-06-29 — Plan phase: flexible ephemeral plans (no auto SOP bind)
+
+- **Area:** agent pipeline / web
+- **Summary:** Planner no longer auto-attaches persona Tier 2 SOPs from memory. Default plan `source` is ephemeral; SOP reference injection is off unless intent names a vault SOP (`candidate_sop_hint`) or policy `bind_persona_sops_in_plan` is enabled. Planner prompts prefer `search_vault` tool over `run_skill_script` for vault lookup; `search_chat_history` in default tool allowlist. Schema v5 migrates existing profiles (`include_sop_reference=false`, `bind_persona_sops_in_plan=false`). Settings → Deterministic → **Bind persona SOPs in plan**.
+- **Key files / symbols:** `collect_sop_candidates`, `find_sop_reference` in `plan.rs`; `PolicyConfig.bind_persona_sops_in_plan` in `profile.rs`; `settings-deterministic-pipeline.tsx`.
+
+### 2026-06-29 — Intent phase: always → plan (remove shortcut exits)
+
+- **Area:** agent pipeline
+- **Summary:** Default intent phase now has a **single transition** (`always` → `plan`). Removed default exits to `direct_answer` / `clarify` from intent. Heuristic intent fast-path removed from `run_intent_phase` and disabled by default — it bypassed the LLM and routed conversational/question messages to direct answer, which could surface raw structured output. Schema v4 migrates stored profiles to the new intent transitions.
+- **Key files / symbols:** `default_intent_phase_transitions()` in `profile.rs`; `run_intent_phase` in `runner.rs`.
+
+### 2026-06-29 — Prior-step handoff: full output vs LLM summary (configurable)
+
+- **Area:** agent pipeline / web
+- **Summary:** Execute phases now store **full step output** (assistant text + tool I/O) in `StepResult.full_output`. Default handoff to the next step is **full** (`prior_step_feed_mode: full`). Optional **summary** mode runs an LLM with a user-defined `prior_step_summary_prompt` (builtin default when empty). Settings → Deterministic → Execute → expand → **Prior step handoff**. Schema v3.
+- **Key files / symbols:** `PriorStepFeedMode`, `prepare_prior_step_feed`, `summarize_prior_step_output` in `execute.rs`; `PhaseContextIncludes.prior_step_*` in `profile.rs`.
+
+### 2026-06-29 — Per-phase context toggles (deterministic pipeline settings)
+
+- **Area:** agent pipeline / web
+- **Summary:** Each pipeline phase now has `context_includes` toggles (system prompt, agent prep prompt, skills catalog, conversation, persona memory, workspace, SOP reference, current request, prior step summaries, step contract, execution summary). Runtime respects these in intent/plan cloud context, execute step messages, consolidate, and direct-answer paths. Schema v2 with `migrate()` from v1 profiles. Settings → Deterministic → expand phase → **Context includes**.
+- **Key files / symbols:** `PhaseContextIncludes` in `profile.rs`; `PipelineCloudContext::format_for`; `compose_system_prompt`; `settings-deterministic-pipeline.tsx`.
+
+### 2026-06-29 — Deterministic pipeline: cloud-rich context, local step contracts
+
+- **Area:** agent pipeline
+- **Summary:** Inverted context distribution to match harness design: **intent/plan (cloud)** now receive a `pipeline_cloud_context` block (skills catalog, ~16k conversation excerpt, persona memory, workspace paths). **Execute (local)** receives only `[current_request]`, prior step summaries, and the explicit step contract (`skill_name`, `skill_script`, `skill_args_hint`, inputs) — no truncated full system prompt or collapsed chat history. Planner prompts require catalog-exact `skill_name`; `normalize_plan` strips unknown skills (e.g. hallucinated `write_professional_summary`).
+- **Key files / symbols:** `src/agent_pipeline/cloud_context.rs` (`build_pipeline_cloud_context`); `intent.rs` / `plan.rs` (cloud context in LLM user messages); `execute.rs` (`build_local_step_messages`, slim `build_step_system`); `validate_plan_skill_names` in `plan.rs`; `runner.rs` (build context once per run).
+
+### 2026-06-29 — LLM thinking settings + multi-model test UI fix
+
+- **Area:** web / llm / multimodel
+- **Summary:** Settings → LLM now exposes **Enable extended thinking** and **Show thinking in replies** (persisted as `LLM_THINKING_ENABLED` / `SHOW_THINKING` in `app_settings`). Gemini requests send `thinkingConfig` when enabled; thought parts render as `<think>` when show is on. Multi-model test no longer calls full config reload (which overwrote unsaved model picks); dropdown stays when the model is in the loaded list.
+- **Key files / symbols:** `apply_thinking_settings`, `gemini_thinking_config`, `build_gemini_request` in `src/llm.rs`; `PATCH /api/llm` in `src/web.rs`; `web/src/components/settings-llm.tsx`, `settings-multimodel.tsx`.
+
+### 2026-06-29 — Cursor settings: thinking effort and context window params
+
+- **Area:** web / cursor engine
+- **Summary:** Settings → Cursor now loads full model metadata from `Cursor.models.list()` (parameters + variants) and exposes per-model dropdowns for SDK params such as thinking effort (`thinking` / `reasoning` / `effort`) and context window (`context`). Values persist as `CURSOR_SDK_MODEL_PARAMS` in `app_settings` and are passed through the sidecar to `Agent.create` via `ModelSelection.params`.
+- **Key files / symbols:** `CursorModelParam`, `fetch_sidecar_model_catalog` in `src/cursor_engine_config.rs`; `SidecarRunRequest.model_params` in `src/cursor_engine.rs`; `_build_model_selection` in `scripts/cursor-sdk-runner.py`; `web/src/components/settings-cursor.tsx`.
+- **Cloud strategy LLM note:** Multi-model strategy / Settings → LLM cloud provider does **not** enable Anthropic extended thinking (no `thinking` block in API requests). `SHOW_THINKING` only controls whether `<think>` tags are shown in channel output when a model emits them.
+
+### 2026-06-29 — Multi-model settings: local model dropdown
+
+- **Area:** web / multimodel
+- **Summary:** Settings → Multi-model now fetches model ids from the configured OpenAI-compatible local server (`GET /v1/models`) and shows a Select dropdown (with optional custom id), matching the Cursor settings pattern. New `GET /api/multimodel/models?base_url=...` proxies the list server-side with the same probe timeouts as connection tests.
+- **Key files / symbols:** `fetch_openai_compatible_models` in `src/llm.rs`; `api_multimodel_models_get` in `src/web.rs`; `web/src/components/settings-multimodel.tsx`.
+
+### 2026-06-29 — PDQE failure surfaced in user-facing replies
+
+- **Area:** evaluators / agent loop
+- **Summary:** When pre-delivery quality evaluation (PDQE) fails, the bot now tells the user instead of showing only a generic timeout. Deliver-anyway paths append a structured notice (issues, review summary, confidence). LLM timeouts after a PDQE-triggered revision use a quality-review-specific message. Classic agent `finish_turn!` now `continue`s the loop on PDQE retry instead of falling through to the unknown stop-reason path. Deterministic/Cursor finish loops no longer short-circuit before the shared gate delivers.
+- **Key files / symbols:** `format_pdqe_user_delivery_notice`, `format_agent_llm_timeout_message` in `src/response_quality_evaluator.rs`; `append_pdqe_delivery_notice` in `finish_turn_with_quality_gate`; `finish_turn!` macro in `src/channels/telegram.rs`; `finish_pipeline` in `src/agent_pipeline/runner.rs`.
+
+### 2026-06-29 — Customizable deterministic pipeline (Web UI, 4 phases)
+
+- **Area:** agent pipeline / web / runtime config
+- **Summary:** Replaced the hardcoded intent→plan→execute→consolidate DAG with a hot-reloadable `PipelineProfile` (max 4 phases, custom transitions, three customization layers). **Layer 1:** operational knobs (timeouts, iteration caps, plan step cap, context limits). **Layer 2:** policy toggles (heuristic intent, merged classify+plan, clarify-on-web/scheduler, skip-consolidate, retry/escalation, local JSON stages). **Layer 3:** per-phase system prompts + optional execute preamble (empty = builtin default). Default profile mirrors prior behavior. API: `GET/PATCH /api/deterministic-pipeline`; Settings → **Deterministic** tab.
+- **Key files / symbols:** `src/agent_pipeline/profile.rs` (`PipelineProfile`, `TransitionCondition`, `load_from_db` / `persist_to_db`, key `DETERMINISTIC_PIPELINE_CONFIG`); `src/agent_pipeline/runner.rs` (`run_profiled_pipeline`); `AppState.pipeline_profile`; `web/src/components/settings-deterministic-pipeline.tsx`.
+- **Boundaries:** Global profile only (not per-persona). Model endpoints stay in Settings → LLM / Multi-model; phases pick `model_route` (`strategy` | `local` | `technical` | `knowledge` | `inherit_global`). Transition DSL is allowlisted (no arbitrary code).
+
+### 2026-06-29 — Generalized skill script CLI contracts
+
+- **Area:** agent pipeline / run_skill_script
+- **Summary:** Replaced persona-specific hotify arg patching with `skill_script_contract` module: parses required CLI flags from skill scripts (`argparse required=True`) and SKILL.md; builds plan-step `skill_args_hint` from contract; enriches missing `run_skill_script` args from step hints, prior tool previews, and artifact paths; augments argparse failures with contract guidance. Works for any skill/persona with a bundled CLI script.
+- **Key files / symbols:** `src/agent_pipeline/skill_script_contract.rs`; `src/agent_pipeline/execute.rs` (`prior_step_snapshots`, contract-aware preamble); `src/agent_pipeline/plan.rs` (`normalize_plan(plan, state)`, `apply_skill_contract_defaults`).
+
+### 2026-06-29 — Deterministic pipeline runtime + skill/SOP binding
+
+- **Area:** agent pipeline / skills / deterministic engine
+- **Summary:** Implemented the optimization plan: heuristic-first intent, merged `classify_and_plan` single LLM call, skip consolidate when output is already good, plan step cap (4), per-step context collapse, circuit breakers (iteration/retry/escalation gates), parallel read-only tools, local tier + 45s timeouts for JSON stages, rich pipeline stage telemetry. Skill binding: extended `format_run_skill_script_hint` for `## Scripts` / `*_cli.py`, planner `skill_name`/`skill_script`/`skill_args_hint` fields, execute preamble + invalid-script correction, gated retry/escalation.
+- **Key files / symbols:** `src/agent_pipeline/{mod,intent,plan,execute,consolidate}.rs`; `src/tools/run_skill_script.rs` (`runnable_script_candidates`, `is_shell_like_script_name`, `runnable_script_hint_for_skill`).
+
 ### 2026-06-28 — Agent harness research doc (Classic / Deterministic / Cursor vs industry)
 
 - **Area:** architecture / agent engines / docs

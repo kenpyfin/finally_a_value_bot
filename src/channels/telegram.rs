@@ -273,6 +273,7 @@ pub struct AppState {
     pub env_redactor: Arc<EnvSecretRedactor>,
     pub runtime_toggles: Arc<crate::runtime_toggles::RuntimeToggles>,
     pub cursor_settings: Arc<std::sync::RwLock<crate::cursor_engine_config::CursorEngineSettings>>,
+    pub pipeline_profile: Arc<std::sync::RwLock<crate::agent_pipeline::PipelineProfile>>,
     pub cursor_sidecar: Arc<crate::cursor_sdk_sidecar::SidecarHandle>,
     /// Telegram bots keyed by `channel_bot_instances.id` (see `Database::sync_channel_bot_instances_from_config`).
     pub telegram_bots: Arc<HashMap<i64, Bot>>,
@@ -494,6 +495,12 @@ pub async fn run_bot(
             crate::cursor_engine_config::CursorEngineSettings::from_env(&config)
         }),
     ));
+    let pipeline_profile = Arc::new(std::sync::RwLock::new(
+        crate::agent_pipeline::profile::load_from_db(&db).unwrap_or_else(|e| {
+            warn!("Failed to load pipeline profile from DB: {e}");
+            crate::agent_pipeline::profile::PipelineProfile::default_profile()
+        }),
+    ));
     let cursor_sidecar =
         crate::cursor_sdk_sidecar::bootstrap(&config, &db, cursor_settings.clone()).await;
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
@@ -587,6 +594,7 @@ pub async fn run_bot(
         env_redactor,
         runtime_toggles,
         cursor_settings,
+        pipeline_profile,
         cursor_sidecar,
         telegram_bots: Arc::new(telegram_bots_map),
         db,
@@ -2487,6 +2495,7 @@ pub(crate) async fn process_classic_agent_with_events(
                 {
                     return Ok(result);
                 }
+                continue 'agent_loop;
             }};
         }
 
@@ -2596,7 +2605,9 @@ pub(crate) async fn process_classic_agent_with_events(
                         chat_id,
                         persona_id,
                         "llm_timeout",
-                        "The request took too long after the last step. Please try again or break your request into smaller steps.".to_string(),
+                        crate::response_quality_evaluator::format_agent_llm_timeout_message(
+                            pdqe_retries > 0,
+                        ),
                         &system_prompt,
                         &mut messages,
                         protected_message_count,
@@ -2856,7 +2867,7 @@ pub(crate) async fn process_classic_agent_with_events(
                 role: "assistant".into(),
                 content: MessageContent::Text(assistant_text.clone()),
             });
-            let display_text = if state.config.show_thinking {
+            let display_text = if state.llm.show_thinking() {
                 assistant_text.clone()
             } else {
                 strip_thinking(&assistant_text)
@@ -3649,7 +3660,7 @@ pub(crate) async fn process_classic_agent_with_events(
                     .iter()
                     .all(|name| is_memory_write_tool(name))
             {
-                let display_text = if state.config.show_thinking {
+                let display_text = if state.llm.show_thinking() {
                     assistant_text.clone()
                 } else {
                     strip_thinking(&assistant_text)
@@ -3858,7 +3869,7 @@ pub(crate) async fn process_classic_agent_with_events(
                                     role: "assistant".into(),
                                     content: MessageContent::Text(text.clone()),
                                 });
-                                let display_text = if state.config.show_thinking {
+                                let display_text = if state.llm.show_thinking() {
                                     text
                                 } else {
                                     strip_thinking(&text)
@@ -4458,6 +4469,9 @@ async fn finish_turn_with_quality_gate(
                             ),
                             eval_provider_label,
                         );
+                        crate::response_quality_evaluator::append_pdqe_delivery_notice(
+                            final_text, &verdict,
+                        );
                     }
                 }
             }
@@ -4512,7 +4526,11 @@ async fn finish_turn_with_quality_gate(
             (
                 ex.pipeline_stages.clone(),
                 ex.cloud_calls,
-                "deterministic".to_string(),
+                if ex.agent_engine.is_empty() {
+                    "deterministic".to_string()
+                } else {
+                    ex.agent_engine.clone()
+                },
             )
         },
     );

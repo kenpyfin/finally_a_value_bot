@@ -60,10 +60,41 @@ export type LlmCatalogModel = {
   from_active_config?: boolean
 }
 
+export type CursorModelParam = {
+  id: string
+  value: string
+}
+
+export type CursorModelParameterValue = {
+  value: string
+  display_name?: string
+}
+
+export type CursorModelParameterDef = {
+  id: string
+  display_name?: string
+  values: CursorModelParameterValue[]
+}
+
+export type CursorModelVariant = {
+  params: CursorModelParam[]
+  display_name: string
+  description?: string
+  is_default?: boolean
+}
+
+export type CursorModelCatalogEntry = {
+  id: string
+  display_name?: string
+  parameters?: CursorModelParameterDef[]
+  variants?: CursorModelVariant[]
+}
+
 export type CursorEngineConfigResponse = {
   ok?: boolean
   sdk_runner_url?: string
   sdk_model?: string
+  sdk_model_params?: CursorModelParam[]
   sdk_runner_ok?: boolean
   sidecar_managed?: boolean
   sidecar_reachable?: boolean
@@ -116,6 +147,122 @@ export type HookDefinition = {
   active_for_persona?: boolean
 }
 
+export type PipelinePhaseKind =
+  | 'intent_classify'
+  | 'plan_generate'
+  | 'execute_plan'
+  | 'synthesize_delivery'
+
+export type PipelineModelRoute =
+  | 'inherit_global'
+  | 'strategy'
+  | 'local'
+
+export type PipelineTransitionCondition =
+  | 'always'
+  | 'intent_category_conversational'
+  | 'intent_category_question'
+  | 'intent_category_task'
+  | 'intent_needs_clarification'
+  | 'intent_needs_clarification_proceed'
+  | 'plan_empty'
+  | 'execute_any_failed'
+  | 'execute_all_succeeded'
+  | 'channel_web'
+  | 'is_scheduled'
+
+export type PipelineTransitionTarget =
+  | { direct_answer: true }
+  | { clarify: true }
+  | { finish: true }
+  | { phase: string }
+
+export type PipelineTransitionRule = {
+  when: PipelineTransitionCondition
+  goto:
+    | 'direct_answer'
+    | 'clarify'
+    | 'finish'
+    | { phase: string }
+}
+
+export type PipelineOperationalConfig = {
+  timeout_secs: number
+  max_iterations: number
+  max_iterations_local: number
+  max_plan_steps: number
+  llm_round_timeout_secs: number
+  tool_execution_timeout_secs: number
+  iteration_breaker_min_chars: number
+  compact_system_max_chars: number
+  collapsed_session_turns: number
+  sop_reference_max_chars: number
+  min_polish_only_summary_chars: number
+  max_polish_only_combined_chars: number
+}
+
+export type PipelinePolicyConfig = {
+  heuristic_intent_enabled: boolean
+  merged_classify_and_plan_enabled: boolean
+  skip_consolidate_when_good: boolean
+  clarify_on_web_proceed: boolean
+  clarify_on_scheduler_proceed: boolean
+  image_input_force_task: boolean
+  retry_failed_steps: boolean
+  escalate_to_strategy_on_skill_failure: boolean
+  use_local_for_json_stages: boolean
+  bind_persona_sops_in_plan: boolean
+}
+
+export type PriorStepFeedMode = 'full' | 'summary'
+
+export type PhaseContextIncludes = {
+  include_system_prompt: boolean
+  include_agent_system_prompt: boolean
+  include_skills_catalog: boolean
+  include_session_excerpt: boolean
+  include_persona_memory: boolean
+  include_workspace_paths: boolean
+  include_sop_reference: boolean
+  include_current_request: boolean
+  include_prior_step_summaries: boolean
+  prior_step_feed_mode: PriorStepFeedMode
+  prior_step_summary_prompt: string
+  prior_step_full_output_max_chars: number
+  include_step_contract: boolean
+  include_execution_summary: boolean
+}
+
+export type PipelinePhase = {
+  id: string
+  label: string
+  enabled: boolean
+  kind: PipelinePhaseKind
+  model_route: PipelineModelRoute
+  system_prompt: string
+  preamble?: string | null
+  context_includes: PhaseContextIncludes
+  transitions: PipelineTransitionRule[]
+}
+
+export type PipelineProfile = {
+  version: number
+  entry_phase_id: string
+  phases: PipelinePhase[]
+  operational: PipelineOperationalConfig
+  policies: PipelinePolicyConfig
+}
+
+export type DeterministicPipelineResponse = {
+  ok?: boolean
+  schema_version?: number
+  profile?: PipelineProfile
+  defaults?: PipelineProfile
+  builtin_prompts?: Record<string, string>
+  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  message?: string
+}
+
 export type PersonaHookSkillPolicy = {
   allowed_hook_ids: number[] | null
   allowed_skill_names: string[] | null
@@ -149,6 +296,11 @@ export type LlmConfigResponse = {
   providers?: LlmProviderOption[]
   cost_reference_note?: string
   custom_model_allowed?: boolean
+  thinking_enabled?: boolean
+  thinking_source?: 'app_settings' | 'default'
+  thinking_supported?: boolean
+  show_thinking?: boolean
+  show_thinking_source?: 'app_settings' | 'env' | 'default'
 }
 
 export type MultimodelConfigResponse = {

@@ -310,6 +310,8 @@ pub struct PipelineStageRecord {
 pub struct PipelineFinishExtras {
     pub pipeline_stages: Vec<PipelineStageRecord>,
     pub cloud_calls: u32,
+    /// `classic` | `deterministic` | `cursor`
+    pub agent_engine: String,
 }
 
 pub struct AgentRunRecord {

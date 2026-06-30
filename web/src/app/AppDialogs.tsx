@@ -16,6 +16,7 @@ import ReactMarkdown from 'react-markdown'
 import { SettingsLlmPanel } from '../components/settings-llm'
 import { SettingsMultimodelPanel } from '../components/settings-multimodel'
 import { SettingsCursorPanel } from '../components/settings-cursor'
+import { SettingsDeterministicPipelinePanel } from '../components/settings-deterministic-pipeline'
 import { SettingsHooksSkillsPanel } from '../components/settings-hooks-skills'
 import { SettingsRuntimePanel } from '../components/settings-runtime'
 import { InitialRunPromptView } from '../components/initial-run-prompt-view'
@@ -649,6 +650,7 @@ export function AppDialogs({
         <Tabs.Trigger value="llm">LLM</Tabs.Trigger>
         <Tabs.Trigger value="multimodel">Multi-model</Tabs.Trigger>
         <Tabs.Trigger value="cursor">Cursor</Tabs.Trigger>
+        <Tabs.Trigger value="deterministic">Deterministic</Tabs.Trigger>
         <Tabs.Trigger value="hooks-skills">Hooks & Skills</Tabs.Trigger>
         <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
         <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
@@ -718,6 +720,9 @@ export function AppDialogs({
       </Tabs.Content>
       <Tabs.Content value="cursor">
         <SettingsCursorPanel api={api} onError={setSettingsError} />
+      </Tabs.Content>
+      <Tabs.Content value="deterministic">
+        <SettingsDeterministicPipelinePanel api={api} onError={setSettingsError} />
       </Tabs.Content>
       <Tabs.Content value="hooks-skills">
         <SettingsHooksSkillsPanel

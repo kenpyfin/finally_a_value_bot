@@ -452,6 +452,7 @@ fn default_config() -> Config {
         discord_bot_token: None,
         discord_allowed_channels: vec![],
         show_thinking: false,
+        llm_thinking_enabled: false,
         web_enabled: true,
         web_host: "127.0.0.1".into(),
         web_port: 10961,

@@ -504,6 +504,20 @@ impl LlmHandle {
             .and_then(|c| c.llm_base_url.clone())
     }
 
+    pub fn thinking_enabled(&self) -> bool {
+        self.base_config
+            .read()
+            .map(|c| c.llm_thinking_enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn show_thinking(&self) -> bool {
+        self.base_config
+            .read()
+            .map(|c| c.show_thinking)
+            .unwrap_or(false)
+    }
+
     fn strategy_endpoint(&self) -> String {
         if let Some(url) = self.current_base_url() {
             let t = url.trim();
@@ -568,6 +582,33 @@ impl LlmHandle {
             tier2_model: mm_cfg.tier2_model,
             tier2_endpoint: mm_cfg.tier2_base_url,
         }
+    }
+
+    /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
+    pub fn apply_thinking_settings(
+        &self,
+        thinking_enabled: bool,
+        show_thinking: bool,
+    ) -> Result<(), String> {
+        {
+            let mut cfg = self
+                .base_config
+                .write()
+                .map_err(|_| "config lock poisoned".to_string())?;
+            cfg.llm_thinking_enabled = thinking_enabled;
+            cfg.show_thinking = show_thinking;
+        }
+        let cfg = self
+            .base_config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .clone();
+        let new_provider = Arc::from(create_provider(&cfg));
+        *self
+            .provider
+            .write()
+            .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
+        Ok(())
     }
 
     /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
@@ -721,6 +762,69 @@ async fn probe_openai_compatible_server(base_url: &str, model: &str) -> Result<(
         }
     }
     Ok(())
+}
+
+/// List model ids from an OpenAI-compatible local server (`GET /v1/models`).
+pub async fn fetch_openai_compatible_models(base_url: &str) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("base_url is required".into());
+    }
+    let models_url = format!("{base}/models");
+    let client = probe_llm_http_client();
+    let resp = client
+        .get(&models_url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach server at {base_url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Server at {base_url} returned HTTP {status}. Response: {}",
+            llm_error_body_preview(&body, 200)
+        ));
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid models JSON: {e}"))?;
+    let mut ids: Vec<String> = parsed
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|data| {
+            data.iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        if let Some(models) = parsed.get("models").and_then(|m| m.as_array()) {
+            ids = models
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                        .or_else(|| entry.as_str().map(str::to_string))
+                })
+                .collect();
+        }
+    }
+    if ids.is_empty() {
+        return Err(format!(
+            "Server at {base_url} returned no models. Response: {}",
+            llm_error_body_preview(&text, 200)
+        ));
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// Test that a model override is reachable with the current provider/config.
@@ -1921,6 +2025,8 @@ pub struct GeminiProvider {
     api_key: String,
     model: String,
     max_tokens: u32,
+    thinking_enabled: bool,
+    show_thinking: bool,
 }
 
 impl GeminiProvider {
@@ -1930,6 +2036,8 @@ impl GeminiProvider {
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
+            thinking_enabled: config.llm_thinking_enabled,
+            show_thinking: config.show_thinking,
         }
     }
 
@@ -1971,7 +2079,15 @@ impl LlmProvider for GeminiProvider {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
-        let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
+        let request_body = build_gemini_request(
+            system,
+            &messages,
+            tools,
+            self.max_tokens,
+            &self.model,
+            self.thinking_enabled,
+            self.show_thinking,
+        );
 
         let mut retries = 0u32;
         let max_retries = 3;
@@ -2006,7 +2122,7 @@ impl LlmProvider for GeminiProvider {
 
             if status.is_success() {
                 let body = response.text().await?;
-                return parse_gemini_response(&body);
+                return parse_gemini_response(&body, self.show_thinking);
             }
 
             let is_transient = status.as_u16() == 429
@@ -2047,7 +2163,15 @@ impl LlmProvider for GeminiProvider {
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
-        let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
+        let request_body = build_gemini_request(
+            system,
+            &messages,
+            tools,
+            self.max_tokens,
+            &self.model,
+            self.thinking_enabled,
+            self.show_thinking,
+        );
 
         let mut retries = 0u32;
         let max_retries = 3;
@@ -2132,6 +2256,7 @@ impl LlmProvider for GeminiProvider {
                     &mut tool_calls,
                     &mut stop_reason,
                     &mut usage,
+                    self.show_thinking,
                 );
             }
         }
@@ -2143,6 +2268,7 @@ impl LlmProvider for GeminiProvider {
                 &mut tool_calls,
                 &mut stop_reason,
                 &mut usage,
+                self.show_thinking,
             );
         }
 
@@ -2188,6 +2314,7 @@ fn process_gemini_stream_event(
     tool_calls: &mut Vec<(String, String, serde_json::Value, Option<String>)>,
     stop_reason: &mut Option<String>,
     usage: &mut Option<Usage>,
+    show_thinking: bool,
 ) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return;
@@ -2208,10 +2335,18 @@ fn process_gemini_stream_event(
                                 .get("thought")
                                 .and_then(|t| t.as_bool())
                                 .unwrap_or(false);
-                            if !is_thought {
-                                accumulated_text.push_str(text);
+                            if is_thought && !show_thinking {
+                                continue;
+                            }
+                            let chunk = if is_thought {
+                                format!("<think>{text}</think>")
+                            } else {
+                                text.to_string()
+                            };
+                            if !chunk.is_empty() {
+                                accumulated_text.push_str(&chunk);
                                 if let Some(tx) = text_tx {
-                                    let _ = tx.send(text.to_string());
+                                    let _ = tx.send(chunk);
                                 }
                             }
                         }
@@ -2254,18 +2389,52 @@ fn process_gemini_stream_event(
     }
 }
 
+fn gemini_thinking_config(
+    model: &str,
+    thinking_enabled: bool,
+    include_thoughts: bool,
+) -> Option<serde_json::Value> {
+    let m = model.trim().to_ascii_lowercase();
+    if !thinking_enabled {
+        if m.contains("2.5-flash") && !m.contains("pro") {
+            return Some(json!({ "thinkingBudget": 0 }));
+        }
+        return None;
+    }
+    if m.contains("gemini-3") {
+        Some(json!({
+            "thinkingLevel": "MEDIUM",
+            "includeThoughts": include_thoughts,
+        }))
+    } else if m.contains("2.5") {
+        Some(json!({
+            "thinkingBudget": -1,
+            "includeThoughts": include_thoughts,
+        }))
+    } else {
+        None
+    }
+}
+
 fn build_gemini_request(
     system: &str,
     messages: &[Message],
     tools: Option<Vec<ToolDefinition>>,
     max_tokens: u32,
+    model: &str,
+    thinking_enabled: bool,
+    show_thinking: bool,
 ) -> serde_json::Value {
     let contents = translate_messages_to_gemini(messages);
+    let mut generation_config = json!({
+        "maxOutputTokens": max_tokens,
+    });
+    if let Some(thinking_config) = gemini_thinking_config(model, thinking_enabled, show_thinking) {
+        generation_config["thinkingConfig"] = thinking_config;
+    }
     let mut request = json!({
         "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-        }
+        "generationConfig": generation_config,
     });
 
     if !system.is_empty() {
@@ -2412,7 +2581,10 @@ fn translate_messages_to_gemini(messages: &[Message]) -> Vec<serde_json::Value> 
     out
 }
 
-fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBotError> {
+fn parse_gemini_response(
+    body: &str,
+    show_thinking: bool,
+) -> Result<MessagesResponse, FinallyAValueBotError> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
         FinallyAValueBotError::LlmApi(format!(
             "Failed to parse Gemini response: {e}\nBody: {body}"
@@ -2442,10 +2614,16 @@ fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBo
                             .get("thought")
                             .and_then(|t| t.as_bool())
                             .unwrap_or(false);
-                        if !is_thought && !text.is_empty() {
-                            content.push(ResponseContentBlock::Text {
-                                text: text.to_string(),
-                            });
+                        if is_thought && !show_thinking {
+                            continue;
+                        }
+                        let rendered = if is_thought {
+                            format!("<think>{text}</think>")
+                        } else {
+                            text.to_string()
+                        };
+                        if !rendered.is_empty() {
+                            content.push(ResponseContentBlock::Text { text: rendered });
                         }
                     }
                     // Function call parts
@@ -3693,7 +3871,7 @@ mod tests {
                 "candidatesTokenCount": 5
             }
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
@@ -3724,7 +3902,7 @@ mod tests {
                 "candidatesTokenCount": 10
             }
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
@@ -3763,7 +3941,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(result.content.len(), 2);
         match &result.content[0] {
@@ -3789,7 +3967,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
             ResponseContentBlock::Text { text } => assert_eq!(text, ""),

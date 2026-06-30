@@ -304,6 +304,8 @@ pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
     if u == crate::llm_catalog::APP_SETTING_LLM_MODEL
         || u == crate::llm_catalog::APP_SETTING_LLM_PROVIDER
         || u == crate::llm_catalog::APP_SETTING_LLM_BASE_URL
+        || u == crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED
+        || u == crate::llm_catalog::APP_SETTING_SHOW_THINKING
     {
         return false;
     }
@@ -463,6 +465,9 @@ pub struct Config {
     pub discord_allowed_channels: Vec<u64>,
     #[serde(default)]
     pub show_thinking: bool,
+    /// When true, request extended thinking from providers that support it (e.g. Gemini thinkingConfig).
+    #[serde(default)]
+    pub llm_thinking_enabled: bool,
     #[serde(default = "default_web_enabled")]
     pub web_enabled: bool,
     #[serde(default = "default_web_host")]
@@ -938,6 +943,7 @@ impl Config {
             discord_bot_token: Self::env("DISCORD_BOT_TOKEN"),
             discord_allowed_channels: Self::env_vec_u64("DISCORD_ALLOWED_CHANNELS"),
             show_thinking: Self::env_bool("SHOW_THINKING", false),
+            llm_thinking_enabled: false,
             web_enabled: Self::env_bool("WEB_ENABLED", default_web_enabled()),
             web_host: Self::env("WEB_HOST").unwrap_or_else(default_web_host),
             web_port: Self::env_u16("WEB_PORT", default_web_port()),
@@ -1172,6 +1178,15 @@ impl Config {
                     had_model_setting = true;
                 }
                 break;
+            }
+        }
+
+        for (key, value) in &settings {
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED) {
+                self.llm_thinking_enabled = parse_bool_setting(value);
+            }
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_SHOW_THINKING) {
+                self.show_thinking = parse_bool_setting(value);
             }
         }
 
@@ -1753,6 +1768,7 @@ pub fn test_config() -> Config {
         discord_bot_token: None,
         discord_allowed_channels: vec![],
         show_thinking: false,
+        llm_thinking_enabled: false,
         web_enabled: true,
         web_host: "127.0.0.1".into(),
         web_port: 10961,

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Callout, Flex, Switch, Text, TextField } from '@radix-ui/themes'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Button, Callout, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import type { MultimodelConfigResponse } from '../types'
 
@@ -22,6 +22,12 @@ export function SettingsMultimodelPanel({ api, onError }: Props) {
   const [enabled, setEnabled] = useState(false)
   const [localBaseUrl, setLocalBaseUrl] = useState('')
   const [localModel, setLocalModel] = useState('')
+  const [availableModels, setAvailableModels] = useState<string[]>([])
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [modelsNotice, setModelsNotice] = useState<string | null>(null)
+  const [useCustomModel, setUseCustomModel] = useState(false)
+  const autoLoadedModelsRef = useRef(false)
+  const lastLoadedBaseUrlRef = useRef('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -45,6 +51,80 @@ export function SettingsMultimodelPanel({ api, onError }: Props) {
   useEffect(() => {
     void load()
   }, [load])
+
+  const loadModels = useCallback(
+    async (opts?: { silent?: boolean; baseUrl?: string; model?: string }) => {
+      const baseUrl = (opts?.baseUrl ?? localBaseUrl).trim()
+      if (!baseUrl) {
+        if (!opts?.silent) {
+          onError('Enter the local server URL before loading models.')
+        }
+        return
+      }
+
+      setLoadingModels(true)
+      setModelsNotice(null)
+      try {
+        const res = await api<{ models?: Array<{ id: string } | string> }>(
+          `/api/multimodel/models?base_url=${encodeURIComponent(baseUrl)}`,
+        )
+        const ids = (res.models ?? [])
+          .map((m) => (typeof m === 'string' ? m : m.id))
+          .filter((id): id is string => Boolean(id))
+        if (ids.length === 0) {
+          const msg = 'No models returned from local server.'
+          setModelsNotice(msg)
+          if (!opts?.silent) onError(msg)
+          return
+        }
+        setAvailableModels(ids)
+        lastLoadedBaseUrlRef.current = baseUrl
+        const current = (opts?.model ?? localModel).trim()
+        if (current && ids.includes(current)) {
+          setUseCustomModel(false)
+        } else if (!current && ids[0]) {
+          setLocalModel(ids[0])
+          setUseCustomModel(false)
+        }
+        setModelsNotice(`${ids.length} model${ids.length === 1 ? '' : 's'} loaded from server.`)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        setModelsNotice(null)
+        if (!opts?.silent) onError(msg)
+      } finally {
+        setLoadingModels(false)
+      }
+    },
+    [api, localBaseUrl, localModel, onError],
+  )
+
+  useEffect(() => {
+    const model = localModel.trim()
+    if (model && availableModels.includes(model)) {
+      setUseCustomModel(false)
+    }
+  }, [localModel, availableModels])
+
+  useEffect(() => {
+    const baseUrl = localBaseUrl.trim()
+    if (!baseUrl) {
+      setAvailableModels([])
+      setModelsNotice(null)
+      autoLoadedModelsRef.current = false
+      lastLoadedBaseUrlRef.current = ''
+      return
+    }
+    if (baseUrl === lastLoadedBaseUrlRef.current) return
+
+    const timer = window.setTimeout(() => {
+      if (!autoLoadedModelsRef.current) {
+        autoLoadedModelsRef.current = true
+      }
+      void loadModels({ silent: true, baseUrl })
+    }, 500)
+
+    return () => window.clearTimeout(timer)
+  }, [localBaseUrl, loadModels])
 
   const localToolsOk = config?.local_tools_ok === true
   const configured = localBaseUrl.trim().length > 0 && localModel.trim().length > 0
@@ -111,7 +191,14 @@ export function SettingsMultimodelPanel({ api, onError }: Props) {
       const ok = res.tools_ok === true
       setTestPassed(ok)
       setTestNotice(res.message ?? (ok ? 'Local model OK.' : 'Test finished.'))
-      await load()
+      setConfig((prev) =>
+        prev
+          ? {
+              ...prev,
+              local_tools_ok: ok,
+            }
+          : prev,
+      )
     } catch (e) {
       setTestPassed(false)
       onError(e instanceof Error ? e.message : String(e))
@@ -195,11 +282,56 @@ export function SettingsMultimodelPanel({ api, onError }: Props) {
             value={localBaseUrl}
             onChange={(e) => setLocalBaseUrl(e.target.value)}
           />
-          <TextField.Root
-            placeholder="qwen3-14b"
-            value={localModel}
-            onChange={(e) => setLocalModel(e.target.value)}
-          />
+          <Flex gap="2" wrap="wrap" align="center">
+            {!useCustomModel && availableModels.length > 0 ? (
+              <Select.Root value={localModel} onValueChange={setLocalModel}>
+                <Select.Trigger placeholder="Select model" style={{ flex: 1, minWidth: 160 }} />
+                <Select.Content>
+                  {availableModels.map((id) => (
+                    <Select.Item key={id} value={id}>
+                      {id}
+                    </Select.Item>
+                  ))}
+                </Select.Content>
+              </Select.Root>
+            ) : (
+              <TextField.Root
+                placeholder="qwen3-14b"
+                value={localModel}
+                onChange={(e) => setLocalModel(e.target.value)}
+                style={{ flex: 1, minWidth: 160 }}
+              />
+            )}
+            <Button
+              size="1"
+              variant="outline"
+              className="cursor-pointer"
+              disabled={loadingModels || !localBaseUrl.trim()}
+              onClick={() => void loadModels()}
+            >
+              {loadingModels ? 'Loading…' : 'Refresh models'}
+            </Button>
+          </Flex>
+          {availableModels.length > 0 ? (
+            <Button
+              size="1"
+              variant="ghost"
+              type="button"
+              onClick={() => setUseCustomModel((v) => !v)}
+            >
+              {useCustomModel ? 'Use model list' : 'Type custom model id'}
+            </Button>
+          ) : null}
+          {modelsNotice ? (
+            <Text size="1" color="gray" role="status">
+              {modelsNotice}
+            </Text>
+          ) : localBaseUrl.trim() ? (
+            <Text size="1" color="gray">
+              Enter the server URL, then refresh to load models from{' '}
+              <code className="text-xs">/v1/models</code>.
+            </Text>
+          ) : null}
           <Button
             size="1"
             variant="outline"

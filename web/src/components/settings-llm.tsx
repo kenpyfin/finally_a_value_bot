@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Callout, Flex, Select, Text, TextField } from '@radix-ui/themes'
+import { Button, Callout, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import type { LlmConfigResponse, LlmProviderOption } from '../types'
 
@@ -17,6 +17,8 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
   const [customModel, setCustomModel] = useState('')
   const [useCustom, setUseCustom] = useState(false)
   const [serverUrl, setServerUrl] = useState('')
+  const [thinkingEnabled, setThinkingEnabled] = useState(false)
+  const [showThinking, setShowThinking] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
 
@@ -58,6 +60,8 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
       } else {
         setServerUrl('')
       }
+      setThinkingEnabled(data.thinking_enabled === true)
+      setShowThinking(data.show_thinking === true)
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       setLlm(null)
@@ -81,6 +85,11 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
     selectedProvider === 'ollama' ||
     selectedProvider === 'llama' ||
     selectedProvider === 'llamacpp'
+
+  const thinkingSupported =
+    selectedProvider === 'google' ||
+    selectedProvider === 'gemini' ||
+    llm?.thinking_supported === true
 
   function onProviderChange(nextProvider: string) {
     setSelectedProvider(nextProvider)
@@ -124,6 +133,8 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
           provider,
           model,
           custom: useCustom,
+          thinking_enabled: thinkingEnabled,
+          show_thinking: showThinking,
           ...(isLocalProvider ? { base_url: serverUrl.trim() } : {}),
         }),
       })
@@ -287,6 +298,47 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
           ) : null}
         </div>
       ) : null}
+
+      <div className="rounded-md border p-3" style={{ borderColor: 'var(--gray-6)' }}>
+        <Text size="2" weight="bold" className="mb-1 block">
+          Thinking
+        </Text>
+        <Flex direction="column" gap="2">
+          <Flex align="center" justify="between" gap="3">
+            <Flex direction="column" gap="1" style={{ flex: 1 }}>
+              <Text size="2">Enable extended thinking</Text>
+              <Text size="1" color="gray">
+                {thinkingSupported
+                  ? 'Sends provider thinking config (Gemini thinkingLevel / thinkingBudget).'
+                  : 'Currently supported for Google (Gemini API) only.'}
+              </Text>
+            </Flex>
+            <Switch
+              size="2"
+              checked={thinkingEnabled}
+              disabled={!thinkingSupported}
+              onCheckedChange={(checked) => {
+                setThinkingEnabled(checked)
+                if (!checked) setShowThinking(false)
+              }}
+            />
+          </Flex>
+          <Flex align="center" justify="between" gap="3">
+            <Flex direction="column" gap="1" style={{ flex: 1 }}>
+              <Text size="2">Show thinking in replies</Text>
+              <Text size="1" color="gray">
+                When enabled, reasoning is included in channel output instead of being hidden.
+              </Text>
+            </Flex>
+            <Switch
+              size="2"
+              checked={showThinking}
+              disabled={!thinkingEnabled}
+              onCheckedChange={setShowThinking}
+            />
+          </Flex>
+        </Flex>
+      </div>
 
       <Flex gap="2" align="center" wrap="wrap">
         <Button

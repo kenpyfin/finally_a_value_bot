@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Callout, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
-import type { CursorEngineConfigResponse } from '../types'
+import type {
+  CursorEngineConfigResponse,
+  CursorModelCatalogEntry,
+  CursorModelParam,
+  CursorModelParameterDef,
+} from '../types'
 
 type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
@@ -14,18 +19,76 @@ function statusColor(ok: boolean | undefined): 'green' | 'orange' | 'gray' {
   return 'gray'
 }
 
+function parameterLabel(param: CursorModelParameterDef): string {
+  const display = param.display_name?.trim()
+  if (display) return display
+  const id = param.id.toLowerCase()
+  if (id === 'thinking' || id === 'reasoning' || id === 'effort') return 'Thinking effort'
+  if (id === 'context') return 'Context window'
+  if (id === 'fast') return 'Fast mode'
+  if (id === 'max_mode' || id === 'maxmode') return 'Max mode'
+  return param.id
+}
+
+function defaultParamsForModel(model: CursorModelCatalogEntry): CursorModelParam[] {
+  const defaultVariant =
+    model.variants?.find((variant) => variant.is_default) ?? model.variants?.[0]
+  if (defaultVariant?.params?.length) {
+    return defaultVariant.params
+  }
+  return (model.parameters ?? [])
+    .map((param) => ({
+      id: param.id,
+      value: param.values[0]?.value ?? '',
+    }))
+    .filter((param) => param.value)
+}
+
+function normalizeModelParams(
+  model: CursorModelCatalogEntry | undefined,
+  saved: CursorModelParam[],
+): CursorModelParam[] {
+  if (!model?.parameters?.length) return []
+  const defaults = defaultParamsForModel(model)
+  const savedById = new Map(saved.map((param) => [param.id, param.value]))
+  return model.parameters.map((param) => {
+    const savedValue = savedById.get(param.id)
+    const allowed = new Set(param.values.map((value) => value.value))
+    if (savedValue && allowed.has(savedValue)) {
+      return { id: param.id, value: savedValue }
+    }
+    const fallback = defaults.find((item) => item.id === param.id)?.value ?? param.values[0]?.value
+    return fallback ? { id: param.id, value: fallback } : null
+  }).filter((param): param is CursorModelParam => param !== null)
+}
+
+function parseModelCatalog(
+  models: Array<CursorModelCatalogEntry | string | { id: string }>,
+): CursorModelCatalogEntry[] {
+  return models
+    .map((model) => {
+      if (typeof model === 'string') return { id: model }
+      if ('parameters' in model || 'variants' in model || 'display_name' in model) {
+        return model as CursorModelCatalogEntry
+      }
+      return { id: model.id }
+    })
+    .filter((model) => Boolean(model.id))
+}
+
 export function SettingsCursorPanel({ api, onError }: Props) {
   const [config, setConfig] = useState<CursorEngineConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [loadingModels, setLoadingModels] = useState(false)
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
-  const [availableModels, setAvailableModels] = useState<string[]>([])
+  const [modelCatalog, setModelCatalog] = useState<CursorModelCatalogEntry[]>([])
   const [modelsNotice, setModelsNotice] = useState<string | null>(null)
   const [useCustomSdkModel, setUseCustomSdkModel] = useState(false)
   const autoLoadedModelsRef = useRef(false)
 
   const [sdkModel, setSdkModel] = useState('')
+  const [sdkModelParams, setSdkModelParams] = useState<CursorModelParam[]>([])
   const [cliPath, setCliPath] = useState('')
   const [cliModel, setCliModel] = useState('')
   const [cliRunnerUrl, setCliRunnerUrl] = useState('')
@@ -39,6 +102,7 @@ export function SettingsCursorPanel({ api, onError }: Props) {
       const data = await api<CursorEngineConfigResponse>('/api/cursor-engine')
       setConfig(data)
       setSdkModel(data.sdk_model ?? '')
+      setSdkModelParams(data.sdk_model_params ?? [])
       setCliPath(data.cli_path ?? '')
       setCliModel(data.cli_model ?? '')
       setCliRunnerUrl(data.cli_runner_url ?? '')
@@ -60,6 +124,11 @@ export function SettingsCursorPanel({ api, onError }: Props) {
   const sidecarManaged = config?.sidecar_managed === true
   const canLoadModels =
     config?.sidecar_reachable === true && config?.api_key_configured === true
+
+  const selectedModelEntry = useMemo(
+    () => modelCatalog.find((model) => model.id === sdkModel),
+    [modelCatalog, sdkModel],
+  )
 
   const readinessSummary = useMemo(() => {
     if (!config) return ''
@@ -89,29 +158,30 @@ export function SettingsCursorPanel({ api, onError }: Props) {
       setLoadingModels(true)
       setModelsNotice(null)
       try {
-        const res = await api<{ models?: Array<{ id: string } | string> }>(
+        const res = await api<{ models?: Array<CursorModelCatalogEntry | string | { id: string }> }>(
           '/api/cursor-engine/models',
         )
-        const ids = (res.models ?? [])
-          .map((m) => (typeof m === 'string' ? m : m.id))
-          .filter((id): id is string => Boolean(id))
-        if (ids.length === 0) {
+        const catalog = parseModelCatalog(res.models ?? [])
+        if (catalog.length === 0) {
           const msg = 'No models returned from Cursor API.'
           setModelsNotice(msg)
           if (!opts?.silent) onError(msg)
           return
         }
-        setAvailableModels(ids)
+        setModelCatalog(catalog)
         const current = sdkModel.trim()
-        if (current && ids.includes(current)) {
+        const currentEntry = catalog.find((model) => model.id === current)
+        if (currentEntry) {
           setUseCustomSdkModel(false)
+          setSdkModelParams((prev) => normalizeModelParams(currentEntry, prev))
         } else if (current) {
           setUseCustomSdkModel(true)
-        } else if (ids[0]) {
-          setSdkModel(ids[0])
+        } else if (catalog[0]) {
+          setSdkModel(catalog[0].id)
+          setSdkModelParams(defaultParamsForModel(catalog[0]))
           setUseCustomSdkModel(false)
         }
-        setModelsNotice(`${ids.length} model${ids.length === 1 ? '' : 's'} loaded from Cursor.`)
+        setModelsNotice(`${catalog.length} model${catalog.length === 1 ? '' : 's'} loaded from Cursor.`)
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         setModelsNotice(null)
@@ -129,6 +199,29 @@ export function SettingsCursorPanel({ api, onError }: Props) {
     void loadModels({ silent: true })
   }, [canLoadModels, loadModels])
 
+  useEffect(() => {
+    if (!selectedModelEntry) return
+    setSdkModelParams((prev) => normalizeModelParams(selectedModelEntry, prev))
+  }, [selectedModelEntry])
+
+  function onSdkModelChange(nextModel: string) {
+    setSdkModel(nextModel)
+    const entry = modelCatalog.find((model) => model.id === nextModel)
+    if (entry) {
+      setSdkModelParams(defaultParamsForModel(entry))
+    } else {
+      setSdkModelParams([])
+    }
+  }
+
+  function onModelParamChange(paramId: string, value: string) {
+    setSdkModelParams((prev) => {
+      const next = prev.filter((param) => param.id !== paramId)
+      if (value) next.push({ id: paramId, value })
+      return next
+    })
+  }
+
   async function save() {
     setSaving(true)
     setSaveNotice(null)
@@ -139,6 +232,7 @@ export function SettingsCursorPanel({ api, onError }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sdk_model: sdkModel,
+          sdk_model_params: sdkModelParams,
           cli_path: cliPath,
           cli_model: cliModel,
           cli_runner_url: cliRunnerUrl,
@@ -148,6 +242,7 @@ export function SettingsCursorPanel({ api, onError }: Props) {
       })
       setSaveNotice(res.message ?? 'Saved.')
       setConfig(res)
+      setSdkModelParams(res.sdk_model_params ?? sdkModelParams)
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -198,13 +293,13 @@ export function SettingsCursorPanel({ api, onError }: Props) {
         </Text>
         <Flex direction="column" gap="2">
           <Flex gap="2" wrap="wrap" align="center">
-            {!useCustomSdkModel && availableModels.length > 0 ? (
-              <Select.Root value={sdkModel} onValueChange={setSdkModel}>
+            {!useCustomSdkModel && modelCatalog.length > 0 ? (
+              <Select.Root value={sdkModel} onValueChange={onSdkModelChange}>
                 <Select.Trigger placeholder="Select model" style={{ flex: 1, minWidth: 160 }} />
                 <Select.Content>
-                  {availableModels.map((id) => (
-                    <Select.Item key={id} value={id}>
-                      {id}
+                  {modelCatalog.map((model) => (
+                    <Select.Item key={model.id} value={model.id}>
+                      {model.display_name?.trim() ? `${model.display_name} (${model.id})` : model.id}
                     </Select.Item>
                   ))}
                 </Select.Content>
@@ -226,15 +321,49 @@ export function SettingsCursorPanel({ api, onError }: Props) {
               {loadingModels ? 'Loading…' : 'Refresh models'}
             </Button>
           </Flex>
-          {availableModels.length > 0 ? (
+          {modelCatalog.length > 0 ? (
             <Button
               size="1"
               variant="ghost"
               type="button"
-              onClick={() => setUseCustomSdkModel((v) => !v)}
+              onClick={() => setUseCustomSdkModel((value) => !value)}
             >
               {useCustomSdkModel ? 'Use model list' : 'Type custom model id'}
             </Button>
+          ) : null}
+          {selectedModelEntry?.parameters && selectedModelEntry.parameters.length > 0 ? (
+            <Flex direction="column" gap="2">
+              {selectedModelEntry.parameters.map((param) => {
+                const currentValue =
+                  sdkModelParams.find((item) => item.id === param.id)?.value ??
+                  param.values[0]?.value ??
+                  ''
+                return (
+                  <Flex key={param.id} direction="column" gap="1">
+                    <Text size="2" weight="medium">
+                      {parameterLabel(param)}
+                    </Text>
+                    <Select.Root
+                      value={currentValue}
+                      onValueChange={(value) => onModelParamChange(param.id, value)}
+                    >
+                      <Select.Trigger placeholder={`Select ${parameterLabel(param).toLowerCase()}`} />
+                      <Select.Content>
+                        {param.values.map((value) => (
+                          <Select.Item key={`${param.id}:${value.value}`} value={value.value}>
+                            {value.display_name?.trim() || value.value}
+                          </Select.Item>
+                        ))}
+                      </Select.Content>
+                    </Select.Root>
+                  </Flex>
+                )
+              })}
+            </Flex>
+          ) : sdkModel.trim() && canLoadModels ? (
+            <Text size="1" color="gray">
+              Refresh models to load thinking effort and context window options for the selected model.
+            </Text>
           ) : null}
           {!canLoadModels ? (
             <Text size="1" color="orange">

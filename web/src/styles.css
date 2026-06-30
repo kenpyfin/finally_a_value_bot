@@ -1674,3 +1674,34 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+.mc-pipeline-section {
+  border: 1px solid var(--mc-border-soft, var(--gray-6));
+  border-radius: var(--radius-3, 8px);
+  padding: 12px;
+  background: var(--mc-bg-panel, var(--gray-2));
+}
+
+.mc-pipeline-phase-card {
+  border: 1px solid var(--mc-border-soft, var(--gray-6));
+  border-radius: var(--radius-2, 6px);
+  padding: 10px 12px;
+  background: var(--mc-bg-elevated, var(--gray-1));
+}
+
+.mc-pipeline-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 140px;
+}
+
+.mc-pipeline-select {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 8px;
+  border-radius: var(--radius-2, 6px);
+  border: 1px solid var(--mc-border-soft, var(--gray-6));
+  background: var(--mc-bg-input, var(--color-background));
+  color: var(--mc-text, inherit);
+}

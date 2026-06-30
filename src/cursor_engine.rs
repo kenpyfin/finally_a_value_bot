@@ -30,6 +30,8 @@ struct SidecarRunRequest<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_params: Option<&'a [crate::cursor_engine_config::CursorModelParam]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +60,52 @@ struct SidecarRunOutcome {
 fn is_stale_cursor_agent_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("not found") && lower.contains("agent")
+}
+
+fn cursor_session_scope(context: &AgentRequestContext<'_>) -> String {
+    if let Some(sid) = context.session_id.as_deref() {
+        return sid.to_string();
+    }
+    if context.is_scheduled_task || context.is_background_job {
+        return context.run_key.clone().unwrap_or_default();
+    }
+    String::new()
+}
+
+async fn cursor_engine_classic_fallback(
+    state: &AppState,
+    context: AgentRequestContext<'_>,
+    prep: &AgentRunPrep,
+    event_tx: Option<&UnboundedSender<AgentEvent>>,
+    cancel: Option<Arc<AtomicBool>>,
+    reason: &str,
+) -> anyhow::Result<AgentProcessResult> {
+    if context.is_scheduled_task {
+        return Err(anyhow::anyhow!(
+            "Scheduled task requires the Cursor engine but it is unavailable ({reason}). \
+             Check Settings → Cursor (CURSOR_SDK_RUNNER_URL) and that the sidecar is running."
+        ));
+    }
+    if context.is_background_job {
+        let prompt = prep.latest_user_text.trim();
+        let override_prompt = if prompt.is_empty() {
+            None
+        } else {
+            Some(prompt)
+        };
+        warn!("Cursor engine fallback to classic for background job: {reason}");
+        return process_classic_agent_with_events(
+            state,
+            context,
+            override_prompt,
+            None,
+            event_tx,
+            cancel,
+        )
+        .await;
+    }
+    warn!("Cursor engine fallback to classic: {reason}");
+    process_classic_agent_with_events(state, context, None, None, event_tx, cancel).await
 }
 
 async fn consume_sidecar_stream(
@@ -156,14 +204,20 @@ pub async fn run_cursor_engine(
     let base_url = settings.sdk_runner_url.trim();
 
     if base_url.is_empty() {
-        warn!("Cursor engine selected but CURSOR_SDK_RUNNER_URL unset; falling back to classic engine");
-        return process_classic_agent_with_events(state, context, None, None, event_tx, cancel)
-            .await;
+        return cursor_engine_classic_fallback(
+            state,
+            context,
+            &prep,
+            event_tx,
+            cancel,
+            "CURSOR_SDK_RUNNER_URL unset",
+        )
+        .await;
     }
 
     let chat_id = context.chat_id;
     let persona_id = context.persona_id;
-    let session_scope = context.session_id.as_deref().unwrap_or("").to_string();
+    let session_scope = cursor_session_scope(&context);
 
     let workspace_root = PathBuf::from(state.config.working_dir());
     let working_dir = tools::persona_shared_dir(&workspace_root, chat_id, persona_id);
@@ -179,6 +233,12 @@ pub async fn run_cursor_engine(
     }
 
     let mut prompt = flatten_turn_prompt(&prep.system_prompt, &prep.messages);
+    if context.is_scheduled_task {
+        prompt = format!(
+            "[scheduled_task]\nAutomated scheduled job — not interactive chat. \
+             Complete the task below and return a concise result.\n\n{prompt}"
+        );
+    }
     if prep.has_image_input {
         prompt.push_str(
             "\n\n(Note: image input was attached but the Cursor engine currently supports text only. \
@@ -213,9 +273,15 @@ pub async fn run_cursor_engine(
     {
         Ok(c) => c,
         Err(e) => {
-            warn!("Cursor sidecar HTTP client failed ({e}); falling back to classic engine");
-            return process_classic_agent_with_events(state, context, None, None, event_tx, cancel)
-                .await;
+            return cursor_engine_classic_fallback(
+                state,
+                context,
+                &prep,
+                event_tx,
+                cancel,
+                &format!("HTTP client build failed: {e}"),
+            )
+            .await;
         }
     };
 
@@ -229,20 +295,31 @@ pub async fn run_cursor_engine(
         sidecar_error: Some("Cursor sidecar run did not start".into()),
     };
 
+    let model_params = if settings.sdk_model_params.is_empty() {
+        None
+    } else {
+        Some(settings.sdk_model_params.as_slice())
+    };
+
     for attempt in 0..2 {
         let body = SidecarRunRequest {
             prompt: &prompt,
             cwd: &cwd,
             model,
             agent_id: resume_id.as_deref(),
+            model_params,
         };
 
         let response = match client.post(&sidecar_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("Cursor sidecar request failed ({e}); falling back to classic engine");
-                return process_classic_agent_with_events(
-                    state, context, None, None, event_tx, cancel,
+                return cursor_engine_classic_fallback(
+                    state,
+                    context,
+                    &prep,
+                    event_tx,
+                    cancel,
+                    &format!("sidecar request failed: {e}"),
                 )
                 .await;
             }
@@ -252,12 +329,19 @@ pub async fn run_cursor_engine(
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             warn!(
-                "Cursor sidecar returned {}: {}; falling back to classic engine",
+                "Cursor sidecar returned {}: {}",
                 status.as_u16(),
                 text.chars().take(200).collect::<String>()
             );
-            return process_classic_agent_with_events(state, context, None, None, event_tx, cancel)
-                .await;
+            return cursor_engine_classic_fallback(
+                state,
+                context,
+                &prep,
+                event_tx,
+                cancel,
+                &format!("sidecar HTTP {}", status.as_u16()),
+            )
+            .await;
         }
 
         outcome = consume_sidecar_stream(response, event_tx, cancel.as_ref()).await?;
@@ -366,6 +450,7 @@ pub async fn run_cursor_engine(
     let extras = PipelineFinishExtras {
         pipeline_stages,
         cloud_calls: 0,
+        agent_engine: "cursor".into(),
     };
 
     let mut messages = prep.messages.clone();
@@ -420,14 +505,7 @@ pub async fn run_cursor_engine(
         {
             Some(result) => return Ok(result),
             None => {
-                if pdqe_retries > 1 {
-                    return Ok(AgentProcessResult {
-                        response: final_text,
-                    });
-                }
-                final_text = format!(
-                    "{final_text}\n\n(Note: quality check requested revision; delivering best effort.)"
-                );
+                // PDQE requested revision; re-enter the finish loop until the gate delivers.
             }
         }
     }
@@ -476,6 +554,25 @@ mod tests {
             "Cursor SDK startup failed: Agent agent-cea12fe8-fdd5-4fa4-880b-d8f7f6225a54 not found"
         ));
         assert!(!is_stale_cursor_agent_error("prompt required"));
+    }
+
+    #[test]
+    fn cursor_session_scope_uses_run_key_for_scheduled() {
+        let ctx = AgentRequestContext {
+            caller_channel: "telegram",
+            chat_id: 1,
+            chat_type: "private",
+            persona_id: 2,
+            is_scheduled_task: true,
+            is_background_job: false,
+            run_key: Some("scheduled:42:2026-01-01T00:00:00Z".into()),
+            reply_bot_instance_id: None,
+            session_id: None,
+        };
+        assert_eq!(
+            cursor_session_scope(&ctx),
+            "scheduled:42:2026-01-01T00:00:00Z"
+        );
     }
 
     #[test]
