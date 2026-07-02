@@ -4,6 +4,12 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-01 — Cursor engine: bot-native hook bridge (Phase 1)
+
+- **Area:** hooks / cursor engine
+- **Summary:** Cursor engine now runs bot `BeforeTurn` and `PreStop` hooks via shared `hook_turn_bridge` (block, `[hook_context]` injection, deferred-commitment nudge retries with resumed `agent_id`). `PostDelivery` unchanged via `pipeline_finish_turn`. Tool hooks (`PreToolUse`/`PostToolUse`/`PostToolBatch`) deferred to Phase 2 (sidecar tool streaming).
+- **Key files / symbols:** `src/channels/hook_turn_bridge.rs`; `run_cursor_engine`, `invoke_sidecar_turn`, `build_cursor_prompt` in `src/cursor_engine.rs`; Classic path uses same bridge in `src/channels/telegram.rs`.
+
 ### 2026-07-01 — Hooks/skills settings: enriched catalog + persona filter
 
 - **Area:** web UI / hooks & skills settings

@@ -8,6 +8,13 @@ use std::sync::OnceLock;
 mod agent_run_prep;
 pub(crate) use agent_run_prep::{prepare_agent_run, AgentRunPrep};
 
+#[path = "hook_turn_bridge.rs"]
+pub(crate) mod hook_turn_bridge;
+pub(crate) use hook_turn_bridge::{
+    assistant_text_defers_work, hook_event_summary, publish_hook_event, run_before_turn_hooks,
+    run_pre_stop_hooks, should_reject_premature_end_turn, DEFERRED_COMMITMENT_MAX_NUDGES,
+};
+
 use regex::Regex;
 use serenity::http::Http as SerenityHttp;
 use teloxide::prelude::*;
@@ -30,7 +37,7 @@ use crate::db::{
     call_blocking, Database, PersonaBulletinFocus, PersonaMessageBookmark, StoredMessage,
 };
 use crate::hook_actions::{apply_deterministic_persona_memory_hygiene, apply_hook_memory_effects};
-use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput, HookRunResult};
+use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::memory::{
@@ -2327,7 +2334,6 @@ pub(crate) async fn process_classic_agent_with_events(
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
     const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 15;
     const DISCOVERY_STREAK_STALL_THRESHOLD: usize = 20;
-    const DEFERRED_COMMITMENT_MAX_NUDGES: usize = 2;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
     let local_delegate_run_summary = state.llm.local_delegate_run_summary(cost_routing);
@@ -2434,42 +2440,18 @@ pub(crate) async fn process_classic_agent_with_events(
         }};
     }
 
-    let before_turn_hooks = run_hooks_for_event_async(
-        state.db.clone(),
-        &state.config,
-        state.env_redactor.as_ref(),
-        HookEventName::BeforeTurn,
-        &HookRunInput {
-            chat_id,
-            persona_id,
-            caller_channel: context.caller_channel.to_string(),
-            is_scheduled_task: context.is_scheduled_task,
-            ..HookRunInput::default()
-        },
-    )
-    .await?;
-    publish_hook_event_observability(
-        state,
-        event_tx,
-        &run_key,
-        chat_id,
-        persona_id,
-        HookEventName::BeforeTurn,
-        None,
-        &before_turn_hooks,
-    )
-    .await;
-    if let Some(reason) = before_turn_hooks.blocked_reason {
+    let before_turn = run_before_turn_hooks(state, &context, &run_key, event_tx).await?;
+    if let Some(reason) = before_turn.result.blocked_reason {
         let blocked = format!("This run was blocked before execution: {reason}");
         let _ = save_run_history!("hook_block_before_turn");
         return Ok(AgentProcessResult { response: blocked });
     }
-    if !before_turn_hooks.additional_contexts.is_empty() {
+    if !before_turn.result.additional_contexts.is_empty() {
         messages.push(Message {
             role: "user".into(),
             content: MessageContent::Text(format!(
                 "[hook_context]\n{}",
-                before_turn_hooks.additional_contexts.join("\n")
+                before_turn.result.additional_contexts.join("\n")
             )),
         });
     }
@@ -2926,83 +2908,41 @@ pub(crate) async fn process_classic_agent_with_events(
                 continue 'agent_loop;
             }
 
-            if let Ok(pre_stop_hook) = run_hooks_for_event_async(
-                state.db.clone(),
-                &state.config,
-                state.env_redactor.as_ref(),
-                HookEventName::PreStop,
-                &HookRunInput {
-                    chat_id,
-                    persona_id,
-                    caller_channel: context.caller_channel.to_string(),
-                    is_scheduled_task: context.is_scheduled_task,
-                    stop_reason: Some(stop_reason.to_string()),
-                    assistant_text: Some(assistant_text_preview.clone()),
-                    runtime_signals: Some(serde_json::json!({
-                        "deferred_commitment_should_reject": stop_reason != "ask_clarification"
-                            && !assistant_text.trim().is_empty()
-                            && should_reject_premature_end_turn(&assistant_text, &messages),
-                        "deferred_commitment_nudges": deferred_commitment_nudges,
-                        "deferred_commitment_max_nudges": DEFERRED_COMMITMENT_MAX_NUDGES,
-                        "can_continue_iteration": iteration + 1 < state.config.max_tool_iterations
-                    })),
-                    ..HookRunInput::default()
-                },
+            let pre_stop = run_pre_stop_hooks(
+                state,
+                &context,
+                &run_key,
+                event_tx,
+                &stop_reason,
+                &assistant_text_preview,
+                &messages,
+                deferred_commitment_nudges,
+                iteration + 1 < state.config.max_tool_iterations,
             )
-            .await
+            .await?;
+            if let Some(summary) =
+                hook_event_summary(HookEventName::PreStop, None, &pre_stop.result)
             {
-                publish_hook_event_observability(
-                    state,
-                    event_tx,
-                    &run_key,
-                    chat_id,
-                    persona_id,
-                    HookEventName::PreStop,
-                    None,
-                    &pre_stop_hook,
-                )
-                .await;
-                if let Some(summary) =
-                    hook_event_summary(HookEventName::PreStop, None, &pre_stop_hook)
-                {
-                    if let Some(last) = history_iterations.last_mut() {
-                        last.hook_events.push(summary);
-                    }
+                if let Some(last) = history_iterations.last_mut() {
+                    last.hook_events.push(summary);
                 }
-                if let Some(reason) = pre_stop_hook.blocked_reason {
-                    let reason_for_prompt = reason
-                        .strip_prefix("deferred_commitment: ")
-                        .unwrap_or(reason.as_str())
-                        .to_string();
-                    if iteration + 1 < state.config.max_tool_iterations {
-                        if reason.starts_with("deferred_commitment: ") {
-                            deferred_commitment_nudges += 1;
-                            info!(
-                                "Main agent iteration {}/{}: deferred_commitment_rejected (nudge {}/{})",
-                                iteration + 1,
-                                state.config.max_tool_iterations,
-                                deferred_commitment_nudges,
-                                DEFERRED_COMMITMENT_MAX_NUDGES
-                            );
-                        }
-                        messages.push(Message {
-                            role: "assistant".into(),
-                            content: MessageContent::Text(final_text.clone()),
-                        });
-                        messages.push(Message {
-                            role: "user".into(),
-                            content: MessageContent::Text(format!(
-                                "[hook_pre_stop_blocked]\n{}",
-                                reason_for_prompt
-                            )),
-                        });
-                        continue;
+            }
+            if let Some(reason) = pre_stop.result.blocked_reason {
+                let reason_for_prompt = reason
+                    .strip_prefix("deferred_commitment: ")
+                    .unwrap_or(reason.as_str())
+                    .to_string();
+                if iteration + 1 < state.config.max_tool_iterations {
+                    if reason.starts_with("deferred_commitment: ") {
+                        deferred_commitment_nudges += 1;
+                        info!(
+                            "Main agent iteration {}/{}: deferred_commitment_rejected (nudge {}/{})",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            deferred_commitment_nudges,
+                            DEFERRED_COMMITMENT_MAX_NUDGES
+                        );
                     }
-                    final_text = format!("I cannot finish this run: {reason_for_prompt}");
-                }
-                if !pre_stop_hook.additional_contexts.is_empty()
-                    && iteration + 1 < state.config.max_tool_iterations
-                {
                     messages.push(Message {
                         role: "assistant".into(),
                         content: MessageContent::Text(final_text.clone()),
@@ -3010,12 +2950,29 @@ pub(crate) async fn process_classic_agent_with_events(
                     messages.push(Message {
                         role: "user".into(),
                         content: MessageContent::Text(format!(
-                            "[hook_context]\n{}",
-                            pre_stop_hook.additional_contexts.join("\n")
+                            "[hook_pre_stop_blocked]\n{}",
+                            reason_for_prompt
                         )),
                     });
                     continue;
                 }
+                final_text = format!("I cannot finish this run: {reason_for_prompt}");
+            }
+            if !pre_stop.result.additional_contexts.is_empty()
+                && iteration + 1 < state.config.max_tool_iterations
+            {
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(final_text.clone()),
+                });
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(format!(
+                        "[hook_context]\n{}",
+                        pre_stop.result.additional_contexts.join("\n")
+                    )),
+                });
+                continue;
             }
             info!(
                 "Main agent finishing: stop_reason={}, final_response_len={}, total_iterations={}",
@@ -3165,7 +3122,7 @@ pub(crate) async fn process_classic_agent_with_events(
                     .await
                     .ok();
                     if let Some(hook) = pre_tool_hook.as_ref() {
-                        publish_hook_event_observability(
+                        publish_hook_event(
                             state,
                             event_tx,
                             &run_key,
@@ -3520,7 +3477,7 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
                     )
                     .await
                     {
-                        publish_hook_event_observability(
+                        publish_hook_event(
                             state,
                             event_tx,
                             &run_key,
@@ -3659,7 +3616,7 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
             )
             .await
             {
-                publish_hook_event_observability(
+                publish_hook_event(
                     state,
                     event_tx,
                     &run_key,
@@ -4650,7 +4607,7 @@ async fn run_post_delivery_hooks_before_gate(
     )
     .await
     {
-        publish_hook_event_observability(
+        publish_hook_event(
             state,
             event_tx,
             run_key,
@@ -4993,64 +4950,6 @@ fn is_progress_tool_use(tool_name: &str) -> bool {
     )
 }
 
-/// True when assistant prose promises imminent work without having issued a tool call.
-fn assistant_text_defers_work(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    const PHRASES: &[&str] = &[
-        "checking the log",
-        "checking run log",
-        "check the log",
-        "check run log",
-        "i will ",
-        "i'll ",
-        "i am going to ",
-        "i'm going to ",
-        "im going to ",
-        "let me ",
-        "one moment",
-        "(checking",
-        "right now",
-        "immediately",
-        "in a moment",
-        "give me a moment",
-        "hold on",
-    ];
-    PHRASES.iter().any(|p| lower.contains(p))
-}
-
-fn most_recent_tool_result_is_error(messages: &[Message]) -> bool {
-    for msg in messages.iter().rev() {
-        if let MessageContent::Blocks(blocks) = &msg.content {
-            for block in blocks.iter().rev() {
-                if let ContentBlock::ToolResult { is_error, .. } = block {
-                    return *is_error == Some(true);
-                }
-            }
-        }
-    }
-    false
-}
-
-fn assistant_text_references_incomplete_work(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("background task")
-        || lower.contains("agent run")
-        || lower.contains("cursor-agent")
-        || lower.contains("cursor agent")
-        || lower.contains("run #")
-        || lower.contains("run logs")
-        || lower.contains("not successfully")
-        || lower.contains("no such file")
-        || lower.contains("was not created")
-        || lower.contains("was not found")
-    {
-        return true;
-    }
-    static RUN_ID_RE: OnceLock<Regex> = OnceLock::new();
-    let re = RUN_ID_RE.get_or_init(|| Regex::new(r"#\d{1,6}\b").expect("run id regex"));
-    re.is_match(text)
-}
-
 /// True when assistant text claims actions (uploads, writes, publishes) not backed by tool use
 /// in the same turn — used to avoid strategy fallback on legitimate bash summaries.
 fn assistant_text_claims_unbacked_actions(text: &str) -> bool {
@@ -5134,14 +5033,6 @@ fn should_fallback_local_tier_to_strategy(
     assistant_text_claims_unbacked_actions(assistant_text)
 }
 
-fn should_reject_premature_end_turn(assistant_text: &str, messages: &[Message]) -> bool {
-    if !assistant_text_defers_work(assistant_text) {
-        return false;
-    }
-    most_recent_tool_result_is_error(messages)
-        || assistant_text_references_incomplete_work(assistant_text)
-}
-
 fn is_discovery_tool_use(tool_name: &str, input: &serde_json::Value) -> bool {
     match tool_name {
         "list_scheduled_tasks" | "list_cursor_agent_runs" => true,
@@ -5215,63 +5106,6 @@ fn recover_latest_assistant_text(messages: &[Message]) -> Option<String> {
         }
     }
     None
-}
-
-fn hook_event_summary(
-    event_name: HookEventName,
-    tool_name: Option<&str>,
-    result: &HookRunResult,
-) -> Option<String> {
-    if result.matched_hook_ids.is_empty()
-        && result.blocked_reason.is_none()
-        && result.additional_contexts.is_empty()
-    {
-        return None;
-    }
-    let tool = tool_name.unwrap_or("-");
-    let blocked = result.blocked_reason.as_deref().unwrap_or("-");
-    Some(format!(
-        "{} tool={} matched={:?} blocked={} add_ctx={}",
-        event_name.as_str(),
-        tool,
-        result.matched_hook_ids,
-        blocked,
-        result.additional_contexts.len()
-    ))
-}
-
-async fn publish_hook_event_observability(
-    state: &AppState,
-    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
-    run_key: &str,
-    chat_id: i64,
-    persona_id: i64,
-    event_name: HookEventName,
-    tool_name: Option<&str>,
-    result: &HookRunResult,
-) {
-    if let Some(tx) = event_tx {
-        let _ = tx.send(AgentEvent::Hook {
-            event_name: event_name.as_str().to_string(),
-            tool_name: tool_name.map(|s| s.to_string()),
-            matched_hook_ids: result.matched_hook_ids.clone(),
-            blocked_reason: result.blocked_reason.clone(),
-            additional_context_count: result.additional_contexts.len(),
-        });
-    }
-    let payload = serde_json::json!({
-        "event_name": event_name.as_str(),
-        "tool_name": tool_name,
-        "matched_hook_ids": result.matched_hook_ids,
-        "blocked_reason": result.blocked_reason,
-        "additional_context_count": result.additional_contexts.len(),
-    })
-    .to_string();
-    let run_key = run_key.to_string();
-    let _ = call_blocking(state.db.clone(), move |db| {
-        db.append_run_timeline_event(&run_key, chat_id, persona_id, "hook", Some(&payload))
-    })
-    .await;
 }
 
 fn is_code_path(path: &str) -> bool {
