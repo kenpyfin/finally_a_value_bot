@@ -6,11 +6,11 @@ use std::path::Path;
 use crate::agent_history::{format_initial_llm_snapshot_json, truncate_preview};
 use crate::claude::{ContentBlock, ImageSource, Message, MessageContent};
 use crate::db::call_blocking;
+use crate::local_delegate::LocalDelegateRunSummary;
 use crate::memory::{
     enrich_persona_memory_for_prompt, render_identity_and_tier1_for_system, render_memory_for_llm,
     render_persona_context_memory_with_options, MemoryPromptBuildOptions, PersonaMemoryState,
 };
-use crate::multimodel::MultimodelRunSummary;
 use crate::tools::ToolAuthContext;
 
 use super::{
@@ -34,7 +34,7 @@ pub struct AgentRunPrep {
     pub has_image_input: bool,
     pub user_msg_preview: String,
     pub initial_llm_snapshot_json: String,
-    pub multimodel_run_summary: MultimodelRunSummary,
+    pub local_delegate_run_summary: LocalDelegateRunSummary,
     pub tool_auth: ToolAuthContext,
     pub persona_memory_state: Option<PersonaMemoryState>,
     pub min_user_suffix: usize,
@@ -365,18 +365,13 @@ pub async fn prepare_agent_run(
     .await;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
-    let multimodel_run_summary = state.llm.multimodel_run_summary();
-    let iter0_route_ctx = crate::multimodel::RouteContext {
-        iteration: 0,
-        is_conversational: false,
-        last_iteration_tools: &[],
-        max_iterations: state.config.max_tool_iterations,
-        force_strategy: false,
-        local_tier_error_streak: 0,
-    };
-    let iter0_tier = state.llm.resolve_route(iter0_route_ctx);
+    let agent_engine = state.runtime_toggles.agent_engine();
+    let mm_cfg = state.llm.local_delegate_config();
+    let cost_routing = crate::local_delegate::cost_routing_active(agent_engine, &mm_cfg);
+    let local_delegate_run_summary = state.llm.local_delegate_run_summary(cost_routing);
+    let iter0_tier = crate::local_delegate::RouteTarget::Strategy;
     let iter0_tier_snap = state.llm.tier_endpoint_snapshot(iter0_tier);
-    let routing_v1 = multimodel_run_summary.routing_v1_json(&iter0_tier_snap);
+    let routing_v1 = local_delegate_run_summary.routing_v1_json(&iter0_tier_snap);
     let initial_llm_snapshot_json = format_initial_llm_snapshot_json(
         &system_prompt,
         &messages,
@@ -415,7 +410,7 @@ pub async fn prepare_agent_run(
         has_image_input,
         user_msg_preview,
         initial_llm_snapshot_json,
-        multimodel_run_summary,
+        local_delegate_run_summary,
         tool_auth,
         persona_memory_state,
         min_user_suffix,

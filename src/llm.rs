@@ -270,9 +270,9 @@ pub fn create_openai_compatible_provider_with_timeout(
     cfg.llm_provider = "llama".into();
     cfg.api_key = String::new();
     cfg.model = model.trim().to_string();
-    cfg.llm_base_url = Some(crate::multimodel::normalize_base_url_for_provider(
+    cfg.llm_base_url = Some(crate::local_delegate::normalize_base_url_for_provider(
         base_url,
-        crate::multimodel::DEFAULT_TIER1_BASE_URL,
+        crate::local_delegate::DEFAULT_LOCAL_BASE_URL,
     ));
     Box::new(OpenAiProvider::new_with_request_timeout(
         &cfg,
@@ -294,10 +294,11 @@ pub struct EvaluatorProviderBundle {
 /// Human-readable backend label for agent history / UI (`local · model @ url` or `perplexity · sonar`).
 pub fn resolve_evaluator_provider_label(
     config: &Config,
-    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    multimodel: Option<&crate::local_delegate::LocalDelegateConfig>,
 ) -> String {
     if let Some(mm) = multimodel {
-        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+        if let Some((base_url, model)) = crate::local_delegate::resolve_local_evaluator_endpoint(mm)
+        {
             return format!("local · {} @ {}", model, base_url);
         }
     }
@@ -316,11 +317,12 @@ pub fn resolve_evaluator_provider_label(
 /// Never used for the main agent loop.
 pub fn create_evaluator_provider(
     config: &Config,
-    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    multimodel: Option<&crate::local_delegate::LocalDelegateConfig>,
 ) -> Result<EvaluatorProviderBundle, FinallyAValueBotError> {
     let request_timeout = std::time::Duration::from_secs(EVALUATOR_TIMEOUT_SECS);
     if let Some(mm) = multimodel {
-        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+        if let Some((base_url, model)) = crate::local_delegate::resolve_local_evaluator_endpoint(mm)
+        {
             let mut eval_config = config.clone();
             eval_config.max_tokens = EVALUATOR_MAX_TOKENS;
             let label = format!("local · {} @ {}", model, base_url);
@@ -362,8 +364,8 @@ pub struct LlmHandle {
     model: std::sync::RwLock<String>,
     provider: std::sync::RwLock<Arc<dyn LlmProvider>>,
     base_config: std::sync::RwLock<Config>,
-    multimodel_config: std::sync::RwLock<crate::multimodel::MultimodelConfig>,
-    multimodel: std::sync::RwLock<Option<crate::multimodel::MultimodelRuntime>>,
+    local_delegate_config: std::sync::RwLock<crate::local_delegate::LocalDelegateConfig>,
+    local_delegate_runtime: std::sync::RwLock<Option<crate::local_delegate::LocalDelegateRuntime>>,
 }
 
 impl LlmHandle {
@@ -376,37 +378,42 @@ impl LlmHandle {
             model: std::sync::RwLock::new(config.model.clone()),
             base_config: std::sync::RwLock::new(config.clone()),
             provider: std::sync::RwLock::new(provider),
-            multimodel_config: std::sync::RwLock::new(
-                crate::multimodel::MultimodelConfig::default(),
+            local_delegate_config: std::sync::RwLock::new(
+                crate::local_delegate::LocalDelegateConfig::default(),
             ),
-            multimodel: std::sync::RwLock::new(None),
+            local_delegate_runtime: std::sync::RwLock::new(None),
         })
     }
 
-    pub fn multimodel_config(&self) -> crate::multimodel::MultimodelConfig {
-        self.multimodel_config
+    pub fn local_delegate_config(&self) -> crate::local_delegate::LocalDelegateConfig {
+        self.local_delegate_config
             .read()
             .ok()
             .map(|cfg| cfg.clone())
             .unwrap_or_default()
     }
 
-    pub fn apply_multimodel_config(
+    /// Backward-compatible alias.
+    pub fn multimodel_config(&self) -> crate::local_delegate::LocalDelegateConfig {
+        self.local_delegate_config()
+    }
+
+    pub fn apply_local_delegate_config(
         &self,
-        config: crate::multimodel::MultimodelConfig,
+        config: crate::local_delegate::LocalDelegateConfig,
     ) -> Result<(), String> {
         let config = config.normalize();
         *self
-            .multimodel_config
+            .local_delegate_config
             .write()
-            .map_err(|_| "multimodel config lock poisoned".to_string())? = config.clone();
+            .map_err(|_| "local delegate config lock poisoned".to_string())? = config.clone();
         let base = self
             .base_config
             .read()
             .map_err(|_| "config lock poisoned".to_string())?
             .clone();
-        let runtime = if config.ready_for_routing() {
-            Some(crate::multimodel::MultimodelRuntime::new(
+        let runtime = if config.local_configured() {
+            Some(crate::local_delegate::LocalDelegateRuntime::new(
                 &base,
                 config.clone(),
             ))
@@ -414,73 +421,68 @@ impl LlmHandle {
             None
         };
         *self
-            .multimodel
+            .local_delegate_runtime
             .write()
-            .map_err(|_| "multimodel lock poisoned".to_string())? = runtime;
+            .map_err(|_| "local delegate runtime lock poisoned".to_string())? = runtime;
         Ok(())
     }
 
-    pub fn resolve_route(
+    /// Backward-compatible alias.
+    pub fn apply_multimodel_config(
         &self,
-        ctx: crate::multimodel::RouteContext<'_>,
-    ) -> crate::multimodel::ModelTier {
-        let cfg = self.multimodel_config();
-        crate::multimodel::resolve_route(&cfg, &ctx)
+        config: crate::local_delegate::LocalDelegateConfig,
+    ) -> Result<(), String> {
+        self.apply_local_delegate_config(config)
     }
 
-    fn provider_for_tier(
+    fn provider_for_target(
         &self,
-        tier: crate::multimodel::ModelTier,
+        target: crate::local_delegate::RouteTarget,
     ) -> Result<Arc<dyn LlmProvider>, FinallyAValueBotError> {
         let strategy = self
             .provider
             .read()
             .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
             .clone();
-        let mm = self
-            .multimodel
-            .read()
-            .map_err(|_| FinallyAValueBotError::LlmApi("multimodel lock poisoned".into()))?;
-        Ok(if let Some(ref runtime) = *mm {
-            if runtime.config.ready_for_routing() {
-                runtime.provider_for_tier(tier, &strategy)
-            } else {
-                strategy
-            }
+        if !target.is_local() {
+            return Ok(strategy);
+        }
+        let rt = self.local_delegate_runtime.read().map_err(|_| {
+            FinallyAValueBotError::LlmApi("local delegate runtime lock poisoned".into())
+        })?;
+        Ok(if let Some(ref runtime) = *rt {
+            runtime.provider_for_target(target, &strategy)
         } else {
             strategy
         })
     }
 
-    pub async fn send_message_for_tier(
+    pub async fn send_message_for_target(
         &self,
-        tier: crate::multimodel::ModelTier,
+        target: crate::local_delegate::RouteTarget,
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
-        let provider = self.provider_for_tier(tier)?;
+        let provider = self.provider_for_target(target)?;
         let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let options = LlmSendOptions {
-            tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+            tool_choice: crate::local_delegate::tool_choice_for_target(target, has_tools),
         };
         provider
             .send_message_with_options(system, messages, tools, options)
             .await
     }
 
-    pub async fn send_message_for_route(
+    pub async fn send_message_for_tier(
         &self,
-        ctx: crate::multimodel::RouteContext<'_>,
+        tier: crate::local_delegate::RouteTarget,
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<(crate::multimodel::ModelTier, MessagesResponse), FinallyAValueBotError> {
-        let tier = self.resolve_route(ctx);
-        let response = self
-            .send_message_for_tier(tier, system, messages, tools)
-            .await?;
-        Ok((tier, response))
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        self.send_message_for_target(tier, system, messages, tools)
+            .await
     }
 
     pub fn current_model(&self) -> String {
@@ -536,52 +538,53 @@ impl LlmHandle {
             })
     }
 
-    fn strategy_tier_snapshot(&self) -> crate::multimodel::TierEndpointSnapshot {
-        crate::multimodel::TierEndpointSnapshot {
-            tier: crate::multimodel::ModelTier::Strategy,
+    fn strategy_tier_snapshot(&self) -> crate::local_delegate::RouteEndpointSnapshot {
+        crate::local_delegate::RouteEndpointSnapshot {
+            target: crate::local_delegate::RouteTarget::Strategy,
             provider: self.current_provider(),
             model: self.current_model(),
             endpoint: self.strategy_endpoint(),
         }
     }
 
-    /// Resolved provider/model/endpoint for a tier (for agent history and debugging).
+    /// Resolved provider/model/endpoint for a route target (for agent history and debugging).
     pub fn tier_endpoint_snapshot(
         &self,
-        tier: crate::multimodel::ModelTier,
-    ) -> crate::multimodel::TierEndpointSnapshot {
-        let mm_cfg = self.multimodel_config();
-        if !mm_cfg.enabled || tier == crate::multimodel::ModelTier::Strategy {
+        target: crate::local_delegate::RouteTarget,
+    ) -> crate::local_delegate::RouteEndpointSnapshot {
+        if !target.is_local() {
             return self.strategy_tier_snapshot();
         }
-        if tier.is_local() {
-            crate::multimodel::TierEndpointSnapshot {
-                tier,
-                provider: "llama".into(),
-                model: mm_cfg.local_model.clone(),
-                endpoint: mm_cfg.local_base_url.clone(),
-            }
-        } else {
-            self.strategy_tier_snapshot()
+        let mm_cfg = self.local_delegate_config();
+        crate::local_delegate::RouteEndpointSnapshot {
+            target,
+            provider: "llama".into(),
+            model: mm_cfg.local_model.clone(),
+            endpoint: mm_cfg.local_base_url.clone(),
         }
     }
 
     /// Run-level routing summary for agent history (captured once per run).
-    pub fn multimodel_run_summary(&self) -> crate::multimodel::MultimodelRunSummary {
-        let mm_cfg = self.multimodel_config();
+    pub fn local_delegate_run_summary(
+        &self,
+        cost_routing_active: bool,
+    ) -> crate::local_delegate::LocalDelegateRunSummary {
+        let mm_cfg = self.local_delegate_config();
         let strategy = self.strategy_tier_snapshot();
-        crate::multimodel::MultimodelRunSummary {
-            enabled: mm_cfg.enabled,
+        crate::local_delegate::LocalDelegateRunSummary {
+            cost_routing_active,
             strategy_provider: strategy.provider,
             strategy_model: strategy.model,
             strategy_endpoint: strategy.endpoint,
             local_model: mm_cfg.local_model.clone(),
             local_endpoint: mm_cfg.local_base_url.clone(),
-            tier1_model: mm_cfg.tier1_model,
-            tier1_endpoint: mm_cfg.tier1_base_url,
-            tier2_model: mm_cfg.tier2_model,
-            tier2_endpoint: mm_cfg.tier2_base_url,
         }
+    }
+
+    /// Backward-compatible alias.
+    pub fn multimodel_run_summary(&self) -> crate::local_delegate::LocalDelegateRunSummary {
+        let mm_cfg = self.local_delegate_config();
+        self.local_delegate_run_summary(mm_cfg.ready_for_routing())
     }
 
     /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
@@ -665,9 +668,9 @@ impl LlmHandle {
             .write()
             .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
         // Clone multimodel config before apply — holding a read guard across
-        // apply_multimodel_config would deadlock (it needs a write lock).
-        let mm_cfg = self.multimodel_config();
-        let _ = self.apply_multimodel_config(mm_cfg);
+        // apply_local_delegate_config would deadlock (it needs a write lock).
+        let mm_cfg = self.local_delegate_config();
+        let _ = self.apply_local_delegate_config(mm_cfg);
         Ok((provider_id, model))
     }
 
@@ -879,10 +882,10 @@ pub async fn test_model(config: &Config, model_override: &str) -> Result<(), Str
 }
 
 /// Probe tool-calling on a local OpenAI-compatible tier (llama.cpp).
-pub async fn test_multimodel_tools(
+pub async fn test_local_delegate_tools(
     config: &Config,
     model: &str,
-    tier: crate::multimodel::ModelTier,
+    tier: crate::local_delegate::ModelTier,
 ) -> Result<(), String> {
     let mut test_config = config.clone();
     test_config.model = model.to_string();
@@ -912,7 +915,7 @@ pub async fn test_multimodel_tools(
     }];
     let has_tools = true;
     let options = LlmSendOptions {
-        tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+        tool_choice: crate::local_delegate::tool_choice_for_tier(tier, has_tools),
     };
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS.saturating_mul(4)),

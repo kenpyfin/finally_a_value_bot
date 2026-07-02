@@ -498,7 +498,7 @@ pub async fn run_cursor_engine(
             &prep.user_msg_preview,
             run_start,
             &prep.initial_llm_snapshot_json,
-            &prep.multimodel_run_summary,
+            &prep.local_delegate_run_summary,
             Some(&extras),
         )
         .await?

@@ -238,7 +238,7 @@ fn build_pte_user_prompt(
 pub async fn evaluate_completion(
     enabled: bool,
     config: &Config,
-    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    multimodel: Option<&crate::local_delegate::LocalDelegateConfig>,
     env_redactor: &EnvSecretRedactor,
     principles_content: &str,
     memory_context: &str,

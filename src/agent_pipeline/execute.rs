@@ -15,7 +15,7 @@ use crate::agent_pipeline::profile::{
 };
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock, ToolDefinition};
 use crate::error::FinallyAValueBotError;
-use crate::multimodel::ModelTier;
+use crate::local_delegate::ModelTier;
 use crate::telegram::{AgentEvent, AppState};
 use crate::tools::run_skill_script::{
     looks_like_skill_script_filename, runnable_script_hint_for_skill,
@@ -204,8 +204,8 @@ async fn run_step_once(
             ctx.state,
             &r.policies,
         )
-    } else if use_local && ctx.state.llm.multimodel_config().local_routable() {
-        ModelTier::Local
+    } else if use_local && ctx.state.llm.local_delegate_config().local_routable() {
+        ModelTier::LocalReadOnly
     } else {
         ModelTier::Strategy
     };

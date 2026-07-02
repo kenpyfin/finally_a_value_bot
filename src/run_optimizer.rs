@@ -16,7 +16,7 @@ use crate::db::call_blocking;
 use crate::error::FinallyAValueBotError;
 use crate::job_heartbeat::{spawn_shared_heartbeat, HeartbeatSignal, JobType};
 use crate::llm::{create_openai_compatible_provider_with_timeout, LlmProvider, LlmSendOptions};
-use crate::multimodel::ModelTier;
+use crate::local_delegate::ModelTier;
 use crate::telegram::AppState;
 use crate::tools::ToolAuthContext;
 
@@ -160,11 +160,13 @@ pub fn build_optimize_user_message(
     body
 }
 
-fn local_tier_config_ready(mm: &crate::multimodel::MultimodelConfig) -> bool {
-    mm.local_routable() || mm.tier1_routable() || mm.tier2_routable()
+fn local_tier_config_ready(mm: &crate::local_delegate::LocalDelegateConfig) -> bool {
+    mm.local_routable() || mm.tier1_configured() || mm.tier2_configured()
 }
 
-fn resolve_optimizer_local_endpoint(mm: &crate::multimodel::MultimodelConfig) -> (String, String) {
+fn resolve_optimizer_local_endpoint(
+    mm: &crate::local_delegate::LocalDelegateConfig,
+) -> (String, String) {
     if !mm.local_base_url.trim().is_empty() {
         (mm.local_base_url.clone(), mm.local_model.clone())
     } else if !mm.tier1_base_url.trim().is_empty() {
@@ -180,7 +182,7 @@ async fn send_local_tier_message(
     messages: Vec<Message>,
     tools: Option<Vec<ToolDefinition>>,
 ) -> Result<crate::claude::MessagesResponse, FinallyAValueBotError> {
-    let mm = state.llm.multimodel_config();
+    let mm = state.llm.local_delegate_config();
     let (base_url, model) = resolve_optimizer_local_endpoint(&mm);
     let request_timeout = std::time::Duration::from_secs(OPTIMIZE_LLM_TIMEOUT_SECS);
     let provider: Arc<dyn LlmProvider> = Arc::from(create_openai_compatible_provider_with_timeout(
@@ -192,7 +194,7 @@ async fn send_local_tier_message(
     let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
     let options = LlmSendOptions {
         tool_choice: if has_tools {
-            crate::multimodel::tool_choice_for_tier(ModelTier::Local, true)
+            crate::local_delegate::tool_choice_for_tier(ModelTier::LocalReadOnly, true)
         } else {
             None
         },
@@ -391,7 +393,7 @@ pub async fn run_optimizer_from_history(
     cancel: &AtomicBool,
     hb_tx: Option<&UnboundedSender<HeartbeatSignal>>,
 ) -> Result<RunOptimizeOutcome, String> {
-    let mm = state.llm.multimodel_config();
+    let mm = state.llm.local_delegate_config();
     if !local_tier_config_ready(&mm) {
         return Err(
             "Local model base URL and model must be configured in Settings → Multi-model.".into(),
@@ -437,7 +439,7 @@ pub async fn try_enqueue_run_optimize(
     history_content: String,
     operator_notes: Option<String>,
 ) -> RunOptimizeEnqueueOutcome {
-    let mm = state.llm.multimodel_config();
+    let mm = state.llm.local_delegate_config();
     if !local_tier_config_ready(&mm) {
         return RunOptimizeEnqueueOutcome::DbCreateFailed("Local model is not configured.".into());
     }

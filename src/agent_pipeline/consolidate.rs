@@ -3,7 +3,7 @@
 use crate::agent_pipeline::profile::{OperationalConfig, PhaseContextIncludes, ResolvedPhase};
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::error::FinallyAValueBotError;
-use crate::multimodel::ModelTier;
+use crate::local_delegate::ModelTier;
 use crate::telegram::AppState;
 
 use super::execute::StepResult;

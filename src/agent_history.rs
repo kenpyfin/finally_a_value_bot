@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::claude::{ContentBlock, Message, MessageContent};
-use crate::multimodel::{MultimodelRunSummary, TierEndpointSnapshot};
+use crate::local_delegate::{LocalDelegateRunSummary, TierEndpointSnapshot};
 
 /// Max UTF-8 bytes for the JSON blob appended under [`SNAPSHOT_SECTION_START`] in run markdown.
 pub const MAX_INITIAL_LLM_SNAPSHOT_BYTES: usize = 800 * 1024;
@@ -290,7 +290,7 @@ impl IterationRecord {
         snap: &TierEndpointSnapshot,
     ) -> (String, String, String, String) {
         (
-            snap.tier.label().to_string(),
+            snap.target.label().to_string(),
             snap.provider.clone(),
             snap.model.clone(),
             snap.endpoint.clone(),
@@ -325,7 +325,7 @@ pub struct AgentRunRecord {
     pub total_duration_ms: u128,
     /// JSON (pretty) of `system_prompt`, `tool_names_first_turn`, and `messages` as sent on the first LLM call.
     pub initial_llm_snapshot: Option<String>,
-    pub multimodel_summary: MultimodelRunSummary,
+    pub multimodel_summary: LocalDelegateRunSummary,
     /// Deterministic pipeline stage timeline (empty for classic runs).
     pub pipeline_stages: Vec<PipelineStageRecord>,
     pub cloud_calls: u32,
@@ -604,19 +604,15 @@ pub fn truncate_preview(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multimodel::{ModelTier, MultimodelRunSummary, TierEndpointSnapshot};
+    use crate::local_delegate::{LocalDelegateRunSummary, ModelTier, TierEndpointSnapshot};
     use chrono::TimeZone;
 
-    fn sample_multimodel_summary() -> MultimodelRunSummary {
-        MultimodelRunSummary {
-            enabled: true,
+    fn sample_multimodel_summary() -> LocalDelegateRunSummary {
+        LocalDelegateRunSummary {
+            cost_routing_active: true,
             strategy_provider: "google".into(),
             strategy_model: "gemini-test".into(),
             strategy_endpoint: "https://generativelanguage.googleapis.com/v1beta".into(),
-            tier1_model: "qwen-test".into(),
-            tier1_endpoint: "http://127.0.0.1:8080/v1".into(),
-            tier2_model: "mistral-test".into(),
-            tier2_endpoint: "http://127.0.0.1:8081/v1".into(),
             local_model: "qwen-test".into(),
             local_endpoint: "http://127.0.0.1:8080/v1".into(),
         }
@@ -635,7 +631,7 @@ mod tests {
                 tool_calls: vec![],
                 hook_events: vec![],
                 pte: None,
-                model_tier: "technical".into(),
+                model_tier: "local_readonly".into(),
                 provider: "llama".into(),
                 model: "qwen-test".into(),
                 endpoint: "http://127.0.0.1:8080/v1".into(),
@@ -651,17 +647,17 @@ mod tests {
             agent_engine: "classic".into(),
         };
         let md = record.to_markdown();
-        assert!(md.contains("Multi-model: enabled"));
-        assert!(md.contains("Tier 1 (technical): qwen-test @ http://127.0.0.1:8080/v1"));
+        assert!(md.contains("Local delegate: cost routing active"));
+        assert!(md.contains("Local (read-only): qwen-test @ http://127.0.0.1:8080/v1"));
         assert!(md.contains(
-            "Model tier: technical | provider: llama | model: qwen-test | endpoint: http://127.0.0.1:8080/v1"
+            "Model tier: local_readonly | provider: llama | model: qwen-test | endpoint: http://127.0.0.1:8080/v1"
         ));
     }
 
     #[test]
     fn format_initial_llm_snapshot_includes_routing_v1() {
         let snap = TierEndpointSnapshot {
-            tier: ModelTier::Strategy,
+            target: ModelTier::Strategy,
             provider: "google".into(),
             model: "gemini-test".into(),
             endpoint: "https://example.com/v1".into(),
@@ -715,17 +711,13 @@ mod tests {
             stop_reason: "end_turn".into(),
             total_duration_ms: 42,
             initial_llm_snapshot: Some("{}".into()),
-            multimodel_summary: MultimodelRunSummary {
-                enabled: false,
+            multimodel_summary: LocalDelegateRunSummary {
+                cost_routing_active: false,
                 strategy_provider: "google".into(),
                 strategy_model: "gemini".into(),
                 strategy_endpoint: "https://example.com/v1".into(),
                 local_model: String::new(),
                 local_endpoint: String::new(),
-                tier1_model: String::new(),
-                tier1_endpoint: String::new(),
-                tier2_model: String::new(),
-                tier2_endpoint: String::new(),
             },
             pipeline_stages: vec![],
             cloud_calls: 0,
@@ -779,17 +771,13 @@ mod tests {
             stop_reason: "end_turn".into(),
             total_duration_ms: 1,
             initial_llm_snapshot: None,
-            multimodel_summary: MultimodelRunSummary {
-                enabled: false,
+            multimodel_summary: LocalDelegateRunSummary {
+                cost_routing_active: false,
                 strategy_provider: "google".into(),
                 strategy_model: "gemini".into(),
                 strategy_endpoint: "https://example.com/v1".into(),
                 local_model: String::new(),
                 local_endpoint: String::new(),
-                tier1_model: String::new(),
-                tier1_endpoint: String::new(),
-                tier2_model: String::new(),
-                tier2_endpoint: String::new(),
             },
             pipeline_stages: vec![],
             cloud_calls: 0,

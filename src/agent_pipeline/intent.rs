@@ -9,7 +9,7 @@ use super::cloud_context::PipelineCloudContext;
 use crate::agent_pipeline::profile::{OperationalConfig, PolicyConfig, ResolvedPhase};
 use crate::claude::{Message, MessageContent, ResponseContentBlock};
 use crate::error::FinallyAValueBotError;
-use crate::multimodel::ModelTier;
+use crate::local_delegate::ModelTier;
 use crate::telegram::AppState;
 
 pub const INTENT_PLAN_TIMEOUT_SECS: u64 = 45;

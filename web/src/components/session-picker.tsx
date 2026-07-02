@@ -1,6 +1,7 @@
 import React, { useCallback, useState } from 'react'
 import {
   Button,
+  Checkbox,
   Dialog,
   DropdownMenu,
   Flex,
@@ -17,7 +18,7 @@ type SessionPickerProps = {
   sessions: ChatSession[]
   activeSessionId: string | null
   onSelectSession: (sessionId: string | null) => void
-  onCreateSession: (intent: string) => Promise<void>
+  onCreateSession: (intent: string, mirrorMainChat: boolean) => Promise<void>
   onArchiveSession: (sessionId: string) => Promise<void>
   onReopenSession: (sessionId: string) => Promise<void>
   onDeleteSession: (sessionId: string) => Promise<void>
@@ -50,6 +51,7 @@ export function SessionPicker({
 }: SessionPickerProps) {
   const [newDialogOpen, setNewDialogOpen] = useState(false)
   const [intentDraft, setIntentDraft] = useState('')
+  const [mirrorMainChatDraft, setMirrorMainChatDraft] = useState(false)
   const [creating, setCreating] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
@@ -62,13 +64,14 @@ export function SessionPicker({
     if (!intentDraft.trim()) return
     setCreating(true)
     try {
-      await onCreateSession(intentDraft.trim())
+      await onCreateSession(intentDraft.trim(), mirrorMainChatDraft)
       setIntentDraft('')
+      setMirrorMainChatDraft(false)
       setNewDialogOpen(false)
     } finally {
       setCreating(false)
     }
-  }, [intentDraft, onCreateSession])
+  }, [intentDraft, mirrorMainChatDraft, onCreateSession])
 
   const currentLabel = activeSessionId
     ? sessions.find((s) => s.id === activeSessionId)?.title || 'Session'
@@ -110,7 +113,8 @@ export function SessionPicker({
           {activeSessions.length > 0 && <Select.Separator />}
           {activeSessions.map((s) => (
             <Select.Item key={s.id} value={s.id}>
-              {s.title} ({formatRelativeTime(s.last_active_at)})
+              {s.title}
+              {s.mirror_main_chat ? ' · main' : ''} ({formatRelativeTime(s.last_active_at)})
             </Select.Item>
           ))}
           {archivedSessions.length > 0 ? (
@@ -222,6 +226,20 @@ export function SessionPicker({
             />
             <Text size="1" color="gray">
               Max 500 characters. Press Cmd+Enter to create.
+            </Text>
+            <Text as="label" size="2">
+              <Flex gap="2" align="start">
+                <Checkbox
+                  checked={mirrorMainChatDraft}
+                  onCheckedChange={(checked) => setMirrorMainChatDraft(checked === true)}
+                />
+                <span>
+                  Include messages in main chat
+                  <Text as="div" size="1" color="gray">
+                    Off by default — session history stays isolated unless you enable this.
+                  </Text>
+                </span>
+              </Flex>
             </Text>
           </Flex>
           <Flex gap="3" mt="4" justify="end">

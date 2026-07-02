@@ -279,6 +279,8 @@ html.dark .aui-assistant-message-content {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
   color: hsl(146 26% 92%);
   line-height: 1.7;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 html.dark .aui-assistant-message-content p {
@@ -387,6 +389,8 @@ html.dark .aui-user-message-content {
   );
   color: hsl(146 26% 92%);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 html.dark .aui-composer-root {
@@ -493,6 +497,8 @@ html:not(.dark) .aui-assistant-message-content {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
   color: var(--mc-text-primary);
   line-height: 1.7;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 html:not(.dark) .aui-assistant-message-content a {
@@ -565,6 +571,8 @@ html:not(.dark) .aui-user-message-content {
   );
   color: color-mix(in srgb, var(--mc-accent) 55%, var(--mc-text-primary));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 html:not(.dark) .aui-composer-root {
@@ -734,6 +742,21 @@ html:not(.dark) .aui-composer-send:hover {
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.mc-reply-quote-preview.mc-reply-quote-composer {
+  margin: 0 0.35rem 0.4rem;
+}
+
+.mc-reply-quote-preview.mc-reply-quote-sent {
+  margin: 0 0 0.4rem;
+}
+
+.mc-reply-follow-up {
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .mc-reply-quote-dismiss {

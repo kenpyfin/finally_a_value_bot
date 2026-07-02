@@ -4,6 +4,60 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-01 — Hooks/skills settings: enriched catalog + persona filter
+
+- **Area:** web UI / hooks & skills settings
+- **Summary:** Settings → Hooks & Skills catalogs show richer metadata and persona-scoped filtering (**Show all personas**). Hooks catalog adds an **Event** dropdown per hook (save via `POST /api/hooks`); removed the separate event filter bar.
+- **Key files / symbols:** `SettingsHooksSkillsPanel` in `web/src/components/settings-hooks-skills.tsx`; `SkillCatalogEntry` in `web/src/types.ts`.
+
+### 2026-07-01 — Web chat: message copy + text selection
+
+- **Area:** web UI / thread pane
+- **Summary:** Added explicit **Copy** actions on user and assistant message rows (replacing the hidden assistant-ui action bar copy). Reply messages copy the readable snippet + follow-up, not the raw `[quoted_message]` block. Mobile message actions now open on **long-press** instead of tap so text selection works; message bodies use `user-select: text`.
+- **Key files / symbols:** `MessageCopyButton`, `messageTextForClipboard`, long-press `useMobileMessageTapProps` in `web/src/components/thread-pane.tsx`; `web/src/lib/reply-quote.ts`.
+
+### 2026-07-01 — Web reply bubbles: snippet-only quote display
+
+- **Area:** web UI / reply quotes
+- **Summary:** Sent reply messages no longer show the full `[quoted_message]` body in the user bubble. `parseReplyForDisplay` in `reply-quote.ts` extracts the quote metadata and renders the same snippet chip as the composer plus optional follow-up text; the full quote is still sent to the agent unchanged.
+- **Key files / symbols:** `parseReplyForDisplay`, `SentReplyQuoteChip`, `UserMessageDisplayBody` in `web/src/components/thread-pane.tsx`; `web/src/lib/reply-quote.ts`; `mc-reply-quote-sent` in `web/src/styles.css`.
+
+### 2026-06-30 — Focused sessions: optional main-chat mirroring
+
+- **Area:** DB / web API / web UI
+- **Summary:** New focused sessions default to **isolated** history (messages only in the session thread). **New session** dialog adds **Include messages in main chat** (`mirror_main_chat`). Main chat history/agent context queries now exclude non-mirrored session messages via `MAIN_CHAT_MESSAGE_VISIBILITY` in `src/db.rs`. `PATCH /api/chat_sessions/:id` accepts `mirror_main_chat` for later toggles.
+- **Key files / symbols:** `mirror_main_chat` on `ChatSession`; `create_chat_session`, message list queries in `src/db.rs`; `CreateChatSessionRequest` / `chat_session_json` in `src/web.rs`; `session-picker.tsx`, `use-persona-session.ts`, `types.ts`.
+
+### 2026-06-30 — Web sessions: instant create + auto-select in picker
+
+- **Area:** web UI / chat sessions API
+- **Summary:** Creating a focused session no longer blocks on the vault/skills bootstrap agent turn — bootstrap runs in a background task after the DB row exists. `POST /api/chat_sessions` now returns a `session` object (same shape as list items) so the UI can switch immediately. Fixed `handleCreateSession`, which previously checked `data.session` while the API only returned flat `session_id` fields, so the picker never updated until a full page refresh.
+- **Key files / symbols:** `bootstrap_chat_session_context`, `api_chat_sessions_create` in `src/web.rs`; `handleCreateSession` in `web/src/hooks/use-persona-session.ts`.
+
+### 2026-06-30 — Web chat: preserve scroll when loading earlier messages
+
+- **Area:** web UI / chat thread
+- **Summary:** Clicking **Load earlier messages** no longer jumps the thread viewport to the top. When older history is prepended, the viewport keeps the same reading position by capturing `scrollTop`/`scrollHeight` before `runtime.thread.reset` and restoring offset after the DOM grows.
+- **Key files / symbols:** `isHistoryPrepend` in `web/src/lib/history-sync.ts`; scroll-restore `useLayoutEffect` / `useEffect` in `web/src/components/thread-pane.tsx`.
+
+### 2026-07-01 — PDQE runs on ask_clarification replies
+
+- **Area:** response quality evaluator
+- **Summary:** Clarification turns are user-visible; removed `ask_clarification` from `should_skip_pdqe` and dropped the auto-pass fast path so PDQE evaluates them like other deliveries. `cancelled` still skips PDQE.
+- **Key files / symbols:** `should_skip_pdqe`, `fast_path_verdict` in `response_quality_evaluator.rs`.
+
+### 2026-06-30 — Classic cost routing: fix silent stop after local read-only turn
+
+- **Area:** classic agent / local delegate
+- **Summary:** After inverse routing sent read-only tool results to the local model, an empty `end_turn` did not trigger strategy fallback (only hallucinated-action text did), so runs could finish with `"Done."` or no streamed web reply. `should_fallback_local_tier_to_strategy` now treats empty assistant text after tool results as fallback-worthy; failed strategy retry continues the loop with `local_error_streak` instead of stopping; end-turn handler continues on strategy when cost routing + tools ran + empty final text.
+- **Key files / symbols:** `should_fallback_local_tier_to_strategy`, tier fallback block, end_turn guard in `telegram.rs`.
+
+### 2026-06-30 — Classic · Cost routing replaces phase-based multimodel
+
+- **Area:** classic agent / local delegate / web settings
+- **Summary:** Removed Plan→Execute→Synthesize phase machine from Classic. New runtime engine **`classic_cost_routing`**: inverse routing (strategy for iter 0 and mutations; local for read-only continuations), `delegate_local_subjob` tool, mutation guard on local route. **`classic`** (Single turn) unchanged — always strategy. `src/multimodel.rs` → `src/local_delegate/` (`resolve_inverse_route`, `cost_routing_active`, `subjob.rs`). Web: Runtime four engine options, Local delegate tab, verification callouts; `/api/runtime` exposes `local_delegate_ready`, `cost_routing_effective`. Boot migration: legacy `MULTIMODEL_ENABLED` + classic → `classic_cost_routing`.
+- **Key files / symbols:** `AgentEngine::ClassicCostRouting` in `runtime_toggles.rs`; Classic loop in `telegram.rs`; `delegate_local_subjob.rs`; `settings-runtime.tsx`, `settings-local-delegate.tsx`; `docs/local-delegate-routing.md`.
+
 ### 2026-06-29 — Deterministic pipeline: drop legacy technical/knowledge model routes
 
 - **Area:** agent pipeline / web

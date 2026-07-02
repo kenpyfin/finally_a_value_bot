@@ -43,6 +43,9 @@ export type InstallationStatus = {
   llm_ready: boolean
   channel_ready: boolean
   cursor_engine_ready?: boolean
+  local_delegate_ready?: boolean
+  agent_engine?: string
+  cost_routing_effective?: boolean
   web_enabled: boolean
   /** @deprecated use requires_restart_for_env_changes */
   requires_restart_to_apply_runtime_settings?: boolean
@@ -118,7 +121,12 @@ export type RuntimeConfigResponse = {
   tool_output_debug?: boolean
   post_tool_evaluator_enabled?: boolean
   response_quality_evaluator_enabled?: boolean
-  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  agent_engine?: 'classic' | 'classic_cost_routing' | 'deterministic' | 'cursor'
+  local_delegate_configured?: boolean
+  local_delegate_tools_ok?: boolean
+  local_delegate_ready?: boolean
+  cost_routing_effective?: boolean
+  warnings?: string[]
   source?: 'env' | 'app_settings'
   sources?: {
     tool_output_debug?: 'env' | 'app_settings'
@@ -145,6 +153,19 @@ export type HookDefinition = {
   scoped_for_persona?: boolean
   allowed_for_persona?: boolean
   active_for_persona?: boolean
+}
+
+export type SkillCatalogEntry = {
+  name: string
+  description: string
+  when_to_use?: string
+  platforms?: string[]
+  deps?: string[]
+  source?: string
+  version?: string
+  updated_at?: string
+  remote?: boolean
+  allowed_for_persona?: boolean
 }
 
 export type PipelinePhaseKind =
@@ -303,8 +324,9 @@ export type LlmConfigResponse = {
   show_thinking_source?: 'app_settings' | 'env' | 'default'
 }
 
-export type MultimodelConfigResponse = {
+export type LocalDelegateConfigResponse = {
   ok?: boolean
+  routing_enabled?: boolean
   enabled?: boolean
   local_base_url?: string
   local_model?: string
@@ -319,6 +341,9 @@ export type MultimodelConfigResponse = {
   strategy_model?: string
   description?: string
 }
+
+/** @deprecated use LocalDelegateConfigResponse */
+export type MultimodelConfigResponse = LocalDelegateConfigResponse
 
 export type AgentHistoryOptimizeResponse = {
   ok?: boolean
@@ -485,4 +510,6 @@ export type ChatSession = {
   last_active_at: string
   archived_at?: string | null
   ttl_hours: number
+  /** When true, session messages also appear on the main chat timeline. */
+  mirror_main_chat?: boolean
 }

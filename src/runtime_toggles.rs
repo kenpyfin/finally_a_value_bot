@@ -15,10 +15,14 @@ pub const APP_SETTING_AGENT_ENGINE: &str = "AGENT_ENGINE";
 const AGENT_ENGINE_CLASSIC: u8 = 0;
 const AGENT_ENGINE_DETERMINISTIC: u8 = 1;
 const AGENT_ENGINE_CURSOR: u8 = 2;
+const AGENT_ENGINE_CLASSIC_COST_ROUTING: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentEngine {
+    /// Single cloud model for the full turn (default).
     Classic,
+    /// Classic tool loop with inverse local cost routing when local delegate is verified.
+    ClassicCostRouting,
     Deterministic,
     Cursor,
 }
@@ -27,6 +31,7 @@ impl AgentEngine {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Classic => "classic",
+            Self::ClassicCostRouting => "classic_cost_routing",
             Self::Deterministic => "deterministic",
             Self::Cursor => "cursor",
         }
@@ -36,6 +41,7 @@ impl AgentEngine {
         match raw.trim().to_ascii_lowercase().as_str() {
             "deterministic" | "pipeline" => Self::Deterministic,
             "cursor" | "cursor_sdk" | "cursor-sdk" => Self::Cursor,
+            "classic_cost_routing" | "classic_routed" | "cost_routing" => Self::ClassicCostRouting,
             _ => Self::Classic,
         }
     }
@@ -44,6 +50,7 @@ impl AgentEngine {
         match v {
             AGENT_ENGINE_DETERMINISTIC => Self::Deterministic,
             AGENT_ENGINE_CURSOR => Self::Cursor,
+            AGENT_ENGINE_CLASSIC_COST_ROUTING => Self::ClassicCostRouting,
             _ => Self::Classic,
         }
     }
@@ -53,7 +60,12 @@ impl AgentEngine {
             Self::Classic => AGENT_ENGINE_CLASSIC,
             Self::Deterministic => AGENT_ENGINE_DETERMINISTIC,
             Self::Cursor => AGENT_ENGINE_CURSOR,
+            Self::ClassicCostRouting => AGENT_ENGINE_CLASSIC_COST_ROUTING,
         }
+    }
+
+    pub fn is_classic_loop(self) -> bool {
+        matches!(self, Self::Classic | Self::ClassicCostRouting)
     }
 }
 
@@ -273,6 +285,10 @@ mod tests {
         );
         assert_eq!(AgentEngine::parse("cursor"), AgentEngine::Cursor);
         assert_eq!(AgentEngine::parse("classic"), AgentEngine::Classic);
+        assert_eq!(
+            AgentEngine::parse("classic_cost_routing"),
+            AgentEngine::ClassicCostRouting
+        );
         assert_eq!(AgentEngine::parse(""), AgentEngine::Classic);
     }
 }

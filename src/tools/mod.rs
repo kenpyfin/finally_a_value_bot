@@ -7,6 +7,7 @@ pub mod browser;
 pub mod bulletin;
 pub mod command_runner;
 pub mod cursor_agent;
+pub mod delegate_local_subjob;
 pub mod edit_file;
 pub mod export_chat;
 pub mod glob;

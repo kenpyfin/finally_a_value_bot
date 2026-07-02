@@ -14,7 +14,7 @@ import {
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
 import { SettingsLlmPanel } from '../components/settings-llm'
-import { SettingsMultimodelPanel } from '../components/settings-multimodel'
+import { SettingsLocalDelegatePanel } from '../components/settings-local-delegate'
 import { SettingsCursorPanel } from '../components/settings-cursor'
 import { SettingsDeterministicPipelinePanel } from '../components/settings-deterministic-pipeline'
 import { SettingsHooksSkillsPanel } from '../components/settings-hooks-skills'
@@ -648,7 +648,7 @@ export function AppDialogs({
       <Tabs.List size="1" className="mb-3 flex-wrap mc-settings-tabs-sticky">
         <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
         <Tabs.Trigger value="llm">LLM</Tabs.Trigger>
-        <Tabs.Trigger value="multimodel">Multi-model</Tabs.Trigger>
+        <Tabs.Trigger value="local-delegate">Local delegate</Tabs.Trigger>
         <Tabs.Trigger value="cursor">Cursor</Tabs.Trigger>
         <Tabs.Trigger value="deterministic">Deterministic</Tabs.Trigger>
         <Tabs.Trigger value="hooks-skills">Hooks & Skills</Tabs.Trigger>
@@ -672,6 +672,15 @@ export function AppDialogs({
                 Cursor engine:{' '}
                 {installationStatus.cursor_engine_ready ? 'ready' : 'not ready'}
               </Text>
+              {installationStatus.agent_engine === 'classic_cost_routing' ? (
+                <Text
+                  size="1"
+                  color={installationStatus.local_delegate_ready ? 'green' : 'orange'}
+                >
+                  Local delegate:{' '}
+                  {installationStatus.local_delegate_ready ? 'verified' : 'not verified'}
+                </Text>
+              ) : null}
               <Text size="1" color="gray">
                 Env restart needed:{' '}
                 {(installationStatus.requires_restart_for_env_changes ??
@@ -715,8 +724,8 @@ export function AppDialogs({
           onError={setSettingsError}
         />
       </Tabs.Content>
-      <Tabs.Content value="multimodel">
-        <SettingsMultimodelPanel api={api} onError={setSettingsError} />
+      <Tabs.Content value="local-delegate">
+        <SettingsLocalDelegatePanel api={api} onError={setSettingsError} />
       </Tabs.Content>
       <Tabs.Content value="cursor">
         <SettingsCursorPanel api={api} onError={setSettingsError} />

@@ -133,6 +133,7 @@ fn build_report() -> DoctorReport {
     check_config(&mut report);
     check_llm_provider_base_url(&mut report);
     check_evaluator_api_key(&mut report);
+    check_cost_routing_local(&mut report);
     check_shadow_workspace(&mut report);
     check_legacy_flat_shared(&mut report);
     check_path(&mut report);
@@ -214,19 +215,22 @@ fn check_llm_provider_base_url(report: &mut DoctorReport) {
 }
 
 fn evaluator_local_endpoint_from_env() -> Option<(String, String)> {
-    let mm = crate::multimodel::MultimodelConfig {
-        local_base_url: std::env::var(crate::multimodel::APP_SETTING_LOCAL_BASE_URL)
+    let mm = crate::local_delegate::LocalDelegateConfig {
+        local_base_url: std::env::var(crate::local_delegate::APP_SETTING_LOCAL_BASE_URL)
             .unwrap_or_default(),
-        local_model: std::env::var(crate::multimodel::APP_SETTING_LOCAL_MODEL).unwrap_or_default(),
-        tier1_base_url: std::env::var(crate::multimodel::APP_SETTING_TIER1_BASE_URL)
+        local_model: std::env::var(crate::local_delegate::APP_SETTING_LOCAL_MODEL)
             .unwrap_or_default(),
-        tier1_model: std::env::var(crate::multimodel::APP_SETTING_TIER1_MODEL).unwrap_or_default(),
-        tier2_base_url: std::env::var(crate::multimodel::APP_SETTING_TIER2_BASE_URL)
+        tier1_base_url: std::env::var(crate::local_delegate::APP_SETTING_TIER1_BASE_URL)
             .unwrap_or_default(),
-        tier2_model: std::env::var(crate::multimodel::APP_SETTING_TIER2_MODEL).unwrap_or_default(),
-        ..crate::multimodel::MultimodelConfig::default()
+        tier1_model: std::env::var(crate::local_delegate::APP_SETTING_TIER1_MODEL)
+            .unwrap_or_default(),
+        tier2_base_url: std::env::var(crate::local_delegate::APP_SETTING_TIER2_BASE_URL)
+            .unwrap_or_default(),
+        tier2_model: std::env::var(crate::local_delegate::APP_SETTING_TIER2_MODEL)
+            .unwrap_or_default(),
+        ..crate::local_delegate::LocalDelegateConfig::default()
     };
-    crate::multimodel::resolve_local_evaluator_endpoint(&mm)
+    crate::local_delegate::resolve_local_evaluator_endpoint(&mm)
 }
 
 fn check_evaluator_api_key(report: &mut DoctorReport) {
@@ -267,6 +271,60 @@ fn check_evaluator_api_key(report: &mut DoctorReport) {
             "No local multimodel endpoint and PERPLEXITY_API_KEY is missing".to_string(),
             Some(
                 "Configure MULTIMODEL_LOCAL_* (or tier URLs) or set PERPLEXITY_API_KEY for PTE/PDQE."
+                    .to_string(),
+            ),
+        );
+    }
+}
+
+fn check_cost_routing_local(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let runtime_dir_str = config.runtime_data_dir();
+    let Ok(db) = crate::db::Database::new(&runtime_dir_str) else {
+        return;
+    };
+    let engine = crate::runtime_toggles::RuntimeToggles::agent_engine_from_app_settings(&db)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            crate::runtime_toggles::AgentEngine::parse(
+                &std::env::var("AGENT_ENGINE").unwrap_or_default(),
+            )
+        });
+    if engine != crate::runtime_toggles::AgentEngine::ClassicCostRouting {
+        return;
+    }
+    let mm = crate::local_delegate::load_from_db(&db).unwrap_or_default();
+    if mm.local_routable() {
+        report.push(
+            "local_delegate.cost_routing",
+            "Classic · Cost routing local delegate",
+            CheckStatus::Pass,
+            format!(
+                "Local delegate verified ({} @ {})",
+                mm.local_model, mm.local_base_url
+            ),
+            None,
+        );
+    } else if mm.local_configured() && !mm.local_tools_ok {
+        report.push(
+            "local_delegate.cost_routing",
+            "Classic · Cost routing local delegate",
+            CheckStatus::Warn,
+            "Local endpoint configured but tool calling not verified".to_string(),
+            Some("Open Settings → Local delegate and run the tool-calling test.".to_string()),
+        );
+    } else {
+        report.push(
+            "local_delegate.cost_routing",
+            "Classic · Cost routing local delegate",
+            CheckStatus::Warn,
+            "Cost routing active but local delegate is not ready — runs fall back to cloud only"
+                .to_string(),
+            Some(
+                "Configure local URL + model and run Test, or switch Runtime to Single turn."
                     .to_string(),
             ),
         );

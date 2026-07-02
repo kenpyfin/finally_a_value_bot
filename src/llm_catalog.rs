@@ -280,7 +280,7 @@ pub const APP_SETTING_SHOW_THINKING: &str = "SHOW_THINKING";
 
 pub fn normalize_local_base_url(raw: &str, provider_id: &str) -> String {
     let fallback = default_base_url_for_provider(provider_id).unwrap_or("http://127.0.0.1:8080/v1");
-    crate::multimodel::normalize_base_url_for_provider(raw, fallback)
+    crate::local_delegate::normalize_base_url_for_provider(raw, fallback)
 }
 
 pub fn local_base_url_from_app_settings(

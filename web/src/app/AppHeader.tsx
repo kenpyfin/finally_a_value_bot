@@ -21,7 +21,7 @@ export type AppHeaderSessionProps = {
   activeSessionId: string | null
   historyLoading: boolean
   onSelectSession: (sessionId: string | null) => void
-  onCreateSession: (intent: string) => Promise<void>
+  onCreateSession: (intent: string, mirrorMainChat: boolean) => Promise<void>
   onArchiveSession: (sessionId: string) => Promise<void>
   onReopenSession: (sessionId: string) => Promise<void>
   onDeleteSession: (sessionId: string) => Promise<void>

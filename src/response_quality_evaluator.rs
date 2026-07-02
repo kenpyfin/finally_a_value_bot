@@ -100,7 +100,7 @@ pub fn should_skip_pdqe(
     if !quality_eval_channel_allowed(config, &ctx.caller_channel) {
         return Some("channel_not_allowed");
     }
-    if ctx.stop_reason == "ask_clarification" || ctx.stop_reason == "cancelled" {
+    if ctx.stop_reason == "cancelled" {
         return Some("stop_reason");
     }
     if ctx.delivered_text.trim().is_empty() {
@@ -266,20 +266,7 @@ pub fn parse_evaluator_json_response(text: &str) -> Result<QualityVerdict, Final
     })
 }
 
-fn fast_path_verdict(config: &Config, ctx: &PostDeliveryEvalContext) -> Option<QualityVerdict> {
-    let reply = ctx.delivered_text.trim();
-    if reply.is_empty() {
-        return None;
-    }
-    if ctx.stop_reason == "ask_clarification" && reply.contains('?') {
-        return Some(QualityVerdict {
-            kind: QualityVerdictKind::Pass,
-            issues: vec![],
-            feedback_for_agent: String::new(),
-            confidence: 1.0,
-        });
-    }
-    let _ = config;
+fn fast_path_verdict(_config: &Config, _ctx: &PostDeliveryEvalContext) -> Option<QualityVerdict> {
     None
 }
 
@@ -292,7 +279,7 @@ pub struct QualityEvalOutcome {
 pub async fn evaluate_delivery_quality(
     pdqe_enabled: bool,
     config: &Config,
-    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    multimodel: Option<&crate::local_delegate::LocalDelegateConfig>,
     env_redactor: &EnvSecretRedactor,
     ctx: &PostDeliveryEvalContext,
 ) -> Result<QualityEvalOutcome, FinallyAValueBotError> {

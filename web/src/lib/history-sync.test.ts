@@ -1,6 +1,6 @@
 import type { ThreadMessageLike } from '@assistant-ui/react'
 import { describe, expect, it } from 'vitest'
-import { historiesEqual, mapBackendHistory } from './history-sync'
+import { historiesEqual, isHistoryPrepend, mapBackendHistory } from './history-sync'
 import type { BackendMessage } from '../types'
 
 describe('mapBackendHistory', () => {
@@ -64,5 +64,36 @@ describe('historiesEqual', () => {
     expect(historiesEqual(a, idMismatch)).toBe(false)
     expect(historiesEqual(a, roleMismatch)).toBe(false)
     expect(historiesEqual(a, contentMismatch)).toBe(false)
+  })
+})
+
+describe('isHistoryPrepend', () => {
+  const base = (): ThreadMessageLike[] => [
+    { id: '1', role: 'user', content: 'a' },
+    { id: '2', role: 'assistant', content: 'b' },
+  ]
+
+  it('returns true when older messages are prepended', () => {
+    const prev = base()
+    const next: ThreadMessageLike[] = [
+      { id: '0', role: 'user', content: 'older' },
+      ...prev,
+    ]
+    expect(isHistoryPrepend(prev, next)).toBe(true)
+  })
+
+  it('returns false when length is unchanged or shrinks', () => {
+    expect(isHistoryPrepend(base(), base())).toBe(false)
+    expect(isHistoryPrepend(base(), base().slice(0, 1))).toBe(false)
+  })
+
+  it('returns false when the suffix does not match prev', () => {
+    const prev = base()
+    const next: ThreadMessageLike[] = [
+      { id: '0', role: 'user', content: 'older' },
+      { id: '1', role: 'user', content: 'changed' },
+      { id: '2', role: 'assistant', content: 'b' },
+    ]
+    expect(isHistoryPrepend(prev, next)).toBe(false)
   })
 })

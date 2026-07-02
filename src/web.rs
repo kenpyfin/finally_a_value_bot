@@ -2880,6 +2880,22 @@ struct ChatSessionsListQuery {
     include_archived: Option<bool>,
 }
 
+fn chat_session_json(session: &crate::db::ChatSession) -> serde_json::Value {
+    serde_json::json!({
+        "id": session.id,
+        "chat_id": session.chat_id,
+        "persona_id": session.persona_id,
+        "title": session.title,
+        "intent": session.intent,
+        "status": session.status,
+        "created_at": session.created_at,
+        "last_active_at": session.last_active_at,
+        "archived_at": session.archived_at,
+        "ttl_hours": session.ttl_hours,
+        "mirror_main_chat": session.mirror_main_chat,
+    })
+}
+
 async fn api_chat_sessions_list(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -2904,23 +2920,7 @@ async fn api_chat_sessions_list(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let items: Vec<serde_json::Value> = sessions
-        .into_iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "chat_id": s.chat_id,
-                "persona_id": s.persona_id,
-                "title": s.title,
-                "intent": s.intent,
-                "status": s.status,
-                "created_at": s.created_at,
-                "last_active_at": s.last_active_at,
-                "archived_at": s.archived_at,
-                "ttl_hours": s.ttl_hours,
-            })
-        })
-        .collect();
+    let items: Vec<serde_json::Value> = sessions.iter().map(chat_session_json).collect();
     Ok(Json(serde_json::json!({ "sessions": items })))
 }
 
@@ -2931,6 +2931,89 @@ struct CreateChatSessionRequest {
     intent: String,
     #[serde(default)]
     ttl_hours: Option<i64>,
+    #[serde(default)]
+    mirror_main_chat: Option<bool>,
+}
+
+async fn bootstrap_chat_session_context(
+    app_state: Arc<AppState>,
+    session_id: String,
+    chat_id: i64,
+    persona_id: i64,
+    intent: String,
+) {
+    let bootstrap_prompt = format!(
+        concat!(
+            "You are bootstrapping a new focused session. The user's intent is:\n\n",
+            "\"{}\"\n\n",
+            "Search the vault (using search_vault or mempalace search) for notes relevant to this intent. ",
+            "Also list which skills from the workspace are relevant.\n\n",
+            "Return ONLY a compact JSON object (no markdown fences) with this structure:\n",
+            "{{\"relevant_notes\": [\"note title or path\", ...], ",
+            "\"selected_skills\": [\"skill_name\", ...], ",
+            "\"key_context\": \"2-3 sentence summary of relevant background knowledge\"}}\n\n",
+            "If nothing relevant is found, return the JSON with empty arrays and a brief note in key_context. ",
+            "Do NOT ask the user anything. Do NOT include explanation outside the JSON."
+        ),
+        intent
+    );
+
+    let bootstrap_result = process_with_agent(
+        &app_state,
+        AgentRequestContext {
+            caller_channel: "web",
+            chat_id,
+            chat_type: "private",
+            persona_id,
+            is_scheduled_task: false,
+            is_background_job: false,
+            run_key: None,
+            reply_bot_instance_id: None,
+            session_id: Some(session_id.clone()),
+        },
+        Some(&bootstrap_prompt),
+        None,
+    )
+    .await;
+
+    let Ok(response) = bootstrap_result else {
+        warn!(
+            session_id = %session_id,
+            "chat session bootstrap agent run failed"
+        );
+        return;
+    };
+
+    let trimmed = response.trim().to_string();
+    let ctx_sid = session_id.clone();
+    let ctx_json = trimmed.clone();
+    if let Err(e) = call_blocking(app_state.db.clone(), move |db| {
+        db.update_chat_session_bootstrap_context(&ctx_sid, &ctx_json)
+    })
+    .await
+    {
+        warn!(
+            session_id = %session_id,
+            error = %e,
+            "failed to persist chat session bootstrap context"
+        );
+    }
+
+    let bot_msg = StoredMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        chat_id,
+        persona_id,
+        session_id: Some(session_id),
+        sender_name: app_state.config.bot_username.clone(),
+        content: format!("Session ready. Context loaded for: {}", intent),
+        is_from_bot: true,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        origin: crate::db::message_origin_interactive(),
+    };
+    if let Err(e) = call_blocking(app_state.db.clone(), move |db| db.store_message(&bot_msg)).await
+    {
+        warn!(error = %e, "failed to store chat session bootstrap message");
+    }
 }
 
 async fn api_chat_sessions_create(
@@ -2962,89 +3045,55 @@ async fn api_chat_sessions_create(
     let session_id = uuid::Uuid::new_v4().to_string();
     let title = intent.chars().take(60).collect::<String>();
     let ttl_hours = body.ttl_hours.unwrap_or(72).max(0);
+    let mirror_main_chat = body.mirror_main_chat.unwrap_or(false);
 
     let sid = session_id.clone();
     let t = title.clone();
     let i = intent.clone();
     call_blocking(state.app_state.db.clone(), move |db| {
-        db.create_chat_session(&sid, chat_id, persona_id, &t, &i, ttl_hours)
+        db.create_chat_session(
+            &sid,
+            chat_id,
+            persona_id,
+            &t,
+            &i,
+            ttl_hours,
+            mirror_main_chat,
+        )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Run bootstrap agent turn: search vault/skills and produce compact context
-    let bootstrap_prompt = format!(
-        concat!(
-            "You are bootstrapping a new focused session. The user's intent is:\n\n",
-            "\"{}\"\n\n",
-            "Search the vault (using search_vault or mempalace search) for notes relevant to this intent. ",
-            "Also list which skills from the workspace are relevant.\n\n",
-            "Return ONLY a compact JSON object (no markdown fences) with this structure:\n",
-            "{{\"relevant_notes\": [\"note title or path\", ...], ",
-            "\"selected_skills\": [\"skill_name\", ...], ",
-            "\"key_context\": \"2-3 sentence summary of relevant background knowledge\"}}\n\n",
-            "If nothing relevant is found, return the JSON with empty arrays and a brief note in key_context. ",
-            "Do NOT ask the user anything. Do NOT include explanation outside the JSON."
-        ),
-        intent
-    );
+    let created = call_blocking(state.app_state.db.clone(), {
+        let session_id = session_id.clone();
+        move |db| db.get_chat_session(&session_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "session not found".into(),
+    ))?;
 
+    let app_state = state.app_state.clone();
     let bootstrap_sid = session_id.clone();
-    let bootstrap_result = process_with_agent(
-        &state.app_state,
-        AgentRequestContext {
-            caller_channel: "web",
-            chat_id,
-            chat_type: "private",
-            persona_id,
-            is_scheduled_task: false,
-            is_background_job: false,
-            run_key: None,
-            reply_bot_instance_id: None,
-            session_id: Some(session_id.clone()),
-        },
-        Some(&bootstrap_prompt),
-        None,
-    )
-    .await;
-
-    let mut bootstrap_summary = String::new();
-    if let Ok(response) = bootstrap_result {
-        let trimmed = response.trim().to_string();
-        // Store as bootstrap_context_json
-        let ctx_sid = bootstrap_sid.clone();
-        let ctx_json = trimmed.clone();
-        let _ = call_blocking(state.app_state.db.clone(), move |db| {
-            db.update_chat_session_bootstrap_context(&ctx_sid, &ctx_json)
-        })
-        .await;
-
-        // Store the bootstrap response as an assistant message in the session
-        let bot_msg = crate::db::StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
+    let bootstrap_intent = intent.clone();
+    tokio::spawn(async move {
+        bootstrap_chat_session_context(
+            app_state,
+            bootstrap_sid,
             chat_id,
             persona_id,
-            session_id: Some(bootstrap_sid.clone()),
-            sender_name: state.app_state.config.bot_username.clone(),
-            content: format!("Session ready. Context loaded for: {}", intent),
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            origin: crate::db::message_origin_interactive(),
-        };
-        let _ = call_blocking(state.app_state.db.clone(), move |db| {
-            db.store_message(&bot_msg)
-        })
+            bootstrap_intent,
+        )
         .await;
-        bootstrap_summary = trimmed;
-    }
+    });
 
     Ok(Json(serde_json::json!({
         "ok": true,
+        "session": chat_session_json(&created),
         "session_id": session_id,
-        "title": title,
-        "chat_id": chat_id,
-        "persona_id": persona_id,
-        "bootstrap_context": bootstrap_summary,
+        "bootstrap_pending": true,
     })))
 }
 
@@ -3061,19 +3110,16 @@ async fn api_chat_sessions_get(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     match session {
-        Some(s) => Ok(Json(serde_json::json!({
-            "id": s.id,
-            "chat_id": s.chat_id,
-            "persona_id": s.persona_id,
-            "title": s.title,
-            "intent": s.intent,
-            "status": s.status,
-            "created_at": s.created_at,
-            "last_active_at": s.last_active_at,
-            "archived_at": s.archived_at,
-            "ttl_hours": s.ttl_hours,
-            "bootstrap_context_json": s.bootstrap_context_json,
-        }))),
+        Some(s) => {
+            let mut value = chat_session_json(&s);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "bootstrap_context_json".into(),
+                    serde_json::json!(s.bootstrap_context_json),
+                );
+            }
+            Ok(Json(value))
+        }
         None => Err((StatusCode::NOT_FOUND, "session not found".into())),
     }
 }
@@ -3083,6 +3129,7 @@ struct PatchChatSessionRequest {
     title: Option<String>,
     status: Option<String>,
     ttl_hours: Option<i64>,
+    mirror_main_chat: Option<bool>,
 }
 
 async fn api_chat_sessions_patch(
@@ -3135,6 +3182,15 @@ async fn api_chat_sessions_patch(
         let ttl_val = ttl.max(0);
         call_blocking(state.app_state.db.clone(), move |db| {
             db.update_chat_session_ttl(&sid, ttl_val)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    if let Some(mirror_main_chat) = body.mirror_main_chat {
+        let sid = session_id.clone();
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_mirror_main_chat(&sid, mirror_main_chat)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4274,7 +4330,7 @@ async fn api_persona_agent_history_optimize(
         return Err((StatusCode::NOT_FOUND, "persona not found".into()));
     }
 
-    let mm = state.app_state.llm.multimodel_config();
+    let mm = state.app_state.llm.local_delegate_config();
     if mm.tier2_base_url.trim().is_empty() || mm.tier2_model.trim().is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5001,12 +5057,19 @@ async fn api_runtime_get(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let toggles = &state.app_state.runtime_toggles;
+    let mm_cfg = state.app_state.llm.local_delegate_config();
+    let engine = toggles.agent_engine();
+    let local_ready = mm_cfg.local_routable();
     Ok(Json(json!({
         "ok": true,
         "tool_output_debug": toggles.tool_output_debug(),
         "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
         "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
-        "agent_engine": toggles.agent_engine().as_str(),
+        "agent_engine": engine.as_str(),
+        "local_delegate_configured": mm_cfg.local_configured(),
+        "local_delegate_tools_ok": mm_cfg.local_tools_ok,
+        "local_delegate_ready": local_ready,
+        "cost_routing_effective": crate::local_delegate::cost_routing_effective(engine, &mm_cfg),
         "sources": {
             "tool_output_debug": if sources.0 { "app_settings" } else { "env" },
             "post_tool_evaluator_enabled": if sources.1 { "app_settings" } else { "env" },
@@ -5075,6 +5138,25 @@ async fn api_runtime_patch(
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let routing_for_engine = engine == crate::runtime_toggles::AgentEngine::ClassicCostRouting;
+        let mut mm_cfg = state.app_state.llm.local_delegate_config();
+        if mm_cfg.routing_enabled != routing_for_engine {
+            mm_cfg.routing_enabled = routing_for_engine;
+            mm_cfg = mm_cfg.normalize();
+            call_blocking(state.app_state.db.clone(), {
+                let cfg_db = mm_cfg.clone();
+                move |db| crate::local_delegate::persist_to_db(db, &cfg_db)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            state
+                .app_state
+                .llm
+                .apply_local_delegate_config(mm_cfg.clone())
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        }
+
         messages.push(match engine {
             crate::runtime_toggles::AgentEngine::Deterministic => {
                 "Agent engine set to deterministic pipeline."
@@ -5082,8 +5164,30 @@ async fn api_runtime_patch(
             crate::runtime_toggles::AgentEngine::Cursor => {
                 "Agent engine set to Cursor SDK (local sidecar)."
             }
-            crate::runtime_toggles::AgentEngine::Classic => "Agent engine set to classic loop.",
+            crate::runtime_toggles::AgentEngine::ClassicCostRouting => {
+                "Agent engine set to Classic · Cost routing."
+            }
+            crate::runtime_toggles::AgentEngine::Classic => {
+                "Agent engine set to Classic · Single turn."
+            }
         });
+    }
+
+    let mm_cfg = state.app_state.llm.local_delegate_config();
+    let engine = toggles.agent_engine();
+    let local_ready = mm_cfg.local_routable();
+    let cost_routing_effective = crate::local_delegate::cost_routing_effective(engine, &mm_cfg);
+    let mut warnings: Vec<String> = Vec::new();
+    if engine == crate::runtime_toggles::AgentEngine::ClassicCostRouting && !local_ready {
+        if !mm_cfg.local_configured() {
+            warnings.push(
+                "Cost routing selected but local URL/model are not configured. Runs use cloud model only until configured and verified.".into(),
+            );
+        } else if !mm_cfg.local_tools_ok {
+            warnings.push(
+                "Cost routing selected but local tool calling is not verified. Runs use cloud model only until you run Test in Local delegate.".into(),
+            );
+        }
     }
 
     if messages.is_empty() {
@@ -5098,7 +5202,12 @@ async fn api_runtime_patch(
         "tool_output_debug": toggles.tool_output_debug(),
         "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
         "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
-        "agent_engine": toggles.agent_engine().as_str(),
+        "agent_engine": engine.as_str(),
+        "local_delegate_configured": mm_cfg.local_configured(),
+        "local_delegate_tools_ok": mm_cfg.local_tools_ok,
+        "local_delegate_ready": local_ready,
+        "cost_routing_effective": cost_routing_effective,
+        "warnings": warnings,
         "source": "app_settings",
         "message": messages.join(" "),
     })))
@@ -5462,7 +5571,7 @@ async fn api_multimodel_models_get(
             "base_url query parameter is required".into(),
         ));
     }
-    let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, "");
+    let base_url = crate::local_delegate::normalize_base_url_for_provider(base_url_raw, "");
     if base_url.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -5484,13 +5593,14 @@ async fn api_multimodel_get(
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let cfg = state.app_state.llm.multimodel_config();
+    let cfg = state.app_state.llm.local_delegate_config();
     let strategy_provider =
         crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
     let strategy_model = state.app_state.llm.current_model();
     Ok(Json(json!({
         "ok": true,
-        "enabled": cfg.enabled,
+        "routing_enabled": cfg.routing_enabled,
+        "enabled": cfg.routing_enabled,
         "local_base_url": cfg.local_base_url,
         "local_model": cfg.local_model,
         "local_tools_ok": cfg.local_tools_ok,
@@ -5502,20 +5612,20 @@ async fn api_multimodel_get(
         "tier2_tools_ok": cfg.tier2_tools_ok,
         "strategy_provider": strategy_provider,
         "strategy_model": strategy_model,
-        "description": "Local model handles tool execution. Strategy (cloud) handles planning and synthesis.",
+        "description": "Local OpenAI-compatible endpoint for cost routing, PTE/PDQE, and deterministic local phases.",
     })))
 }
 
 async fn api_multimodel_patch(
     headers: HeaderMap,
     State(state): State<WebState>,
-    Json(body): Json<crate::multimodel::MultimodelPatchRequest>,
+    Json(body): Json<crate::local_delegate::LocalDelegatePatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let old = state.app_state.llm.multimodel_config();
+    let old = state.app_state.llm.local_delegate_config();
     let mut cfg = old.clone();
-    if let Some(enabled) = body.enabled {
-        cfg.enabled = enabled;
+    if let Some(routing) = body.routing_enabled.or(body.enabled) {
+        cfg.routing_enabled = routing;
     }
     // New unified local fields
     if let Some(ref url) = body.local_base_url {
@@ -5545,41 +5655,41 @@ async fn api_multimodel_patch(
         cfg.local_tools_ok = false;
     }
     cfg = cfg.normalize();
-    if cfg.enabled && !cfg.local_configured() {
+    if cfg.routing_enabled && !cfg.local_configured() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Local model base URL and model are required to enable multi-model routing.".into(),
+            "Local model base URL and model are required to enable cost routing.".into(),
         ));
     }
-    if cfg.enabled && !cfg.local_tools_ok {
+    if cfg.routing_enabled && !cfg.local_tools_ok {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Run the tool-calling test for the local model before enabling multi-model routing."
-                .into(),
+            "Run the tool-calling test for the local model before enabling cost routing.".into(),
         ));
     }
     call_blocking(state.app_state.db.clone(), {
         let cfg_db = cfg.clone();
-        move |db| crate::multimodel::persist_to_db(db, &cfg_db)
+        move |db| crate::local_delegate::persist_to_db(db, &cfg_db)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state
         .app_state
         .llm
-        .apply_multimodel_config(cfg.clone())
+        .apply_local_delegate_config(cfg.clone())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({
         "ok": true,
-        "enabled": cfg.enabled,
+        "routing_enabled": cfg.routing_enabled,
+        "enabled": cfg.routing_enabled,
         "local_base_url": cfg.local_base_url,
         "local_model": cfg.local_model,
         "local_tools_ok": cfg.local_tools_ok,
-        "message": if cfg.enabled {
-            "Multi-model routing enabled. Execute phase routes to local model."
+        "message": if cfg.routing_enabled {
+            "Local delegate routing enabled."
         } else {
-            "Multi-model routing disabled. All iterations use the strategy LLM."
+            "Local delegate routing disabled."
         },
     })))
 }
@@ -5591,8 +5701,9 @@ async fn api_multimodel_test_post(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let tier = match body.tier.trim().to_ascii_lowercase().as_str() {
-        "local" | "technical" | "tier1" | "1" => crate::multimodel::ModelTier::Local,
-        "knowledge" | "tier2" | "2" => crate::multimodel::ModelTier::Local,
+        "local" | "technical" | "tier1" | "1" | "knowledge" | "tier2" | "2" => {
+            crate::local_delegate::ModelTier::LocalReadOnly
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -5610,7 +5721,8 @@ async fn api_multimodel_test_post(
     }
     let label = "local";
     let fallback_base = "";
-    let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, fallback_base);
+    let base_url =
+        crate::local_delegate::normalize_base_url_for_provider(base_url_raw, fallback_base);
     let base = state.app_state.config.clone();
     let mut test_cfg = base;
     test_cfg.llm_provider = "llama".into();
@@ -5621,19 +5733,19 @@ async fn api_multimodel_test_post(
         Ok(()) => {}
         Err(e) => return Err((StatusCode::BAD_GATEWAY, e)),
     }
-    match crate::llm::test_multimodel_tools(&test_cfg, model, tier).await {
+    match crate::llm::test_local_delegate_tools(&test_cfg, model, tier).await {
         Ok(()) => {
             call_blocking(state.app_state.db.clone(), move |db| {
-                crate::multimodel::persist_tier_tools_ok(db, tier, true)
+                crate::local_delegate::persist_tier_tools_ok(db, tier, true)
             })
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             if let Ok(cfg) = call_blocking(state.app_state.db.clone(), |db| {
-                crate::multimodel::load_from_db(db)
+                crate::local_delegate::load_from_db(db)
             })
             .await
             {
-                let _ = state.app_state.llm.apply_multimodel_config(cfg);
+                let _ = state.app_state.llm.apply_local_delegate_config(cfg);
             }
             Ok(Json(json!({
                 "ok": true,
@@ -5930,6 +6042,9 @@ async fn api_settings_get(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .clone();
     let cursor_engine_ready = cursor_cfg.sdk_configured() && cursor_cfg.sdk_runner_ok;
+    let mm_cfg = state.app_state.llm.local_delegate_config();
+    let agent_engine = state.app_state.runtime_toggles.agent_engine();
+    let local_delegate_ready = mm_cfg.local_routable();
     Ok(Json(json!({
         "ok": true,
         "settings": items,
@@ -5944,6 +6059,9 @@ async fn api_settings_get(
             "llm_ready": is_llm_ready(cfg),
             "channel_ready": is_channel_ready(cfg),
             "cursor_engine_ready": cursor_engine_ready,
+            "local_delegate_ready": local_delegate_ready,
+            "agent_engine": agent_engine.as_str(),
+            "cost_routing_effective": crate::local_delegate::cost_routing_effective(agent_engine, &mm_cfg),
             "web_enabled": cfg.web_enabled,
             // PATCH /api/settings is disabled; no in-app "pending restart" until we track real diffs.
             "requires_restart_for_env_changes": false,

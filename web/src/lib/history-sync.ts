@@ -22,3 +22,10 @@ export function historiesEqual(a: ThreadMessageLike[], b: ThreadMessageLike[]): 
   }
   return true
 }
+
+/** True when `next` is `prev` with older messages prepended (visible suffix unchanged). */
+export function isHistoryPrepend(prev: ThreadMessageLike[], next: ThreadMessageLike[]): boolean {
+  if (next.length <= prev.length) return false
+  const offset = next.length - prev.length
+  return historiesEqual(prev, next.slice(offset))
+}
