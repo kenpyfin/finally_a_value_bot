@@ -40,6 +40,8 @@ export type AppHeaderToolbarProps = {
   onOpenArtifacts: () => void
   onOpenMemory: () => void
   onOpenAgentHistory: () => void
+  onOpenTerminal?: () => void
+  terminalAvailable?: boolean
   agentHistoryDisabled?: boolean
 }
 
@@ -93,6 +95,8 @@ export function AppHeader({
     onOpenArtifacts,
     onOpenMemory,
     onOpenAgentHistory,
+    onOpenTerminal,
+    terminalAvailable = false,
     agentHistoryDisabled = false,
   } = toolbar
 
@@ -233,6 +237,11 @@ export function AppHeader({
             <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenArtifacts}>
               Artifacts
             </Button>
+            {terminalAvailable && onOpenTerminal ? (
+              <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenTerminal}>
+                Terminal
+              </Button>
+            ) : null}
             <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenMemory}>
               Memory
             </Button>

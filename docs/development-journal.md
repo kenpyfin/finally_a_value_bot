@@ -4,6 +4,14 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-02 — Web UI interactive terminal (PTY + WebSocket)
+
+- **Area:** web UI / web server / config
+- **Summary:** Added an optional interactive browser terminal: `POST /api/terminal/sessions` (Bearer auth + short-lived `ws_ticket`) and `GET /api/terminal/ws` (auth JSON, then binary PTY I/O). Frontend uses `@xterm/xterm` in a new **Terminal** dialog (header + mobile ops). Off by default (`WEB_TERMINAL_ENABLED=false`); requires `WEB_AUTH_TOKEN` even on localhost; blocked in Docker unless `WEB_TERMINAL_ALLOW_IN_DOCKER=true`. Session caps and idle timeout configurable.
+- **Rationale:** Operators sometimes need a real shell on the gateway host/workspace without SSH. This is **not** agent-mediated `bash` — no per-command `bash_safety`; treat as operator-equivalent access for anyone holding the shared web token.
+- **Key files / symbols:** `src/web_terminal.rs` (`TerminalHub`, `handle_websocket`); `Config::web_terminal_*` in `src/config.rs`; routes in `src/web.rs`; `web/src/components/terminal-pane.tsx`; `installation_status.terminal` on `GET /api/settings` and `terminal` on `GET /api/runtime`.
+- **Follow-ups:** Optional persona-scoped cwd; background-job log attach from Queue UI; wire SSE `tool_result` into live chat tool cards.
+
 ### 2026-07-01 — Cursor engine: bot-native hook bridge (Phase 1)
 
 - **Area:** hooks / cursor engine

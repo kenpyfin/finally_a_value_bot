@@ -74,6 +74,12 @@ fn default_web_run_history_limit() -> usize {
 fn default_web_session_idle_ttl_seconds() -> u64 {
     300
 }
+fn default_web_terminal_max_sessions() -> usize {
+    2
+}
+fn default_web_terminal_idle_timeout_secs() -> u64 {
+    1800
+}
 fn default_browser_managed() -> bool {
     false
 }
@@ -486,6 +492,16 @@ pub struct Config {
     pub web_run_history_limit: usize,
     #[serde(default = "default_web_session_idle_ttl_seconds")]
     pub web_session_idle_ttl_seconds: u64,
+    /// When true, web UI may open an interactive PTY terminal (requires WEB_AUTH_TOKEN). Env: WEB_TERMINAL_ENABLED.
+    #[serde(default)]
+    pub web_terminal_enabled: bool,
+    #[serde(default = "default_web_terminal_max_sessions")]
+    pub web_terminal_max_sessions: usize,
+    #[serde(default = "default_web_terminal_idle_timeout_secs")]
+    pub web_terminal_idle_timeout_secs: u64,
+    /// Allow web terminal inside Docker (default false). Env: WEB_TERMINAL_ALLOW_IN_DOCKER.
+    #[serde(default)]
+    pub web_terminal_allow_in_docker: bool,
     /// When set, web UI uses this chat_id for all requests (single universal contact across channels). Env: UNIVERSAL_CHAT_ID.
     #[serde(default)]
     pub universal_chat_id: Option<i64>,
@@ -729,6 +745,21 @@ impl Config {
         }
     }
 
+    /// Whether web terminal is enabled and allowed in the current runtime environment.
+    pub fn web_terminal_effective(&self) -> bool {
+        self.web_terminal_enabled
+            && (self.web_terminal_allow_in_docker || !crate::background_shell::in_docker())
+    }
+
+    /// Whether operators can open a web terminal (enabled, environment OK, auth token configured).
+    pub fn web_terminal_available(&self) -> bool {
+        self.web_terminal_effective()
+            && self
+                .web_auth_token
+                .as_ref()
+                .is_some_and(|t| !t.trim().is_empty())
+    }
+
     /// Resolve path to .env file. FINALLY_A_VALUE_BOT_CONFIG can override (points to .env).
     pub fn resolve_config_path() -> Result<Option<PathBuf>, FinallyAValueBotError> {
         if let Ok(custom) = std::env::var("FINALLY_A_VALUE_BOT_CONFIG") {
@@ -968,6 +999,16 @@ impl Config {
                 "WEB_SESSION_IDLE_TTL_SECONDS",
                 default_web_session_idle_ttl_seconds(),
             ),
+            web_terminal_enabled: Self::env_bool("WEB_TERMINAL_ENABLED", false),
+            web_terminal_max_sessions: Self::env_usize(
+                "WEB_TERMINAL_MAX_SESSIONS",
+                default_web_terminal_max_sessions(),
+            ),
+            web_terminal_idle_timeout_secs: Self::env_u64(
+                "WEB_TERMINAL_IDLE_TIMEOUT_SECS",
+                default_web_terminal_idle_timeout_secs(),
+            ),
+            web_terminal_allow_in_docker: Self::env_bool("WEB_TERMINAL_ALLOW_IN_DOCKER", false),
             universal_chat_id: Self::env("UNIVERSAL_CHAT_ID").and_then(|s| s.parse().ok()),
             browser_managed: Self::env_bool("BROWSER_MANAGED", default_browser_managed()),
             browser_executable_path: Self::env("BROWSER_EXECUTABLE_PATH"),
@@ -1390,6 +1431,23 @@ impl Config {
         if self.web_session_idle_ttl_seconds == 0 {
             self.web_session_idle_ttl_seconds = default_web_session_idle_ttl_seconds();
         }
+        if self.web_terminal_max_sessions == 0 {
+            self.web_terminal_max_sessions = default_web_terminal_max_sessions();
+        }
+        if self.web_terminal_idle_timeout_secs == 0 {
+            self.web_terminal_idle_timeout_secs = default_web_terminal_idle_timeout_secs();
+        }
+        if self.web_terminal_enabled
+            && self
+                .web_auth_token
+                .as_ref()
+                .map(|t| t.trim().is_empty())
+                .unwrap_or(true)
+        {
+            return Err(FinallyAValueBotError::Config(
+                "web_auth_token is required when WEB_TERMINAL_ENABLED=true".into(),
+            ));
+        }
         // Evaluator model aliases (legacy env names).
         if !self.response_quality_evaluator_model.trim().is_empty() {
             self.evaluator_model = self.response_quality_evaluator_model.trim().to_string();
@@ -1778,6 +1836,10 @@ pub fn test_config() -> Config {
         web_rate_window_seconds: 10,
         web_run_history_limit: 512,
         web_session_idle_ttl_seconds: 300,
+        web_terminal_enabled: false,
+        web_terminal_max_sessions: default_web_terminal_max_sessions(),
+        web_terminal_idle_timeout_secs: default_web_terminal_idle_timeout_secs(),
+        web_terminal_allow_in_docker: false,
         universal_chat_id: None,
         browser_managed: false,
         browser_executable_path: None,

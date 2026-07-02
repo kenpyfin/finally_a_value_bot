@@ -4,7 +4,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::ws::WebSocket;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -38,6 +39,7 @@ use crate::telegram::{
     archive_conversation, process_with_agent, process_with_agent_with_events, AgentEvent,
     AgentRequestContext, AppState,
 };
+use crate::web_terminal::{self, TerminalHub};
 use std::time::SystemTime;
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
@@ -48,6 +50,7 @@ struct WebState {
     auth_token: Option<String>,
     run_hub: RunHub,
     request_hub: RequestHub,
+    terminal_hub: TerminalHub,
     limits: WebLimits,
     /// Cache for `ensure_web_binding_for_universal` to avoid repeated DB writes on every
     /// `/api/history` poll while this server process is alive.
@@ -5070,6 +5073,7 @@ async fn api_runtime_get(
         "local_delegate_tools_ok": mm_cfg.local_tools_ok,
         "local_delegate_ready": local_ready,
         "cost_routing_effective": crate::local_delegate::cost_routing_effective(engine, &mm_cfg),
+        "terminal": web_terminal::capabilities_json(&state.app_state.config),
         "sources": {
             "tool_output_debug": if sources.0 { "app_settings" } else { "env" },
             "post_tool_evaluator_enabled": if sources.1 { "app_settings" } else { "env" },
@@ -6070,6 +6074,7 @@ async fn api_settings_get(
             "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
             "post_tool_evaluator_enabled": state.app_state.runtime_toggles.post_tool_evaluator_enabled(),
             "response_quality_evaluator_enabled": state.app_state.runtime_toggles.response_quality_evaluator_enabled(),
+            "terminal": web_terminal::capabilities_json(cfg),
         }
     })))
 }
@@ -6285,6 +6290,26 @@ async fn api_channel_persona_policy_delete(
     })))
 }
 
+async fn api_terminal_sessions_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    web_terminal::require_terminal_api_auth(&headers, &state.app_state.config)?;
+    let body = state
+        .terminal_hub
+        .create_session(&state.app_state.config)
+        .await?;
+    Ok(Json(body))
+}
+
+async fn api_terminal_ws(ws: WebSocketUpgrade, State(state): State<WebState>) -> impl IntoResponse {
+    let hub = state.terminal_hub.clone();
+    let config = Arc::new(state.app_state.config.clone());
+    ws.on_upgrade(move |socket: WebSocket| async move {
+        web_terminal::handle_websocket(socket, hub, config).await;
+    })
+}
+
 pub async fn start_web_server(state: Arc<AppState>) {
     let limits = WebLimits::from_config(&state.config);
     let web_state = WebState {
@@ -6292,6 +6317,7 @@ pub async fn start_web_server(state: Arc<AppState>) {
         app_state: state.clone(),
         run_hub: RunHub::default(),
         request_hub: RequestHub::default(),
+        terminal_hub: TerminalHub::default(),
         limits,
         web_binding_universal_done: Arc::new(Mutex::new(None)),
     };
@@ -6673,6 +6699,8 @@ fn build_router(web_state: WebState) -> Router {
             "/api/runtime",
             get(api_runtime_get).patch(api_runtime_patch),
         )
+        .route("/api/terminal/sessions", post(api_terminal_sessions_post))
+        .route("/api/terminal/ws", get(api_terminal_ws))
         .route(
             "/api/deterministic-pipeline",
             get(api_deterministic_pipeline_get).patch(api_deterministic_pipeline_patch),
@@ -7130,6 +7158,7 @@ mod tests {
             auth_token,
             run_hub: RunHub::default(),
             request_hub: RequestHub::default(),
+            terminal_hub: TerminalHub::default(),
             limits,
             web_binding_universal_done: Arc::new(Mutex::new(None)),
         }

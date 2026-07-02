@@ -39,6 +39,15 @@ export type RuntimeSettingItem = {
 }
 
 /** Matches `/api/settings` `installation_status` and web Settings UI. */
+export type TerminalCapabilities = {
+  web_terminal_enabled?: boolean
+  web_terminal_available?: boolean
+  web_terminal_blocked_reason?: string | null
+  web_terminal_max_sessions?: number
+  web_terminal_idle_timeout_secs?: number
+}
+
+/** Matches `/api/settings` `installation_status` and web Settings UI. */
 export type InstallationStatus = {
   llm_ready: boolean
   channel_ready: boolean
@@ -47,6 +56,7 @@ export type InstallationStatus = {
   agent_engine?: string
   cost_routing_effective?: boolean
   web_enabled: boolean
+  terminal?: TerminalCapabilities
   /** @deprecated use requires_restart_for_env_changes */
   requires_restart_to_apply_runtime_settings?: boolean
   requires_restart_for_env_changes?: boolean

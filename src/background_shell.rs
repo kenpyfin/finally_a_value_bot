@@ -79,7 +79,7 @@ fn join_workspace_relative_dir(workspace_root: &Path, relative: &Path) -> PathBu
 }
 
 /// Resolve workdir to an absolute path under the workspace root.
-fn resolve_shell_workdir(config: &Config, workdir: &Path) -> PathBuf {
+pub fn resolve_shell_workdir(config: &Config, workdir: &Path) -> PathBuf {
     let p = if workdir.is_absolute() {
         workdir.to_path_buf()
     } else {

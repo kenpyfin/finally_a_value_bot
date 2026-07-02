@@ -48,6 +48,7 @@ pub mod sop_context_gate;
 pub mod tools;
 pub mod transcribe;
 pub mod web;
+pub mod web_terminal;
 pub use channels::discord;
 pub use channels::telegram;
 pub use channels::whatsapp;

@@ -429,6 +429,8 @@ export function App({
   const [schedulesShowArchived, setSchedulesShowArchived] = useState(false)
   const [memoryDialogOpen, setMemoryDialogOpen] = useState<boolean>(false)
   const [artifactsDialogOpen, setArtifactsDialogOpen] = useState<boolean>(false)
+  const [terminalDialogOpen, setTerminalDialogOpen] = useState<boolean>(false)
+  const [terminalError, setTerminalError] = useState<string>('')
   const [artifacts, setArtifacts] = useState<ArtifactItem[]>([])
   const [artifactsBusy, setArtifactsBusy] = useState<boolean>(false)
   const [artifactsError, setArtifactsError] = useState<string>('')
@@ -1765,6 +1767,11 @@ export function App({
                 onOpenQueue: () => setQueueDialogOpen(true),
                 onOpenPrinciples: () => setAgentsMdOpen(true),
                 onOpenArtifacts: () => setArtifactsDialogOpen(true),
+                onOpenTerminal: () => {
+                  setTerminalError('')
+                  setTerminalDialogOpen(true)
+                },
+                terminalAvailable: installationStatus?.terminal?.web_terminal_available === true,
                 onOpenMemory: () => setMemoryDialogOpen(true),
                 onOpenAgentHistory: () => setAgentHistoryDialogOpen(true),
                 agentHistoryDisabled: activePersonaId == null,
@@ -2072,6 +2079,15 @@ export function App({
           load: loadAgentHistoryLatest,
           optimize: optimizeAgentHistoryLatest,
         }}
+        terminal={{
+          open: terminalDialogOpen,
+          onOpenChange: (open) => {
+            setTerminalDialogOpen(open)
+            if (!open) setTerminalError('')
+          },
+          error: terminalError,
+          setError: setTerminalError,
+        }}
       />
       {confirmDialog}
       <MobileOpsSheet
@@ -2081,6 +2097,11 @@ export function App({
         onOpenSchedules={() => setSchedulesDialogOpen(true)}
         onOpenPrinciples={() => setAgentsMdOpen(true)}
         onOpenArtifacts={() => setArtifactsDialogOpen(true)}
+        onOpenTerminal={() => {
+          setTerminalError('')
+          setTerminalDialogOpen(true)
+        }}
+        terminalAvailable={installationStatus?.terminal?.web_terminal_available === true}
         onOpenMemory={() => setMemoryDialogOpen(true)}
         onOpenAgentHistory={() => setAgentHistoryDialogOpen(true)}
         agentHistoryDisabled={activePersonaId == null}
