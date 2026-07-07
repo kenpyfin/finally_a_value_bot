@@ -120,6 +120,12 @@ export type CursorEngineConfigResponse = {
   cli_on_path?: boolean
   timeout_secs?: number
   tmux_enabled?: boolean
+  mcp_tools_enabled?: boolean
+  mcp_expose_send_message?: boolean
+  delegation_slim_prompt?: boolean
+  delegation_resume_delta?: boolean
+  mcp_endpoint_url?: string
+  mcp_bridge_ready?: boolean
   install_steps?: string[]
   sidecar_error?: string | null
   health_ok?: boolean

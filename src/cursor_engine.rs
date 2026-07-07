@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
 use crate::agent_history::{
-    EvaluatorStepRecord, IterationRecord, PipelineFinishExtras, PipelineStageRecord,
+    EvaluatorStepRecord, IterationRecord, PipelineFinishExtras, PipelineStageRecord, ToolCallRecord,
 };
 use crate::channels::telegram::hook_turn_bridge::{
     append_hook_context_messages, pre_stop_follow_up, run_before_turn_hooks, run_pre_stop_hooks,
@@ -21,11 +21,16 @@ use crate::channels::telegram::{
     pipeline_finish_turn, process_classic_agent_with_events, AgentEvent, AgentProcessResult,
     AgentRequestContext, AgentRunPrep, AppState,
 };
-use crate::claude::{ContentBlock, Message, MessageContent};
+use crate::claude::{Message, MessageContent};
+use crate::cursor_delegation_prompt::{
+    build_cursor_delegation_prompt, select_delegation_prompt_mode, slim_delegation_system_prompt,
+    DelegationPromptMode, DelegationRuntimeHeader,
+};
+use crate::cursor_mcp_bridge::{
+    build_mcp_servers_config, mcp_endpoint_url, CursorMcpRegisterParams,
+};
 use crate::db::call_blocking;
 use crate::tools;
-
-const MAX_PROMPT_LEN: usize = 120_000;
 
 #[derive(Debug, Serialize)]
 struct SidecarRunRequest<'a> {
@@ -36,6 +41,8 @@ struct SidecarRunRequest<'a> {
     agent_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_params: Option<&'a [crate::cursor_engine_config::CursorModelParam]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_servers: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +59,16 @@ struct SidecarStreamEvent {
     agent_id: Option<String>,
     #[serde(default)]
     result: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    is_error: Option<bool>,
+    #[serde(default)]
+    thinking: Option<String>,
 }
 
 struct SidecarRunOutcome {
@@ -59,6 +76,7 @@ struct SidecarRunOutcome {
     returned_agent_id: Option<String>,
     run_status: String,
     sidecar_error: Option<String>,
+    cleared_stale_resume: bool,
 }
 
 fn is_stale_cursor_agent_error(message: &str) -> bool {
@@ -116,6 +134,8 @@ async fn consume_sidecar_stream(
     response: reqwest::Response,
     event_tx: Option<&UnboundedSender<AgentEvent>>,
     cancel: Option<&Arc<AtomicBool>>,
+    tool_call_records: &mut Vec<ToolCallRecord>,
+    mcp_tool_count: &mut usize,
 ) -> Result<SidecarRunOutcome, anyhow::Error> {
     let mut final_text = String::new();
     let mut returned_agent_id: Option<String> = None;
@@ -177,6 +197,60 @@ async fn consume_sidecar_stream(
                         event.message
                     });
                 }
+                "tool_use" => {
+                    let name = event.name.unwrap_or_default();
+                    let tool_use_id = uuid::Uuid::new_v4().to_string();
+                    let input = event.input.unwrap_or(serde_json::json!({}));
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(AgentEvent::ToolStart {
+                            tool_use_id: tool_use_id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                    }
+                    tool_call_records.push(ToolCallRecord {
+                        name,
+                        input_preview: serde_json::to_string(&input).unwrap_or_default(),
+                        result_preview: String::new(),
+                        duration_ms: 0,
+                        is_error: false,
+                    });
+                }
+                "tool_result" => {
+                    let name = event.name.unwrap_or_default();
+                    let is_error = event.is_error.unwrap_or(false);
+                    let output = event.output.unwrap_or_default();
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(AgentEvent::ToolResult {
+                            tool_use_id: uuid::Uuid::new_v4().to_string(),
+                            name: name.clone(),
+                            is_error,
+                            output: output.clone(),
+                            duration_ms: 0,
+                            status_code: Some(if is_error { 1 } else { 0 }),
+                            bytes: output.len(),
+                            error_type: None,
+                        });
+                    }
+                    if let Some(record) = tool_call_records
+                        .iter_mut()
+                        .rev()
+                        .find(|r| r.name == name && r.result_preview.is_empty())
+                    {
+                        record.result_preview = output;
+                        record.is_error = is_error;
+                    }
+                    *mcp_tool_count = mcp_tool_count.saturating_add(1);
+                }
+                "thinking" => {
+                    if state_show_thinking(event_tx) {
+                        if let Some(text) = event.thinking.filter(|s| !s.is_empty()) {
+                            if let Some(tx) = event_tx {
+                                let _ = tx.send(AgentEvent::TextDelta { delta: text });
+                            }
+                        }
+                    }
+                }
                 other => {
                     warn!("Cursor sidecar unknown event type: {other}");
                 }
@@ -189,7 +263,12 @@ async fn consume_sidecar_stream(
         returned_agent_id,
         run_status,
         sidecar_error,
+        cleared_stale_resume: false,
     })
+}
+
+fn state_show_thinking(event_tx: Option<&UnboundedSender<AgentEvent>>) -> bool {
+    event_tx.is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -201,95 +280,95 @@ async fn invoke_sidecar_turn(
     cwd: &str,
     model: &str,
     model_params: Option<&[crate::cursor_engine_config::CursorModelParam]>,
-    mut resume_id: Option<String>,
+    resume_id: Option<String>,
     chat_id: i64,
     persona_id: i64,
     session_scope: &str,
     event_tx: Option<&UnboundedSender<AgentEvent>>,
     cancel: Option<&Arc<AtomicBool>>,
+    mcp_servers: Option<serde_json::Value>,
+    tool_call_records: &mut Vec<ToolCallRecord>,
+    mcp_tool_count: &mut usize,
 ) -> Result<SidecarRunOutcome, anyhow::Error> {
-    for attempt in 0..2 {
-        let body = SidecarRunRequest {
-            prompt,
-            cwd,
-            model,
-            agent_id: resume_id.as_deref(),
-            model_params,
-        };
+    let body = SidecarRunRequest {
+        prompt,
+        cwd,
+        model,
+        agent_id: resume_id.as_deref(),
+        model_params,
+        mcp_servers: mcp_servers.clone(),
+    };
 
-        let response = client
-            .post(sidecar_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("sidecar request failed: {e}"))?;
+    let response = client
+        .post(sidecar_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("sidecar request failed: {e}"))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "sidecar HTTP {}: {}",
-                status.as_u16(),
-                text.chars().take(200).collect::<String>()
-            ));
-        }
-
-        let outcome = consume_sidecar_stream(response, event_tx, cancel).await?;
-
-        if let Some(ref err) = outcome.sidecar_error {
-            if attempt == 0 && resume_id.is_some() && is_stale_cursor_agent_error(err) {
-                warn!(
-                    chat_id,
-                    persona_id,
-                    stale_agent_id = resume_id.as_deref().unwrap_or(""),
-                    "Stale Cursor agent id; clearing and retrying with a fresh session"
-                );
-                let db = state.db.clone();
-                let session_scope_for_db = session_scope.to_string();
-                let _ = call_blocking(db, move |database| {
-                    database.clear_cursor_engine_agent_id(
-                        chat_id,
-                        persona_id,
-                        &session_scope_for_db,
-                    )
-                })
-                .await;
-                resume_id = None;
-                continue;
-            }
-            return Err(anyhow::anyhow!(err.clone()));
-        }
-
-        return Ok(outcome);
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "sidecar HTTP {}: {}",
+            status.as_u16(),
+            text.chars().take(200).collect::<String>()
+        ));
     }
 
-    Err(anyhow::anyhow!("Cursor sidecar run did not complete"))
+    let outcome = consume_sidecar_stream(
+        response,
+        event_tx,
+        cancel,
+        tool_call_records,
+        mcp_tool_count,
+    )
+    .await?;
+
+    if let Some(ref err) = outcome.sidecar_error {
+        if resume_id.is_some() && is_stale_cursor_agent_error(err) {
+            warn!(
+                chat_id,
+                persona_id,
+                stale_agent_id = resume_id.as_deref().unwrap_or(""),
+                "Stale Cursor agent id; clearing for fresh delegation prompt"
+            );
+            let db = state.db.clone();
+            let session_scope_for_db = session_scope.to_string();
+            let _ = call_blocking(db, move |database| {
+                database.clear_cursor_engine_agent_id(chat_id, persona_id, &session_scope_for_db)
+            })
+            .await;
+            return Ok(SidecarRunOutcome {
+                final_text: String::new(),
+                returned_agent_id: None,
+                run_status: "stale_agent_id".into(),
+                sidecar_error: None,
+                cleared_stale_resume: true,
+            });
+        }
+        return Err(anyhow::anyhow!(err.clone()));
+    }
+
+    Ok(outcome)
 }
 
-fn build_cursor_prompt(
-    system_prompt: &str,
-    messages: &[Message],
+fn rebuild_delegation_prompt(
+    mode: DelegationPromptMode,
+    delegation_system: &str,
+    hook_messages: &[Message],
+    runtime_header: &DelegationRuntimeHeader,
     is_scheduled_task: bool,
     has_image_input: bool,
 ) -> String {
-    let mut prompt = flatten_turn_prompt(system_prompt, messages);
-    if is_scheduled_task {
-        prompt = format!(
-            "[scheduled_task]\nAutomated scheduled job — not interactive chat. \
-             Complete the task below and return a concise result.\n\n{prompt}"
-        );
-    }
-    if has_image_input {
-        prompt.push_str(
-            "\n\n(Note: image input was attached but the Cursor engine currently supports text only. \
-             Describe any needed visual context in follow-up if required.)\n",
-        );
-    }
-    if prompt.len() > MAX_PROMPT_LEN {
-        prompt.truncate(prompt.floor_char_boundary(MAX_PROMPT_LEN));
-        prompt.push_str("\n\n(prompt truncated for Cursor engine limit)");
-    }
-    prompt
+    build_cursor_delegation_prompt(
+        mode,
+        delegation_system,
+        hook_messages,
+        runtime_header,
+        is_scheduled_task,
+        has_image_input,
+    )
 }
 
 pub async fn run_cursor_engine(
@@ -388,22 +467,63 @@ pub async fn run_cursor_engine(
         Some(settings.sdk_model_params.as_slice())
     };
 
+    let mcp_enabled = settings.mcp_tools_enabled && state.config.web_enabled;
+    let (mcp_token, mcp_servers) = if mcp_enabled {
+        let url = mcp_endpoint_url(state.config.web_port);
+        let token = state.cursor_mcp.register_run(
+            CursorMcpRegisterParams {
+                run_key: prep.run_key.clone(),
+                chat_id,
+                persona_id,
+                caller_channel: context.caller_channel.to_string(),
+                is_scheduled_task: context.is_scheduled_task,
+                tool_auth: prep.tool_auth.clone(),
+                expose_send_message: settings.mcp_expose_send_message,
+            },
+            event_tx.cloned(),
+        );
+        let servers = build_mcp_servers_config(&url, &token);
+        (Some(token), Some(servers))
+    } else {
+        (None, None)
+    };
+
     let started_at = chrono::Utc::now().to_rfc3339();
     let sidecar_started = Instant::now();
     let mut resume_id = resume_agent_id.clone();
-    let initial_prompt = build_cursor_prompt(
-        &prep.system_prompt,
+
+    let slim_enabled = settings.delegation_slim_prompt && mcp_enabled;
+    let delegation_system = slim_delegation_system_prompt(&prep.system_prompt, slim_enabled);
+    let runtime_header = DelegationRuntimeHeader {
+        chat_id,
+        persona_id,
+        mcp_enabled,
+    };
+    let mut delegation_mode = select_delegation_prompt_mode(
+        resume_agent_id.as_deref(),
+        context.is_scheduled_task,
+        settings.delegation_resume_delta,
+    );
+    let mut delegation_mode_label = delegation_mode.as_str().to_string();
+    let initial_prompt = rebuild_delegation_prompt(
+        delegation_mode,
+        &delegation_system,
         &hook_messages,
+        &runtime_header,
         context.is_scheduled_task,
         prep.has_image_input,
     );
+    let initial_prompt_len = initial_prompt.len();
     let mut prompt = initial_prompt.clone();
     let mut nudge_count = 0usize;
     let mut final_text;
     let mut run_status;
     let mut returned_agent_id: Option<String> = None;
+    let mut stream_tool_records: Vec<ToolCallRecord> = Vec::new();
+    let mut mcp_tool_count_total = 0usize;
 
     loop {
+        let mut mcp_tool_count_turn = 0usize;
         let outcome = match invoke_sidecar_turn(
             state,
             &client,
@@ -418,11 +538,17 @@ pub async fn run_cursor_engine(
             &session_scope,
             event_tx,
             cancel.as_ref(),
+            mcp_servers.clone(),
+            &mut stream_tool_records,
+            &mut mcp_tool_count_turn,
         )
         .await
         {
             Ok(o) => o,
             Err(e) => {
+                if let Some(token) = mcp_token.as_deref() {
+                    state.cursor_mcp.revoke_run(token);
+                }
                 let msg = e.to_string();
                 if msg.contains("sidecar request failed") {
                     return cursor_engine_classic_fallback(
@@ -439,6 +565,23 @@ pub async fn run_cursor_engine(
                 return Err(e);
             }
         };
+
+        mcp_tool_count_total = mcp_tool_count_total.saturating_add(mcp_tool_count_turn);
+
+        if outcome.cleared_stale_resume {
+            resume_id = None;
+            delegation_mode = DelegationPromptMode::FullSlim;
+            delegation_mode_label = "full_slim_stale_retry".into();
+            prompt = rebuild_delegation_prompt(
+                delegation_mode,
+                &delegation_system,
+                &hook_messages,
+                &runtime_header,
+                context.is_scheduled_task,
+                prep.has_image_input,
+            );
+            continue;
+        }
 
         final_text = outcome.final_text;
         run_status = outcome.run_status;
@@ -489,6 +632,33 @@ pub async fn run_cursor_engine(
 
     let finished_at = chrono::Utc::now().to_rfc3339();
     let success = run_status == "finished" || run_status == "success";
+
+    let mut run_tool_names: Vec<String> = Vec::new();
+    let mut history_tool_records: Vec<ToolCallRecord> = Vec::new();
+    let mut history_hook_events: Vec<String> = Vec::new();
+
+    if let Some(token) = mcp_token.as_deref() {
+        if let Some((stall, names, records, hook_events)) = state
+            .cursor_mcp
+            .finish_run(state, &context, &prep.run_key, token, event_tx)
+            .await
+        {
+            if let Some(stall_text) = stall {
+                final_text = stall_text;
+                run_status = "loop_guard_stalled".into();
+            }
+            run_tool_names = names;
+            history_tool_records = records;
+            history_hook_events = hook_events;
+        }
+    }
+
+    if run_tool_names.is_empty() && !stream_tool_records.is_empty() {
+        run_tool_names = stream_tool_records.iter().map(|r| r.name.clone()).collect();
+        history_tool_records = stream_tool_records.clone();
+    }
+
+    let had_tool_calls = mcp_tool_count_total > 0 || !run_tool_names.is_empty();
     let initial_prompt_preview: String = if initial_prompt.len() <= 200 {
         initial_prompt.clone()
     } else {
@@ -537,20 +707,31 @@ pub async fn run_cursor_engine(
     })
     .await;
 
-    let hooks_detail = if hook_summaries.is_empty() {
+    let hooks_detail = if hook_summaries.is_empty() && history_hook_events.is_empty() {
         String::new()
     } else {
-        format!(" hooks={}", hook_summaries.join(";"))
+        let mut parts = hook_summaries.clone();
+        parts.extend(history_hook_events.clone());
+        format!(" hooks={}", parts.join(";"))
+    };
+    let tool_detail = if run_tool_names.is_empty() {
+        String::new()
+    } else {
+        format!(" tools={}", run_tool_names.join(","))
     };
     let pipeline_stages = vec![PipelineStageRecord {
         stage: "cursor_sdk".into(),
         detail: format!(
-            "model={} resume={} status={} nudges={}{}",
+            "model={} resume={} status={} nudges={} mcp={} delegation={} prompt_chars={}{}{}",
             model,
             resume_agent_id.is_some(),
             run_status,
             nudge_count,
-            hooks_detail
+            mcp_enabled,
+            delegation_mode_label,
+            initial_prompt_len,
+            hooks_detail,
+            tool_detail
         ),
         duration_ms: sidecar_started.elapsed().as_millis(),
     }];
@@ -561,11 +742,33 @@ pub async fn run_cursor_engine(
     };
 
     let mut messages = prep.messages.clone();
+    messages.push(Message {
+        role: "assistant".into(),
+        content: MessageContent::Text(final_text.clone()),
+    });
     let mut pdqe_retries = 0usize;
     let mut pdqe_steps: Vec<EvaluatorStepRecord> = Vec::new();
-    let history_iterations: Vec<IterationRecord> = Vec::new();
+    let history_iterations = if history_tool_records.is_empty() {
+        Vec::new()
+    } else {
+        vec![IterationRecord {
+            iteration: 1,
+            stop_reason: "tool_use".into(),
+            assistant_text_preview: if final_text.len() <= 200 {
+                final_text.clone()
+            } else {
+                format!("{}...", &final_text[..final_text.floor_char_boundary(200)])
+            },
+            tool_calls: history_tool_records,
+            hook_events: history_hook_events,
+            pte: None,
+            model_tier: "cursor".into(),
+            provider: "cursor_sdk".into(),
+            model: model.to_string(),
+            endpoint: settings.sdk_runner_url.clone(),
+        }]
+    };
     let mut agent_history_basename: Option<String> = None;
-    let run_tool_names: Vec<String> = Vec::new();
 
     info!(
         chat_id,
@@ -602,7 +805,7 @@ pub async fn run_cursor_engine(
             true,
             &run_tool_names,
             &mut agent_history_basename,
-            false,
+            had_tool_calls,
             &prep.user_msg_preview,
             run_start,
             &prep.initial_llm_snapshot_json,
@@ -619,43 +822,9 @@ pub async fn run_cursor_engine(
     }
 }
 
-pub(crate) fn flatten_turn_prompt(system_prompt: &str, messages: &[Message]) -> String {
-    let mut out = String::new();
-    out.push_str("# System\n\n");
-    out.push_str(system_prompt);
-    out.push_str("\n\n# Conversation\n\n");
-    for msg in messages {
-        let text = message_text(msg);
-        if text.trim().is_empty() {
-            continue;
-        }
-        out.push_str("## ");
-        out.push_str(msg.role.as_str());
-        out.push('\n');
-        out.push_str(&text);
-        out.push_str("\n\n");
-    }
-    out
-}
-
-fn message_text(msg: &Message) -> String {
-    match &msg.content {
-        MessageContent::Text(t) => t.clone(),
-        MessageContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::telegram::hook_turn_bridge::append_hook_context_messages;
 
     #[test]
     fn is_stale_cursor_agent_error_detects_missing_agent() {
@@ -685,8 +854,10 @@ mod tests {
     }
 
     #[test]
-    fn flatten_turn_prompt_includes_roles() {
-        let messages = vec![
+    fn full_slim_prompt_includes_roles_and_hook_context() {
+        use crate::channels::telegram::hook_turn_bridge::append_hook_context_messages;
+
+        let mut messages = vec![
             Message {
                 role: "user".into(),
                 content: MessageContent::Text("hello".into()),
@@ -696,22 +867,25 @@ mod tests {
                 content: MessageContent::Text("hi".into()),
             },
         ];
-        let out = flatten_turn_prompt("sys", &messages);
-        assert!(out.contains("# System"));
-        assert!(out.contains("## user"));
-        assert!(out.contains("hello"));
-        assert!(out.contains("## assistant"));
-    }
-
-    #[test]
-    fn flatten_turn_prompt_includes_hook_context() {
-        let mut messages = vec![Message {
-            role: "user".into(),
-            content: MessageContent::Text("go".into()),
-        }];
         append_hook_context_messages(&mut messages, &["scheduled policy".into()]);
-        let out = flatten_turn_prompt("sys", &messages);
-        assert!(out.contains("[hook_context]"));
-        assert!(out.contains("scheduled policy"));
+        let header = DelegationRuntimeHeader {
+            chat_id: 1,
+            persona_id: 2,
+            mcp_enabled: false,
+        };
+        let prompt = build_cursor_delegation_prompt(
+            DelegationPromptMode::FullSlim,
+            "sys",
+            &messages,
+            &header,
+            false,
+            false,
+        );
+        assert!(prompt.contains("# System"));
+        assert!(prompt.contains("## user"));
+        assert!(prompt.contains("hello"));
+        assert!(prompt.contains("## assistant"));
+        assert!(prompt.contains("[hook_context]"));
+        assert!(prompt.contains("scheduled policy"));
     }
 }

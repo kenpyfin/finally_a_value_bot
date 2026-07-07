@@ -141,16 +141,19 @@ def _open_agent(
     cwd: str,
     api_key: str,
     opts: Any,
+    mcp_servers: dict[str, Any] | None,
 ):
-    from cursor_sdk import Agent, LocalAgentOptions
+    from cursor_sdk import Agent, AgentOptions, LocalAgentOptions
 
     model_selection = _build_model_selection(model, model_params)
+    agent_opts = AgentOptions(
+        api_key=api_key,
+        model=model_selection,
+        local=LocalAgentOptions(cwd=cwd),
+        mcp_servers=mcp_servers or None,
+    )
     if not agent_id:
-        return Agent.create(
-            model=model_selection,
-            api_key=api_key,
-            local=LocalAgentOptions(cwd=cwd),
-        )
+        return Agent.create(agent_opts)
 
     try:
         return Agent.resume(agent_id, opts)
@@ -158,11 +161,7 @@ def _open_agent(
         from cursor_sdk import CursorAgentError
 
         if isinstance(err, CursorAgentError) and _is_stale_agent_error(err):
-            return Agent.create(
-                model=model_selection,
-                api_key=api_key,
-                local=LocalAgentOptions(cwd=cwd),
-            )
+            return Agent.create(agent_opts)
         raise
 
 
@@ -172,6 +171,9 @@ async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
     model = (body.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     model_params = body.get("model_params")
     agent_id = (body.get("agent_id") or "").strip() or None
+    mcp_servers = body.get("mcp_servers")
+    if not isinstance(mcp_servers, dict):
+        mcp_servers = None
 
     if not prompt:
         yield json.dumps({"type": "error", "message": "prompt required"}) + "\n"
@@ -207,8 +209,9 @@ async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
                 cwd=cwd,
                 api_key=api_key,
                 opts=opts,
+                mcp_servers=mcp_servers,
             )
-            for line in _stream_agent_turn(agent_ctx, prompt, resume_id):
+            for line in _stream_agent_turn(agent_ctx, prompt, resume_id, mcp_servers):
                 yield line
             return
         except CursorAgentError as err:
@@ -231,14 +234,18 @@ def _stream_agent_turn(
     agent_ctx: Any,
     prompt: str,
     resume_id: str | None,
+    mcp_servers: dict[str, Any] | None,
 ):
     final_text_parts: list[str] = []
     returned_agent_id: str | None = resume_id
     status = "error"
+    send_options: dict[str, Any] | None = None
+    if mcp_servers:
+        send_options = {"mcp_servers": mcp_servers}
 
     with agent_ctx as agent:
         returned_agent_id = getattr(agent, "agent_id", None) or resume_id
-        run = agent.send(prompt)
+        run = agent.send(prompt, send_options) if send_options else agent.send(prompt)
         for message in run.messages():
             msg_type = getattr(message, "type", None)
             if msg_type != "assistant":
@@ -247,13 +254,38 @@ def _stream_agent_turn(
             if payload is None:
                 continue
             for block in getattr(payload, "content", []) or []:
-                if getattr(block, "type", None) != "text":
-                    continue
-                text = getattr(block, "text", "") or ""
-                if not text:
-                    continue
-                final_text_parts.append(text)
-                yield json.dumps({"type": "text", "text": text}) + "\n"
+                block_type = getattr(block, "type", None)
+                if block_type == "text":
+                    text = getattr(block, "text", "") or ""
+                    if not text:
+                        continue
+                    final_text_parts.append(text)
+                    yield json.dumps({"type": "text", "text": text}) + "\n"
+                elif block_type == "tool_use":
+                    name = getattr(block, "name", "") or ""
+                    tool_input = getattr(block, "input", None)
+                    if not isinstance(tool_input, dict):
+                        tool_input = {}
+                    yield json.dumps(
+                        {
+                            "type": "tool_use",
+                            "name": name,
+                            "input": tool_input,
+                        }
+                    ) + "\n"
+                elif block_type == "tool_result":
+                    yield json.dumps(
+                        {
+                            "type": "tool_result",
+                            "name": getattr(block, "name", "") or "",
+                            "output": getattr(block, "content", "") or "",
+                            "is_error": bool(getattr(block, "is_error", False)),
+                        }
+                    ) + "\n"
+                elif block_type == "thinking":
+                    thinking = getattr(block, "thinking", "") or getattr(block, "text", "") or ""
+                    if thinking:
+                        yield json.dumps({"type": "thinking", "thinking": thinking}) + "\n"
 
         result = run.wait()
         status = getattr(result, "status", None) or "finished"
@@ -287,6 +319,7 @@ async def handle_health(_request: web.Request) -> web.Response:
             "service": "cursor-sdk-runner",
             "api_key_configured": bool(_api_key()),
             "cursor_sdk_installed": cursor_sdk_installed,
+            "mcp_supported": True,
         }
     )
 

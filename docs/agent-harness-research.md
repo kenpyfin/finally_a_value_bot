@@ -199,13 +199,15 @@ Shared spine: `prepare_agent_run` (prep) → engine-specific loop → `pipeline_
 
 | Aspect | Implementation |
 |--------|------------------|
-| Loop | **Opaque** — delegated to Cursor SDK / hosted backend |
-| Bridge | Rust → HTTP → Python sidecar → `cursor_sdk` → Node bridge → Cursor API |
-| Tools | Cursor's built-in tools; zero visibility in Rust |
+| Loop | Remote planning in Cursor hosted loop; bot tools via loopback MCP |
+| Bridge | Rust → sidecar → `cursor_sdk` → Cursor API; MCP → `ToolRegistry` |
+| Tools | Bot `ToolRegistry` over MCP when enabled; Cursor built-ins + MCP in remote loop |
 | Input | Flattened text prompt (`flatten_turn_prompt`, 120k cap); images unsupported v1 |
 | State | Resume `agent_id` per chat/persona/session in `cursor_engine_agents` |
-| Fallback | Auto-fallback to Classic on sidecar failure |
-| Observability | Single synthetic `cursor_sdk` pipeline stage; no per-tool trace |
+| Fallback | Auto-fallback to Classic on sidecar failure (non-scheduled) |
+| Observability | `cursor_sdk` stage + per-tool rows when MCP tools run |
+
+**Authoritative integration doc:** [`cursor-engine-integration.md`](cursor-engine-integration.md).
 
 ---
 
@@ -243,9 +245,9 @@ Path: `workspace/runtime/cursor-sdk-venv/lib/python3.12/site-packages/cursor_sdk
 
 "Local runtime" = **local file/shell access with remote brains**. Planning, tool-calling loop, and model routing run on Cursor's servers.
 
-### Sidecar filtering (self-imposed opacity)
+### Sidecar streaming
 
-`cursor-sdk-runner.py` `_stream_agent_turn` forwards only `type:"assistant"` **text** blocks. The SDK exposes richer types (`SDKToolUseMessage`, `ShellCommand`, `SDKThinkingMessage`, artifacts) that the sidecar drops. Observability could be improved at layer 2 without changing engines.
+`cursor-sdk-runner.py` `_stream_agent_turn` forwards assistant **text** plus optional **tool_use** / **tool_result** / **thinking** NDJSON events for observability. Bot tool execution and hooks run in Rust on MCP `tools/call`, not in the sidecar. See [`cursor-engine-integration.md`](cursor-engine-integration.md).
 
 ### Security notes from SDK source
 

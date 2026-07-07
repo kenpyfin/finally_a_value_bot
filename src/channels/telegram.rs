@@ -289,6 +289,7 @@ pub struct AppState {
     pub skills: SkillManager,
     pub llm: Arc<crate::llm::LlmHandle>,
     pub tools: ToolRegistry,
+    pub cursor_mcp: Arc<crate::cursor_mcp_bridge::CursorMcpRegistry>,
     /// Discord HTTP clients keyed by `channel_bot_instances.id`.
     pub discord_http: Arc<HashMap<i64, Arc<SerenityHttp>>>,
     pub chat_queue: ChatRunQueue,
@@ -617,6 +618,7 @@ pub async fn run_bot(
         skills,
         llm,
         tools,
+        cursor_mcp: Arc::new(crate::cursor_mcp_bridge::CursorMcpRegistry::new()),
         discord_http: Arc::new(discord_http_map),
         chat_queue: ChatRunQueue::default(),
         background_job_control: BackgroundJobControl::default(),

@@ -5772,6 +5772,8 @@ fn cursor_engine_json(
     health: &crate::cursor_engine_config::SidecarHealth,
     agent_engine: &str,
     sidecar_managed: bool,
+    web_port: u16,
+    web_enabled: bool,
 ) -> serde_json::Value {
     json!({
         "ok": true,
@@ -5790,6 +5792,12 @@ fn cursor_engine_json(
         "cli_on_path": crate::cursor_engine_config::cli_on_path(&cfg.cli_path),
         "timeout_secs": cfg.timeout_secs,
         "tmux_enabled": cfg.tmux_enabled,
+        "mcp_tools_enabled": cfg.mcp_tools_enabled,
+        "mcp_expose_send_message": cfg.mcp_expose_send_message,
+        "delegation_slim_prompt": cfg.delegation_slim_prompt,
+        "delegation_resume_delta": cfg.delegation_resume_delta,
+        "mcp_endpoint_url": crate::cursor_mcp_bridge::mcp_endpoint_url(web_port),
+        "mcp_bridge_ready": web_enabled && cfg.mcp_tools_enabled,
         "install_steps": [
             "Set CURSOR_API_KEY in repo-root .env (Cursor Dashboard → Integrations)",
             "Restart the bot — it auto-creates a runtime venv and installs cursor-sdk + aiohttp",
@@ -5817,6 +5825,8 @@ async fn api_cursor_engine_get(
         &health,
         agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
+        state.app_state.config.web_port,
+        state.app_state.config.web_enabled,
     )))
 }
 
@@ -5873,6 +5883,18 @@ async fn api_cursor_engine_patch(
     if let Some(enabled) = body.tmux_enabled {
         cfg.tmux_enabled = enabled;
     }
+    if let Some(enabled) = body.mcp_tools_enabled {
+        cfg.mcp_tools_enabled = enabled;
+    }
+    if let Some(enabled) = body.mcp_expose_send_message {
+        cfg.mcp_expose_send_message = enabled;
+    }
+    if let Some(enabled) = body.delegation_slim_prompt {
+        cfg.delegation_slim_prompt = enabled;
+    }
+    if let Some(enabled) = body.delegation_resume_delta {
+        cfg.delegation_resume_delta = enabled;
+    }
 
     if cfg.sdk_model.trim().is_empty() {
         cfg.sdk_model = crate::config::default_cursor_sdk_model();
@@ -5904,6 +5926,8 @@ async fn api_cursor_engine_patch(
         &health,
         agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
+        state.app_state.config.web_port,
+        state.app_state.config.web_enabled,
     );
     if let serde_json::Value::Object(ref mut map) = out {
         map.insert(
@@ -5958,12 +5982,24 @@ async fn api_cursor_engine_health_post(
         &health,
         agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
+        state.app_state.config.web_port,
+        state.app_state.config.web_enabled,
     );
     if let serde_json::Value::Object(ref mut map) = out {
         map.insert("message".into(), serde_json::Value::String(message));
         map.insert("health_ok".into(), serde_json::Value::Bool(ok));
     }
     Ok(Json(out))
+}
+
+async fn api_cursor_mcp_post(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    crate::cursor_mcp_bridge::handle_cursor_mcp(addr, State(state.app_state.clone()), headers, body)
+        .await
 }
 
 async fn api_cursor_engine_models_get(
@@ -6334,7 +6370,12 @@ pub async fn start_web_server(state: Arc<AppState>) {
     };
 
     info!("Web UI available at http://{addr}");
-    if let Err(e) = axum::serve(listener, router).await {
+    if let Err(e) = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         error!("Web server error: {e}");
     }
 }
@@ -6695,6 +6736,7 @@ fn build_router(web_state: WebState) -> Router {
             "/api/cursor-engine/models",
             get(api_cursor_engine_models_get),
         )
+        .route("/internal/cursor-mcp", post(api_cursor_mcp_post))
         .route(
             "/api/runtime",
             get(api_runtime_get).patch(api_runtime_patch),
@@ -7140,6 +7182,7 @@ mod tests {
             skills: SkillManager::from_skills_dirs(cfg.skill_discovery_dirs()),
             llm,
             tools: ToolRegistry::new(&cfg, bot, db, runtime_toggles, env_redactor),
+            cursor_mcp: Arc::new(crate::cursor_mcp_bridge::CursorMcpRegistry::new()),
             discord_http: Arc::new(std::collections::HashMap::new()),
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
             background_job_control: crate::background_jobs::BackgroundJobControl::default(),

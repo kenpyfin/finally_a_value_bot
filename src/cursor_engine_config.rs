@@ -16,6 +16,10 @@ pub const APP_SETTING_CURSOR_AGENT_RUNNER_URL: &str = "CURSOR_AGENT_RUNNER_URL";
 pub const APP_SETTING_CURSOR_AGENT_TIMEOUT_SECS: &str = "CURSOR_AGENT_TIMEOUT_SECS";
 pub const APP_SETTING_CURSOR_AGENT_TMUX_ENABLED: &str = "CURSOR_AGENT_TMUX_ENABLED";
 pub const APP_SETTING_CURSOR_SDK_MODEL_PARAMS: &str = "CURSOR_SDK_MODEL_PARAMS";
+pub const APP_SETTING_CURSOR_MCP_TOOLS_ENABLED: &str = "CURSOR_MCP_TOOLS_ENABLED";
+pub const APP_SETTING_CURSOR_MCP_EXPOSE_SEND_MESSAGE: &str = "CURSOR_MCP_EXPOSE_SEND_MESSAGE";
+pub const APP_SETTING_CURSOR_DELEGATION_SLIM_PROMPT: &str = "CURSOR_DELEGATION_SLIM_PROMPT";
+pub const APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA: &str = "CURSOR_DELEGATION_RESUME_DELTA";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CursorModelParam {
@@ -70,6 +74,14 @@ pub struct CursorEngineSettings {
     pub cli_runner_url: String,
     pub timeout_secs: u64,
     pub tmux_enabled: bool,
+    /// Expose bot ToolRegistry to Cursor via loopback MCP (default on).
+    pub mcp_tools_enabled: bool,
+    /// Allow `send_message` through Cursor MCP (default off).
+    pub mcp_expose_send_message: bool,
+    /// Strip tool catalog from Cursor sidecar system prompt when MCP is live (default on).
+    pub delegation_slim_prompt: bool,
+    /// On resumed Cursor sessions, send delta prompts instead of full flatten (default on).
+    pub delegation_resume_delta: bool,
 }
 
 impl Default for CursorEngineSettings {
@@ -84,6 +96,10 @@ impl Default for CursorEngineSettings {
             cli_runner_url: String::new(),
             timeout_secs: 3600,
             tmux_enabled: true,
+            mcp_tools_enabled: true,
+            mcp_expose_send_message: false,
+            delegation_slim_prompt: true,
+            delegation_resume_delta: true,
         }
     }
 }
@@ -113,6 +129,10 @@ impl CursorEngineSettings {
                 .to_string(),
             timeout_secs: config.cursor_agent_timeout_secs,
             tmux_enabled: config.cursor_agent_tmux_enabled,
+            mcp_tools_enabled: true,
+            mcp_expose_send_message: false,
+            delegation_slim_prompt: true,
+            delegation_resume_delta: true,
         }
     }
 
@@ -198,6 +218,18 @@ pub fn load_from_db(
     if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_AGENT_TMUX_ENABLED) {
         cfg.tmux_enabled = parse_bool(&v);
     }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_MCP_TOOLS_ENABLED) {
+        cfg.mcp_tools_enabled = parse_bool(&v);
+    }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_MCP_EXPOSE_SEND_MESSAGE) {
+        cfg.mcp_expose_send_message = parse_bool(&v);
+    }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_DELEGATION_SLIM_PROMPT) {
+        cfg.delegation_slim_prompt = parse_bool(&v);
+    }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA) {
+        cfg.delegation_resume_delta = parse_bool(&v);
+    }
 
     if cfg.sdk_model.trim().is_empty() {
         cfg.sdk_model = crate::config::default_cursor_sdk_model();
@@ -238,6 +270,38 @@ pub fn persist_to_db(
     db.set_app_setting(
         APP_SETTING_CURSOR_AGENT_TMUX_ENABLED,
         if cfg.tmux_enabled { "true" } else { "false" },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_MCP_TOOLS_ENABLED,
+        if cfg.mcp_tools_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_MCP_EXPOSE_SEND_MESSAGE,
+        if cfg.mcp_expose_send_message {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_DELEGATION_SLIM_PROMPT,
+        if cfg.delegation_slim_prompt {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA,
+        if cfg.delegation_resume_delta {
+            "true"
+        } else {
+            "false"
+        },
     )?;
     Ok(())
 }
@@ -400,6 +464,14 @@ pub struct CursorEnginePatchRequest {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub tmux_enabled: Option<bool>,
+    #[serde(default)]
+    pub mcp_tools_enabled: Option<bool>,
+    #[serde(default)]
+    pub mcp_expose_send_message: Option<bool>,
+    #[serde(default)]
+    pub delegation_slim_prompt: Option<bool>,
+    #[serde(default)]
+    pub delegation_resume_delta: Option<bool>,
 }
 
 #[cfg(test)]

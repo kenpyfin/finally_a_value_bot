@@ -177,6 +177,51 @@ pub struct ScheduledTask {
     pub created_at: String,
 }
 
+/// Read a column as text, tolerating rows whose value was stored with BLOB affinity
+/// (e.g. a prompt hand-edited via the sqlite CLI). SQLite is dynamically typed, so a
+/// single BLOB in a TEXT column otherwise makes `row.get::<String>` fail and aborts the
+/// entire query (which previously took down the scheduler and Schedules API).
+fn row_text(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<String> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(String::new()),
+        ValueRef::Text(t) => Ok(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+        ValueRef::Integer(i) => Ok(i.to_string()),
+        ValueRef::Real(f) => Ok(f.to_string()),
+    }
+}
+
+/// Optional variant of [`row_text`]; `NULL` maps to `None`.
+fn row_text_opt(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<String>> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(t) => Ok(Some(String::from_utf8_lossy(t).into_owned())),
+        ValueRef::Blob(b) => Ok(Some(String::from_utf8_lossy(b).into_owned())),
+        ValueRef::Integer(i) => Ok(Some(i.to_string())),
+        ValueRef::Real(f) => Ok(Some(f.to_string())),
+    }
+}
+
+/// Shared, blob-tolerant row mapping for `scheduled_tasks` queries. All list/lookup queries
+/// must select columns in this order: id, chat_id, persona_id, prompt, schedule_type,
+/// schedule_value, next_run, last_run, status, created_at.
+fn map_scheduled_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask> {
+    Ok(ScheduledTask {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        persona_id: row.get(2)?,
+        prompt: row_text(row, 3)?,
+        schedule_type: row_text(row, 4)?,
+        schedule_value: row_text(row, 5)?,
+        next_run: row_text(row, 6)?,
+        last_run: row_text_opt(row, 7)?,
+        status: row_text(row, 8)?,
+        created_at: row_text(row, 9)?,
+    })
+}
+
 /// External channel identity for delivery and persona policy. `0` = web (no bot token).
 pub const BOT_INSTANCE_WEB: i64 = 0;
 pub const BOT_INSTANCE_TELEGRAM_PRIMARY: i64 = 1;
@@ -3055,20 +3100,7 @@ impl Database {
              ORDER BY next_run ASC, id ASC",
         )?;
         let tasks = stmt
-            .query_map(params![now], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![now], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3082,20 +3114,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map([], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map([], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3113,20 +3132,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map([], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map([], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3145,20 +3151,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3177,20 +3170,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id, persona_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3207,20 +3187,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3239,20 +3206,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id, persona_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3267,20 +3221,7 @@ impl Database {
              FROM scheduled_tasks
              WHERE id = ?1",
             params![task_id],
-            |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            },
+            map_scheduled_task_row,
         );
         match result {
             Ok(task) => Ok(Some(task)),

@@ -140,8 +140,49 @@ fn build_report() -> DoctorReport {
     check_shell(&mut report);
     check_node_and_browser(&mut report);
     check_mcp_dependencies(&mut report);
+    check_cursor_mcp_bridge(&mut report);
 
     report
+}
+
+fn check_cursor_mcp_bridge(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let runtime_dir_str = config.runtime_data_dir();
+    let engine = crate::db::Database::new(&runtime_dir_str)
+        .ok()
+        .and_then(|db| {
+            crate::runtime_toggles::RuntimeToggles::agent_engine_from_app_settings(&db).ok()
+        })
+        .flatten()
+        .unwrap_or_else(|| {
+            crate::runtime_toggles::AgentEngine::parse(
+                &std::env::var("AGENT_ENGINE").unwrap_or_default(),
+            )
+        });
+    if engine != crate::runtime_toggles::AgentEngine::Cursor {
+        return;
+    }
+    let endpoint = crate::cursor_mcp_bridge::mcp_endpoint_url(config.web_port);
+    if !config.web_enabled {
+        report.push(
+            "cursor_engine.mcp_bridge",
+            "Cursor engine MCP tool bridge",
+            CheckStatus::Warn,
+            "AGENT_ENGINE=cursor but WEB_ENABLED=false — bot tools are unavailable to Cursor"
+                .to_string(),
+            Some("Set WEB_ENABLED=true so the loopback MCP endpoint can start.".to_string()),
+        );
+        return;
+    }
+    report.push(
+        "cursor_engine.mcp_bridge",
+        "Cursor engine MCP tool bridge",
+        CheckStatus::Pass,
+        format!("Loopback MCP expected at {endpoint} (enable in Settings → Cursor)"),
+        None,
+    );
 }
 
 fn check_config(report: &mut DoctorReport) {

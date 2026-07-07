@@ -94,6 +94,10 @@ export function SettingsCursorPanel({ api, onError }: Props) {
   const [cliRunnerUrl, setCliRunnerUrl] = useState('')
   const [timeoutSecs, setTimeoutSecs] = useState('3600')
   const [tmuxEnabled, setTmuxEnabled] = useState(true)
+  const [mcpToolsEnabled, setMcpToolsEnabled] = useState(true)
+  const [mcpExposeSendMessage, setMcpExposeSendMessage] = useState(false)
+  const [delegationSlimPrompt, setDelegationSlimPrompt] = useState(true)
+  const [delegationResumeDelta, setDelegationResumeDelta] = useState(true)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -108,6 +112,10 @@ export function SettingsCursorPanel({ api, onError }: Props) {
       setCliRunnerUrl(data.cli_runner_url ?? '')
       setTimeoutSecs(String(data.timeout_secs ?? 3600))
       setTmuxEnabled(data.tmux_enabled ?? true)
+      setMcpToolsEnabled(data.mcp_tools_enabled ?? true)
+      setMcpExposeSendMessage(data.mcp_expose_send_message ?? false)
+      setDelegationSlimPrompt(data.delegation_slim_prompt ?? true)
+      setDelegationResumeDelta(data.delegation_resume_delta ?? true)
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       setConfig(null)
@@ -238,6 +246,10 @@ export function SettingsCursorPanel({ api, onError }: Props) {
           cli_runner_url: cliRunnerUrl,
           timeout_secs: Number.isFinite(secs) ? secs : 3600,
           tmux_enabled: tmuxEnabled,
+          mcp_tools_enabled: mcpToolsEnabled,
+          mcp_expose_send_message: mcpExposeSendMessage,
+          delegation_slim_prompt: delegationSlimPrompt,
+          delegation_resume_delta: delegationResumeDelta,
         }),
       })
       setSaveNotice(res.message ?? 'Saved.')
@@ -278,6 +290,9 @@ export function SettingsCursorPanel({ api, onError }: Props) {
         <Text size="1" color="gray">
           Runner: {config.sdk_runner_url ?? '—'}
           {sidecarManaged ? ' (managed by bot)' : ''}
+        </Text>
+        <Text size="1" color={statusColor(config.mcp_bridge_ready)}>
+          MCP bridge: {config.mcp_bridge_ready ? 'ready' : 'off or web disabled'}
         </Text>
       </Flex>
 
@@ -375,6 +390,53 @@ export function SettingsCursorPanel({ api, onError }: Props) {
               {modelsNotice}
             </Text>
           ) : null}
+        </Flex>
+      </div>
+
+      <div className="rounded-md border p-3" style={{ borderColor: 'var(--gray-6)' }}>
+        <Text size="2" weight="bold" className="mb-1 block">
+          Bot tools (MCP)
+        </Text>
+        <Text size="1" color="gray" className="mb-2 block">
+          Exposes the bot ToolRegistry to the Cursor SDK agent via loopback MCP at{' '}
+          <code>{config.mcp_endpoint_url ?? '/internal/cursor-mcp'}</code>. Requires Web UI
+          enabled. Recursive <code>cursor_agent</code> tools are always denied.
+        </Text>
+        <Flex direction="column" gap="2">
+          <Flex align="center" justify="between" gap="3">
+            <Text size="2">Expose bot tools to Cursor (MCP)</Text>
+            <Switch
+              size="2"
+              checked={mcpToolsEnabled}
+              onCheckedChange={setMcpToolsEnabled}
+            />
+          </Flex>
+          <Flex align="center" justify="between" gap="3">
+            <Text size="2">Allow send_message via MCP</Text>
+            <Switch
+              size="2"
+              checked={mcpExposeSendMessage}
+              disabled={!mcpToolsEnabled}
+              onCheckedChange={setMcpExposeSendMessage}
+            />
+          </Flex>
+          <Flex align="center" justify="between" gap="3">
+            <Text size="2">Slim sidecar prompt (strip tool catalog when MCP on)</Text>
+            <Switch
+              size="2"
+              checked={delegationSlimPrompt}
+              disabled={!mcpToolsEnabled}
+              onCheckedChange={setDelegationSlimPrompt}
+            />
+          </Flex>
+          <Flex align="center" justify="between" gap="3">
+            <Text size="2">Resume delta prompts (smaller follow-up turns)</Text>
+            <Switch
+              size="2"
+              checked={delegationResumeDelta}
+              onCheckedChange={setDelegationResumeDelta}
+            />
+          </Flex>
         </Flex>
       </div>
 

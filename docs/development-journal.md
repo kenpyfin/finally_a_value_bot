@@ -4,6 +4,32 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-07 — Scheduler resilience: blob-typed prompt broke all task queries
+
+- **Area:** scheduler / db
+- **Summary:** All scheduled tasks stopped running and the web Schedules tab showed empty. Root cause: one `scheduled_tasks` row (task #35) had its `prompt` stored with BLOB affinity (SQLite is dynamically typed; likely a manual `sqlite3` edit — Rust insert/update paths only bind `&str`). `row.get::<String>(3)` then failed for that row, aborting the entire `get_due_tasks` / `get_tasks_for_chat` query every scheduler tick (`ERROR scheduler: failed to query due tasks: Invalid column type Blob at index: 3, name: prompt`). Fixed live data with `UPDATE scheduled_tasks SET prompt = CAST(prompt AS TEXT) WHERE typeof(prompt)='blob'`; scheduler recovered on the next tick and caught up 8 overdue tasks. Hardened reads with blob-tolerant helpers so one malformed row can no longer take down the scheduler/API.
+- **Key files / symbols:** `row_text`, `row_text_opt`, `map_scheduled_task_row` in `src/db.rs` (replace 8 inline `ScheduledTask` mappings + `get_task_by_id`); `run_due_tasks` in `src/scheduler.rs`.
+- **Note:** Data fix applies to the running instance immediately; the code hardening requires rebuild + reinstall of `~/.local/bin/finally-a-value-bot` to take effect.
+
+### 2026-07-07 — Cursor engine: context deduplication for sidecar delegation
+
+- **Area:** cursor engine / web settings
+- **Summary:** Cursor-only prompt shaping reduces duplicated context sent to the SDK sidecar: when MCP is live, strip the long `## Tool groups` catalog from the delegation system prompt (schemas come from MCP `tools/list`); on resumed sessions, send resume-delta prompts (runtime header + trusted message tags only) instead of re-flattening full history. `prep.system_prompt` stays full for `pipeline_finish_turn`. Stale `agent_id` clears DB and retries with full slim. Settings → Cursor toggles **Slim sidecar prompt** and **Resume delta prompts** (`CURSOR_DELEGATION_SLIM_PROMPT`, `CURSOR_DELEGATION_RESUME_DELTA`).
+- **Key files / symbols:** `src/cursor_delegation_prompt.rs` (`slim_delegation_system_prompt`, `build_cursor_delegation_prompt`, `DelegationPromptMode`); `run_cursor_engine` in `src/cursor_engine.rs`; `CursorEngineSettings` in `src/cursor_engine_config.rs`; `settings-cursor.tsx`.
+- **Scope:** Classic and Deterministic engines unchanged.
+
+### 2026-07-06 — Docs: Cursor engine integration (tools, skills, hooks)
+
+- **Area:** documentation
+- **Summary:** Added [`docs/cursor-engine-integration.md`](cursor-engine-integration.md) — how ToolRegistry, skills, and bot-native hooks link to Cursor via loopback MCP (not `.cursor/*` sync). Indexed in [`DEVELOP.md`](../DEVELOP.md); cross-links from [`hooks-architecture.md`](hooks-architecture.md) and updated Cursor section in [`agent-harness-research.md`](agent-harness-research.md).
+
+### 2026-07-03 — Cursor engine: MCP tool bridge + full hook parity
+
+- **Area:** cursor engine / hooks / tools / web
+- **Summary:** Cursor SDK runs now expose the bot `ToolRegistry` via loopback MCP (`POST /internal/cursor-mcp`) with run-scoped Bearer tokens. `PreToolUse`/`PostToolUse` run in MCP `tools/call`; `PostToolBatch` at turn end. Assistant text is appended to `messages` before `pipeline_finish_turn` (fixes focus sync). Sidecar passes `mcp_servers` on each `agent.send`; streams `tool_use`/`tool_result` for observability. Settings → Cursor toggles MCP + optional `send_message`.
+- **Key files / symbols:** `src/cursor_mcp_bridge.rs`, `src/tool_hook_dispatch.rs`, `run_cursor_engine` in `src/cursor_engine.rs`, `scripts/cursor-sdk-runner.py`, `web/src/components/settings-cursor.tsx`.
+- **Follow-ups:** ~~Optional trim of tool catalog from flattened Cursor prompt~~ (done 2026-07-07); per-persona engine override.
+
 ### 2026-07-02 — Web UI interactive terminal (PTY + WebSocket)
 
 - **Area:** web UI / web server / config
