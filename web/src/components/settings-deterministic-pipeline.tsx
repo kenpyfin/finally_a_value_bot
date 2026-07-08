@@ -104,8 +104,12 @@ const POLICY_FIELDS: { key: keyof PipelinePolicyConfig; label: string; hint: str
   },
 ]
 
+type BooleanContextKey = {
+  [K in keyof PhaseContextIncludes]: PhaseContextIncludes[K] extends boolean ? K : never
+}[keyof PhaseContextIncludes]
+
 const CONTEXT_FIELDS: {
-  key: keyof PhaseContextIncludes
+  key: BooleanContextKey
   label: string
   hint: string
   kinds?: PipelinePhaseKind[]

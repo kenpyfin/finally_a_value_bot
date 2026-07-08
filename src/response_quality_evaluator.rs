@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn channel_allowlist() {
-        let mut config = Config::test_config();
+        let mut config = crate::config::test_config();
         config.quality_eval_channels = "telegram,web".into();
         assert!(quality_eval_channel_allowed(&config, "telegram"));
         assert!(quality_eval_channel_allowed(&config, "Web"));

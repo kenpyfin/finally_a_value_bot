@@ -333,6 +333,7 @@ mod tests {
             "warn_confirm".into(),
             vec!["destructive".into()],
             RuntimeToggles::new(false),
+            Arc::new(EnvSecretRedactor::empty()),
         );
         let result = tool.execute(json!({"command": "rm -rf /tmp/foo"})).await;
         assert!(result.is_error);
@@ -347,6 +348,7 @@ mod tests {
             "warn_confirm".into(),
             vec!["destructive".into()],
             RuntimeToggles::new(false),
+            Arc::new(EnvSecretRedactor::empty()),
         );
         // Unix: real rm; Windows (PowerShell): keep `rm -rf` substring for destructive match but run a no-op.
         let cmd = if cfg!(windows) {
@@ -365,6 +367,7 @@ mod tests {
             "strict".into(),
             vec!["package".into()],
             RuntimeToggles::new(false),
+            Arc::new(EnvSecretRedactor::empty()),
         );
         let result = tool.execute(json!({"command": "npm install lodash"})).await;
         assert!(result.is_error);

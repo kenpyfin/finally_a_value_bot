@@ -3,7 +3,7 @@
 //! Tests full lifecycle operations across multiple tables,
 //! verifying cross-table consistency and complex query patterns.
 
-use finally_a_value_bot::db::{Database, StoredMessage};
+use finally_a_value_bot::db::{message_origin_interactive, Database, StoredMessage};
 
 fn test_db() -> (Database, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
@@ -36,11 +36,12 @@ fn test_message_full_lifecycle() {
             id: format!("chat1_msg{i}"),
             chat_id: 100,
             persona_id: pid1,
+            session_id: None,
             sender_name: "alice".into(),
             content: format!("chat1 message {i}"),
             is_from_bot: false,
             timestamp: format!("2024-01-01T00:00:{:02}Z", i),
-            origin: crate::db::message_origin_interactive(),
+            origin: message_origin_interactive(),
         })
         .unwrap();
     }
@@ -49,11 +50,12 @@ fn test_message_full_lifecycle() {
             id: format!("chat2_msg{i}"),
             chat_id: 200,
             persona_id: pid2,
+            session_id: None,
             sender_name: "bob".into(),
             content: format!("chat2 message {i}"),
             is_from_bot: false,
             timestamp: format!("2024-01-01T00:00:{:02}Z", i),
-            origin: crate::db::message_origin_interactive(),
+            origin: message_origin_interactive(),
         })
         .unwrap();
     }
@@ -321,11 +323,12 @@ fn test_catch_up_query_complex() {
             id: id.to_string(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: sender.to_string(),
             content: content.to_string(),
             is_from_bot: *is_bot,
             timestamp: ts.to_string(),
-            origin: crate::db::message_origin_interactive(),
+            origin: message_origin_interactive(),
         })
         .unwrap();
     }
@@ -360,11 +363,12 @@ fn test_new_user_messages_since() {
             id: id.to_string(),
             chat_id: 100,
             persona_id: pid,
+            session_id: None,
             sender_name: sender.to_string(),
             content: content.to_string(),
             is_from_bot: *is_bot,
             timestamp: ts.to_string(),
-            origin: crate::db::message_origin_interactive(),
+            origin: message_origin_interactive(),
         })
         .unwrap();
     }
@@ -394,11 +398,12 @@ fn test_chat_and_messages_together() {
         id: "msg1".into(),
         chat_id: 100,
         persona_id: pid,
+        session_id: None,
         sender_name: "alice".into(),
         content: "hello".into(),
         is_from_bot: false,
         timestamp: "2024-01-01T00:00:00Z".into(),
-        origin: crate::db::message_origin_interactive(),
+        origin: message_origin_interactive(),
     })
     .unwrap();
 

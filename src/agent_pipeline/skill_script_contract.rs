@@ -746,7 +746,7 @@ parser.add_argument("--output", help="y")
     }
 
     #[test]
-    fn find_artifact_paths_in_text() {
+    fn find_artifact_paths_in_text_extracts_paths() {
         let paths = find_artifact_paths_in_text(
             "SUCCESS: Result saved to parking/PZ_REF.png\nARTIFACT: /tmp/out.png",
         );
