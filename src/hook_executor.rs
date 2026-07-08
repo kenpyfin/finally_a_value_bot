@@ -399,6 +399,7 @@ pub async fn execute_prompt_hook(
 mod tests {
     use super::*;
     use crate::config::test_config;
+    #[cfg(unix)]
     use std::fs;
 
     #[test]

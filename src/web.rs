@@ -6135,10 +6135,10 @@ async fn api_restart_post(
     require_auth(&headers, state.auth_token.as_deref())?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        return Err((
+        Err((
             StatusCode::NOT_IMPLEMENTED,
             "Gateway restart is only supported on Linux and macOS.".to_string(),
-        ));
+        ))
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
