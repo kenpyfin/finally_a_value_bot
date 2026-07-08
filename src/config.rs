@@ -1974,7 +1974,9 @@ mod tests {
     fn test_config_yaml_defaults() {
         let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.llm_provider, "anthropic");
+        // Provider now defaults to empty (set via Web UI / env); post_deserialize
+        // leaves it unset when not provided.
+        assert_eq!(config.llm_provider, "");
         assert_eq!(config.max_tokens, 8192);
         assert_eq!(config.max_tool_iterations, 100);
         assert_eq!(config.workspace_dir, "./workspace");
@@ -1998,7 +2000,7 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert_eq!(config.llm_provider, "anthropic");
-        assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.model, "claude-opus-4-7");
     }
 
     #[test]
@@ -2029,17 +2031,21 @@ mod tests {
     }
 
     #[test]
-    fn test_post_deserialize_missing_api_key() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\n";
+    fn test_post_deserialize_missing_api_key_allows_local_fallback() {
+        // web_enabled defaults to true (web-first); the LLM-key requirement only
+        // applies when web is disabled. Even then, a local model catalog is always
+        // available, so `any_provider_api_key_configured()` is satisfied and the
+        // config is accepted without a cloud API key.
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\nweb_enabled: false\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = config.post_deserialize().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("At least one LLM API key"));
+        config.post_deserialize().unwrap();
     }
 
     #[test]
     fn test_post_deserialize_missing_bot_tokens() {
-        let yaml = "bot_username: bot\napi_key: key\n";
+        // A channel token is only required when web is disabled (web_enabled
+        // defaults to true), so disable web to exercise the validation.
+        let yaml = "bot_username: bot\napi_key: key\nweb_enabled: false\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         let err = config.post_deserialize().unwrap_err();
         let msg = err.to_string();
@@ -2090,7 +2096,13 @@ mod tests {
         let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: openai\nopenai_api_key: sk-openai-fallback\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.api_key, "sk-openai-fallback");
+        // openai_api_key is kept in its own field and resolved directly at call
+        // time (no longer copied into api_key).
+        assert_eq!(config.openai_api_key.as_deref(), Some("sk-openai-fallback"));
+        assert_eq!(
+            crate::llm_catalog::resolve_api_key_for_provider_with_config("openai", Some(&config)),
+            "sk-openai-fallback"
+        );
     }
 
     #[test]
@@ -2106,7 +2118,7 @@ mod tests {
         let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: llama\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.model, "local");
+        assert_eq!(config.model, "qwen2.5-coder-14b-instruct");
         assert_eq!(
             config.llm_base_url.as_deref(),
             Some("http://127.0.0.1:8080/v1")
@@ -2138,7 +2150,7 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert_eq!(config.llm_provider, "anthropic");
-        assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.model, "claude-opus-4-7");
     }
 
     #[test]

@@ -4901,7 +4901,12 @@ pub(super) fn trim_to_token_budget(
         let rest = &messages[trim_at..];
         let nu = rest.iter().filter(|m| m.role == "user").count();
         let na = rest.iter().filter(|m| m.role == "assistant").count();
-        if nu < min_user_remaining || na < min_asst_remaining {
+        // Break if removing the candidate would drop the retained suffix below
+        // the minimum retained user/assistant counts (check post-removal counts,
+        // since the candidate itself is about to be removed).
+        let nu_after = nu - usize::from(messages[trim_at].role == "user");
+        let na_after = na - usize::from(messages[trim_at].role == "assistant");
+        if nu_after < min_user_remaining || na_after < min_asst_remaining {
             break;
         }
         let removed = messages.remove(trim_at);
@@ -7011,8 +7016,12 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
         if let MessageContent::Text(t) = &messages[0].content {
-            assert!(t.contains("<user_message sender=\"alice\">hello</user_message>"));
-            assert!(t.contains("<user_message sender=\"bob\">hi</user_message>"));
+            assert!(t.contains(
+                "<user_message sender=\"alice\" at=\"2024-01-01T00:00:01Z\">hello</user_message>"
+            ));
+            assert!(t.contains(
+                "<user_message sender=\"bob\" at=\"2024-01-01T00:00:02Z\">hi</user_message>"
+            ));
         } else {
             panic!("Expected Text content");
         }
@@ -7154,16 +7163,27 @@ mod tests {
 
     #[test]
     fn test_history_to_claude_messages_strips_bulletin_focus_from_assistant() {
-        let history = vec![make_msg(
-            "1",
-            "bot",
-            "Here is the image.\n\n[bulletin_focus]\nPZ Ops: Rooftop\nNext Step: publish",
-            true,
-            "2024-01-01T00:00:01Z",
-        )];
+        // A leading user turn is required so the assistant reply is not stripped as
+        // a leading-assistant message; keep_trailing_assistant retains the reply.
+        let history = vec![
+            make_msg(
+                "0",
+                "alice",
+                "show me the render",
+                false,
+                "2024-01-01T00:00:00Z",
+            ),
+            make_msg(
+                "1",
+                "bot",
+                "Here is the image.\n\n[bulletin_focus]\nPZ Ops: Rooftop\nNext Step: publish",
+                true,
+                "2024-01-01T00:00:01Z",
+            ),
+        ];
         let messages = history_to_claude_messages(&history, "bot", true);
-        assert_eq!(messages.len(), 1);
-        if let MessageContent::Text(t) = &messages[0].content {
+        assert_eq!(messages.len(), 2);
+        if let MessageContent::Text(t) = &messages[1].content {
             assert!(t.contains("Here is the image."));
             assert!(!t.contains("bulletin_focus"));
             assert!(!t.contains("Next Step"));
@@ -7194,7 +7214,10 @@ mod tests {
         assert!(prompt.contains("12345"));
         assert!(prompt.contains("**Shell:** bash"));
         assert!(prompt.contains("[persona_context]"));
-        assert!(!prompt.contains("# Principles"));
+        // The "# Principles" phrase now appears in static guidance referencing
+        // AGENTS.md, so check that the loaded Principles *section* is absent when
+        // no principles content is provided.
+        assert!(!prompt.contains("# Principles\n\nThe following is loaded from the file"));
         assert!(!prompt.contains("# Agent Skills"));
     }
 
@@ -8176,8 +8199,8 @@ mod tests {
         );
         assert!(prompt.contains("update_bulletin_focus"));
         assert!(prompt.contains("Bulletin + memory sync"));
-        assert!(prompt.contains("persisted automatically by lifecycle hooks"));
-        assert!(prompt.contains("Tier 2 is durable knowledge only"));
+        assert!(prompt.contains("persist automatically via post-delivery hooks"));
+        assert!(prompt.contains("Tier 2 holds terminology"));
     }
 
     #[test]
@@ -8223,8 +8246,8 @@ mod tests {
             "",
         );
         assert!(prompt.contains("For serving files to users:"));
-        assert!(prompt.contains("Never fabricate `/api/uploads/...` links"));
-        assert!(prompt.contains("attachment_path"));
+        assert!(prompt.contains("Never fabricate `/api/uploads/...` URLs"));
+        assert!(prompt.contains("absolute local file paths"));
     }
 
     #[test]

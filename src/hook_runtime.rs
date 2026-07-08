@@ -397,7 +397,8 @@ mod tests {
                 None,
                 "block-bash",
                 HookEventName::PreToolUse.as_str(),
-                Some("^bash$"),
+                // Matcher is tested against the composite target ("tool_name=bash …").
+                Some("tool_name=bash"),
                 "block",
                 r#"{"reason":"blocked"}"#,
                 None,

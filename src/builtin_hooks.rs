@@ -324,6 +324,7 @@ mod tests {
                 matcher TEXT,
                 action_type TEXT NOT NULL,
                 action_payload_json TEXT NOT NULL DEFAULT '{}',
+                scoped_persona_ids_json TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );",

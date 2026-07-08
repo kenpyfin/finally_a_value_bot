@@ -236,9 +236,11 @@ mod tests {
             "finally_a_value_bot_repo_map_{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(root.join("src").join("lib.rs"), "pub fn helper() {}\n").unwrap();
+        // Tools resolve their working dir to `<root>/shared`, so place sources there.
+        let src = root.join("shared").join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn helper() {}\n").unwrap();
 
         let tool = ReadRepoMapTool::new(root.to_str().unwrap());
         let result = tool.execute(json!({"max_files": 10})).await;

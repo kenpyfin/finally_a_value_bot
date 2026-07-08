@@ -1061,6 +1061,9 @@ mod tests {
         };
         let flat = root.join("shared").join("scripts").join("a.py");
         std::fs::create_dir_all(flat.parent().unwrap()).unwrap();
+        // Create the file so `is_under` canonicalizes the full path (matching the
+        // canonicalized root) regardless of symlinked temp dirs.
+        std::fs::write(&flat, "x").unwrap();
         let err = assert_persona_tool_path_allowed(&root, &flat, Some(&auth), true).unwrap_err();
         assert!(err.contains("flat shared paths"));
         let _ = std::fs::remove_dir_all(&root);

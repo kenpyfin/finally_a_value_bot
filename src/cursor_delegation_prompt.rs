@@ -14,7 +14,7 @@ const MCP_TOOLS_DELEGATION_SECTION: &str = r#"## Tool groups (MCP delegation)
 Bot tools are exposed via MCP server `finally-a-value-bot` (loopback). Tool names and parameter schemas come from MCP `tools/list` — do not rely on prose catalogs here.
 - **Prefer MCP** for persona-scoped files (`read_file`, `write_file`, `grep`, …), vault (`search_vault`, `read_file`), scheduler, bulletin (`update_bulletin_focus`), channel delivery, and skills (`activate_skill`, `run_skill_script`).
 - Cursor built-ins (shell, search) exist; use MCP file tools for paths under the persona cwd and for vault/scheduler/bulletin workflows.
-- **Skills:** metadata in `# Agent Skills` below is routing only; call `activate_skill` before following procedural skill steps.
+- **Skills:** metadata in the Agent Skills section below is routing only; call `activate_skill` before following procedural skill steps.
 
 "#;
 

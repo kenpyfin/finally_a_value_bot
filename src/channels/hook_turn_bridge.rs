@@ -276,6 +276,7 @@ fn assistant_text_references_incomplete_work(text: &str) -> bool {
         || lower.contains("cursor agent")
         || lower.contains("run #")
         || lower.contains("run logs")
+        || lower.contains("the log")
         || lower.contains("not successfully")
         || lower.contains("no such file")
         || lower.contains("was not created")
