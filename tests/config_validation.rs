@@ -28,8 +28,10 @@ fn test_yaml_parse_minimal() {
     assert_eq!(config.telegram_bot_token, "tok");
     assert_eq!(config.bot_username, "bot");
     assert_eq!(config.api_key, "key");
-    // Defaults
-    assert_eq!(config.llm_provider, "anthropic");
+    // Defaults: llm_provider deserializes empty and is resolved during
+    // post_deserialize (web-first defaults / local fallback), so the raw
+    // parsed value is "" rather than a hardcoded "anthropic".
+    assert_eq!(config.llm_provider, "");
     assert_eq!(config.max_tokens, 8192);
     assert_eq!(config.max_tool_iterations, 100);
     assert_eq!(config.max_document_size_mb, 100);
