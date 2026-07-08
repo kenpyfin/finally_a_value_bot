@@ -22,7 +22,7 @@ pub fn sop_request_steer(user_request: &str) -> Option<String> {
     }
     Some(format!(
         "[hook_context]\n\
-         **SOP vocabulary:** \"Workflow\" / \"pipeline\" = vault SOP at `tier2.sops[].vault_path` (ORIGIN markdown), not YAML/`run_workflow`. If a Tier 2 SOP matches, `read_file` that vault path and follow it. PZ default: `{SOP_VAULT_PATH}`. Use `activate_skill` + `run_skill_script`.\n\
+         **SOP vocabulary:** \"Workflow\" / \"pipeline\" = vault SOP at `tier2.sops[].vault_path` (ORIGIN markdown), not YAML (`run_workflow` was removed). Use `search_vault` to locate the SOP, then `read_file` that vault path and follow it. PZ default: `{SOP_VAULT_PATH}`. Use `activate_skill` + `run_skill_script`.\n\
          [/hook_context]"
     ))
 }

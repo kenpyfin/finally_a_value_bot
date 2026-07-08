@@ -209,23 +209,52 @@ export function usePersonaSession({
   )
 
   const handleCreateSession = useCallback(
-    async (intent: string) => {
+    async (intent: string, mirrorMainChat = false) => {
       if (chatId == null || activePersonaId == null) return
-      const data = await api<{ session?: ChatSession }>('/api/chat_sessions', {
+      const data = await api<{
+        session?: ChatSession
+        session_id?: string
+        title?: string
+      }>('/api/chat_sessions', {
         method: 'POST',
-        body: JSON.stringify({ chat_id: chatId, persona_id: activePersonaId, intent }),
+        body: JSON.stringify({
+          chat_id: chatId,
+          persona_id: activePersonaId,
+          intent,
+          mirror_main_chat: mirrorMainChat,
+        }),
       })
-      if (data.session) {
-        await loadSessions()
-        setActiveSessionId(data.session.id)
-        writeStoredSessionForPersona(activePersonaId, data.session.id)
-        resetHistoryPagination()
-        await loadHistory(chatId, activePersonaId, null, {
-          force: true,
-          limitOverride: HISTORY_PAGE_SIZE,
-          sessionId: data.session.id,
-        })
-      }
+      const session =
+        data.session ??
+        (data.session_id
+          ? {
+              id: data.session_id,
+              chat_id: chatId,
+              persona_id: activePersonaId,
+              title: data.title ?? intent.slice(0, 60),
+              intent,
+              status: 'active' as const,
+              created_at: new Date().toISOString(),
+              last_active_at: new Date().toISOString(),
+              ttl_hours: 72,
+              mirror_main_chat: mirrorMainChat,
+            }
+          : null)
+      if (!session) return
+
+      setChatSessions((prev) => {
+        if (prev.some((s) => s.id === session.id)) return prev
+        return [session, ...prev]
+      })
+      setActiveSessionId(session.id)
+      writeStoredSessionForPersona(activePersonaId, session.id)
+      resetHistoryPagination()
+      await loadHistory(chatId, activePersonaId, null, {
+        force: true,
+        limitOverride: HISTORY_PAGE_SIZE,
+        sessionId: session.id,
+      })
+      void loadSessions()
     },
     [activePersonaId, chatId, loadHistory, loadSessions, resetHistoryPagination],
   )

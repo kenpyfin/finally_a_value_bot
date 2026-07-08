@@ -91,7 +91,9 @@ Redaction runs on tool results, logs, hook/PTE prompts, scheduler delivery, fina
 
 | Topic | Doc |
 | --- | --- |
+| **Cursor engine** — tools, skills, hooks via loopback MCP | [`docs/cursor-engine-integration.md`](docs/cursor-engine-integration.md) |
 | Multi-model local tiers (llama.cpp, tool probe, cross-install setup) | [`docs/multimodel-local-tiers.md`](docs/multimodel-local-tiers.md) |
+| Bot-native hooks (catalog, events, storage) | [`docs/hooks-architecture.md`](docs/hooks-architecture.md) |
 | Vault SOPs (workflows as procedure context) | [`docs/sops.md`](docs/sops.md) |
 | Deprecated SQLite learned workflows | [`docs/workflow.md`](docs/workflow.md) |
 | Runtime parity / deferred agent-runtime items | [`docs/runtime-gap-analysis.md`](docs/runtime-gap-analysis.md) |

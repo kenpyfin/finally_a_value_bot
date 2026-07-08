@@ -74,6 +74,12 @@ fn default_web_run_history_limit() -> usize {
 fn default_web_session_idle_ttl_seconds() -> u64 {
     300
 }
+fn default_web_terminal_max_sessions() -> usize {
+    2
+}
+fn default_web_terminal_idle_timeout_secs() -> u64 {
+    1800
+}
 fn default_browser_managed() -> bool {
     false
 }
@@ -304,6 +310,8 @@ pub fn is_llm_related_runtime_setting_key(key: &str) -> bool {
     if u == crate::llm_catalog::APP_SETTING_LLM_MODEL
         || u == crate::llm_catalog::APP_SETTING_LLM_PROVIDER
         || u == crate::llm_catalog::APP_SETTING_LLM_BASE_URL
+        || u == crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED
+        || u == crate::llm_catalog::APP_SETTING_SHOW_THINKING
     {
         return false;
     }
@@ -463,6 +471,9 @@ pub struct Config {
     pub discord_allowed_channels: Vec<u64>,
     #[serde(default)]
     pub show_thinking: bool,
+    /// When true, request extended thinking from providers that support it (e.g. Gemini thinkingConfig).
+    #[serde(default)]
+    pub llm_thinking_enabled: bool,
     #[serde(default = "default_web_enabled")]
     pub web_enabled: bool,
     #[serde(default = "default_web_host")]
@@ -481,6 +492,16 @@ pub struct Config {
     pub web_run_history_limit: usize,
     #[serde(default = "default_web_session_idle_ttl_seconds")]
     pub web_session_idle_ttl_seconds: u64,
+    /// When true, web UI may open an interactive PTY terminal (requires WEB_AUTH_TOKEN). Env: WEB_TERMINAL_ENABLED.
+    #[serde(default)]
+    pub web_terminal_enabled: bool,
+    #[serde(default = "default_web_terminal_max_sessions")]
+    pub web_terminal_max_sessions: usize,
+    #[serde(default = "default_web_terminal_idle_timeout_secs")]
+    pub web_terminal_idle_timeout_secs: u64,
+    /// Allow web terminal inside Docker (default false). Env: WEB_TERMINAL_ALLOW_IN_DOCKER.
+    #[serde(default)]
+    pub web_terminal_allow_in_docker: bool,
     /// When set, web UI uses this chat_id for all requests (single universal contact across channels). Env: UNIVERSAL_CHAT_ID.
     #[serde(default)]
     pub universal_chat_id: Option<i64>,
@@ -724,6 +745,21 @@ impl Config {
         }
     }
 
+    /// Whether web terminal is enabled and allowed in the current runtime environment.
+    pub fn web_terminal_effective(&self) -> bool {
+        self.web_terminal_enabled
+            && (self.web_terminal_allow_in_docker || !crate::background_shell::in_docker())
+    }
+
+    /// Whether operators can open a web terminal (enabled, environment OK, auth token configured).
+    pub fn web_terminal_available(&self) -> bool {
+        self.web_terminal_effective()
+            && self
+                .web_auth_token
+                .as_ref()
+                .is_some_and(|t| !t.trim().is_empty())
+    }
+
     /// Resolve path to .env file. FINALLY_A_VALUE_BOT_CONFIG can override (points to .env).
     pub fn resolve_config_path() -> Result<Option<PathBuf>, FinallyAValueBotError> {
         if let Ok(custom) = std::env::var("FINALLY_A_VALUE_BOT_CONFIG") {
@@ -938,6 +974,7 @@ impl Config {
             discord_bot_token: Self::env("DISCORD_BOT_TOKEN"),
             discord_allowed_channels: Self::env_vec_u64("DISCORD_ALLOWED_CHANNELS"),
             show_thinking: Self::env_bool("SHOW_THINKING", false),
+            llm_thinking_enabled: false,
             web_enabled: Self::env_bool("WEB_ENABLED", default_web_enabled()),
             web_host: Self::env("WEB_HOST").unwrap_or_else(default_web_host),
             web_port: Self::env_u16("WEB_PORT", default_web_port()),
@@ -962,6 +999,16 @@ impl Config {
                 "WEB_SESSION_IDLE_TTL_SECONDS",
                 default_web_session_idle_ttl_seconds(),
             ),
+            web_terminal_enabled: Self::env_bool("WEB_TERMINAL_ENABLED", false),
+            web_terminal_max_sessions: Self::env_usize(
+                "WEB_TERMINAL_MAX_SESSIONS",
+                default_web_terminal_max_sessions(),
+            ),
+            web_terminal_idle_timeout_secs: Self::env_u64(
+                "WEB_TERMINAL_IDLE_TIMEOUT_SECS",
+                default_web_terminal_idle_timeout_secs(),
+            ),
+            web_terminal_allow_in_docker: Self::env_bool("WEB_TERMINAL_ALLOW_IN_DOCKER", false),
             universal_chat_id: Self::env("UNIVERSAL_CHAT_ID").and_then(|s| s.parse().ok()),
             browser_managed: Self::env_bool("BROWSER_MANAGED", default_browser_managed()),
             browser_executable_path: Self::env("BROWSER_EXECUTABLE_PATH"),
@@ -1175,6 +1222,15 @@ impl Config {
             }
         }
 
+        for (key, value) in &settings {
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED) {
+                self.llm_thinking_enabled = parse_bool_setting(value);
+            }
+            if key.eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_SHOW_THINKING) {
+                self.show_thinking = parse_bool_setting(value);
+            }
+        }
+
         let mut persist_defaults = false;
         if self.llm_provider.is_empty() {
             if let Some(p) = crate::llm_catalog::first_provider_with_api_key() {
@@ -1374,6 +1430,23 @@ impl Config {
         }
         if self.web_session_idle_ttl_seconds == 0 {
             self.web_session_idle_ttl_seconds = default_web_session_idle_ttl_seconds();
+        }
+        if self.web_terminal_max_sessions == 0 {
+            self.web_terminal_max_sessions = default_web_terminal_max_sessions();
+        }
+        if self.web_terminal_idle_timeout_secs == 0 {
+            self.web_terminal_idle_timeout_secs = default_web_terminal_idle_timeout_secs();
+        }
+        if self.web_terminal_enabled
+            && self
+                .web_auth_token
+                .as_ref()
+                .map(|t| t.trim().is_empty())
+                .unwrap_or(true)
+        {
+            return Err(FinallyAValueBotError::Config(
+                "web_auth_token is required when WEB_TERMINAL_ENABLED=true".into(),
+            ));
         }
         // Evaluator model aliases (legacy env names).
         if !self.response_quality_evaluator_model.trim().is_empty() {
@@ -1753,6 +1826,7 @@ pub fn test_config() -> Config {
         discord_bot_token: None,
         discord_allowed_channels: vec![],
         show_thinking: false,
+        llm_thinking_enabled: false,
         web_enabled: true,
         web_host: "127.0.0.1".into(),
         web_port: 10961,
@@ -1762,6 +1836,10 @@ pub fn test_config() -> Config {
         web_rate_window_seconds: 10,
         web_run_history_limit: 512,
         web_session_idle_ttl_seconds: 300,
+        web_terminal_enabled: false,
+        web_terminal_max_sessions: default_web_terminal_max_sessions(),
+        web_terminal_idle_timeout_secs: default_web_terminal_idle_timeout_secs(),
+        web_terminal_allow_in_docker: false,
         universal_chat_id: None,
         browser_managed: false,
         browser_executable_path: None,
@@ -1896,7 +1974,9 @@ mod tests {
     fn test_config_yaml_defaults() {
         let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.llm_provider, "anthropic");
+        // Provider now defaults to empty (set via Web UI / env); post_deserialize
+        // leaves it unset when not provided.
+        assert_eq!(config.llm_provider, "");
         assert_eq!(config.max_tokens, 8192);
         assert_eq!(config.max_tool_iterations, 100);
         assert_eq!(config.workspace_dir, "./workspace");
@@ -1920,7 +2000,7 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert_eq!(config.llm_provider, "anthropic");
-        assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.model, "claude-opus-4-7");
     }
 
     #[test]
@@ -1951,17 +2031,21 @@ mod tests {
     }
 
     #[test]
-    fn test_post_deserialize_missing_api_key() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\n";
+    fn test_post_deserialize_missing_api_key_allows_local_fallback() {
+        // web_enabled defaults to true (web-first); the LLM-key requirement only
+        // applies when web is disabled. Even then, a local model catalog is always
+        // available, so `any_provider_api_key_configured()` is satisfied and the
+        // config is accepted without a cloud API key.
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\nweb_enabled: false\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = config.post_deserialize().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("At least one LLM API key"));
+        config.post_deserialize().unwrap();
     }
 
     #[test]
     fn test_post_deserialize_missing_bot_tokens() {
-        let yaml = "bot_username: bot\napi_key: key\n";
+        // A channel token is only required when web is disabled (web_enabled
+        // defaults to true), so disable web to exercise the validation.
+        let yaml = "bot_username: bot\napi_key: key\nweb_enabled: false\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         let err = config.post_deserialize().unwrap_err();
         let msg = err.to_string();
@@ -2012,7 +2096,13 @@ mod tests {
         let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: openai\nopenai_api_key: sk-openai-fallback\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.api_key, "sk-openai-fallback");
+        // openai_api_key is kept in its own field and resolved directly at call
+        // time (no longer copied into api_key).
+        assert_eq!(config.openai_api_key.as_deref(), Some("sk-openai-fallback"));
+        assert_eq!(
+            crate::llm_catalog::resolve_api_key_for_provider_with_config("openai", Some(&config)),
+            "sk-openai-fallback"
+        );
     }
 
     #[test]
@@ -2028,7 +2118,7 @@ mod tests {
         let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: llama\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.model, "local");
+        assert_eq!(config.model, "qwen2.5-coder-14b-instruct");
         assert_eq!(
             config.llm_base_url.as_deref(),
             Some("http://127.0.0.1:8080/v1")
@@ -2060,7 +2150,7 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
         assert_eq!(config.llm_provider, "anthropic");
-        assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.model, "claude-opus-4-7");
     }
 
     #[test]

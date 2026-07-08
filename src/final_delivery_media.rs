@@ -333,7 +333,7 @@ mod tests {
 
         let input = "Hello\n\nPZ-foo.png (Refined Identity)\n\nBye";
         let out = normalize_assistant_artifact_references(&input, &root, 1, 2);
-        assert!(out.contains("!("));
+        assert!(out.contains("!["));
         assert!(out.contains("PZ-foo.png"));
         assert!(!out.contains("PZ-foo.png (Refined Identity)"));
         let _ = fs::remove_dir_all(root);

@@ -23,18 +23,16 @@ import { ThreadWelcomeHints } from './thread-welcome-hints'
 import { LoadEarlierMessages } from './load-earlier-messages'
 import { ScrollToLatest } from './scroll-to-latest'
 import {
-  AssistantActionBar,
   AssistantMessage,
   BranchPicker,
   Composer,
   Thread,
-  UserActionBar,
   UserMessage,
   makeMarkdownText,
 } from '@assistant-ui/react-ui'
 import remarkGfm from 'remark-gfm'
-import { historiesEqual } from '../lib/history-sync'
-import type { PendingReplyQuote } from '../lib/reply-quote'
+import { historiesEqual, isHistoryPrepend } from '../lib/history-sync'
+import { messageTextForClipboard, parseReplyForDisplay, type DisplayReplyQuote, type PendingReplyQuote } from '../lib/reply-quote'
 import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -51,6 +49,12 @@ function formatUnknown(value: unknown): string {
   } catch {
     return String(value)
   }
+}
+
+type ScrollAnchor = { scrollTop: number; scrollHeight: number }
+
+function captureScrollAnchor(el: HTMLElement): ScrollAnchor {
+  return { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight }
 }
 
 function ToolCallCard(props: ToolCallMessagePartProps) {
@@ -131,27 +135,90 @@ const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
 function ComposerQuotePreview() {
   const { pendingReply, onDismissPendingReply } = React.useContext(ThreadPaneUiContext)
   if (!pendingReply) return null
-  const label = pendingReply.isFromBot
-    ? 'assistant'
-    : (pendingReply.senderName.trim() || 'user')
   return (
-    <div className="mc-reply-quote-preview" role="note" aria-label={`Replying to ${label}`}>
+    <SentReplyQuoteChip
+      quote={pendingReply}
+      onDismiss={onDismissPendingReply}
+      className="mc-reply-quote-composer"
+    />
+  )
+}
+
+function replyQuoteLabel(quote: { isFromBot?: boolean; role?: 'user' | 'assistant'; senderName?: string; sender?: string }): string {
+  const isBot = quote.isFromBot ?? quote.role === 'assistant'
+  if (isBot) return 'assistant'
+  const name = (quote.senderName ?? quote.sender ?? '').trim()
+  return name || 'user'
+}
+
+function SentReplyQuoteChip({
+  quote,
+  onDismiss,
+  className,
+}: {
+  quote: PendingReplyQuote | DisplayReplyQuote
+  onDismiss?: () => void
+  className?: string
+}) {
+  const label = replyQuoteLabel(
+    'isFromBot' in quote
+      ? quote
+      : { role: quote.role, sender: quote.sender },
+  )
+  const snippet = quote.snippet
+  return (
+    <div
+      className={['mc-reply-quote-preview', className].filter(Boolean).join(' ')}
+      role="note"
+      aria-label={`Replying to ${label}`}
+    >
       <div className="mc-reply-quote-bar" aria-hidden />
       <div className="mc-reply-quote-body">
         <div className="mc-reply-quote-label">Replying to {label}</div>
-        <div className="mc-reply-quote-snippet">{pendingReply.snippet}</div>
+        <div className="mc-reply-quote-snippet">{snippet}</div>
       </div>
-      {onDismissPendingReply ? (
+      {onDismiss ? (
         <button
           type="button"
           className="mc-reply-quote-dismiss"
-          onClick={onDismissPendingReply}
+          onClick={onDismiss}
           aria-label="Remove quoted message"
           title="Remove quote"
         >
           ×
         </button>
       ) : null}
+    </div>
+  )
+}
+
+function messageTextContent(content: unknown, joiner = ''): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((part): part is { type: 'text'; text: string } => {
+        return typeof part === 'object' && part !== null && (part as { type?: string }).type === 'text'
+      })
+      .map((part) => part.text)
+      .join(joiner)
+  }
+  return ''
+}
+
+function getMessageClipboardText(content: unknown): string {
+  return messageTextForClipboard(messageTextContent(content, '\n'))
+}
+
+function UserMessageDisplayBody() {
+  const rawText = useMessage((m) => messageTextContent(m.content))
+  const parsed = React.useMemo(() => parseReplyForDisplay(rawText), [rawText])
+  if (!parsed) {
+    return <UserMessage.Content />
+  }
+  return (
+    <div className="aui-user-message-content">
+      <SentReplyQuoteChip quote={parsed.quote} className="mc-reply-quote-sent" />
+      {parsed.followUp.trim() ? <div className="mc-reply-follow-up">{parsed.followUp}</div> : null}
     </div>
   )
 }
@@ -168,6 +235,7 @@ function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
   if (!messageId || mobileActionMessageId !== messageId) return null
   return (
     <div className="mc-msg-mobile-actions" role="toolbar" aria-label="Message actions">
+      <MessageCopyButton />
       {onReplyToMessage ? (
         <button
           type="button"
@@ -216,15 +284,71 @@ function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
 
 function useMobileMessageTapProps(messageId: string) {
   const { onMobileMessageTap } = React.useContext(ThreadPaneUiContext)
+  const longPressRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pointerStartRef = React.useRef<{ x: number; y: number } | null>(null)
+
+  const clearLongPress = React.useCallback(() => {
+    if (longPressRef.current !== null) {
+      clearTimeout(longPressRef.current)
+      longPressRef.current = null
+    }
+    pointerStartRef.current = null
+  }, [])
+
+  React.useEffect(() => () => clearLongPress(), [clearLongPress])
+
   return {
-    onClick: (e: React.MouseEvent) => {
+    onPointerDown: (e: React.PointerEvent) => {
       if (typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches) return
       const target = e.target as HTMLElement
-      if (target.closest('button, a, input, textarea, [role="toolbar"]')) return
+      if (target.closest('button, a, input, textarea, [role="toolbar"], pre, code')) return
       if (!messageId || !onMobileMessageTap) return
-      onMobileMessageTap(messageId)
+      pointerStartRef.current = { x: e.clientX, y: e.clientY }
+      clearLongPress()
+      longPressRef.current = setTimeout(() => {
+        onMobileMessageTap(messageId)
+        clearLongPress()
+      }, 450)
+    },
+    onPointerMove: (e: React.PointerEvent) => {
+      const start = pointerStartRef.current
+      if (!start) return
+      const dx = e.clientX - start.x
+      const dy = e.clientY - start.y
+      if (dx * dx + dy * dy > 100) clearLongPress()
+    },
+    onPointerUp: () => {
+      clearLongPress()
+    },
+    onPointerCancel: () => {
+      clearLongPress()
     },
   }
+}
+
+function MessageCopyButton() {
+  const textToCopy = useMessage((m) => {
+    if (m.role === 'assistant' && m.status?.type === 'running') return ''
+    return getMessageClipboardText(m.content)
+  })
+  const [copied, setCopied] = React.useState(false)
+  if (!textToCopy.trim()) return null
+  return (
+    <button
+      type="button"
+      className="mc-msg-action-btn"
+      onClick={() => {
+        void navigator.clipboard.writeText(textToCopy).then(() => {
+          setCopied(true)
+          window.setTimeout(() => setCopied(false), 2000)
+        })
+      }}
+      title={copied ? 'Copied' : 'Copy message'}
+      aria-label={copied ? 'Copied' : 'Copy message'}
+    >
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  )
 }
 
 function MessageBookmarkButton({
@@ -313,9 +437,9 @@ function CustomAssistantMessage() {
       <BranchPicker />
       <div className="mc-msg-meta-row mc-msg-meta-row-desktop">
         <MessageBookmarkButton role="assistant" />
+        <MessageCopyButton />
         <MessageReplyButton />
         <MessageDeleteButton />
-        <AssistantActionBar />
         <MessageTimestamp align="left" />
       </div>
       <MessageMobileActionSheet role="assistant" />
@@ -332,13 +456,13 @@ function CustomUserMessage() {
       <MessagePrimitive.If hasContent>
         <div className="mc-msg-meta-row mc-msg-meta-row-user mc-msg-meta-row-desktop">
           <MessageBookmarkButton role="user" />
+          <MessageCopyButton />
           <MessageReplyButton />
           <MessageDeleteButton />
-          <UserActionBar />
         </div>
         <MessageMobileActionSheet role="user" />
         <div className="mc-user-content-wrap">
-          <UserMessage.Content />
+          <UserMessageDisplayBody />
           <MessageTimestamp align="right" />
         </div>
       </MessagePrimitive.If>
@@ -502,7 +626,12 @@ export const ThreadPane = React.memo(function ThreadPane({
   })
   const lastInitialMessagesRef = React.useRef<ThreadMessageLike[]>(initialMessages)
   const lastRuntimeKeyRef = React.useRef(runtimeKey)
-  React.useEffect(() => {
+  const viewportRef = React.useRef<HTMLDivElement | null>(null)
+  const viewportScrollCleanupRef = React.useRef<(() => void) | null>(null)
+  const lastViewportScrollTopRef = React.useRef(0)
+  const scrollGuardUntilRef = React.useRef(0)
+  const pendingScrollRestoreRef = React.useRef<ScrollAnchor | null>(null)
+  React.useLayoutEffect(() => {
     const runtimeKeyChanged = lastRuntimeKeyRef.current !== runtimeKey
     if (!runtimeKeyChanged && isStreaming) return
     if (
@@ -511,10 +640,50 @@ export const ThreadPane = React.memo(function ThreadPane({
     ) {
       return
     }
+    const prev = lastInitialMessagesRef.current
+    const prepend =
+      !runtimeKeyChanged && isHistoryPrepend(prev, initialMessages)
+    if (prepend && viewportRef.current) {
+      pendingScrollRestoreRef.current = captureScrollAnchor(viewportRef.current)
+    } else {
+      pendingScrollRestoreRef.current = null
+    }
     runtime.thread.reset(initialMessages)
     lastInitialMessagesRef.current = initialMessages
     lastRuntimeKeyRef.current = runtimeKey
   }, [initialMessages, runtime, runtimeKey, isStreaming])
+
+  React.useLayoutEffect(() => {
+    const anchor = pendingScrollRestoreRef.current
+    const el = viewportRef.current
+    if (!anchor || !el) return
+    const apply = () => {
+      const heightDelta = el.scrollHeight - anchor.scrollHeight
+      if (heightDelta <= 0) return false
+      el.scrollTop = anchor.scrollTop + heightDelta
+      pendingScrollRestoreRef.current = null
+      scrollGuardUntilRef.current = Date.now() + 700
+      lastViewportScrollTopRef.current = el.scrollTop
+      return true
+    }
+    if (apply()) return
+    requestAnimationFrame(() => {
+      if (apply()) return
+      requestAnimationFrame(apply)
+    })
+  }, [initialMessages])
+
+  React.useEffect(() => {
+    const anchor = pendingScrollRestoreRef.current
+    const el = viewportRef.current
+    if (!anchor || !el) return
+    const heightDelta = el.scrollHeight - anchor.scrollHeight
+    if (heightDelta <= 0) return
+    el.scrollTop = anchor.scrollTop + heightDelta
+    pendingScrollRestoreRef.current = null
+    scrollGuardUntilRef.current = Date.now() + 700
+    lastViewportScrollTopRef.current = el.scrollTop
+  }, [initialMessages, historyLoadingMore])
   const uiContextValue = React.useMemo<ThreadPaneUiContextValue>(
     () => ({
       bookmarkedMessageIds,
@@ -544,12 +713,9 @@ export const ThreadPane = React.memo(function ThreadPane({
     ],
   )
 
-  const viewportScrollCleanupRef = React.useRef<(() => void) | null>(null)
-  const lastViewportScrollTopRef = React.useRef(0)
-  const scrollGuardUntilRef = React.useRef(0)
-
   const bindThreadViewport = React.useCallback(
     (el: HTMLDivElement | null) => {
+      viewportRef.current = el
       viewportScrollCleanupRef.current?.()
       viewportScrollCleanupRef.current = null
       if (!el || !onMobileThreadScroll) return
@@ -615,7 +781,6 @@ export const ThreadPane = React.memo(function ThreadPane({
         <Thread.Root
           config={{
             assistantMessage: {
-              allowCopy: false,
               allowReload: false,
               allowSpeak: false,
               allowFeedbackNegative: false,

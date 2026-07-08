@@ -1097,6 +1097,20 @@ fn legacy_markdown_to_state(markdown: &str) -> PersonaMemoryState {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
+    // Legacy Tier 2 lines that are not SOP pointers are preserved as preferences
+    // so migration does not silently drop mid-term notes.
+    let mut tier2_sops = Vec::new();
+    let mut tier2_preferences = Vec::new();
+    for line in &tier2_known_steps {
+        if let Some(sop) = SopPointer::from_legacy_line(line) {
+            tier2_sops.push(sop);
+        } else {
+            let cleaned = line.trim_start_matches('-').trim();
+            if !cleaned.is_empty() {
+                tier2_preferences.push(cleaned.to_string());
+            }
+        }
+    }
     let tier3_lines: Vec<String> = tiers[2]
         .lines()
         .map(str::trim)
@@ -1117,11 +1131,8 @@ fn legacy_markdown_to_state(markdown: &str) -> PersonaMemoryState {
         },
         tier2: Tier2Memory {
             user_terminology: Vec::new(),
-            sops: tier2_known_steps
-                .into_iter()
-                .filter_map(|line| SopPointer::from_legacy_line(&line))
-                .collect(),
-            preferences: Vec::new(),
+            sops: tier2_sops,
+            preferences: tier2_preferences,
             legacy_known_steps: Vec::new(),
             legacy_active_projects: Vec::new(),
             legacy_migration: None,
@@ -1167,20 +1178,38 @@ fn append_identity_sections(sections: &mut Vec<String>, state: &PersonaMemorySta
 }
 
 fn append_tier1_sections(sections: &mut Vec<String>, state: &PersonaMemoryState) {
-    let mut tier1 = Vec::new();
+    let mut facts = Vec::new();
     for item in &state.tier1.stable_facts {
         let t = item.trim();
         if !t.is_empty() {
-            tier1.push(format!("- {t}"));
+            facts.push(format!("- {t}"));
         }
     }
-    if tier1.is_empty() {
+    let principles: Vec<String> = state
+        .tier1
+        .workflow_principles
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("- {p}"))
+        .collect();
+    if facts.is_empty() && principles.is_empty() {
         return;
     }
     let mut block = String::from("### Long-term context (Tier 1)\n\n");
-    for line in tier1 {
-        block.push_str(&line);
+    for line in &facts {
+        block.push_str(line);
         block.push('\n');
+    }
+    if !principles.is_empty() {
+        if !facts.is_empty() {
+            block.push('\n');
+        }
+        block.push_str("Workflow principles:\n");
+        for line in &principles {
+            block.push_str(line);
+            block.push('\n');
+        }
     }
     sections.push(block);
 }
@@ -1820,6 +1849,8 @@ mod tests {
     fn test_validate_memory_state_confidence_range() {
         let (mm, dir) = test_memory_manager();
         let mut state = PersonaMemoryState::default();
+        // A valid schema version is required so validation reaches the confidence check.
+        state.meta.version = 1;
         state.workflow_memory.intents.push(WorkflowMemoryEntry {
             intent_signature: "test".into(),
             confidence: 2.0,

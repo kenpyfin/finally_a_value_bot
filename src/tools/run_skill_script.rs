@@ -43,7 +43,19 @@ impl RunSkillScriptTool {
 
 /// If the skill dir has exactly one `*_tool.py`, return its file name.
 pub fn primary_tool_script_name(skill_dir: &Path) -> Option<String> {
-    let entries = std::fs::read_dir(skill_dir).ok()?;
+    let mut matches = list_tool_py_scripts(skill_dir);
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
+fn list_tool_py_scripts(skill_dir: &Path) -> Vec<String> {
+    let entries = match std::fs::read_dir(skill_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
     let mut matches: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
@@ -57,19 +69,183 @@ pub fn primary_tool_script_name(skill_dir: &Path) -> Option<String> {
         })
         .collect();
     matches.sort();
-    if matches.len() == 1 {
-        matches.into_iter().next()
-    } else {
-        None
+    matches
+}
+
+fn list_cli_scripts(skill_dir: &Path) -> Vec<String> {
+    let entries = match std::fs::read_dir(skill_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut matches: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with("_cli.py") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort();
+    matches
+}
+
+/// Parse runnable script filenames from SKILL.md `## Scripts` section or inline backticks.
+pub fn scripts_from_skill_md(skill_dir: &Path) -> Vec<String> {
+    let skill_md = skill_dir.join("SKILL.md");
+    let Ok(body) = std::fs::read_to_string(&skill_md) else {
+        return Vec::new();
+    };
+    let mut scripts = Vec::new();
+    let mut in_scripts = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            in_scripts = trimmed.eq_ignore_ascii_case("## Scripts")
+                || trimmed.to_ascii_lowercase().starts_with("## scripts");
+            continue;
+        }
+        if in_scripts {
+            if trimmed.starts_with("## ") {
+                break;
+            }
+            for token in extract_script_tokens(trimmed) {
+                if !scripts.contains(&token) {
+                    scripts.push(token);
+                }
+            }
+        }
     }
+    for token in extract_script_tokens(&body) {
+        if (token.ends_with(".py") || token.ends_with(".sh") || token.ends_with(".js"))
+            && skill_dir.join(&token).is_file()
+            && !scripts.contains(&token)
+        {
+            scripts.push(token);
+        }
+    }
+    scripts.sort();
+    scripts
+}
+
+fn extract_script_tokens(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in line.split(['`', '(', ')', '[', ']', ',']) {
+        let p = part.trim();
+        if p.contains('/') {
+            continue;
+        }
+        if p.ends_with(".py") || p.ends_with(".sh") || p.ends_with(".js") {
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+/// Collect candidate runnable script names for hints and validation.
+pub fn runnable_script_candidates(skill_dir: &Path) -> Vec<String> {
+    if let Some(one) = primary_tool_script_name(skill_dir) {
+        return vec![one];
+    }
+    let from_md = scripts_from_skill_md(skill_dir);
+    if !from_md.is_empty() {
+        return from_md;
+    }
+    let cli = list_cli_scripts(skill_dir);
+    if cli.len() == 1 {
+        return cli;
+    }
+    if !cli.is_empty() {
+        return cli;
+    }
+    Vec::new()
+}
+
+pub fn is_shell_like_script_name(script: &str) -> bool {
+    matches!(
+        script.trim().to_ascii_lowercase().as_str(),
+        "ls" | "bash"
+            | "sh"
+            | "python"
+            | "python3"
+            | "node"
+            | "npm"
+            | "npx"
+            | "cat"
+            | "echo"
+            | "find"
+            | "grep"
+            | "wc"
+            | "pwd"
+            | "cd"
+            | "cp"
+            | "mv"
+            | "rm"
+            | "mkdir"
+            | "chmod"
+            | "curl"
+            | "wget"
+            | "."
+            | ".."
+    )
+}
+
+/// True when `script` looks like a skill file name (not a shell command).
+pub fn looks_like_skill_script_filename(script: &str) -> bool {
+    let trimmed = script.trim();
+    if trimmed.is_empty() || trimmed.contains("..") || Path::new(trimmed).is_absolute() {
+        return false;
+    }
+    if is_shell_like_script_name(trimmed) {
+        return false;
+    }
+    Path::new(trimmed)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "py" | "sh" | "js" | "mjs" | "cjs" | "ps1"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Hint line appended by `activate_skill` when runnable scripts exist.
 pub fn format_run_skill_script_hint(skill_name: &str, skill_dir: &Path) -> Option<String> {
-    let script = primary_tool_script_name(skill_dir)?;
+    let candidates = runnable_script_candidates(skill_dir);
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        let script = &candidates[0];
+        return Some(format!(
+            "Run scripts: run_skill_script(skill_name=\"{skill_name}\", script=\"{script}\", args=[\"--help\"])\n"
+        ));
+    }
+    let numbered = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("  {}. {s}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
     Some(format!(
-        "Run scripts: run_skill_script(skill_name=\"{skill_name}\", script=\"{script}\", args=[\"--help\"])\n"
+        "Run scripts (pick one filename):\n{numbered}\nExample: run_skill_script(skill_name=\"{skill_name}\", script=\"{}\", args=[...])\n",
+        candidates[0]
     ))
+}
+
+/// Resolve a hint for pipeline validation when a skill was activated.
+pub fn runnable_script_hint_for_skill(
+    state: &crate::telegram::AppState,
+    skill_name: &str,
+) -> Option<String> {
+    let manager = SkillManager::from_skills_dirs(state.config.skill_discovery_dirs());
+    let (meta, _body) = manager.load_skill(skill_name)?;
+    format_run_skill_script_hint(skill_name, &meta.dir_path)
 }
 
 pub fn resolve_script_under_skill_dir(skill_dir: &Path, script: &str) -> Result<PathBuf, String> {
@@ -399,6 +575,46 @@ mod tests {
             Some("demo_tool.py")
         );
         cleanup(&dir);
+    }
+
+    fn create_hotify_style_skill(base_dir: &Path, name: &str) -> PathBuf {
+        let skill_dir = base_dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pz-hotify\ndescription: Hotify\n---\n## Scripts\n- `hotify_cli.py`\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("hotify_cli.py"),
+            "#!/usr/bin/env python3\nprint('ok')\n",
+        )
+        .unwrap();
+        skill_dir
+    }
+
+    #[test]
+    fn test_cli_script_hint_without_tool_py() {
+        let dir = test_dir();
+        let skill_dir = create_hotify_style_skill(&dir, "pz-hotify");
+        let hint = format_run_skill_script_hint("pz-hotify", &skill_dir).expect("hint");
+        assert!(hint.contains("hotify_cli.py"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_is_shell_like_script_name() {
+        assert!(is_shell_like_script_name("bash"));
+        assert!(is_shell_like_script_name("find"));
+        assert!(is_shell_like_script_name("."));
+        assert!(!is_shell_like_script_name("hotify_cli.py"));
+    }
+
+    #[test]
+    fn test_looks_like_skill_script_filename() {
+        assert!(looks_like_skill_script_filename("hotify_cli.py"));
+        assert!(!looks_like_skill_script_filename("find"));
+        assert!(!looks_like_skill_script_filename("."));
     }
 
     #[test]

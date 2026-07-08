@@ -456,24 +456,31 @@ async fn run_scheduled_agent_and_finalize(
         })
     };
 
-    let agent_fut = process_with_agent_with_events(
-        &state,
-        AgentRequestContext {
-            caller_channel: channel,
-            chat_id,
-            chat_type: "private",
-            persona_id,
-            is_scheduled_task: true,
-            is_background_job: false,
-            run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
-            reply_bot_instance_id: None,
-            session_id: None,
-        },
-        Some(&prompt),
-        None,
-        Some(&evt_tx),
-        cancel,
-    );
+    let agent_fut = {
+        let engine = state.runtime_toggles.agent_engine().as_str();
+        info!(
+            "Scheduler: task #{} starting agent run (engine={engine}, persona={persona_id})",
+            task_id,
+        );
+        process_with_agent_with_events(
+            &state,
+            AgentRequestContext {
+                caller_channel: channel,
+                chat_id,
+                chat_type: "private",
+                persona_id,
+                is_scheduled_task: true,
+                is_background_job: false,
+                run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
+                reply_bot_instance_id: None,
+                session_id: None,
+            },
+            Some(&prompt),
+            None,
+            Some(&evt_tx),
+            cancel,
+        )
+    };
 
     let (success, result_summary) = match tokio::time::timeout(
         std::time::Duration::from_secs(task_timeout_secs),

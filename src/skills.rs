@@ -252,6 +252,15 @@ impl SkillManager {
         self.build_skills_catalog_with_mode_for_allowed(mode, None)
     }
 
+    /// Same as [`Self::build_skills_catalog_for_allowed`] with an explicit catalog mode.
+    pub fn build_skills_catalog_for_allowed_with_mode(
+        &self,
+        mode: SkillsCatalogMode,
+        allowed_skill_names: Option<&std::collections::HashSet<String>>,
+    ) -> String {
+        self.build_skills_catalog_with_mode_for_allowed(mode, allowed_skill_names)
+    }
+
     fn build_skills_catalog_with_mode_for_allowed(
         &self,
         mode: SkillsCatalogMode,

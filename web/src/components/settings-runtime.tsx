@@ -55,6 +55,9 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
         body: JSON.stringify(body),
       })
       setRuntime(res)
+      if (res.warnings?.length) {
+        onError(res.warnings.join(' '))
+      }
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       await load()
@@ -68,6 +71,10 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
   }
 
   const sources = runtime?.sources ?? {}
+  const costRoutingSelected = runtime?.agent_engine === 'classic_cost_routing'
+  const localReady = runtime?.local_delegate_ready === true
+  const localConfigured = runtime?.local_delegate_configured === true
+  const toolsOk = runtime?.local_delegate_tools_ok === true
 
   return (
     <Flex direction="column" gap="4">
@@ -99,7 +106,7 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
           </Text>
           <Text size="1" color="gray">
             After each tool iteration, ask a sidecar model whether the session goal is fulfilled.
-            Can exit early or add latency on tool-heavy runs. Uses local multimodel when
+            Can exit early or add latency on tool-heavy runs. Uses the local delegate endpoint when
             configured, else Perplexity. Applies immediately (
             {sourceLabel(sources.post_tool_evaluator_enabled)}).
           </Text>
@@ -143,13 +150,24 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
           Agent engine
         </Text>
         <Text size="1" color="gray">
-          Classic: heuristic tool loop with optional Plan/Execute/Synthesize phases. Deterministic:
-          structured intent → plan → per-step local execution → cloud synthesis. Cursor: delegates
-          the full turn to a local Cursor SDK sidecar (auto-started with the bot). Applies
-          immediately ({sourceLabel(sources.agent_engine)}).
+          Single turn uses one cloud model for the full Classic loop. Cost routing keeps the same
+          loop but routes read-only tool chains to a verified local model. Deterministic runs a
+          structured pipeline. Cursor delegates the turn to a local SDK sidecar. Applies immediately
+          ({sourceLabel(sources.agent_engine)}).
         </Text>
         <Flex gap="2" wrap="wrap">
-          {(['classic', 'deterministic', 'cursor'] as const).map((engine) => (
+          {(
+            [
+              ['classic', 'Single turn', 'One cloud model — best reasoning continuity'],
+              [
+                'classic_cost_routing',
+                'Classic · Cost routing',
+                'Local read-only discovery + delegate sub-jobs',
+              ],
+              ['deterministic', 'Deterministic pipeline', 'Intent → plan → execute → consolidate'],
+              ['cursor', 'Cursor (SDK)', 'Full turn via Cursor sidecar'],
+            ] as const
+          ).map(([engine, label, subtitle]) => (
             <button
               key={engine}
               type="button"
@@ -159,16 +177,26 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
                   ? 'mc-engine-option mc-engine-option--active'
                   : 'mc-engine-option'
               }
+              title={subtitle}
               onClick={() => void patchRuntime({ agent_engine: engine }, 'agent_engine')}
             >
-              {engine === 'classic'
-                ? 'Classic'
-                : engine === 'deterministic'
-                  ? 'Deterministic'
-                  : 'Cursor (SDK)'}
+              {label}
             </button>
           ))}
         </Flex>
+
+        {costRoutingSelected && !localReady ? (
+          <Callout.Root color="orange" size="1" variant="soft" role="alert">
+            <Callout.Text>
+              {!localConfigured
+                ? 'Cost routing is selected but no local URL/model is configured. Runs use the cloud model only until you configure Local delegate settings.'
+                : !toolsOk
+                  ? 'Cost routing is selected but local tool calling is not verified. Runs use the cloud model only until you run Test in Local delegate.'
+                  : 'Cost routing is selected but the local delegate is not ready. Runs use the cloud model only.'}
+            </Callout.Text>
+          </Callout.Root>
+        ) : null}
+
         {runtime?.agent_engine === 'cursor' && cursorStatus && !cursorStatus.engine_ready ? (
           <Callout.Root color="orange" size="1" variant="soft">
             <Callout.Text>

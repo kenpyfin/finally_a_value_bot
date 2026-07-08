@@ -140,3 +140,20 @@ Command hooks may return `effects.memory_tier3_prune`; Rust applies writes via `
 ## Separation from delivery safeguards
 
 Hooks are additive policy controls. Baseline delivery correctness and final-response guardrails remain in the shared agent path.
+
+## Cursor engine (bot-native hooks)
+
+When **Settings → Runtime → Agent engine** is **Cursor**, bot hooks still run in Rust — they are **not** Cursor IDE `.cursor/hooks.json` hooks.
+
+**Full integration guide** (tools via MCP, skills prompt + execution, hook dispatch per event): [`cursor-engine-integration.md`](cursor-engine-integration.md).
+
+| Event | Cursor engine | Classic engine |
+|-------|---------------|----------------|
+| `BeforeTurn` | Yes — block or inject `[hook_context]` into flattened prompt | Yes |
+| `PreToolUse` | Yes — loopback MCP `tools/call` (`tool_hook_dispatch`) | Yes |
+| `PostToolUse` | Yes — loopback MCP `tools/call` | Yes |
+| `PostToolBatch` | Yes — end of Cursor sidecar turn | Yes |
+| `PreStop` | Yes — `end_turn` + deferred-commitment nudge loop (max 2 sidecar resumes) | Yes |
+| `PostDelivery` | Yes — via `pipeline_finish_turn` (assistant message appended first) | Yes |
+
+Shared turn-boundary helpers live in `src/channels/hook_turn_bridge.rs`. Tool hooks: `src/tool_hook_dispatch.rs`, `src/cursor_mcp_bridge.rs` (`POST /internal/cursor-mcp`). Cursor dispatch: `src/cursor_engine.rs` (`run_cursor_engine`).

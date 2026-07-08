@@ -100,7 +100,7 @@ pub fn should_skip_pdqe(
     if !quality_eval_channel_allowed(config, &ctx.caller_channel) {
         return Some("channel_not_allowed");
     }
-    if ctx.stop_reason == "ask_clarification" || ctx.stop_reason == "cancelled" {
+    if ctx.stop_reason == "cancelled" {
         return Some("stop_reason");
     }
     if ctx.delivered_text.trim().is_empty() {
@@ -116,6 +116,49 @@ pub fn should_skip_pdqe(
         return Some("no_session_goal");
     }
     None
+}
+
+/// User-visible notice when PDQE fails but the candidate reply is still delivered.
+pub fn format_pdqe_user_delivery_notice(verdict: &QualityVerdict) -> String {
+    let mut notice =
+        String::from("A pre-delivery quality review flagged potential issues with this response.");
+    if !verdict.issues.is_empty() {
+        notice.push_str("\n\nIssues noted:");
+        for issue in &verdict.issues {
+            notice.push_str("\n- ");
+            notice.push_str(issue);
+        }
+    }
+    if !verdict.feedback_for_agent.trim().is_empty() {
+        notice.push_str("\n\nReview summary: ");
+        notice.push_str(verdict.feedback_for_agent.trim());
+    }
+    let pct = (verdict.confidence.clamp(0.0, 1.0) * 100.0).round() as i32;
+    notice.push_str(&format!("\n\n(Review confidence: {pct}%)"));
+    notice
+}
+
+pub fn append_pdqe_delivery_notice(final_text: &mut String, verdict: &QualityVerdict) {
+    let notice = format_pdqe_user_delivery_notice(verdict);
+    if final_text.trim().is_empty() {
+        *final_text = notice;
+        return;
+    }
+    final_text.push_str("\n\n---\n\n");
+    final_text.push_str(&notice);
+}
+
+/// User-visible message when a PDQE-triggered revision pass times out before completing.
+pub fn format_post_quality_eval_retry_timeout_message() -> String {
+    "A quality review flagged issues with my previous answer, but I could not finish revising it in time. Please try again or break your request into smaller steps.".to_string()
+}
+
+pub fn format_agent_llm_timeout_message(pending_quality_eval_retry: bool) -> String {
+    if pending_quality_eval_retry {
+        format_post_quality_eval_retry_timeout_message()
+    } else {
+        "The request took too long after the last step. Please try again or break your request into smaller steps.".to_string()
+    }
 }
 
 pub fn build_quality_feedback_message(
@@ -223,20 +266,7 @@ pub fn parse_evaluator_json_response(text: &str) -> Result<QualityVerdict, Final
     })
 }
 
-fn fast_path_verdict(config: &Config, ctx: &PostDeliveryEvalContext) -> Option<QualityVerdict> {
-    let reply = ctx.delivered_text.trim();
-    if reply.is_empty() {
-        return None;
-    }
-    if ctx.stop_reason == "ask_clarification" && reply.contains('?') {
-        return Some(QualityVerdict {
-            kind: QualityVerdictKind::Pass,
-            issues: vec![],
-            feedback_for_agent: String::new(),
-            confidence: 1.0,
-        });
-    }
-    let _ = config;
+fn fast_path_verdict(_config: &Config, _ctx: &PostDeliveryEvalContext) -> Option<QualityVerdict> {
     None
 }
 
@@ -249,7 +279,7 @@ pub struct QualityEvalOutcome {
 pub async fn evaluate_delivery_quality(
     pdqe_enabled: bool,
     config: &Config,
-    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    multimodel: Option<&crate::local_delegate::LocalDelegateConfig>,
     env_redactor: &EnvSecretRedactor,
     ctx: &PostDeliveryEvalContext,
 ) -> Result<QualityEvalOutcome, FinallyAValueBotError> {
@@ -396,8 +426,31 @@ mod tests {
     }
 
     #[test]
+    fn format_pdqe_user_delivery_notice_includes_issues() {
+        let notice = format_pdqe_user_delivery_notice(&QualityVerdict {
+            kind: QualityVerdictKind::Fail,
+            issues: vec!["incomplete".into(), "off-topic".into()],
+            feedback_for_agent: "Answer the user's question directly.".into(),
+            confidence: 0.91,
+        });
+        assert!(notice.contains("quality review flagged"));
+        assert!(notice.contains("- incomplete"));
+        assert!(notice.contains("Answer the user's question directly."));
+        assert!(notice.contains("91%"));
+    }
+
+    #[test]
+    fn format_agent_llm_timeout_message_after_pdqe_retry() {
+        let msg = format_agent_llm_timeout_message(true);
+        assert!(msg.contains("quality review flagged"));
+        assert!(!msg.contains("after the last step"));
+        let generic = format_agent_llm_timeout_message(false);
+        assert!(generic.contains("after the last step"));
+    }
+
+    #[test]
     fn channel_allowlist() {
-        let mut config = Config::test_config();
+        let mut config = crate::config::test_config();
         config.quality_eval_channels = "telegram,web".into();
         assert!(quality_eval_channel_allowed(&config, "telegram"));
         assert!(quality_eval_channel_allowed(&config, "Web"));

@@ -20,6 +20,54 @@ function escapeQuotedAttr(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
+function unescapeQuotedAttr(value: string): string {
+  return value.replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+}
+
+const QUOTED_MESSAGE_OPEN_RE =
+  /^\[quoted_message id="((?:\\.|[^"\\])*)" role="(assistant|user)" sender="((?:\\.|[^"\\])*)"\]\n/
+
+export type DisplayReplyQuote = {
+  messageId: string
+  role: 'user' | 'assistant'
+  sender: string
+  snippet: string
+}
+
+export type ParsedReplyMessage = {
+  quote: DisplayReplyQuote
+  followUp: string
+}
+
+/** Parse a sent reply body for bubble display (snippet + follow-up only). */
+export function parseReplyForDisplay(text: string): ParsedReplyMessage | null {
+  const openMatch = text.match(QUOTED_MESSAGE_OPEN_RE)
+  if (!openMatch) return null
+
+  const afterOpen = text.slice(openMatch[0].length)
+  const closeMarker = '\n[/quoted_message]'
+  const closeIdx = afterOpen.indexOf(closeMarker)
+  if (closeIdx < 0) return null
+
+  const quotedContent = afterOpen.slice(0, closeIdx)
+  let followUp = afterOpen.slice(closeIdx + closeMarker.length)
+  if (followUp.startsWith('\n\n')) {
+    followUp = followUp.slice(2)
+  } else if (followUp === '\n') {
+    followUp = ''
+  }
+
+  return {
+    quote: {
+      messageId: unescapeQuotedAttr(openMatch[1]),
+      role: openMatch[2] as 'user' | 'assistant',
+      sender: unescapeQuotedAttr(openMatch[3]),
+      snippet: makeReplySnippet(quotedContent),
+    },
+    followUp,
+  }
+}
+
 /** Compose the user message body sent to `/api/send_stream` (full quote + optional follow-up). */
 export function formatReplyForSend(quote: PendingReplyQuote, userText: string): string {
   const role = quote.isFromBot ? 'assistant' : 'user'
@@ -32,4 +80,18 @@ export function formatReplyForSend(quote: PendingReplyQuote, userText: string): 
     return `${block}\n\n${trimmed}`
   }
   return block
+}
+
+/** Human-readable clipboard text for reply messages (snippet + follow-up, not raw quote block). */
+export function messageTextForClipboard(text: string): string {
+  const parsed = parseReplyForDisplay(text)
+  if (!parsed) return text
+  const label = parsed.quote.role === 'assistant'
+    ? 'assistant'
+    : (parsed.quote.sender.trim() || 'user')
+  let out = `Replying to ${label}: ${parsed.quote.snippet}`
+  if (parsed.followUp.trim()) {
+    out += `\n\n${parsed.followUp.trim()}`
+  }
+  return out
 }

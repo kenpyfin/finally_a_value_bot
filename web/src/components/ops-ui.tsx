@@ -57,6 +57,8 @@ export type MobileOpsSheetProps = {
   onOpenArtifacts: () => void
   onOpenMemory: () => void
   onOpenAgentHistory: () => void
+  onOpenTerminal?: () => void
+  terminalAvailable?: boolean
   agentHistoryDisabled?: boolean
 }
 
@@ -69,6 +71,8 @@ export function MobileOpsSheet({
   onOpenArtifacts,
   onOpenMemory,
   onOpenAgentHistory,
+  onOpenTerminal,
+  terminalAvailable = false,
   agentHistoryDisabled,
 }: MobileOpsSheetProps) {
   const pick = (fn: () => void) => () => {
@@ -96,6 +100,11 @@ export function MobileOpsSheet({
           <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenArtifacts)}>
             Artifacts
           </Button>
+          {terminalAvailable && onOpenTerminal ? (
+            <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenTerminal)}>
+              Terminal
+            </Button>
+          ) : null}
           <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenMemory)}>
             Memory
           </Button>

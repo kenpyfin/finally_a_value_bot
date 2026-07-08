@@ -8,6 +8,13 @@ use std::sync::OnceLock;
 mod agent_run_prep;
 pub(crate) use agent_run_prep::{prepare_agent_run, AgentRunPrep};
 
+#[path = "hook_turn_bridge.rs"]
+pub(crate) mod hook_turn_bridge;
+pub(crate) use hook_turn_bridge::{
+    assistant_text_defers_work, hook_event_summary, publish_hook_event, run_before_turn_hooks,
+    run_pre_stop_hooks, should_reject_premature_end_turn, DEFERRED_COMMITMENT_MAX_NUDGES,
+};
+
 use regex::Regex;
 use serenity::http::Http as SerenityHttp;
 use teloxide::prelude::*;
@@ -30,7 +37,7 @@ use crate::db::{
     call_blocking, Database, PersonaBulletinFocus, PersonaMessageBookmark, StoredMessage,
 };
 use crate::hook_actions::{apply_deterministic_persona_memory_hygiene, apply_hook_memory_effects};
-use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput, HookRunResult};
+use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput};
 use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::memory::{
@@ -273,6 +280,7 @@ pub struct AppState {
     pub env_redactor: Arc<EnvSecretRedactor>,
     pub runtime_toggles: Arc<crate::runtime_toggles::RuntimeToggles>,
     pub cursor_settings: Arc<std::sync::RwLock<crate::cursor_engine_config::CursorEngineSettings>>,
+    pub pipeline_profile: Arc<std::sync::RwLock<crate::agent_pipeline::PipelineProfile>>,
     pub cursor_sidecar: Arc<crate::cursor_sdk_sidecar::SidecarHandle>,
     /// Telegram bots keyed by `channel_bot_instances.id` (see `Database::sync_channel_bot_instances_from_config`).
     pub telegram_bots: Arc<HashMap<i64, Bot>>,
@@ -281,6 +289,7 @@ pub struct AppState {
     pub skills: SkillManager,
     pub llm: Arc<crate::llm::LlmHandle>,
     pub tools: ToolRegistry,
+    pub cursor_mcp: Arc<crate::cursor_mcp_bridge::CursorMcpRegistry>,
     /// Discord HTTP clients keyed by `channel_bot_instances.id`.
     pub discord_http: Arc<HashMap<i64, Arc<SerenityHttp>>>,
     pub chat_queue: ChatRunQueue,
@@ -299,13 +308,6 @@ const PERSONA_SWITCH_CALLBACK_PREFIX: &str = "persona:switch:";
 /// Sentinel prefix returned by `process_with_agent` when a web caller's tool
 /// times out and the work should be retried as a background job.
 pub const BACKGROUND_JOB_HANDOFF_PREFIX: &str = "##BACKGROUND_JOB_HANDOFF##";
-
-const EXECUTE_PREAMBLE: &str = "[EXECUTION PHASE]\n\
-You are continuing tool execution for a task already planned. You MUST call tools \
-directly — do not describe commands in code blocks, do not ask for confirmation, \
-do not re-explain or re-plan. Use bash, run_skill_script, or other tools NOW. \
-If you encounter an unexpected error you cannot resolve, respond with [ESCALATE] \
-and a one-line explanation.\n\n";
 
 #[derive(Debug, Clone)]
 pub struct AgentRequestContext<'a> {
@@ -483,15 +485,36 @@ pub async fn run_bot(
     config.response_quality_evaluator_enabled = toggle_init.response_quality_evaluator_enabled;
     let runtime_toggles = crate::runtime_toggles::RuntimeToggles::from_init(toggle_init);
     let llm = crate::llm::LlmHandle::new(&config);
-    if let Ok(mm_cfg) = crate::multimodel::load_from_db(&db) {
-        if let Err(e) = llm.apply_multimodel_config(mm_cfg) {
-            warn!("Failed to apply multi-model config: {e}");
+    if let Ok(mm_cfg) = crate::local_delegate::load_from_db(&db) {
+        if let Err(e) = llm.apply_local_delegate_config(mm_cfg) {
+            warn!("Failed to apply local delegate config: {e}");
+        }
+    }
+    if runtime_toggles.agent_engine() == crate::runtime_toggles::AgentEngine::Classic {
+        let mm = llm.local_delegate_config();
+        if mm.routing_enabled {
+            runtime_toggles
+                .set_agent_engine(crate::runtime_toggles::AgentEngine::ClassicCostRouting);
+            if let Err(e) = crate::runtime_toggles::RuntimeToggles::persist_agent_engine(
+                &db,
+                crate::runtime_toggles::AgentEngine::ClassicCostRouting,
+            ) {
+                warn!("Failed to migrate agent engine to classic_cost_routing: {e}");
+            } else {
+                info!("Migrated agent engine to classic_cost_routing (legacy MULTIMODEL_ENABLED)");
+            }
         }
     }
     let cursor_settings = Arc::new(std::sync::RwLock::new(
         crate::cursor_engine_config::load_from_db(&db, &config).unwrap_or_else(|e| {
             warn!("Failed to load Cursor settings from DB: {e}");
             crate::cursor_engine_config::CursorEngineSettings::from_env(&config)
+        }),
+    ));
+    let pipeline_profile = Arc::new(std::sync::RwLock::new(
+        crate::agent_pipeline::profile::load_from_db(&db).unwrap_or_else(|e| {
+            warn!("Failed to load pipeline profile from DB: {e}");
+            crate::agent_pipeline::profile::PipelineProfile::default_profile()
         }),
     ));
     let cursor_sidecar =
@@ -587,6 +610,7 @@ pub async fn run_bot(
         env_redactor,
         runtime_toggles,
         cursor_settings,
+        pipeline_profile,
         cursor_sidecar,
         telegram_bots: Arc::new(telegram_bots_map),
         db,
@@ -594,6 +618,7 @@ pub async fn run_bot(
         skills,
         llm,
         tools,
+        cursor_mcp: Arc::new(crate::cursor_mcp_bridge::CursorMcpRegistry::new()),
         discord_http: Arc::new(discord_http_map),
         chat_queue: ChatRunQueue::default(),
         background_job_control: BackgroundJobControl::default(),
@@ -2230,24 +2255,36 @@ pub(crate) async fn process_classic_agent_with_events(
     let mut run_tool_names: Vec<String> = Vec::new();
     let mut last_iteration_tools: Vec<String> = Vec::new();
     let mut local_tier_error_streak: u32 = 0;
-    let mm_cfg_for_phase_check = state.llm.multimodel_config();
-    let use_phases = !is_conversational
-        && matches!(intent, UserIntent::Task)
-        && mm_cfg_for_phase_check.ready_for_routing();
-    let mut current_phase = crate::multimodel::AgentPhase::Plan;
+    let agent_engine = state.runtime_toggles.agent_engine();
+    let mm_cfg_for_routing = state.llm.local_delegate_config();
+    let cost_routing =
+        crate::local_delegate::cost_routing_active(agent_engine, &mm_cfg_for_routing);
+    if agent_engine == crate::runtime_toggles::AgentEngine::ClassicCostRouting
+        && !mm_cfg_for_routing.local_routable()
+    {
+        info!(
+            "cost_routing_requested_but_local_unverified: routing_enabled={}, local_configured={}, tools_ok={}",
+            mm_cfg_for_routing.routing_enabled,
+            mm_cfg_for_routing.local_configured(),
+            mm_cfg_for_routing.local_tools_ok
+        );
+    }
     info!(
-        "Phase routing: use_phases={}, intent={:?}, mm_enabled={}, local_routable={}, local_tools_ok={}",
-        use_phases,
+        "Cost routing: active={}, engine={}, intent={:?}, local_routable={}, local_tools_ok={}",
+        cost_routing,
+        agent_engine.as_str(),
         intent,
-        mm_cfg_for_phase_check.enabled,
-        mm_cfg_for_phase_check.local_routable(),
-        mm_cfg_for_phase_check.local_tools_ok
+        mm_cfg_for_routing.local_routable(),
+        mm_cfg_for_routing.local_tools_ok
     );
-    let tool_defs = match intent {
+    let mut tool_defs = match intent {
         UserIntent::Conversational => Vec::new(),
         UserIntent::Question => state.tools.definitions_filtered(true),
         UserIntent::Task => state.tools.definitions(),
     };
+    if cost_routing && matches!(intent, UserIntent::Task) {
+        tool_defs.push(crate::tools::delegate_local_subjob::delegate_local_subjob_definition());
+    }
     let tool_auth = ToolAuthContext {
         caller_channel: context.caller_channel.to_string(),
         caller_chat_id: chat_id,
@@ -2299,21 +2336,12 @@ pub(crate) async fn process_classic_agent_with_events(
     const SWAP_NO_EVIDENCE_REPEAT_THRESHOLD: usize = 2;
     const DISCOVERY_STREAK_HINT_THRESHOLD: usize = 15;
     const DISCOVERY_STREAK_STALL_THRESHOLD: usize = 20;
-    const DEFERRED_COMMITMENT_MAX_NUDGES: usize = 2;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
-    let multimodel_run_summary = state.llm.multimodel_run_summary();
-    let iter0_route_ctx = crate::multimodel::RouteContext {
-        iteration: 0,
-        is_conversational,
-        last_iteration_tools: &[],
-        max_iterations: state.config.max_tool_iterations,
-        force_strategy: false,
-        local_tier_error_streak: 0,
-    };
-    let iter0_tier = state.llm.resolve_route(iter0_route_ctx);
+    let local_delegate_run_summary = state.llm.local_delegate_run_summary(cost_routing);
+    let iter0_tier = crate::local_delegate::RouteTarget::Strategy;
     let iter0_tier_snap = state.llm.tier_endpoint_snapshot(iter0_tier);
-    let routing_v1 = multimodel_run_summary.routing_v1_json(&iter0_tier_snap);
+    let routing_v1 = local_delegate_run_summary.routing_v1_json(&iter0_tier_snap);
     let initial_llm_snapshot_json = format_initial_llm_snapshot_json(
         &system_prompt,
         &messages,
@@ -2382,10 +2410,10 @@ pub(crate) async fn process_classic_agent_with_events(
                 stop_reason: stop_reason_owned.clone(),
                 total_duration_ms: run_start.elapsed().as_millis(),
                 initial_llm_snapshot: Some(initial_llm_snapshot_json.clone()),
-                multimodel_summary: multimodel_run_summary.clone(),
+                multimodel_summary: local_delegate_run_summary.clone(),
                 pipeline_stages: Vec::new(),
                 cloud_calls: 0,
-                agent_engine: "classic".into(),
+                agent_engine: agent_engine.as_str().into(),
             };
             let basename = write_agent_history_run(
                 &state.config.runtime_data_dir(),
@@ -2414,42 +2442,18 @@ pub(crate) async fn process_classic_agent_with_events(
         }};
     }
 
-    let before_turn_hooks = run_hooks_for_event_async(
-        state.db.clone(),
-        &state.config,
-        state.env_redactor.as_ref(),
-        HookEventName::BeforeTurn,
-        &HookRunInput {
-            chat_id,
-            persona_id,
-            caller_channel: context.caller_channel.to_string(),
-            is_scheduled_task: context.is_scheduled_task,
-            ..HookRunInput::default()
-        },
-    )
-    .await?;
-    publish_hook_event_observability(
-        state,
-        event_tx,
-        &run_key,
-        chat_id,
-        persona_id,
-        HookEventName::BeforeTurn,
-        None,
-        &before_turn_hooks,
-    )
-    .await;
-    if let Some(reason) = before_turn_hooks.blocked_reason {
+    let before_turn = run_before_turn_hooks(state, &context, &run_key, event_tx).await?;
+    if let Some(reason) = before_turn.result.blocked_reason {
         let blocked = format!("This run was blocked before execution: {reason}");
         let _ = save_run_history!("hook_block_before_turn");
         return Ok(AgentProcessResult { response: blocked });
     }
-    if !before_turn_hooks.additional_contexts.is_empty() {
+    if !before_turn.result.additional_contexts.is_empty() {
         messages.push(Message {
             role: "user".into(),
             content: MessageContent::Text(format!(
                 "[hook_context]\n{}",
-                before_turn_hooks.additional_contexts.join("\n")
+                before_turn.result.additional_contexts.join("\n")
             )),
         });
     }
@@ -2480,13 +2484,14 @@ pub(crate) async fn process_classic_agent_with_events(
                     &user_msg_preview,
                     run_start,
                     &initial_llm_snapshot_json,
-                    &multimodel_run_summary,
+                    &local_delegate_run_summary,
                     None,
                 )
                 .await?
                 {
                     return Ok(result);
                 }
+                continue 'agent_loop;
             }};
         }
 
@@ -2516,19 +2521,16 @@ pub(crate) async fn process_classic_agent_with_events(
         })
         .await;
 
-        let model_tier = if use_phases {
-            current_phase.model_tier()
-        } else {
-            let route_ctx = crate::multimodel::RouteContext {
+        let model_tier = crate::local_delegate::resolve_inverse_route(
+            agent_engine,
+            &state.llm.local_delegate_config(),
+            &crate::local_delegate::InverseRouteContext {
                 iteration,
-                is_conversational,
                 last_iteration_tools: &last_iteration_tools,
                 max_iterations: state.config.max_tool_iterations,
-                force_strategy: false,
-                local_tier_error_streak,
-            };
-            state.llm.resolve_route(route_ctx)
-        };
+                local_error_streak: local_tier_error_streak,
+            },
+        );
         let tier_snap = state.llm.tier_endpoint_snapshot(model_tier);
         let (tier_label, tier_provider, tier_model, tier_endpoint) =
             IterationRecord::tier_fields_from_snapshot(&tier_snap);
@@ -2542,19 +2544,26 @@ pub(crate) async fn process_classic_agent_with_events(
         );
 
         let llm_start = std::time::Instant::now();
-        let effective_system =
-            if use_phases && current_phase == crate::multimodel::AgentPhase::Execute {
-                format!("{EXECUTE_PREAMBLE}{system_prompt}")
-            } else {
-                system_prompt.clone()
-            };
-        let response = {
-            let llm_messages = messages.clone();
-            let tool_defs = if tool_defs.is_empty() {
+        let effective_system = system_prompt.clone();
+        let tools_for_llm: Option<Vec<crate::claude::ToolDefinition>> = if tool_defs.is_empty() {
+            None
+        } else if model_tier.is_local() {
+            let filtered: Vec<_> = tool_defs
+                .iter()
+                .filter(|d| crate::local_delegate::is_read_only_tool(&d.name))
+                .cloned()
+                .collect();
+            if filtered.is_empty() {
                 None
             } else {
-                Some(tool_defs.clone())
-            };
+                Some(filtered)
+            }
+        } else {
+            Some(tool_defs.clone())
+        };
+        let response = {
+            let llm_messages = messages.clone();
+            let tool_defs = tools_for_llm;
             match await_with_cancel(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
@@ -2596,7 +2605,9 @@ pub(crate) async fn process_classic_agent_with_events(
                         chat_id,
                         persona_id,
                         "llm_timeout",
-                        "The request took too long after the last step. Please try again or break your request into smaller steps.".to_string(),
+                        crate::response_quality_evaluator::format_agent_llm_timeout_message(
+                            pdqe_retries > 0,
+                        ),
                         &system_prompt,
                         &mut messages,
                         protected_message_count,
@@ -2611,7 +2622,7 @@ pub(crate) async fn process_classic_agent_with_events(
                         &user_msg_preview,
                         run_start,
                         &initial_llm_snapshot_json,
-                        &multimodel_run_summary,
+                        &local_delegate_run_summary,
                         None,
                     )
                     .await?
@@ -2649,7 +2660,7 @@ pub(crate) async fn process_classic_agent_with_events(
                         &user_msg_preview,
                         run_start,
                         &initial_llm_snapshot_json,
-                        &multimodel_run_summary,
+                        &local_delegate_run_summary,
                         None,
                     )
                     .await?
@@ -2698,6 +2709,7 @@ pub(crate) async fn process_classic_agent_with_events(
 
         let has_tool_use = stop_reason == "tool_use";
         let mut local_fallback_this_iter = false;
+        let mut local_fallback_succeeded = false;
         if should_fallback_local_tier_to_strategy(
             model_tier,
             tools_offered,
@@ -2740,7 +2752,7 @@ pub(crate) async fn process_classic_agent_with_events(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
                     state.llm.send_message_for_tier(
-                        crate::multimodel::ModelTier::Strategy,
+                        crate::local_delegate::ModelTier::Strategy,
                         &system_prompt,
                         llm_messages,
                         fallback_tools,
@@ -2751,15 +2763,14 @@ pub(crate) async fn process_classic_agent_with_events(
             .await
             {
                 Ok(Ok(Ok(fallback_response))) => {
+                    local_fallback_succeeded = true;
                     response = fallback_response;
-                    model_tier = crate::multimodel::ModelTier::Strategy;
-                    if use_phases {
-                        local_tier_error_streak = local_tier_error_streak.saturating_add(1);
-                        info!(
-                            "tier_tool_fallback incremented local_error_streak={}",
-                            local_tier_error_streak
-                        );
-                    }
+                    model_tier = crate::local_delegate::ModelTier::Strategy;
+                    local_tier_error_streak = local_tier_error_streak.saturating_add(1);
+                    info!(
+                        "tier_tool_fallback incremented local_error_streak={}",
+                        local_tier_error_streak
+                    );
                     let fallback_snap = state.llm.tier_endpoint_snapshot(model_tier);
                     (tier_label, tier_provider, tier_model, tier_endpoint) =
                         IterationRecord::tier_fields_from_snapshot(&fallback_snap);
@@ -2798,6 +2809,15 @@ pub(crate) async fn process_classic_agent_with_events(
                     info!("tier_tool_fallback: strategy retry cancelled");
                 }
             }
+            if local_fallback_this_iter && !local_fallback_succeeded {
+                local_tier_error_streak = local_tier_error_streak.saturating_add(1);
+                info!(
+                    "tier_tool_fallback failed after local empty/non-tool reply; \
+                     local_error_streak={}, continuing agent loop on strategy",
+                    local_tier_error_streak
+                );
+                continue 'agent_loop;
+            }
         }
 
         let stop_reason = stop_reason;
@@ -2821,20 +2841,6 @@ pub(crate) async fn process_classic_agent_with_events(
             assistant_text_preview.replace('\n', "\\n")
         );
 
-        if use_phases
-            && current_phase == crate::multimodel::AgentPhase::Execute
-            && (stop_reason == "end_turn" || stop_reason == "max_tokens")
-            && assistant_text.contains("[ESCALATE]")
-        {
-            info!("Phase: execute → synthesize (local escalated via text)");
-            current_phase = crate::multimodel::AgentPhase::Synthesize;
-            messages.push(Message {
-                role: "assistant".into(),
-                content: MessageContent::Text(assistant_text.clone()),
-            });
-            continue;
-        }
-
         if stop_reason == "end_turn"
             || stop_reason == "max_tokens"
             || stop_reason == "ask_clarification"
@@ -2856,7 +2862,7 @@ pub(crate) async fn process_classic_agent_with_events(
                 role: "assistant".into(),
                 content: MessageContent::Text(assistant_text.clone()),
             });
-            let display_text = if state.config.show_thinking {
+            let display_text = if state.llm.show_thinking() {
                 assistant_text.clone()
             } else {
                 strip_thinking(&assistant_text)
@@ -2874,83 +2880,71 @@ pub(crate) async fn process_classic_agent_with_events(
                 }
             }
 
-            if let Ok(pre_stop_hook) = run_hooks_for_event_async(
-                state.db.clone(),
-                &state.config,
-                state.env_redactor.as_ref(),
-                HookEventName::PreStop,
-                &HookRunInput {
-                    chat_id,
-                    persona_id,
-                    caller_channel: context.caller_channel.to_string(),
-                    is_scheduled_task: context.is_scheduled_task,
-                    stop_reason: Some(stop_reason.to_string()),
-                    assistant_text: Some(assistant_text_preview.clone()),
-                    runtime_signals: Some(serde_json::json!({
-                        "deferred_commitment_should_reject": stop_reason != "ask_clarification"
-                            && !assistant_text.trim().is_empty()
-                            && should_reject_premature_end_turn(&assistant_text, &messages),
-                        "deferred_commitment_nudges": deferred_commitment_nudges,
-                        "deferred_commitment_max_nudges": DEFERRED_COMMITMENT_MAX_NUDGES,
-                        "can_continue_iteration": iteration + 1 < state.config.max_tool_iterations
-                    })),
-                    ..HookRunInput::default()
-                },
-            )
-            .await
+            if cost_routing
+                && !run_tool_names.is_empty()
+                && final_text.trim().is_empty()
+                && iteration + 1 < state.config.max_tool_iterations
             {
-                publish_hook_event_observability(
-                    state,
-                    event_tx,
-                    &run_key,
-                    chat_id,
-                    persona_id,
-                    HookEventName::PreStop,
-                    None,
-                    &pre_stop_hook,
-                )
-                .await;
-                if let Some(summary) =
-                    hook_event_summary(HookEventName::PreStop, None, &pre_stop_hook)
-                {
-                    if let Some(last) = history_iterations.last_mut() {
-                        last.hook_events.push(summary);
-                    }
+                local_tier_error_streak = local_tier_error_streak.saturating_add(1);
+                info!(
+                    "Main agent iteration {}/{}: empty end_turn after tools with cost routing; \
+                     continuing on strategy (local_error_streak={})",
+                    iteration + 1,
+                    state.config.max_tool_iterations,
+                    local_tier_error_streak
+                );
+                if let Some(last) = history_iterations.last_mut() {
+                    last.hook_events.push(
+                        "local_empty_end_turn: bumped error streak, retrying on strategy".into(),
+                    );
                 }
-                if let Some(reason) = pre_stop_hook.blocked_reason {
-                    let reason_for_prompt = reason
-                        .strip_prefix("deferred_commitment: ")
-                        .unwrap_or(reason.as_str())
-                        .to_string();
-                    if iteration + 1 < state.config.max_tool_iterations {
-                        if reason.starts_with("deferred_commitment: ") {
-                            deferred_commitment_nudges += 1;
-                            info!(
-                                "Main agent iteration {}/{}: deferred_commitment_rejected (nudge {}/{})",
-                                iteration + 1,
-                                state.config.max_tool_iterations,
-                                deferred_commitment_nudges,
-                                DEFERRED_COMMITMENT_MAX_NUDGES
-                            );
-                        }
-                        messages.push(Message {
-                            role: "assistant".into(),
-                            content: MessageContent::Text(final_text.clone()),
-                        });
-                        messages.push(Message {
-                            role: "user".into(),
-                            content: MessageContent::Text(format!(
-                                "[hook_pre_stop_blocked]\n{}",
-                                reason_for_prompt
-                            )),
-                        });
-                        continue;
-                    }
-                    final_text = format!("I cannot finish this run: {reason_for_prompt}");
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "[system] The local read-only model returned no user-facing answer after \
+                         tool results. Continue on the strategy model: summarize findings and \
+                         complete the task or call mutation tools as needed."
+                            .into(),
+                    ),
+                });
+                continue 'agent_loop;
+            }
+
+            let pre_stop = run_pre_stop_hooks(
+                state,
+                &context,
+                &run_key,
+                event_tx,
+                &stop_reason,
+                &assistant_text_preview,
+                &messages,
+                deferred_commitment_nudges,
+                iteration + 1 < state.config.max_tool_iterations,
+            )
+            .await?;
+            if let Some(summary) =
+                hook_event_summary(HookEventName::PreStop, None, &pre_stop.result)
+            {
+                if let Some(last) = history_iterations.last_mut() {
+                    last.hook_events.push(summary);
                 }
-                if !pre_stop_hook.additional_contexts.is_empty()
-                    && iteration + 1 < state.config.max_tool_iterations
-                {
+            }
+            if let Some(reason) = pre_stop.result.blocked_reason {
+                let reason_for_prompt = reason
+                    .strip_prefix("deferred_commitment: ")
+                    .unwrap_or(reason.as_str())
+                    .to_string();
+                if iteration + 1 < state.config.max_tool_iterations {
+                    if reason.starts_with("deferred_commitment: ") {
+                        deferred_commitment_nudges += 1;
+                        info!(
+                            "Main agent iteration {}/{}: deferred_commitment_rejected (nudge {}/{})",
+                            iteration + 1,
+                            state.config.max_tool_iterations,
+                            deferred_commitment_nudges,
+                            DEFERRED_COMMITMENT_MAX_NUDGES
+                        );
+                    }
                     messages.push(Message {
                         role: "assistant".into(),
                         content: MessageContent::Text(final_text.clone()),
@@ -2958,12 +2952,29 @@ pub(crate) async fn process_classic_agent_with_events(
                     messages.push(Message {
                         role: "user".into(),
                         content: MessageContent::Text(format!(
-                            "[hook_context]\n{}",
-                            pre_stop_hook.additional_contexts.join("\n")
+                            "[hook_pre_stop_blocked]\n{}",
+                            reason_for_prompt
                         )),
                     });
                     continue;
                 }
+                final_text = format!("I cannot finish this run: {reason_for_prompt}");
+            }
+            if !pre_stop.result.additional_contexts.is_empty()
+                && iteration + 1 < state.config.max_tool_iterations
+            {
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(final_text.clone()),
+                });
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(format!(
+                        "[hook_context]\n{}",
+                        pre_stop.result.additional_contexts.join("\n")
+                    )),
+                });
+                continue;
             }
             info!(
                 "Main agent finishing: stop_reason={}, final_response_len={}, total_iterations={}",
@@ -3113,7 +3124,7 @@ pub(crate) async fn process_classic_agent_with_events(
                     .await
                     .ok();
                     if let Some(hook) = pre_tool_hook.as_ref() {
-                        publish_hook_event_observability(
+                        publish_hook_event(
                             state,
                             event_tx,
                             &run_key,
@@ -3178,83 +3189,120 @@ pub(crate) async fn process_classic_agent_with_events(
                         && requested_skill_name
                             .map(|skill| skill.eq_ignore_ascii_case(REQUIRED_MODIFY_SKILL))
                             .unwrap_or(false);
-                    let mut result = match await_with_cancel(
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
-                            state.tools.execute_with_auth(
-                                name,
-                                hook_input_for_exec.clone(),
-                                &tool_auth,
-                            ),
-                        ),
-                        cancel.as_ref(),
-                    )
-                    .await
+
+                    let result = if name
+                        == crate::tools::delegate_local_subjob::DELEGATE_LOCAL_SUBJOB_NAME
                     {
-                        Ok(Ok(tool_result)) => tool_result,
-                        Ok(Err(_)) => {
-                            info!(
-                                "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
-                                iteration + 1,
-                                state.config.max_tool_iterations,
-                                name,
-                                TOOL_EXECUTION_TIMEOUT_SECS
-                            );
-                            iteration_timed_out = true;
-                            let error_content = format!(
-                                "Tool execution timed out after {}s. The tool took too long to complete. This may indicate a network issue or the service is slow. Please try again later or break the request into smaller steps.",
-                                TOOL_EXECUTION_TIMEOUT_SECS
-                            );
-                            let error_bytes = error_content.len();
-                            crate::tools::ToolResult {
-                                content: error_content,
-                                is_error: true,
-                                duration_ms: Some(started.elapsed().as_millis()),
-                                status_code: Some(1),
-                                bytes: error_bytes,
-                                error_type: Some("timeout".into()),
-                            }
+                        let brief = hook_input_for_exec
+                            .get("brief")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let max_iterations = hook_input_for_exec
+                            .get("max_iterations")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize);
+                        match crate::local_delegate::subjob::run_local_subjob(
+                            state,
+                            &state.tools,
+                            &tool_auth,
+                            crate::local_delegate::subjob::SubjobParams {
+                                brief,
+                                max_iterations,
+                                current_request: Some(&latest_user_text),
+                            },
+                        )
+                        .await
+                        {
+                            Ok(summary) => crate::tools::ToolResult::success(summary),
+                            Err(e) => crate::tools::ToolResult::error(e.to_string()),
                         }
-                        Err(()) => {
-                            info!(
-                                "Main agent iteration {}/{}: tool={} interrupted by cancel request",
-                                iteration + 1,
-                                state.config.max_tool_iterations,
-                                name
-                            );
-                            if let Some(r) = try_finish_agent_turn(
-                                state,
-                                &context,
-                                event_tx,
-                                &run_key,
-                                chat_id,
-                                persona_id,
-                                "cancelled",
-                                "Run cancelled.".to_string(),
-                                &system_prompt,
-                                &mut messages,
-                                protected_message_count,
-                                &mut pdqe_retries,
-                                &mut pdqe_steps,
-                                &mut history_iterations,
-                                &principles_content,
-                                is_conversational,
-                                &run_tool_names,
-                                &mut agent_history_basename,
-                                iteration > 0,
-                                &user_msg_preview,
-                                run_start,
-                                &initial_llm_snapshot_json,
-                                &multimodel_run_summary,
-                                None,
-                            )
-                            .await?
-                            {
-                                return Ok(r);
+                    } else if model_tier.is_local() && crate::local_delegate::is_mutation_tool(name)
+                    {
+                        crate::tools::ToolResult::error(format!(
+                            "Tool `{name}` is not allowed on the local read-only route. \
+Use the strategy model for mutations or delegate_local_subjob for discovery."
+                        ))
+                    } else {
+                        match await_with_cancel(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(TOOL_EXECUTION_TIMEOUT_SECS),
+                                state.tools.execute_with_auth(
+                                    name,
+                                    hook_input_for_exec.clone(),
+                                    &tool_auth,
+                                ),
+                            ),
+                            cancel.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tool_result)) => tool_result,
+                            Ok(Err(_)) => {
+                                info!(
+                                    "Main agent iteration {}/{}: tool={} TIMED OUT after {}s",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    name,
+                                    TOOL_EXECUTION_TIMEOUT_SECS
+                                );
+                                iteration_timed_out = true;
+                                let error_content = format!(
+                                    "Tool execution timed out after {}s. The tool took too long to complete. This may indicate a network issue or the service is slow. Please try again later or break the request into smaller steps.",
+                                    TOOL_EXECUTION_TIMEOUT_SECS
+                                );
+                                let error_bytes = error_content.len();
+                                crate::tools::ToolResult {
+                                    content: error_content,
+                                    is_error: true,
+                                    duration_ms: Some(started.elapsed().as_millis()),
+                                    status_code: Some(1),
+                                    bytes: error_bytes,
+                                    error_type: Some("timeout".into()),
+                                }
                             }
-                            continue 'agent_loop;
+                            Err(()) => {
+                                info!(
+                                    "Main agent iteration {}/{}: tool={} interrupted by cancel request",
+                                    iteration + 1,
+                                    state.config.max_tool_iterations,
+                                    name
+                                );
+                                if let Some(r) = try_finish_agent_turn(
+                                    state,
+                                    &context,
+                                    event_tx,
+                                    &run_key,
+                                    chat_id,
+                                    persona_id,
+                                    "cancelled",
+                                    "Run cancelled.".to_string(),
+                                    &system_prompt,
+                                    &mut messages,
+                                    protected_message_count,
+                                    &mut pdqe_retries,
+                                    &mut pdqe_steps,
+                                    &mut history_iterations,
+                                    &principles_content,
+                                    is_conversational,
+                                    &run_tool_names,
+                                    &mut agent_history_basename,
+                                    iteration > 0,
+                                    &user_msg_preview,
+                                    run_start,
+                                    &initial_llm_snapshot_json,
+                                    &local_delegate_run_summary,
+                                    None,
+                                )
+                                .await?
+                                {
+                                    return Ok(r);
+                                }
+                                continue 'agent_loop;
+                            }
                         }
                     };
+
+                    let mut result = result;
                     if state.config.post_edit_validation_enabled
                         && !result.is_error
                         && should_validate_post_edit(name, &hook_input_for_exec)
@@ -3431,7 +3479,7 @@ pub(crate) async fn process_classic_agent_with_events(
                     )
                     .await
                     {
-                        publish_hook_event_observability(
+                        publish_hook_event(
                             state,
                             event_tx,
                             &run_key,
@@ -3524,39 +3572,6 @@ pub(crate) async fn process_classic_agent_with_events(
                 local_tier_error_streak = 0;
             }
 
-            if use_phases {
-                let has_mutation = executed_tool_names
-                    .iter()
-                    .any(|t| crate::multimodel::is_mutation_tool(t));
-                info!(
-                    "advance_phase input: current={}, iteration={}, tools={:?}, has_mutation={}",
-                    current_phase.label(),
-                    iteration,
-                    executed_tool_names,
-                    has_mutation
-                );
-                let (next_phase, transition) = crate::multimodel::advance_phase(
-                    &state.llm.multimodel_config(),
-                    current_phase,
-                    iteration,
-                    state.config.max_tool_iterations,
-                    is_conversational,
-                    &executed_tool_names,
-                    "tool_use",
-                    &assistant_text,
-                    local_tier_error_streak,
-                );
-                if next_phase != current_phase {
-                    info!(
-                        "Phase: {} → {} ({:?})",
-                        current_phase.label(),
-                        next_phase.label(),
-                        transition
-                    );
-                }
-                current_phase = next_phase;
-            }
-
             let used_legacy_edit = executed_tool_names
                 .iter()
                 .any(|name| matches!(name.as_str(), "write_file" | "edit_file"));
@@ -3603,7 +3618,7 @@ pub(crate) async fn process_classic_agent_with_events(
             )
             .await
             {
-                publish_hook_event_observability(
+                publish_hook_event(
                     state,
                     event_tx,
                     &run_key,
@@ -3649,7 +3664,7 @@ pub(crate) async fn process_classic_agent_with_events(
                     .iter()
                     .all(|name| is_memory_write_tool(name))
             {
-                let display_text = if state.config.show_thinking {
+                let display_text = if state.llm.show_thinking() {
                     assistant_text.clone()
                 } else {
                     strip_thinking(&assistant_text)
@@ -3686,7 +3701,7 @@ pub(crate) async fn process_classic_agent_with_events(
                     evaluate_completion(
                         state.runtime_toggles.post_tool_evaluator_enabled(),
                         &state.config,
-                        Some(&state.llm.multimodel_config()),
+                        Some(&state.llm.local_delegate_config()),
                         state.env_redactor.as_ref(),
                         &principles_content,
                         &pte_memory_prose,
@@ -3725,7 +3740,7 @@ pub(crate) async fn process_classic_agent_with_events(
                                     tokio::time::timeout(
                                         std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
                                         state.llm.send_message_for_tier(
-                                            crate::multimodel::ModelTier::Strategy,
+                                            crate::local_delegate::ModelTier::Strategy,
                                             &system_prompt,
                                             messages.clone(),
                                             None,
@@ -3777,7 +3792,7 @@ pub(crate) async fn process_classic_agent_with_events(
                                     &user_msg_preview,
                                     run_start,
                                     &initial_llm_snapshot_json,
-                                    &multimodel_run_summary,
+                                    &local_delegate_run_summary,
                                     None,
                                 )
                                 .await?
@@ -3815,7 +3830,7 @@ pub(crate) async fn process_classic_agent_with_events(
                                             &user_msg_preview,
                                             run_start,
                                             &initial_llm_snapshot_json,
-                                            &multimodel_run_summary,
+                                            &local_delegate_run_summary,
                                             None,
                                         )
                                         .await?
@@ -3844,9 +3859,9 @@ pub(crate) async fn process_classic_agent_with_events(
                             text.len()
                         );
 
-                                let pte_snap = state
-                                    .llm
-                                    .tier_endpoint_snapshot(crate::multimodel::ModelTier::Strategy);
+                                let pte_snap = state.llm.tier_endpoint_snapshot(
+                                    crate::local_delegate::ModelTier::Strategy,
+                                );
                                 if let Some(last) = history_iterations.last_mut() {
                                     last.hook_events.push(format!(
                                         "PTE synthesis: {}",
@@ -3858,7 +3873,7 @@ pub(crate) async fn process_classic_agent_with_events(
                                     role: "assistant".into(),
                                     content: MessageContent::Text(text.clone()),
                                 });
-                                let display_text = if state.config.show_thinking {
+                                let display_text = if state.llm.show_thinking() {
                                     text
                                 } else {
                                     strip_thinking(&text)
@@ -4083,7 +4098,7 @@ pub(crate) async fn process_classic_agent_with_events(
         &user_msg_preview,
         run_start,
         &initial_llm_snapshot_json,
-        &multimodel_run_summary,
+        &local_delegate_run_summary,
         None,
     )
     .await?
@@ -4165,7 +4180,7 @@ async fn try_finish_agent_turn(
     user_msg_preview: &str,
     run_start: std::time::Instant,
     initial_llm_snapshot_json: &str,
-    multimodel_summary: &crate::multimodel::MultimodelRunSummary,
+    multimodel_summary: &crate::local_delegate::LocalDelegateRunSummary,
     pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
 ) -> anyhow::Result<Option<AgentProcessResult>> {
     let mut final_text = response;
@@ -4226,7 +4241,7 @@ pub(crate) async fn pipeline_finish_turn(
     user_msg_preview: &str,
     run_start: std::time::Instant,
     initial_llm_snapshot_json: &str,
-    multimodel_summary: &crate::multimodel::MultimodelRunSummary,
+    multimodel_summary: &crate::local_delegate::LocalDelegateRunSummary,
     pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
 ) -> anyhow::Result<Option<AgentProcessResult>> {
     try_finish_agent_turn(
@@ -4281,7 +4296,7 @@ async fn finish_turn_with_quality_gate(
     user_msg_preview: &str,
     run_start: std::time::Instant,
     initial_llm_snapshot_json: &str,
-    multimodel_summary: &crate::multimodel::MultimodelRunSummary,
+    multimodel_summary: &crate::local_delegate::LocalDelegateRunSummary,
     pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
 ) -> anyhow::Result<FinishTurnOutcome> {
     let (hook_summary, should_run_focus_sync) = run_post_delivery_hooks_before_gate(
@@ -4345,7 +4360,7 @@ async fn finish_turn_with_quality_gate(
     {
         let provider_label = crate::llm::resolve_evaluator_provider_label(
             &state.config,
-            Some(&state.llm.multimodel_config()),
+            Some(&state.llm.local_delegate_config()),
         );
         push_pdqe_step(pdqe_steps, "quality_eval_started", "", &provider_label);
         crate::response_quality_evaluator::append_quality_timeline(
@@ -4361,7 +4376,7 @@ async fn finish_turn_with_quality_gate(
         match crate::response_quality_evaluator::evaluate_delivery_quality(
             state.runtime_toggles.response_quality_evaluator_enabled(),
             &state.config,
-            Some(&state.llm.multimodel_config()),
+            Some(&state.llm.local_delegate_config()),
             state.env_redactor.as_ref(),
             &pdqe_ctx,
         )
@@ -4458,6 +4473,9 @@ async fn finish_turn_with_quality_gate(
                             ),
                             eval_provider_label,
                         );
+                        crate::response_quality_evaluator::append_pdqe_delivery_notice(
+                            final_text, &verdict,
+                        );
                     }
                 }
             }
@@ -4512,7 +4530,11 @@ async fn finish_turn_with_quality_gate(
             (
                 ex.pipeline_stages.clone(),
                 ex.cloud_calls,
-                "deterministic".to_string(),
+                if ex.agent_engine.is_empty() {
+                    "deterministic".to_string()
+                } else {
+                    ex.agent_engine.clone()
+                },
             )
         },
     );
@@ -4587,7 +4609,7 @@ async fn run_post_delivery_hooks_before_gate(
     )
     .await
     {
-        publish_hook_event_observability(
+        publish_hook_event(
             state,
             event_tx,
             run_key,
@@ -4879,7 +4901,12 @@ pub(super) fn trim_to_token_budget(
         let rest = &messages[trim_at..];
         let nu = rest.iter().filter(|m| m.role == "user").count();
         let na = rest.iter().filter(|m| m.role == "assistant").count();
-        if nu < min_user_remaining || na < min_asst_remaining {
+        // Break if removing the candidate would drop the retained suffix below
+        // the minimum retained user/assistant counts (check post-removal counts,
+        // since the candidate itself is about to be removed).
+        let nu_after = nu - usize::from(messages[trim_at].role == "user");
+        let na_after = na - usize::from(messages[trim_at].role == "assistant");
+        if nu_after < min_user_remaining || na_after < min_asst_remaining {
             break;
         }
         let removed = messages.remove(trim_at);
@@ -4928,64 +4955,6 @@ fn is_progress_tool_use(tool_name: &str) -> bool {
             | "schedule_task"
             | "register_tracked_job"
     )
-}
-
-/// True when assistant prose promises imminent work without having issued a tool call.
-fn assistant_text_defers_work(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    const PHRASES: &[&str] = &[
-        "checking the log",
-        "checking run log",
-        "check the log",
-        "check run log",
-        "i will ",
-        "i'll ",
-        "i am going to ",
-        "i'm going to ",
-        "im going to ",
-        "let me ",
-        "one moment",
-        "(checking",
-        "right now",
-        "immediately",
-        "in a moment",
-        "give me a moment",
-        "hold on",
-    ];
-    PHRASES.iter().any(|p| lower.contains(p))
-}
-
-fn most_recent_tool_result_is_error(messages: &[Message]) -> bool {
-    for msg in messages.iter().rev() {
-        if let MessageContent::Blocks(blocks) = &msg.content {
-            for block in blocks.iter().rev() {
-                if let ContentBlock::ToolResult { is_error, .. } = block {
-                    return *is_error == Some(true);
-                }
-            }
-        }
-    }
-    false
-}
-
-fn assistant_text_references_incomplete_work(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("background task")
-        || lower.contains("agent run")
-        || lower.contains("cursor-agent")
-        || lower.contains("cursor agent")
-        || lower.contains("run #")
-        || lower.contains("run logs")
-        || lower.contains("not successfully")
-        || lower.contains("no such file")
-        || lower.contains("was not created")
-        || lower.contains("was not found")
-    {
-        return true;
-    }
-    static RUN_ID_RE: OnceLock<Regex> = OnceLock::new();
-    let re = RUN_ID_RE.get_or_init(|| Regex::new(r"#\d{1,6}\b").expect("run id regex"));
-    re.is_match(text)
 }
 
 /// True when assistant text claims actions (uploads, writes, publishes) not backed by tool use
@@ -5042,7 +5011,7 @@ fn assistant_text_claims_unbacked_actions(text: &str) -> bool {
 }
 
 fn should_fallback_local_tier_to_strategy(
-    model_tier: crate::multimodel::ModelTier,
+    model_tier: crate::local_delegate::ModelTier,
     tools_offered: bool,
     last_iteration_tools: &[String],
     stop_reason: &str,
@@ -5065,15 +5034,10 @@ fn should_fallback_local_tier_to_strategy(
     if is_conversational {
         return false;
     }
-    assistant_text_claims_unbacked_actions(assistant_text)
-}
-
-fn should_reject_premature_end_turn(assistant_text: &str, messages: &[Message]) -> bool {
-    if !assistant_text_defers_work(assistant_text) {
-        return false;
+    if assistant_text.trim().is_empty() {
+        return true;
     }
-    most_recent_tool_result_is_error(messages)
-        || assistant_text_references_incomplete_work(assistant_text)
+    assistant_text_claims_unbacked_actions(assistant_text)
 }
 
 fn is_discovery_tool_use(tool_name: &str, input: &serde_json::Value) -> bool {
@@ -5149,63 +5113,6 @@ fn recover_latest_assistant_text(messages: &[Message]) -> Option<String> {
         }
     }
     None
-}
-
-fn hook_event_summary(
-    event_name: HookEventName,
-    tool_name: Option<&str>,
-    result: &HookRunResult,
-) -> Option<String> {
-    if result.matched_hook_ids.is_empty()
-        && result.blocked_reason.is_none()
-        && result.additional_contexts.is_empty()
-    {
-        return None;
-    }
-    let tool = tool_name.unwrap_or("-");
-    let blocked = result.blocked_reason.as_deref().unwrap_or("-");
-    Some(format!(
-        "{} tool={} matched={:?} blocked={} add_ctx={}",
-        event_name.as_str(),
-        tool,
-        result.matched_hook_ids,
-        blocked,
-        result.additional_contexts.len()
-    ))
-}
-
-async fn publish_hook_event_observability(
-    state: &AppState,
-    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
-    run_key: &str,
-    chat_id: i64,
-    persona_id: i64,
-    event_name: HookEventName,
-    tool_name: Option<&str>,
-    result: &HookRunResult,
-) {
-    if let Some(tx) = event_tx {
-        let _ = tx.send(AgentEvent::Hook {
-            event_name: event_name.as_str().to_string(),
-            tool_name: tool_name.map(|s| s.to_string()),
-            matched_hook_ids: result.matched_hook_ids.clone(),
-            blocked_reason: result.blocked_reason.clone(),
-            additional_context_count: result.additional_contexts.len(),
-        });
-    }
-    let payload = serde_json::json!({
-        "event_name": event_name.as_str(),
-        "tool_name": tool_name,
-        "matched_hook_ids": result.matched_hook_ids,
-        "blocked_reason": result.blocked_reason,
-        "additional_context_count": result.additional_contexts.len(),
-    })
-    .to_string();
-    let run_key = run_key.to_string();
-    let _ = call_blocking(state.db.clone(), move |db| {
-        db.append_run_timeline_event(&run_key, chat_id, persona_id, "hook", Some(&payload))
-    })
-    .await;
 }
 
 fn is_code_path(path: &str) -> bool {
@@ -7109,8 +7016,12 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
         if let MessageContent::Text(t) = &messages[0].content {
-            assert!(t.contains("<user_message sender=\"alice\">hello</user_message>"));
-            assert!(t.contains("<user_message sender=\"bob\">hi</user_message>"));
+            assert!(t.contains(
+                "<user_message sender=\"alice\" at=\"2024-01-01T00:00:01Z\">hello</user_message>"
+            ));
+            assert!(t.contains(
+                "<user_message sender=\"bob\" at=\"2024-01-01T00:00:02Z\">hi</user_message>"
+            ));
         } else {
             panic!("Expected Text content");
         }
@@ -7252,16 +7163,27 @@ mod tests {
 
     #[test]
     fn test_history_to_claude_messages_strips_bulletin_focus_from_assistant() {
-        let history = vec![make_msg(
-            "1",
-            "bot",
-            "Here is the image.\n\n[bulletin_focus]\nPZ Ops: Rooftop\nNext Step: publish",
-            true,
-            "2024-01-01T00:00:01Z",
-        )];
+        // A leading user turn is required so the assistant reply is not stripped as
+        // a leading-assistant message; keep_trailing_assistant retains the reply.
+        let history = vec![
+            make_msg(
+                "0",
+                "alice",
+                "show me the render",
+                false,
+                "2024-01-01T00:00:00Z",
+            ),
+            make_msg(
+                "1",
+                "bot",
+                "Here is the image.\n\n[bulletin_focus]\nPZ Ops: Rooftop\nNext Step: publish",
+                true,
+                "2024-01-01T00:00:01Z",
+            ),
+        ];
         let messages = history_to_claude_messages(&history, "bot", true);
-        assert_eq!(messages.len(), 1);
-        if let MessageContent::Text(t) = &messages[0].content {
+        assert_eq!(messages.len(), 2);
+        if let MessageContent::Text(t) = &messages[1].content {
             assert!(t.contains("Here is the image."));
             assert!(!t.contains("bulletin_focus"));
             assert!(!t.contains("Next Step"));
@@ -7292,7 +7214,10 @@ mod tests {
         assert!(prompt.contains("12345"));
         assert!(prompt.contains("**Shell:** bash"));
         assert!(prompt.contains("[persona_context]"));
-        assert!(!prompt.contains("# Principles"));
+        // The "# Principles" phrase now appears in static guidance referencing
+        // AGENTS.md, so check that the loaded Principles *section* is absent when
+        // no principles content is provided.
+        assert!(!prompt.contains("# Principles\n\nThe following is loaded from the file"));
         assert!(!prompt.contains("# Agent Skills"));
     }
 
@@ -8274,8 +8199,8 @@ mod tests {
         );
         assert!(prompt.contains("update_bulletin_focus"));
         assert!(prompt.contains("Bulletin + memory sync"));
-        assert!(prompt.contains("persisted automatically by lifecycle hooks"));
-        assert!(prompt.contains("Tier 2 is durable knowledge only"));
+        assert!(prompt.contains("persist automatically via post-delivery hooks"));
+        assert!(prompt.contains("Tier 2 holds terminology"));
     }
 
     #[test]
@@ -8321,8 +8246,8 @@ mod tests {
             "",
         );
         assert!(prompt.contains("For serving files to users:"));
-        assert!(prompt.contains("Never fabricate `/api/uploads/...` links"));
-        assert!(prompt.contains("attachment_path"));
+        assert!(prompt.contains("Never fabricate `/api/uploads/...` URLs"));
+        assert!(prompt.contains("absolute local file paths"));
     }
 
     #[test]
@@ -8676,7 +8601,7 @@ mod tests {
     fn test_should_fallback_local_tier_to_strategy() {
         let last_tools = vec!["bash".into()];
         assert!(should_fallback_local_tier_to_strategy(
-            crate::multimodel::ModelTier::Local,
+            crate::local_delegate::ModelTier::LocalReadOnly,
             true,
             &last_tools,
             "end_turn",
@@ -8684,8 +8609,17 @@ mod tests {
             false,
             "Generated and uploaded HOTIFY-V5.png",
         ));
+        assert!(should_fallback_local_tier_to_strategy(
+            crate::local_delegate::ModelTier::LocalReadOnly,
+            true,
+            &last_tools,
+            "end_turn",
+            false,
+            false,
+            "",
+        ));
         assert!(!should_fallback_local_tier_to_strategy(
-            crate::multimodel::ModelTier::Local,
+            crate::local_delegate::ModelTier::LocalReadOnly,
             true,
             &last_tools,
             "end_turn",
@@ -8694,7 +8628,7 @@ mod tests {
             "Files in the directory: a.txt, b.txt",
         ));
         assert!(!should_fallback_local_tier_to_strategy(
-            crate::multimodel::ModelTier::Strategy,
+            crate::local_delegate::ModelTier::Strategy,
             true,
             &last_tools,
             "end_turn",

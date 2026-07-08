@@ -14,10 +14,12 @@ import {
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
 import { SettingsLlmPanel } from '../components/settings-llm'
-import { SettingsMultimodelPanel } from '../components/settings-multimodel'
+import { SettingsLocalDelegatePanel } from '../components/settings-local-delegate'
 import { SettingsCursorPanel } from '../components/settings-cursor'
+import { SettingsDeterministicPipelinePanel } from '../components/settings-deterministic-pipeline'
 import { SettingsHooksSkillsPanel } from '../components/settings-hooks-skills'
 import { SettingsRuntimePanel } from '../components/settings-runtime'
+import { TerminalPane } from '../components/terminal-pane'
 import { InitialRunPromptView } from '../components/initial-run-prompt-view'
 import {
   ArtifactListSkeleton,
@@ -202,6 +204,13 @@ export interface AppDialogsAgentHistoryProps {
   optimize: (personaId: number, operatorNotes?: string) => Promise<void>
 }
 
+export interface AppDialogsTerminalProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  error: string
+  setError: (v: string) => void
+}
+
 export interface AppDialogsProps {
   appearance: Appearance
   api: <T>(path: string, init?: RequestInit) => Promise<T>
@@ -216,6 +225,7 @@ export interface AppDialogsProps {
   artifacts: AppDialogsArtifactsProps
   memory: AppDialogsMemoryProps
   agentHistory: AppDialogsAgentHistoryProps
+  terminal: AppDialogsTerminalProps
 }
 
 function formatBytes(value: number | null | undefined): string {
@@ -493,6 +503,7 @@ export function AppDialogs({
   artifacts,
   memory,
   agentHistory,
+  terminal,
 }: AppDialogsProps) {
   const settingsDialogOpen = settings.open
   const setSettingsDialogOpen = settings.onOpenChange
@@ -617,6 +628,12 @@ export function AppDialogs({
   const agentHistoryOptimizeBusy = agentHistory.optimizeBusy
   const agentHistoryOptimizeNotes = agentHistory.optimizeNotes
   const setAgentHistoryOptimizeNotes = agentHistory.setOptimizeNotes
+
+  const terminalDialogOpen = terminal.open
+  const setTerminalDialogOpen = terminal.onOpenChange
+  const terminalError = terminal.error
+  const setTerminalError = terminal.setError
+
   const loadAgentHistoryLatest = agentHistory.load
   const optimizeAgentHistoryLatest = agentHistory.optimize
 
@@ -647,8 +664,9 @@ export function AppDialogs({
       <Tabs.List size="1" className="mb-3 flex-wrap mc-settings-tabs-sticky">
         <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
         <Tabs.Trigger value="llm">LLM</Tabs.Trigger>
-        <Tabs.Trigger value="multimodel">Multi-model</Tabs.Trigger>
+        <Tabs.Trigger value="local-delegate">Local delegate</Tabs.Trigger>
         <Tabs.Trigger value="cursor">Cursor</Tabs.Trigger>
+        <Tabs.Trigger value="deterministic">Deterministic</Tabs.Trigger>
         <Tabs.Trigger value="hooks-skills">Hooks & Skills</Tabs.Trigger>
         <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
         <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
@@ -670,6 +688,15 @@ export function AppDialogs({
                 Cursor engine:{' '}
                 {installationStatus.cursor_engine_ready ? 'ready' : 'not ready'}
               </Text>
+              {installationStatus.agent_engine === 'classic_cost_routing' ? (
+                <Text
+                  size="1"
+                  color={installationStatus.local_delegate_ready ? 'green' : 'orange'}
+                >
+                  Local delegate:{' '}
+                  {installationStatus.local_delegate_ready ? 'verified' : 'not verified'}
+                </Text>
+              ) : null}
               <Text size="1" color="gray">
                 Env restart needed:{' '}
                 {(installationStatus.requires_restart_for_env_changes ??
@@ -713,11 +740,14 @@ export function AppDialogs({
           onError={setSettingsError}
         />
       </Tabs.Content>
-      <Tabs.Content value="multimodel">
-        <SettingsMultimodelPanel api={api} onError={setSettingsError} />
+      <Tabs.Content value="local-delegate">
+        <SettingsLocalDelegatePanel api={api} onError={setSettingsError} />
       </Tabs.Content>
       <Tabs.Content value="cursor">
         <SettingsCursorPanel api={api} onError={setSettingsError} />
+      </Tabs.Content>
+      <Tabs.Content value="deterministic">
+        <SettingsDeterministicPipelinePanel api={api} onError={setSettingsError} />
       </Tabs.Content>
       <Tabs.Content value="hooks-skills">
         <SettingsHooksSkillsPanel
@@ -1878,6 +1908,29 @@ export function AppDialogs({
       >
         Reload
       </Button>
+      <Dialog.Close>
+        <Button size="1" variant="soft">Close</Button>
+      </Dialog.Close>
+    </Flex>
+  </Dialog.Content>
+</Dialog.Root>
+
+<Dialog.Root open={terminalDialogOpen} onOpenChange={setTerminalDialogOpen}>
+  <Dialog.Content style={{ maxWidth: 1080, width: 'min(96vw, 1080px)' }} className="flex max-h-[min(88vh,900px)] flex-col">
+    <Dialog.Title>Terminal</Dialog.Title>
+    <Dialog.Description size="2" mb="3">
+      Interactive shell in the gateway workspace. Operator-only; requires WEB_AUTH_TOKEN and WEB_TERMINAL_ENABLED.
+    </Dialog.Description>
+    {terminalError ? (
+      <Callout.Root color="red" size="1" variant="soft" className="mb-2 shrink-0">
+        <Callout.Text>{terminalError}</Callout.Text>
+      </Callout.Root>
+    ) : null}
+    <TerminalPane
+      active={terminalDialogOpen}
+      onError={(message) => setTerminalError(message)}
+    />
+    <Flex justify="end" mt="3" className="shrink-0">
       <Dialog.Close>
         <Button size="1" variant="soft">Close</Button>
       </Dialog.Close>

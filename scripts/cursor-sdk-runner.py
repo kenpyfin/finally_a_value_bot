@@ -47,22 +47,113 @@ def _is_stale_agent_error(err: Exception) -> bool:
     return "not found" in msg and "agent" in msg
 
 
+def _serialize_model_param_values(raw_params: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for item in raw_params or []:
+        if isinstance(item, dict):
+            param_id = str(item.get("id") or "").strip()
+            value = str(item.get("value") or "").strip()
+        else:
+            param_id = str(getattr(item, "id", "") or "").strip()
+            value = str(getattr(item, "value", "") or "").strip()
+        if param_id and value:
+            out.append({"id": param_id, "value": value})
+    return out
+
+
+def _build_model_selection(model: str, model_params: list[dict[str, str]] | None):
+    params = _serialize_model_param_values(model_params)
+    if not params:
+        return model
+    try:
+        from cursor_sdk import ModelParameterValue, ModelSelection
+    except ImportError:
+        return model
+    return ModelSelection(
+        id=model,
+        params=[ModelParameterValue(id=p["id"], value=p["value"]) for p in params],
+    )
+
+
+def _serialize_model_entry(model: Any) -> dict[str, Any] | None:
+    model_id = getattr(model, "id", None) or getattr(model, "model", None)
+    if not model_id:
+        return None
+    entry: dict[str, Any] = {"id": str(model_id)}
+    display_name = getattr(model, "display_name", None) or getattr(model, "displayName", None)
+    if display_name:
+        entry["display_name"] = str(display_name)
+
+    parameters: list[dict[str, Any]] = []
+    for param in getattr(model, "parameters", None) or []:
+        param_id = getattr(param, "id", None)
+        if not param_id:
+            continue
+        values: list[dict[str, str]] = []
+        for value in getattr(param, "values", None) or []:
+            raw_value = getattr(value, "value", None)
+            if raw_value is None:
+                continue
+            value_entry: dict[str, str] = {"value": str(raw_value)}
+            value_label = getattr(value, "display_name", None) or getattr(
+                value, "displayName", None
+            )
+            if value_label:
+                value_entry["display_name"] = str(value_label)
+            values.append(value_entry)
+        if not values:
+            continue
+        param_entry: dict[str, Any] = {"id": str(param_id), "values": values}
+        param_label = getattr(param, "display_name", None) or getattr(param, "displayName", None)
+        if param_label:
+            param_entry["display_name"] = str(param_label)
+        parameters.append(param_entry)
+    if parameters:
+        entry["parameters"] = parameters
+
+    variants: list[dict[str, Any]] = []
+    for variant in getattr(model, "variants", None) or []:
+        variant_params = _serialize_model_param_values(getattr(variant, "params", None))
+        variant_name = getattr(variant, "display_name", None) or getattr(
+            variant, "displayName", None
+        )
+        if not variant_name:
+            continue
+        variant_entry: dict[str, Any] = {
+            "params": variant_params,
+            "display_name": str(variant_name),
+            "is_default": bool(getattr(variant, "is_default", False) or getattr(variant, "isDefault", False)),
+        }
+        description = getattr(variant, "description", None)
+        if description:
+            variant_entry["description"] = str(description)
+        variants.append(variant_entry)
+    if variants:
+        entry["variants"] = variants
+    return entry
+
+
 def _open_agent(
     *,
     agent_id: str | None,
     model: str,
+    model_params: list[dict[str, str]] | None,
     cwd: str,
     api_key: str,
     opts: Any,
+    mcp_servers: dict[str, Any] | None,
 ):
-    from cursor_sdk import Agent, LocalAgentOptions
+    from cursor_sdk import Agent, AgentOptions, LocalAgentOptions
 
+    model_selection = _build_model_selection(model, model_params)
+    agent_opts = AgentOptions(
+        api_key=api_key,
+        model=model_selection,
+        local=LocalAgentOptions(cwd=cwd),
+        mcp_servers=mcp_servers or None,
+    )
     if not agent_id:
-        return Agent.create(
-            model=model,
-            api_key=api_key,
-            local=LocalAgentOptions(cwd=cwd),
-        )
+        return Agent.create(agent_opts)
 
     try:
         return Agent.resume(agent_id, opts)
@@ -70,11 +161,7 @@ def _open_agent(
         from cursor_sdk import CursorAgentError
 
         if isinstance(err, CursorAgentError) and _is_stale_agent_error(err):
-            return Agent.create(
-                model=model,
-                api_key=api_key,
-                local=LocalAgentOptions(cwd=cwd),
-            )
+            return Agent.create(agent_opts)
         raise
 
 
@@ -82,7 +169,11 @@ async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
     prompt = (body.get("prompt") or "").strip()
     cwd = (body.get("cwd") or ".").strip() or "."
     model = (body.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    model_params = body.get("model_params")
     agent_id = (body.get("agent_id") or "").strip() or None
+    mcp_servers = body.get("mcp_servers")
+    if not isinstance(mcp_servers, dict):
+        mcp_servers = None
 
     if not prompt:
         yield json.dumps({"type": "error", "message": "prompt required"}) + "\n"
@@ -114,11 +205,13 @@ async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
             agent_ctx = _open_agent(
                 agent_id=resume_id,
                 model=model,
+                model_params=model_params if isinstance(model_params, list) else None,
                 cwd=cwd,
                 api_key=api_key,
                 opts=opts,
+                mcp_servers=mcp_servers,
             )
-            for line in _stream_agent_turn(agent_ctx, prompt, resume_id):
+            for line in _stream_agent_turn(agent_ctx, prompt, resume_id, mcp_servers):
                 yield line
             return
         except CursorAgentError as err:
@@ -141,14 +234,18 @@ def _stream_agent_turn(
     agent_ctx: Any,
     prompt: str,
     resume_id: str | None,
+    mcp_servers: dict[str, Any] | None,
 ):
     final_text_parts: list[str] = []
     returned_agent_id: str | None = resume_id
     status = "error"
+    send_options: dict[str, Any] | None = None
+    if mcp_servers:
+        send_options = {"mcp_servers": mcp_servers}
 
     with agent_ctx as agent:
         returned_agent_id = getattr(agent, "agent_id", None) or resume_id
-        run = agent.send(prompt)
+        run = agent.send(prompt, send_options) if send_options else agent.send(prompt)
         for message in run.messages():
             msg_type = getattr(message, "type", None)
             if msg_type != "assistant":
@@ -157,13 +254,38 @@ def _stream_agent_turn(
             if payload is None:
                 continue
             for block in getattr(payload, "content", []) or []:
-                if getattr(block, "type", None) != "text":
-                    continue
-                text = getattr(block, "text", "") or ""
-                if not text:
-                    continue
-                final_text_parts.append(text)
-                yield json.dumps({"type": "text", "text": text}) + "\n"
+                block_type = getattr(block, "type", None)
+                if block_type == "text":
+                    text = getattr(block, "text", "") or ""
+                    if not text:
+                        continue
+                    final_text_parts.append(text)
+                    yield json.dumps({"type": "text", "text": text}) + "\n"
+                elif block_type == "tool_use":
+                    name = getattr(block, "name", "") or ""
+                    tool_input = getattr(block, "input", None)
+                    if not isinstance(tool_input, dict):
+                        tool_input = {}
+                    yield json.dumps(
+                        {
+                            "type": "tool_use",
+                            "name": name,
+                            "input": tool_input,
+                        }
+                    ) + "\n"
+                elif block_type == "tool_result":
+                    yield json.dumps(
+                        {
+                            "type": "tool_result",
+                            "name": getattr(block, "name", "") or "",
+                            "output": getattr(block, "content", "") or "",
+                            "is_error": bool(getattr(block, "is_error", False)),
+                        }
+                    ) + "\n"
+                elif block_type == "thinking":
+                    thinking = getattr(block, "thinking", "") or getattr(block, "text", "") or ""
+                    if thinking:
+                        yield json.dumps({"type": "thinking", "thinking": thinking}) + "\n"
 
         result = run.wait()
         status = getattr(result, "status", None) or "finished"
@@ -197,6 +319,7 @@ async def handle_health(_request: web.Request) -> web.Response:
             "service": "cursor-sdk-runner",
             "api_key_configured": bool(_api_key()),
             "cursor_sdk_installed": cursor_sdk_installed,
+            "mcp_supported": True,
         }
     )
 
@@ -242,9 +365,9 @@ async def handle_models(_request: web.Request) -> web.Response:
         models = Cursor.models.list(api_key=api_key)
         payload = []
         for m in models or []:
-            model_id = getattr(m, "id", None) or getattr(m, "model", None)
-            if model_id:
-                payload.append({"id": str(model_id)})
+            entry = _serialize_model_entry(m)
+            if entry:
+                payload.append(entry)
         return web.json_response({"ok": True, "models": payload})
     except Exception as err:  # pragma: no cover
         return web.json_response({"ok": False, "error": str(err)}, status=502)

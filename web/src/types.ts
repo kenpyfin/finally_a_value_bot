@@ -39,11 +39,24 @@ export type RuntimeSettingItem = {
 }
 
 /** Matches `/api/settings` `installation_status` and web Settings UI. */
+export type TerminalCapabilities = {
+  web_terminal_enabled?: boolean
+  web_terminal_available?: boolean
+  web_terminal_blocked_reason?: string | null
+  web_terminal_max_sessions?: number
+  web_terminal_idle_timeout_secs?: number
+}
+
+/** Matches `/api/settings` `installation_status` and web Settings UI. */
 export type InstallationStatus = {
   llm_ready: boolean
   channel_ready: boolean
   cursor_engine_ready?: boolean
+  local_delegate_ready?: boolean
+  agent_engine?: string
+  cost_routing_effective?: boolean
   web_enabled: boolean
+  terminal?: TerminalCapabilities
   /** @deprecated use requires_restart_for_env_changes */
   requires_restart_to_apply_runtime_settings?: boolean
   requires_restart_for_env_changes?: boolean
@@ -60,10 +73,41 @@ export type LlmCatalogModel = {
   from_active_config?: boolean
 }
 
+export type CursorModelParam = {
+  id: string
+  value: string
+}
+
+export type CursorModelParameterValue = {
+  value: string
+  display_name?: string
+}
+
+export type CursorModelParameterDef = {
+  id: string
+  display_name?: string
+  values: CursorModelParameterValue[]
+}
+
+export type CursorModelVariant = {
+  params: CursorModelParam[]
+  display_name: string
+  description?: string
+  is_default?: boolean
+}
+
+export type CursorModelCatalogEntry = {
+  id: string
+  display_name?: string
+  parameters?: CursorModelParameterDef[]
+  variants?: CursorModelVariant[]
+}
+
 export type CursorEngineConfigResponse = {
   ok?: boolean
   sdk_runner_url?: string
   sdk_model?: string
+  sdk_model_params?: CursorModelParam[]
   sdk_runner_ok?: boolean
   sidecar_managed?: boolean
   sidecar_reachable?: boolean
@@ -76,6 +120,12 @@ export type CursorEngineConfigResponse = {
   cli_on_path?: boolean
   timeout_secs?: number
   tmux_enabled?: boolean
+  mcp_tools_enabled?: boolean
+  mcp_expose_send_message?: boolean
+  delegation_slim_prompt?: boolean
+  delegation_resume_delta?: boolean
+  mcp_endpoint_url?: string
+  mcp_bridge_ready?: boolean
   install_steps?: string[]
   sidecar_error?: string | null
   health_ok?: boolean
@@ -87,7 +137,12 @@ export type RuntimeConfigResponse = {
   tool_output_debug?: boolean
   post_tool_evaluator_enabled?: boolean
   response_quality_evaluator_enabled?: boolean
-  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  agent_engine?: 'classic' | 'classic_cost_routing' | 'deterministic' | 'cursor'
+  local_delegate_configured?: boolean
+  local_delegate_tools_ok?: boolean
+  local_delegate_ready?: boolean
+  cost_routing_effective?: boolean
+  warnings?: string[]
   source?: 'env' | 'app_settings'
   sources?: {
     tool_output_debug?: 'env' | 'app_settings'
@@ -114,6 +169,135 @@ export type HookDefinition = {
   scoped_for_persona?: boolean
   allowed_for_persona?: boolean
   active_for_persona?: boolean
+}
+
+export type SkillCatalogEntry = {
+  name: string
+  description: string
+  when_to_use?: string
+  platforms?: string[]
+  deps?: string[]
+  source?: string
+  version?: string
+  updated_at?: string
+  remote?: boolean
+  allowed_for_persona?: boolean
+}
+
+export type PipelinePhaseKind =
+  | 'intent_classify'
+  | 'plan_generate'
+  | 'execute_plan'
+  | 'synthesize_delivery'
+
+export type PipelineModelRoute =
+  | 'inherit_global'
+  | 'strategy'
+  | 'local'
+
+export type PipelineTransitionCondition =
+  | 'always'
+  | 'intent_category_conversational'
+  | 'intent_category_question'
+  | 'intent_category_task'
+  | 'intent_needs_clarification'
+  | 'intent_needs_clarification_proceed'
+  | 'plan_empty'
+  | 'execute_any_failed'
+  | 'execute_all_succeeded'
+  | 'channel_web'
+  | 'is_scheduled'
+
+export type PipelineTransitionTarget =
+  | { direct_answer: true }
+  | { clarify: true }
+  | { finish: true }
+  | { phase: string }
+
+export type PipelineTransitionRule = {
+  when: PipelineTransitionCondition
+  goto:
+    | 'direct_answer'
+    | 'clarify'
+    | 'finish'
+    | { phase: string }
+}
+
+export type PipelineOperationalConfig = {
+  timeout_secs: number
+  max_iterations: number
+  max_iterations_local: number
+  max_plan_steps: number
+  llm_round_timeout_secs: number
+  tool_execution_timeout_secs: number
+  iteration_breaker_min_chars: number
+  compact_system_max_chars: number
+  collapsed_session_turns: number
+  sop_reference_max_chars: number
+  min_polish_only_summary_chars: number
+  max_polish_only_combined_chars: number
+}
+
+export type PipelinePolicyConfig = {
+  heuristic_intent_enabled: boolean
+  merged_classify_and_plan_enabled: boolean
+  skip_consolidate_when_good: boolean
+  clarify_on_web_proceed: boolean
+  clarify_on_scheduler_proceed: boolean
+  image_input_force_task: boolean
+  retry_failed_steps: boolean
+  escalate_to_strategy_on_skill_failure: boolean
+  use_local_for_json_stages: boolean
+  bind_persona_sops_in_plan: boolean
+}
+
+export type PriorStepFeedMode = 'full' | 'summary'
+
+export type PhaseContextIncludes = {
+  include_system_prompt: boolean
+  include_agent_system_prompt: boolean
+  include_skills_catalog: boolean
+  include_session_excerpt: boolean
+  include_persona_memory: boolean
+  include_workspace_paths: boolean
+  include_sop_reference: boolean
+  include_current_request: boolean
+  include_prior_step_summaries: boolean
+  prior_step_feed_mode: PriorStepFeedMode
+  prior_step_summary_prompt: string
+  prior_step_full_output_max_chars: number
+  include_step_contract: boolean
+  include_execution_summary: boolean
+}
+
+export type PipelinePhase = {
+  id: string
+  label: string
+  enabled: boolean
+  kind: PipelinePhaseKind
+  model_route: PipelineModelRoute
+  system_prompt: string
+  preamble?: string | null
+  context_includes: PhaseContextIncludes
+  transitions: PipelineTransitionRule[]
+}
+
+export type PipelineProfile = {
+  version: number
+  entry_phase_id: string
+  phases: PipelinePhase[]
+  operational: PipelineOperationalConfig
+  policies: PipelinePolicyConfig
+}
+
+export type DeterministicPipelineResponse = {
+  ok?: boolean
+  schema_version?: number
+  profile?: PipelineProfile
+  defaults?: PipelineProfile
+  builtin_prompts?: Record<string, string>
+  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  message?: string
 }
 
 export type PersonaHookSkillPolicy = {
@@ -149,10 +333,16 @@ export type LlmConfigResponse = {
   providers?: LlmProviderOption[]
   cost_reference_note?: string
   custom_model_allowed?: boolean
+  thinking_enabled?: boolean
+  thinking_source?: 'app_settings' | 'default'
+  thinking_supported?: boolean
+  show_thinking?: boolean
+  show_thinking_source?: 'app_settings' | 'env' | 'default'
 }
 
-export type MultimodelConfigResponse = {
+export type LocalDelegateConfigResponse = {
   ok?: boolean
+  routing_enabled?: boolean
   enabled?: boolean
   local_base_url?: string
   local_model?: string
@@ -167,6 +357,9 @@ export type MultimodelConfigResponse = {
   strategy_model?: string
   description?: string
 }
+
+/** @deprecated use LocalDelegateConfigResponse */
+export type MultimodelConfigResponse = LocalDelegateConfigResponse
 
 export type AgentHistoryOptimizeResponse = {
   ok?: boolean
@@ -333,4 +526,6 @@ export type ChatSession = {
   last_active_at: string
   archived_at?: string | null
   ttl_hours: number
+  /** When true, session messages also appear on the main chat timeline. */
+  mirror_main_chat?: boolean
 }

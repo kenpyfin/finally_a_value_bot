@@ -68,6 +68,35 @@ fn stored_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMe
 const MESSAGE_SELECT_COLS: &str =
     "id, chat_id, persona_id, session_id, sender_name, content, is_from_bot, timestamp, origin";
 
+/// Main chat timeline: legacy rows plus focused sessions opted into main chat.
+const MAIN_CHAT_MESSAGE_VISIBILITY: &str = "(
+    session_id IS NULL
+    OR EXISTS (
+        SELECT 1 FROM chat_sessions cs
+        WHERE cs.id = session_id AND cs.mirror_main_chat = 1
+    )
+)";
+
+const CHAT_SESSION_SELECT_COLS: &str =
+    "id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json, mirror_main_chat";
+
+fn chat_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatSession> {
+    Ok(ChatSession {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        persona_id: row.get(2)?,
+        title: row.get(3)?,
+        intent: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        last_active_at: row.get(7)?,
+        archived_at: row.get(8)?,
+        ttl_hours: row.get(9)?,
+        bootstrap_context_json: row.get(10)?,
+        mirror_main_chat: row.get::<_, i64>(11)? != 0,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatSession {
     pub id: String,
@@ -81,6 +110,8 @@ pub struct ChatSession {
     pub archived_at: Option<String>,
     pub ttl_hours: i64,
     pub bootstrap_context_json: Option<String>,
+    /// When true, session messages also appear on the persona main chat timeline.
+    pub mirror_main_chat: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +175,51 @@ pub struct ScheduledTask {
     pub last_run: Option<String>,
     pub status: String, // "active", "running", "paused", "completed", "cancelled"
     pub created_at: String,
+}
+
+/// Read a column as text, tolerating rows whose value was stored with BLOB affinity
+/// (e.g. a prompt hand-edited via the sqlite CLI). SQLite is dynamically typed, so a
+/// single BLOB in a TEXT column otherwise makes `row.get::<String>` fail and aborts the
+/// entire query (which previously took down the scheduler and Schedules API).
+fn row_text(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<String> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(String::new()),
+        ValueRef::Text(t) => Ok(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+        ValueRef::Integer(i) => Ok(i.to_string()),
+        ValueRef::Real(f) => Ok(f.to_string()),
+    }
+}
+
+/// Optional variant of [`row_text`]; `NULL` maps to `None`.
+fn row_text_opt(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<String>> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(t) => Ok(Some(String::from_utf8_lossy(t).into_owned())),
+        ValueRef::Blob(b) => Ok(Some(String::from_utf8_lossy(b).into_owned())),
+        ValueRef::Integer(i) => Ok(Some(i.to_string())),
+        ValueRef::Real(f) => Ok(Some(f.to_string())),
+    }
+}
+
+/// Shared, blob-tolerant row mapping for `scheduled_tasks` queries. All list/lookup queries
+/// must select columns in this order: id, chat_id, persona_id, prompt, schedule_type,
+/// schedule_value, next_run, last_run, status, created_at.
+fn map_scheduled_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask> {
+    Ok(ScheduledTask {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        persona_id: row.get(2)?,
+        prompt: row_text(row, 3)?,
+        schedule_type: row_text(row, 4)?,
+        schedule_value: row_text(row, 5)?,
+        next_run: row_text(row, 6)?,
+        last_run: row_text_opt(row, 7)?,
+        status: row_text(row, 8)?,
+        created_at: row_text(row, 9)?,
+    })
 }
 
 /// External channel identity for delivery and persona policy. `0` = web (no bot token).
@@ -1312,6 +1388,12 @@ impl Database {
                     ON messages(session_id, timestamp ASC);",
             )?;
         }
+        if !Self::column_exists(conn, "chat_sessions", "mirror_main_chat")? {
+            conn.execute(
+                "ALTER TABLE chat_sessions ADD COLUMN mirror_main_chat INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -1609,6 +1691,7 @@ impl Database {
                 "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
                  WHERE chat_id = ?1 AND persona_id = ?2 AND origin != ?4
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}
                  ORDER BY timestamp DESC
                  LIMIT ?3"
             ))?;
@@ -1622,6 +1705,7 @@ impl Database {
                 "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
                  WHERE chat_id = ?1 AND persona_id = ?2
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}
                  ORDER BY timestamp DESC
                  LIMIT ?3"
             ))?;
@@ -1647,6 +1731,7 @@ impl Database {
             "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
+               AND {MAIN_CHAT_MESSAGE_VISIBILITY}
              ORDER BY timestamp ASC"
         ))?;
         let messages = stmt
@@ -1668,6 +1753,7 @@ impl Database {
             "SELECT {MESSAGE_SELECT_COLS}
              FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
+               AND {MAIN_CHAT_MESSAGE_VISIBILITY}
                AND (?3 IS NULL OR timestamp >= ?3)
                AND (?4 IS NULL OR timestamp <= ?4)
              ORDER BY timestamp ASC
@@ -1688,11 +1774,12 @@ impl Database {
         persona_id: i64,
     ) -> Result<Vec<String>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT DISTINCT date(timestamp) AS d FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2
+               AND {MAIN_CHAT_MESSAGE_VISIBILITY}
              ORDER BY d DESC",
-        )?;
+        ))?;
         let days: Vec<String> = stmt
             .query_map(params![chat_id, persona_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2754,19 +2841,25 @@ impl Database {
 
         let last_bot_ts: Option<String> = if exclude_scheduled {
             conn.query_row(
-                "SELECT timestamp FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
-                   AND origin != ?3
-                 ORDER BY timestamp DESC LIMIT 1",
+                &format!(
+                    "SELECT timestamp FROM messages
+                     WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
+                       AND origin != ?3
+                       AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                     ORDER BY timestamp DESC LIMIT 1"
+                ),
                 params![chat_id, persona_id, MESSAGE_ORIGIN_SCHEDULED],
                 |row| row.get(0),
             )
             .ok()
         } else {
             conn.query_row(
-                "SELECT timestamp FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
-                 ORDER BY timestamp DESC LIMIT 1",
+                &format!(
+                    "SELECT timestamp FROM messages
+                     WHERE chat_id = ?1 AND persona_id = ?2 AND is_from_bot = 1
+                       AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                     ORDER BY timestamp DESC LIMIT 1"
+                ),
                 params![chat_id, persona_id],
                 |row| row.get(0),
             )
@@ -2783,7 +2876,8 @@ impl Database {
             let sql = format!(
                 "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3{origin_filter}
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND timestamp >= ?3
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}{origin_filter}
                  ORDER BY timestamp DESC
                  LIMIT ?4"
             );
@@ -2810,7 +2904,8 @@ impl Database {
             let sql = format!(
                 "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
-                 WHERE chat_id = ?1 AND persona_id = ?2{origin_filter}
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}{origin_filter}
                  ORDER BY timestamp DESC
                  LIMIT ?3"
             );
@@ -3005,20 +3100,7 @@ impl Database {
              ORDER BY next_run ASC, id ASC",
         )?;
         let tasks = stmt
-            .query_map(params![now], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![now], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3032,20 +3114,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map([], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map([], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3063,20 +3132,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map([], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map([], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3095,20 +3151,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3127,20 +3170,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id, persona_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3157,20 +3187,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3189,20 +3206,7 @@ impl Database {
              ORDER BY id",
         )?;
         let tasks = stmt
-            .query_map(params![chat_id, persona_id], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id], map_scheduled_task_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -3217,20 +3221,7 @@ impl Database {
              FROM scheduled_tasks
              WHERE id = ?1",
             params![task_id],
-            |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    prompt: row.get(3)?,
-                    schedule_type: row.get(4)?,
-                    schedule_value: row.get(5)?,
-                    next_run: row.get(6)?,
-                    last_run: row.get(7)?,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            },
+            map_scheduled_task_row,
         );
         match result {
             Ok(task) => Ok(Some(task)),
@@ -5570,13 +5561,23 @@ impl Database {
         title: &str,
         intent: &str,
         ttl_hours: i64,
+        mirror_main_chat: bool,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO chat_sessions (id, chat_id, persona_id, title, intent, status, created_at, last_active_at, ttl_hours)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)",
-            params![id, chat_id, persona_id, title, intent, now, ttl_hours],
+            "INSERT INTO chat_sessions (id, chat_id, persona_id, title, intent, status, created_at, last_active_at, ttl_hours, mirror_main_chat)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7, ?8)",
+            params![
+                id,
+                chat_id,
+                persona_id,
+                title,
+                intent,
+                now,
+                ttl_hours,
+                i64::from(mirror_main_chat)
+            ],
         )?;
         Ok(())
     }
@@ -5589,24 +5590,12 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let result = conn
             .query_row(
-                "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
-                 FROM chat_sessions WHERE id = ?1",
+                &format!(
+                    "SELECT {CHAT_SESSION_SELECT_COLS}
+                 FROM chat_sessions WHERE id = ?1"
+                ),
                 params![session_id],
-                |row| {
-                    Ok(ChatSession {
-                        id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        persona_id: row.get(2)?,
-                        title: row.get(3)?,
-                        intent: row.get(4)?,
-                        status: row.get(5)?,
-                        created_at: row.get(6)?,
-                        last_active_at: row.get(7)?,
-                        archived_at: row.get(8)?,
-                        ttl_hours: row.get(9)?,
-                        bootstrap_context_json: row.get(10)?,
-                    })
-                },
+                chat_session_from_row,
             )
             .optional()?;
         Ok(result)
@@ -5620,31 +5609,21 @@ impl Database {
     ) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let query = if include_archived {
-            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+            format!(
+                "SELECT {CHAT_SESSION_SELECT_COLS}
              FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2
              ORDER BY last_active_at DESC"
+            )
         } else {
-            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+            format!(
+                "SELECT {CHAT_SESSION_SELECT_COLS}
              FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2 AND status = 'active'
              ORDER BY last_active_at DESC"
+            )
         };
-        let mut stmt = conn.prepare(query)?;
+        let mut stmt = conn.prepare(&query)?;
         let sessions = stmt
-            .query_map(params![chat_id, persona_id], |row| {
-                Ok(ChatSession {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    title: row.get(3)?,
-                    intent: row.get(4)?,
-                    status: row.get(5)?,
-                    created_at: row.get(6)?,
-                    last_active_at: row.get(7)?,
-                    archived_at: row.get(8)?,
-                    ttl_hours: row.get(9)?,
-                    bootstrap_context_json: row.get(10)?,
-                })
-            })?
+            .query_map(params![chat_id, persona_id], chat_session_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(sessions)
     }
@@ -5684,6 +5663,19 @@ impl Database {
         conn.execute(
             "UPDATE chat_sessions SET ttl_hours = ?1 WHERE id = ?2",
             params![ttl_hours, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_chat_session_mirror_main_chat(
+        &self,
+        session_id: &str,
+        mirror_main_chat: bool,
+    ) -> Result<(), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_sessions SET mirror_main_chat = ?1 WHERE id = ?2",
+            params![i64::from(mirror_main_chat), session_id],
         )?;
         Ok(())
     }
@@ -5753,29 +5745,15 @@ impl Database {
 
     pub fn get_expired_chat_sessions(&self) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHAT_SESSION_SELECT_COLS}
              FROM chat_sessions
              WHERE status = 'active'
                AND ttl_hours > 0
                AND datetime(last_active_at, '+' || ttl_hours || ' hours') < datetime('now')",
-        )?;
+        ))?;
         let sessions = stmt
-            .query_map([], |row| {
-                Ok(ChatSession {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    persona_id: row.get(2)?,
-                    title: row.get(3)?,
-                    intent: row.get(4)?,
-                    status: row.get(5)?,
-                    created_at: row.get(6)?,
-                    last_active_at: row.get(7)?,
-                    archived_at: row.get(8)?,
-                    ttl_hours: row.get(9)?,
-                    bootstrap_context_json: row.get(10)?,
-                })
-            })?
+            .query_map([], chat_session_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(sessions)
     }
@@ -5895,6 +5873,7 @@ mod tests {
                 id: format!("msg{i}"),
                 chat_id: 100,
                 persona_id: pid,
+                session_id: None,
                 sender_name: "alice".into(),
                 content: format!("message {i}"),
                 is_from_bot: false,
@@ -6001,6 +5980,7 @@ mod tests {
                 id: format!("m{i}"),
                 chat_id: 100,
                 persona_id: pid,
+                session_id: None,
                 sender_name: "alice".into(),
                 content: format!("msg {i}"),
                 is_from_bot: false,
@@ -6208,6 +6188,7 @@ mod tests {
                 id: format!("msg{i}"),
                 chat_id: 100,
                 persona_id: pid,
+                session_id: None,
                 sender_name: "alice".into(),
                 content: format!("message {i}"),
                 is_from_bot: false,

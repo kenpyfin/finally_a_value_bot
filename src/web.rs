@@ -4,7 +4,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::ws::WebSocket;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -38,6 +39,7 @@ use crate::telegram::{
     archive_conversation, process_with_agent, process_with_agent_with_events, AgentEvent,
     AgentRequestContext, AppState,
 };
+use crate::web_terminal::{self, TerminalHub};
 use std::time::SystemTime;
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
@@ -48,6 +50,7 @@ struct WebState {
     auth_token: Option<String>,
     run_hub: RunHub,
     request_hub: RequestHub,
+    terminal_hub: TerminalHub,
     limits: WebLimits,
     /// Cache for `ensure_web_binding_for_universal` to avoid repeated DB writes on every
     /// `/api/history` poll while this server process is alive.
@@ -2880,6 +2883,22 @@ struct ChatSessionsListQuery {
     include_archived: Option<bool>,
 }
 
+fn chat_session_json(session: &crate::db::ChatSession) -> serde_json::Value {
+    serde_json::json!({
+        "id": session.id,
+        "chat_id": session.chat_id,
+        "persona_id": session.persona_id,
+        "title": session.title,
+        "intent": session.intent,
+        "status": session.status,
+        "created_at": session.created_at,
+        "last_active_at": session.last_active_at,
+        "archived_at": session.archived_at,
+        "ttl_hours": session.ttl_hours,
+        "mirror_main_chat": session.mirror_main_chat,
+    })
+}
+
 async fn api_chat_sessions_list(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -2904,23 +2923,7 @@ async fn api_chat_sessions_list(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let items: Vec<serde_json::Value> = sessions
-        .into_iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "chat_id": s.chat_id,
-                "persona_id": s.persona_id,
-                "title": s.title,
-                "intent": s.intent,
-                "status": s.status,
-                "created_at": s.created_at,
-                "last_active_at": s.last_active_at,
-                "archived_at": s.archived_at,
-                "ttl_hours": s.ttl_hours,
-            })
-        })
-        .collect();
+    let items: Vec<serde_json::Value> = sessions.iter().map(chat_session_json).collect();
     Ok(Json(serde_json::json!({ "sessions": items })))
 }
 
@@ -2931,6 +2934,89 @@ struct CreateChatSessionRequest {
     intent: String,
     #[serde(default)]
     ttl_hours: Option<i64>,
+    #[serde(default)]
+    mirror_main_chat: Option<bool>,
+}
+
+async fn bootstrap_chat_session_context(
+    app_state: Arc<AppState>,
+    session_id: String,
+    chat_id: i64,
+    persona_id: i64,
+    intent: String,
+) {
+    let bootstrap_prompt = format!(
+        concat!(
+            "You are bootstrapping a new focused session. The user's intent is:\n\n",
+            "\"{}\"\n\n",
+            "Search the vault (using search_vault or mempalace search) for notes relevant to this intent. ",
+            "Also list which skills from the workspace are relevant.\n\n",
+            "Return ONLY a compact JSON object (no markdown fences) with this structure:\n",
+            "{{\"relevant_notes\": [\"note title or path\", ...], ",
+            "\"selected_skills\": [\"skill_name\", ...], ",
+            "\"key_context\": \"2-3 sentence summary of relevant background knowledge\"}}\n\n",
+            "If nothing relevant is found, return the JSON with empty arrays and a brief note in key_context. ",
+            "Do NOT ask the user anything. Do NOT include explanation outside the JSON."
+        ),
+        intent
+    );
+
+    let bootstrap_result = process_with_agent(
+        &app_state,
+        AgentRequestContext {
+            caller_channel: "web",
+            chat_id,
+            chat_type: "private",
+            persona_id,
+            is_scheduled_task: false,
+            is_background_job: false,
+            run_key: None,
+            reply_bot_instance_id: None,
+            session_id: Some(session_id.clone()),
+        },
+        Some(&bootstrap_prompt),
+        None,
+    )
+    .await;
+
+    let Ok(response) = bootstrap_result else {
+        warn!(
+            session_id = %session_id,
+            "chat session bootstrap agent run failed"
+        );
+        return;
+    };
+
+    let trimmed = response.trim().to_string();
+    let ctx_sid = session_id.clone();
+    let ctx_json = trimmed.clone();
+    if let Err(e) = call_blocking(app_state.db.clone(), move |db| {
+        db.update_chat_session_bootstrap_context(&ctx_sid, &ctx_json)
+    })
+    .await
+    {
+        warn!(
+            session_id = %session_id,
+            error = %e,
+            "failed to persist chat session bootstrap context"
+        );
+    }
+
+    let bot_msg = StoredMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        chat_id,
+        persona_id,
+        session_id: Some(session_id),
+        sender_name: app_state.config.bot_username.clone(),
+        content: format!("Session ready. Context loaded for: {}", intent),
+        is_from_bot: true,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        origin: crate::db::message_origin_interactive(),
+    };
+    if let Err(e) = call_blocking(app_state.db.clone(), move |db| db.store_message(&bot_msg)).await
+    {
+        warn!(error = %e, "failed to store chat session bootstrap message");
+    }
 }
 
 async fn api_chat_sessions_create(
@@ -2962,89 +3048,55 @@ async fn api_chat_sessions_create(
     let session_id = uuid::Uuid::new_v4().to_string();
     let title = intent.chars().take(60).collect::<String>();
     let ttl_hours = body.ttl_hours.unwrap_or(72).max(0);
+    let mirror_main_chat = body.mirror_main_chat.unwrap_or(false);
 
     let sid = session_id.clone();
     let t = title.clone();
     let i = intent.clone();
     call_blocking(state.app_state.db.clone(), move |db| {
-        db.create_chat_session(&sid, chat_id, persona_id, &t, &i, ttl_hours)
+        db.create_chat_session(
+            &sid,
+            chat_id,
+            persona_id,
+            &t,
+            &i,
+            ttl_hours,
+            mirror_main_chat,
+        )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Run bootstrap agent turn: search vault/skills and produce compact context
-    let bootstrap_prompt = format!(
-        concat!(
-            "You are bootstrapping a new focused session. The user's intent is:\n\n",
-            "\"{}\"\n\n",
-            "Search the vault (using search_vault or mempalace search) for notes relevant to this intent. ",
-            "Also list which skills from the workspace are relevant.\n\n",
-            "Return ONLY a compact JSON object (no markdown fences) with this structure:\n",
-            "{{\"relevant_notes\": [\"note title or path\", ...], ",
-            "\"selected_skills\": [\"skill_name\", ...], ",
-            "\"key_context\": \"2-3 sentence summary of relevant background knowledge\"}}\n\n",
-            "If nothing relevant is found, return the JSON with empty arrays and a brief note in key_context. ",
-            "Do NOT ask the user anything. Do NOT include explanation outside the JSON."
-        ),
-        intent
-    );
+    let created = call_blocking(state.app_state.db.clone(), {
+        let session_id = session_id.clone();
+        move |db| db.get_chat_session(&session_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "session not found".into(),
+    ))?;
 
+    let app_state = state.app_state.clone();
     let bootstrap_sid = session_id.clone();
-    let bootstrap_result = process_with_agent(
-        &state.app_state,
-        AgentRequestContext {
-            caller_channel: "web",
-            chat_id,
-            chat_type: "private",
-            persona_id,
-            is_scheduled_task: false,
-            is_background_job: false,
-            run_key: None,
-            reply_bot_instance_id: None,
-            session_id: Some(session_id.clone()),
-        },
-        Some(&bootstrap_prompt),
-        None,
-    )
-    .await;
-
-    let mut bootstrap_summary = String::new();
-    if let Ok(response) = bootstrap_result {
-        let trimmed = response.trim().to_string();
-        // Store as bootstrap_context_json
-        let ctx_sid = bootstrap_sid.clone();
-        let ctx_json = trimmed.clone();
-        let _ = call_blocking(state.app_state.db.clone(), move |db| {
-            db.update_chat_session_bootstrap_context(&ctx_sid, &ctx_json)
-        })
-        .await;
-
-        // Store the bootstrap response as an assistant message in the session
-        let bot_msg = crate::db::StoredMessage {
-            id: uuid::Uuid::new_v4().to_string(),
+    let bootstrap_intent = intent.clone();
+    tokio::spawn(async move {
+        bootstrap_chat_session_context(
+            app_state,
+            bootstrap_sid,
             chat_id,
             persona_id,
-            session_id: Some(bootstrap_sid.clone()),
-            sender_name: state.app_state.config.bot_username.clone(),
-            content: format!("Session ready. Context loaded for: {}", intent),
-            is_from_bot: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            origin: crate::db::message_origin_interactive(),
-        };
-        let _ = call_blocking(state.app_state.db.clone(), move |db| {
-            db.store_message(&bot_msg)
-        })
+            bootstrap_intent,
+        )
         .await;
-        bootstrap_summary = trimmed;
-    }
+    });
 
     Ok(Json(serde_json::json!({
         "ok": true,
+        "session": chat_session_json(&created),
         "session_id": session_id,
-        "title": title,
-        "chat_id": chat_id,
-        "persona_id": persona_id,
-        "bootstrap_context": bootstrap_summary,
+        "bootstrap_pending": true,
     })))
 }
 
@@ -3061,19 +3113,16 @@ async fn api_chat_sessions_get(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     match session {
-        Some(s) => Ok(Json(serde_json::json!({
-            "id": s.id,
-            "chat_id": s.chat_id,
-            "persona_id": s.persona_id,
-            "title": s.title,
-            "intent": s.intent,
-            "status": s.status,
-            "created_at": s.created_at,
-            "last_active_at": s.last_active_at,
-            "archived_at": s.archived_at,
-            "ttl_hours": s.ttl_hours,
-            "bootstrap_context_json": s.bootstrap_context_json,
-        }))),
+        Some(s) => {
+            let mut value = chat_session_json(&s);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "bootstrap_context_json".into(),
+                    serde_json::json!(s.bootstrap_context_json),
+                );
+            }
+            Ok(Json(value))
+        }
         None => Err((StatusCode::NOT_FOUND, "session not found".into())),
     }
 }
@@ -3083,6 +3132,7 @@ struct PatchChatSessionRequest {
     title: Option<String>,
     status: Option<String>,
     ttl_hours: Option<i64>,
+    mirror_main_chat: Option<bool>,
 }
 
 async fn api_chat_sessions_patch(
@@ -3135,6 +3185,15 @@ async fn api_chat_sessions_patch(
         let ttl_val = ttl.max(0);
         call_blocking(state.app_state.db.clone(), move |db| {
             db.update_chat_session_ttl(&sid, ttl_val)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    if let Some(mirror_main_chat) = body.mirror_main_chat {
+        let sid = session_id.clone();
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.update_chat_session_mirror_main_chat(&sid, mirror_main_chat)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4274,7 +4333,7 @@ async fn api_persona_agent_history_optimize(
         return Err((StatusCode::NOT_FOUND, "persona not found".into()));
     }
 
-    let mm = state.app_state.llm.multimodel_config();
+    let mm = state.app_state.llm.local_delegate_config();
     if mm.tier2_base_url.trim().is_empty() || mm.tier2_model.trim().is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4964,6 +5023,10 @@ struct LlmModelPatchRequest {
     custom: bool,
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    thinking_enabled: Option<bool>,
+    #[serde(default)]
+    show_thinking: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4997,12 +5060,20 @@ async fn api_runtime_get(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let toggles = &state.app_state.runtime_toggles;
+    let mm_cfg = state.app_state.llm.local_delegate_config();
+    let engine = toggles.agent_engine();
+    let local_ready = mm_cfg.local_routable();
     Ok(Json(json!({
         "ok": true,
         "tool_output_debug": toggles.tool_output_debug(),
         "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
         "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
-        "agent_engine": toggles.agent_engine().as_str(),
+        "agent_engine": engine.as_str(),
+        "local_delegate_configured": mm_cfg.local_configured(),
+        "local_delegate_tools_ok": mm_cfg.local_tools_ok,
+        "local_delegate_ready": local_ready,
+        "cost_routing_effective": crate::local_delegate::cost_routing_effective(engine, &mm_cfg),
+        "terminal": web_terminal::capabilities_json(&state.app_state.config),
         "sources": {
             "tool_output_debug": if sources.0 { "app_settings" } else { "env" },
             "post_tool_evaluator_enabled": if sources.1 { "app_settings" } else { "env" },
@@ -5071,6 +5142,25 @@ async fn api_runtime_patch(
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let routing_for_engine = engine == crate::runtime_toggles::AgentEngine::ClassicCostRouting;
+        let mut mm_cfg = state.app_state.llm.local_delegate_config();
+        if mm_cfg.routing_enabled != routing_for_engine {
+            mm_cfg.routing_enabled = routing_for_engine;
+            mm_cfg = mm_cfg.normalize();
+            call_blocking(state.app_state.db.clone(), {
+                let cfg_db = mm_cfg.clone();
+                move |db| crate::local_delegate::persist_to_db(db, &cfg_db)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            state
+                .app_state
+                .llm
+                .apply_local_delegate_config(mm_cfg.clone())
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        }
+
         messages.push(match engine {
             crate::runtime_toggles::AgentEngine::Deterministic => {
                 "Agent engine set to deterministic pipeline."
@@ -5078,8 +5168,30 @@ async fn api_runtime_patch(
             crate::runtime_toggles::AgentEngine::Cursor => {
                 "Agent engine set to Cursor SDK (local sidecar)."
             }
-            crate::runtime_toggles::AgentEngine::Classic => "Agent engine set to classic loop.",
+            crate::runtime_toggles::AgentEngine::ClassicCostRouting => {
+                "Agent engine set to Classic · Cost routing."
+            }
+            crate::runtime_toggles::AgentEngine::Classic => {
+                "Agent engine set to Classic · Single turn."
+            }
         });
+    }
+
+    let mm_cfg = state.app_state.llm.local_delegate_config();
+    let engine = toggles.agent_engine();
+    let local_ready = mm_cfg.local_routable();
+    let cost_routing_effective = crate::local_delegate::cost_routing_effective(engine, &mm_cfg);
+    let mut warnings: Vec<String> = Vec::new();
+    if engine == crate::runtime_toggles::AgentEngine::ClassicCostRouting && !local_ready {
+        if !mm_cfg.local_configured() {
+            warnings.push(
+                "Cost routing selected but local URL/model are not configured. Runs use cloud model only until configured and verified.".into(),
+            );
+        } else if !mm_cfg.local_tools_ok {
+            warnings.push(
+                "Cost routing selected but local tool calling is not verified. Runs use cloud model only until you run Test in Local delegate.".into(),
+            );
+        }
     }
 
     if messages.is_empty() {
@@ -5094,9 +5206,111 @@ async fn api_runtime_patch(
         "tool_output_debug": toggles.tool_output_debug(),
         "post_tool_evaluator_enabled": toggles.post_tool_evaluator_enabled(),
         "response_quality_evaluator_enabled": toggles.response_quality_evaluator_enabled(),
-        "agent_engine": toggles.agent_engine().as_str(),
+        "agent_engine": engine.as_str(),
+        "local_delegate_configured": mm_cfg.local_configured(),
+        "local_delegate_tools_ok": mm_cfg.local_tools_ok,
+        "local_delegate_ready": local_ready,
+        "cost_routing_effective": cost_routing_effective,
+        "warnings": warnings,
         "source": "app_settings",
         "message": messages.join(" "),
+    })))
+}
+
+async fn api_deterministic_pipeline_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let profile = state
+        .app_state
+        .pipeline_profile
+        .read()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pipeline profile lock poisoned".into(),
+            )
+        })?
+        .clone();
+    let defaults = crate::agent_pipeline::profile::PipelineProfile::default_profile();
+    let builtin_prompts: serde_json::Map<String, serde_json::Value> =
+        crate::agent_pipeline::profile::PhaseKind::all()
+            .iter()
+            .map(|kind| {
+                (
+                    kind.label().to_string(),
+                    serde_json::Value::String(
+                        crate::agent_pipeline::profile::builtin_prompt_for_kind(*kind).to_string(),
+                    ),
+                )
+            })
+            .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "schema_version": crate::agent_pipeline::profile::SCHEMA_VERSION,
+        "profile": profile,
+        "defaults": defaults,
+        "builtin_prompts": builtin_prompts,
+        "agent_engine": state.app_state.runtime_toggles.agent_engine().as_str(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeterministicPipelinePatchRequest {
+    #[serde(default)]
+    reset_defaults: bool,
+    #[serde(default)]
+    profile: Option<crate::agent_pipeline::profile::PipelineProfile>,
+}
+
+async fn api_deterministic_pipeline_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<DeterministicPipelinePatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let new_profile = if body.reset_defaults {
+        crate::agent_pipeline::profile::PipelineProfile::default_profile()
+    } else if let Some(p) = body.profile {
+        p
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide profile or reset_defaults=true".into(),
+        ));
+    };
+    let new_profile = new_profile.migrate();
+    if let Err(errs) = new_profile.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::to_string(&json!({ "ok": false, "errors": errs }))
+                .unwrap_or_else(|_| "validation failed".into()),
+        ));
+    }
+    call_blocking(state.app_state.db.clone(), {
+        let profile_db = new_profile.clone();
+        move |db| crate::agent_pipeline::profile::persist_to_db(db, &profile_db)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        let mut guard = state.app_state.pipeline_profile.write().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pipeline profile lock poisoned".into(),
+            )
+        })?;
+        *guard = new_profile.clone();
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "profile": new_profile,
+        "message": if body.reset_defaults {
+            "Deterministic pipeline profile reset to defaults."
+        } else {
+            "Deterministic pipeline profile saved."
+        },
     })))
 }
 
@@ -5109,7 +5323,7 @@ async fn api_llm_get(
         crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
     let preset = crate::llm_catalog::find_provider(&provider_id);
     let current_model = state.app_state.llm.current_model();
-    let (model_source, provider_source, base_url_source) =
+    let (model_source, provider_source, base_url_source, thinking_source, show_thinking_source) =
         call_blocking(state.app_state.db.clone(), |db| {
             let settings = db.list_app_settings()?;
             let model_source = settings.iter().any(|s| {
@@ -5127,7 +5341,23 @@ async fn api_llm_get(
                     .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_BASE_URL)
                     && !s.value.trim().is_empty()
             });
-            Ok((model_source, provider_source, base_url_source))
+            let thinking_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED)
+                    && !s.value.trim().is_empty()
+            });
+            let show_thinking_source = settings.iter().any(|s| {
+                s.key
+                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_SHOW_THINKING)
+                    && !s.value.trim().is_empty()
+            });
+            Ok((
+                model_source,
+                provider_source,
+                base_url_source,
+                thinking_source,
+                show_thinking_source,
+            ))
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -5180,6 +5410,21 @@ async fn api_llm_get(
         "catalog_source": "static_curated",
         "cost_reference_note": "Curated catalog (not live from provider APIs). Put API keys in repo-root .env only (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or LLM_API_KEY). Approximate USD per 1M tokens — verify on your provider billing page.",
         "custom_model_allowed": true,
+        "thinking_enabled": state.app_state.llm.thinking_enabled(),
+        "thinking_source": if thinking_source {
+            "app_settings"
+        } else {
+            "default"
+        },
+        "show_thinking": state.app_state.llm.show_thinking(),
+        "show_thinking_source": if show_thinking_source {
+            "app_settings"
+        } else if std::env::var("SHOW_THINKING").is_ok() {
+            "env"
+        } else {
+            "default"
+        },
+        "thinking_supported": provider_id == "google" || provider_id == "gemini",
     })))
 }
 
@@ -5252,6 +5497,12 @@ async fn api_llm_patch(
         None
     };
     let base_url_response = base_url_db.clone();
+    let thinking_enabled = body
+        .thinking_enabled
+        .unwrap_or_else(|| state.app_state.llm.thinking_enabled());
+    let show_thinking = body
+        .show_thinking
+        .unwrap_or_else(|| state.app_state.llm.show_thinking());
     call_blocking(state.app_state.db.clone(), move |db| {
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_PROVIDER, &provider_db)?;
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_db)?;
@@ -5260,10 +5511,24 @@ async fn api_llm_patch(
         } else {
             db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, "")?;
         }
+        db.set_app_setting(
+            crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED,
+            if thinking_enabled { "true" } else { "false" },
+        )?;
+        db.set_app_setting(
+            crate::llm_catalog::APP_SETTING_SHOW_THINKING,
+            if show_thinking { "true" } else { "false" },
+        )?;
         Ok(())
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state
+        .app_state
+        .llm
+        .apply_thinking_settings(thinking_enabled, show_thinking)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({
         "ok": true,
@@ -5272,6 +5537,8 @@ async fn api_llm_patch(
         },
         "model": model_saved,
         "base_url": base_url_response,
+        "thinking_enabled": thinking_enabled,
+        "show_thinking": show_thinking,
         "provider_source": "app_settings",
         "model_source": "app_settings",
         "base_url_source": if base_url_response.is_some() {
@@ -5290,18 +5557,54 @@ struct MultimodelTestRequest {
     model: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct MultimodelModelsQuery {
+    base_url: String,
+}
+
+async fn api_multimodel_models_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<MultimodelModelsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let base_url_raw = query.base_url.trim();
+    if base_url_raw.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_url query parameter is required".into(),
+        ));
+    }
+    let base_url = crate::local_delegate::normalize_base_url_for_provider(base_url_raw, "");
+    if base_url.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_url query parameter is required".into(),
+        ));
+    }
+    match crate::llm::fetch_openai_compatible_models(&base_url).await {
+        Ok(models) => Ok(Json(json!({
+            "ok": true,
+            "models": models,
+            "base_url": base_url,
+        }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
+}
+
 async fn api_multimodel_get(
     headers: HeaderMap,
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let cfg = state.app_state.llm.multimodel_config();
+    let cfg = state.app_state.llm.local_delegate_config();
     let strategy_provider =
         crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
     let strategy_model = state.app_state.llm.current_model();
     Ok(Json(json!({
         "ok": true,
-        "enabled": cfg.enabled,
+        "routing_enabled": cfg.routing_enabled,
+        "enabled": cfg.routing_enabled,
         "local_base_url": cfg.local_base_url,
         "local_model": cfg.local_model,
         "local_tools_ok": cfg.local_tools_ok,
@@ -5313,20 +5616,20 @@ async fn api_multimodel_get(
         "tier2_tools_ok": cfg.tier2_tools_ok,
         "strategy_provider": strategy_provider,
         "strategy_model": strategy_model,
-        "description": "Local model handles tool execution. Strategy (cloud) handles planning and synthesis.",
+        "description": "Local OpenAI-compatible endpoint for cost routing, PTE/PDQE, and deterministic local phases.",
     })))
 }
 
 async fn api_multimodel_patch(
     headers: HeaderMap,
     State(state): State<WebState>,
-    Json(body): Json<crate::multimodel::MultimodelPatchRequest>,
+    Json(body): Json<crate::local_delegate::LocalDelegatePatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let old = state.app_state.llm.multimodel_config();
+    let old = state.app_state.llm.local_delegate_config();
     let mut cfg = old.clone();
-    if let Some(enabled) = body.enabled {
-        cfg.enabled = enabled;
+    if let Some(routing) = body.routing_enabled.or(body.enabled) {
+        cfg.routing_enabled = routing;
     }
     // New unified local fields
     if let Some(ref url) = body.local_base_url {
@@ -5356,41 +5659,41 @@ async fn api_multimodel_patch(
         cfg.local_tools_ok = false;
     }
     cfg = cfg.normalize();
-    if cfg.enabled && !cfg.local_configured() {
+    if cfg.routing_enabled && !cfg.local_configured() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Local model base URL and model are required to enable multi-model routing.".into(),
+            "Local model base URL and model are required to enable cost routing.".into(),
         ));
     }
-    if cfg.enabled && !cfg.local_tools_ok {
+    if cfg.routing_enabled && !cfg.local_tools_ok {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Run the tool-calling test for the local model before enabling multi-model routing."
-                .into(),
+            "Run the tool-calling test for the local model before enabling cost routing.".into(),
         ));
     }
     call_blocking(state.app_state.db.clone(), {
         let cfg_db = cfg.clone();
-        move |db| crate::multimodel::persist_to_db(db, &cfg_db)
+        move |db| crate::local_delegate::persist_to_db(db, &cfg_db)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state
         .app_state
         .llm
-        .apply_multimodel_config(cfg.clone())
+        .apply_local_delegate_config(cfg.clone())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({
         "ok": true,
-        "enabled": cfg.enabled,
+        "routing_enabled": cfg.routing_enabled,
+        "enabled": cfg.routing_enabled,
         "local_base_url": cfg.local_base_url,
         "local_model": cfg.local_model,
         "local_tools_ok": cfg.local_tools_ok,
-        "message": if cfg.enabled {
-            "Multi-model routing enabled. Execute phase routes to local model."
+        "message": if cfg.routing_enabled {
+            "Local delegate routing enabled."
         } else {
-            "Multi-model routing disabled. All iterations use the strategy LLM."
+            "Local delegate routing disabled."
         },
     })))
 }
@@ -5402,8 +5705,9 @@ async fn api_multimodel_test_post(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
     let tier = match body.tier.trim().to_ascii_lowercase().as_str() {
-        "local" | "technical" | "tier1" | "1" => crate::multimodel::ModelTier::Local,
-        "knowledge" | "tier2" | "2" => crate::multimodel::ModelTier::Local,
+        "local" | "technical" | "tier1" | "1" | "knowledge" | "tier2" | "2" => {
+            crate::local_delegate::ModelTier::LocalReadOnly
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -5421,7 +5725,8 @@ async fn api_multimodel_test_post(
     }
     let label = "local";
     let fallback_base = "";
-    let base_url = crate::multimodel::normalize_base_url_for_provider(base_url_raw, fallback_base);
+    let base_url =
+        crate::local_delegate::normalize_base_url_for_provider(base_url_raw, fallback_base);
     let base = state.app_state.config.clone();
     let mut test_cfg = base;
     test_cfg.llm_provider = "llama".into();
@@ -5432,19 +5737,19 @@ async fn api_multimodel_test_post(
         Ok(()) => {}
         Err(e) => return Err((StatusCode::BAD_GATEWAY, e)),
     }
-    match crate::llm::test_multimodel_tools(&test_cfg, model, tier).await {
+    match crate::llm::test_local_delegate_tools(&test_cfg, model, tier).await {
         Ok(()) => {
             call_blocking(state.app_state.db.clone(), move |db| {
-                crate::multimodel::persist_tier_tools_ok(db, tier, true)
+                crate::local_delegate::persist_tier_tools_ok(db, tier, true)
             })
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             if let Ok(cfg) = call_blocking(state.app_state.db.clone(), |db| {
-                crate::multimodel::load_from_db(db)
+                crate::local_delegate::load_from_db(db)
             })
             .await
             {
-                let _ = state.app_state.llm.apply_multimodel_config(cfg);
+                let _ = state.app_state.llm.apply_local_delegate_config(cfg);
             }
             Ok(Json(json!({
                 "ok": true,
@@ -5467,11 +5772,14 @@ fn cursor_engine_json(
     health: &crate::cursor_engine_config::SidecarHealth,
     agent_engine: &str,
     sidecar_managed: bool,
+    web_port: u16,
+    web_enabled: bool,
 ) -> serde_json::Value {
     json!({
         "ok": true,
         "sdk_runner_url": cfg.sdk_runner_url,
         "sdk_model": cfg.sdk_model,
+        "sdk_model_params": cfg.sdk_model_params,
         "sdk_runner_ok": cfg.sdk_runner_ok,
         "sidecar_reachable": health.reachable,
         "api_key_configured": health.api_key_configured,
@@ -5484,6 +5792,12 @@ fn cursor_engine_json(
         "cli_on_path": crate::cursor_engine_config::cli_on_path(&cfg.cli_path),
         "timeout_secs": cfg.timeout_secs,
         "tmux_enabled": cfg.tmux_enabled,
+        "mcp_tools_enabled": cfg.mcp_tools_enabled,
+        "mcp_expose_send_message": cfg.mcp_expose_send_message,
+        "delegation_slim_prompt": cfg.delegation_slim_prompt,
+        "delegation_resume_delta": cfg.delegation_resume_delta,
+        "mcp_endpoint_url": crate::cursor_mcp_bridge::mcp_endpoint_url(web_port),
+        "mcp_bridge_ready": web_enabled && cfg.mcp_tools_enabled,
         "install_steps": [
             "Set CURSOR_API_KEY in repo-root .env (Cursor Dashboard → Integrations)",
             "Restart the bot — it auto-creates a runtime venv and installs cursor-sdk + aiohttp",
@@ -5511,6 +5825,8 @@ async fn api_cursor_engine_get(
         &health,
         agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
+        state.app_state.config.web_port,
+        state.app_state.config.web_enabled,
     )))
 }
 
@@ -5541,6 +5857,12 @@ async fn api_cursor_engine_patch(
     if let Some(ref model) = body.sdk_model {
         cfg.sdk_model = model.trim().to_string();
     }
+    if let Some(params) = body.sdk_model_params {
+        cfg.sdk_model_params = params
+            .into_iter()
+            .filter(|p| !p.id.trim().is_empty() && !p.value.trim().is_empty())
+            .collect();
+    }
     if let Some(ref path) = body.cli_path {
         cfg.cli_path = path.trim().to_string();
     }
@@ -5560,6 +5882,18 @@ async fn api_cursor_engine_patch(
     }
     if let Some(enabled) = body.tmux_enabled {
         cfg.tmux_enabled = enabled;
+    }
+    if let Some(enabled) = body.mcp_tools_enabled {
+        cfg.mcp_tools_enabled = enabled;
+    }
+    if let Some(enabled) = body.mcp_expose_send_message {
+        cfg.mcp_expose_send_message = enabled;
+    }
+    if let Some(enabled) = body.delegation_slim_prompt {
+        cfg.delegation_slim_prompt = enabled;
+    }
+    if let Some(enabled) = body.delegation_resume_delta {
+        cfg.delegation_resume_delta = enabled;
     }
 
     if cfg.sdk_model.trim().is_empty() {
@@ -5592,6 +5926,8 @@ async fn api_cursor_engine_patch(
         &health,
         agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
+        state.app_state.config.web_port,
+        state.app_state.config.web_enabled,
     );
     if let serde_json::Value::Object(ref mut map) = out {
         map.insert(
@@ -5646,12 +5982,24 @@ async fn api_cursor_engine_health_post(
         &health,
         agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
+        state.app_state.config.web_port,
+        state.app_state.config.web_enabled,
     );
     if let serde_json::Value::Object(ref mut map) = out {
         map.insert("message".into(), serde_json::Value::String(message));
         map.insert("health_ok".into(), serde_json::Value::Bool(ok));
     }
     Ok(Json(out))
+}
+
+async fn api_cursor_mcp_post(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    crate::cursor_mcp_bridge::handle_cursor_mcp(addr, State(state.app_state.clone()), headers, body)
+        .await
 }
 
 async fn api_cursor_engine_models_get(
@@ -5665,7 +6013,7 @@ async fn api_cursor_engine_models_get(
         .read()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .clone();
-    match crate::cursor_engine_config::fetch_sidecar_models(&cfg.sdk_runner_url).await {
+    match crate::cursor_engine_config::fetch_sidecar_model_catalog(&cfg.sdk_runner_url).await {
         Ok(models) => Ok(Json(json!({
             "ok": true,
             "models": models,
@@ -5734,6 +6082,9 @@ async fn api_settings_get(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .clone();
     let cursor_engine_ready = cursor_cfg.sdk_configured() && cursor_cfg.sdk_runner_ok;
+    let mm_cfg = state.app_state.llm.local_delegate_config();
+    let agent_engine = state.app_state.runtime_toggles.agent_engine();
+    let local_delegate_ready = mm_cfg.local_routable();
     Ok(Json(json!({
         "ok": true,
         "settings": items,
@@ -5748,6 +6099,9 @@ async fn api_settings_get(
             "llm_ready": is_llm_ready(cfg),
             "channel_ready": is_channel_ready(cfg),
             "cursor_engine_ready": cursor_engine_ready,
+            "local_delegate_ready": local_delegate_ready,
+            "agent_engine": agent_engine.as_str(),
+            "cost_routing_effective": crate::local_delegate::cost_routing_effective(agent_engine, &mm_cfg),
             "web_enabled": cfg.web_enabled,
             // PATCH /api/settings is disabled; no in-app "pending restart" until we track real diffs.
             "requires_restart_for_env_changes": false,
@@ -5756,6 +6110,7 @@ async fn api_settings_get(
             "tool_output_debug": state.app_state.runtime_toggles.tool_output_debug(),
             "post_tool_evaluator_enabled": state.app_state.runtime_toggles.post_tool_evaluator_enabled(),
             "response_quality_evaluator_enabled": state.app_state.runtime_toggles.response_quality_evaluator_enabled(),
+            "terminal": web_terminal::capabilities_json(cfg),
         }
     })))
 }
@@ -5780,10 +6135,10 @@ async fn api_restart_post(
     require_auth(&headers, state.auth_token.as_deref())?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        return Err((
+        Err((
             StatusCode::NOT_IMPLEMENTED,
             "Gateway restart is only supported on Linux and macOS.".to_string(),
-        ));
+        ))
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -5971,6 +6326,26 @@ async fn api_channel_persona_policy_delete(
     })))
 }
 
+async fn api_terminal_sessions_post(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    web_terminal::require_terminal_api_auth(&headers, &state.app_state.config)?;
+    let body = state
+        .terminal_hub
+        .create_session(&state.app_state.config)
+        .await?;
+    Ok(Json(body))
+}
+
+async fn api_terminal_ws(ws: WebSocketUpgrade, State(state): State<WebState>) -> impl IntoResponse {
+    let hub = state.terminal_hub.clone();
+    let config = Arc::new(state.app_state.config.clone());
+    ws.on_upgrade(move |socket: WebSocket| async move {
+        web_terminal::handle_websocket(socket, hub, config).await;
+    })
+}
+
 pub async fn start_web_server(state: Arc<AppState>) {
     let limits = WebLimits::from_config(&state.config);
     let web_state = WebState {
@@ -5978,6 +6353,7 @@ pub async fn start_web_server(state: Arc<AppState>) {
         app_state: state.clone(),
         run_hub: RunHub::default(),
         request_hub: RequestHub::default(),
+        terminal_hub: TerminalHub::default(),
         limits,
         web_binding_universal_done: Arc::new(Mutex::new(None)),
     };
@@ -5994,7 +6370,12 @@ pub async fn start_web_server(state: Arc<AppState>) {
     };
 
     info!("Web UI available at http://{addr}");
-    if let Err(e) = axum::serve(listener, router).await {
+    if let Err(e) = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         error!("Web server error: {e}");
     }
 }
@@ -6342,6 +6723,7 @@ fn build_router(web_state: WebState) -> Router {
             get(api_multimodel_get).patch(api_multimodel_patch),
         )
         .route("/api/multimodel/test", post(api_multimodel_test_post))
+        .route("/api/multimodel/models", get(api_multimodel_models_get))
         .route(
             "/api/cursor-engine",
             get(api_cursor_engine_get).patch(api_cursor_engine_patch),
@@ -6354,9 +6736,16 @@ fn build_router(web_state: WebState) -> Router {
             "/api/cursor-engine/models",
             get(api_cursor_engine_models_get),
         )
+        .route("/internal/cursor-mcp", post(api_cursor_mcp_post))
         .route(
             "/api/runtime",
             get(api_runtime_get).patch(api_runtime_patch),
+        )
+        .route("/api/terminal/sessions", post(api_terminal_sessions_post))
+        .route("/api/terminal/ws", get(api_terminal_ws))
+        .route(
+            "/api/deterministic-pipeline",
+            get(api_deterministic_pipeline_get).patch(api_deterministic_pipeline_patch),
         )
         .route("/api/restart", post(api_restart_post))
         .route(
@@ -6776,12 +7165,16 @@ mod tests {
         let cursor_settings = Arc::new(std::sync::RwLock::new(
             crate::cursor_engine_config::CursorEngineSettings::from_env(&cfg),
         ));
+        let pipeline_profile = Arc::new(std::sync::RwLock::new(
+            crate::agent_pipeline::profile::PipelineProfile::default_profile(),
+        ));
         let cursor_sidecar = crate::cursor_sdk_sidecar::SidecarHandle::inactive();
         let state = AppState {
             config: cfg.clone(),
             env_redactor: env_redactor.clone(),
             runtime_toggles: runtime_toggles.clone(),
             cursor_settings,
+            pipeline_profile,
             cursor_sidecar,
             telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
@@ -6789,6 +7182,7 @@ mod tests {
             skills: SkillManager::from_skills_dirs(cfg.skill_discovery_dirs()),
             llm,
             tools: ToolRegistry::new(&cfg, bot, db, runtime_toggles, env_redactor),
+            cursor_mcp: Arc::new(crate::cursor_mcp_bridge::CursorMcpRegistry::new()),
             discord_http: Arc::new(std::collections::HashMap::new()),
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
             background_job_control: crate::background_jobs::BackgroundJobControl::default(),
@@ -6807,6 +7201,7 @@ mod tests {
             auth_token,
             run_hub: RunHub::default(),
             request_hub: RequestHub::default(),
+            terminal_hub: TerminalHub::default(),
             limits,
             web_binding_universal_done: Arc::new(Mutex::new(None)),
         }

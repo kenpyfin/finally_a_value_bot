@@ -9,6 +9,11 @@ website/
 tmp/
 working_dir/
 web/node_modules/
+web/dist/
+web/vite.config.ts.timestamp-*.mjs
+
+# Local SQLite database (may contain user data / secrets)
+finally-a-value-bot.db
 shared/*
 
 .cursorrules

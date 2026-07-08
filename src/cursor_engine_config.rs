@@ -15,17 +15,73 @@ pub const APP_SETTING_CURSOR_AGENT_MODEL: &str = "CURSOR_AGENT_MODEL";
 pub const APP_SETTING_CURSOR_AGENT_RUNNER_URL: &str = "CURSOR_AGENT_RUNNER_URL";
 pub const APP_SETTING_CURSOR_AGENT_TIMEOUT_SECS: &str = "CURSOR_AGENT_TIMEOUT_SECS";
 pub const APP_SETTING_CURSOR_AGENT_TMUX_ENABLED: &str = "CURSOR_AGENT_TMUX_ENABLED";
+pub const APP_SETTING_CURSOR_SDK_MODEL_PARAMS: &str = "CURSOR_SDK_MODEL_PARAMS";
+pub const APP_SETTING_CURSOR_MCP_TOOLS_ENABLED: &str = "CURSOR_MCP_TOOLS_ENABLED";
+pub const APP_SETTING_CURSOR_MCP_EXPOSE_SEND_MESSAGE: &str = "CURSOR_MCP_EXPOSE_SEND_MESSAGE";
+pub const APP_SETTING_CURSOR_DELEGATION_SLIM_PROMPT: &str = "CURSOR_DELEGATION_SLIM_PROMPT";
+pub const APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA: &str = "CURSOR_DELEGATION_RESUME_DELTA";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CursorModelParam {
+    pub id: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorModelParameterValue {
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorModelParameterDef {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub values: Vec<CursorModelParameterValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorModelVariant {
+    pub params: Vec<CursorModelParam>,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorModelCatalogEntry {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<CursorModelParameterDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<CursorModelVariant>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CursorEngineSettings {
     pub sdk_runner_url: String,
     pub sdk_model: String,
+    pub sdk_model_params: Vec<CursorModelParam>,
     pub sdk_runner_ok: bool,
     pub cli_path: String,
     pub cli_model: String,
     pub cli_runner_url: String,
     pub timeout_secs: u64,
     pub tmux_enabled: bool,
+    /// Expose bot ToolRegistry to Cursor via loopback MCP (default on).
+    pub mcp_tools_enabled: bool,
+    /// Allow `send_message` through Cursor MCP (default off).
+    pub mcp_expose_send_message: bool,
+    /// Strip tool catalog from Cursor sidecar system prompt when MCP is live (default on).
+    pub delegation_slim_prompt: bool,
+    /// On resumed Cursor sessions, send delta prompts instead of full flatten (default on).
+    pub delegation_resume_delta: bool,
 }
 
 impl Default for CursorEngineSettings {
@@ -33,12 +89,17 @@ impl Default for CursorEngineSettings {
         Self {
             sdk_runner_url: String::new(),
             sdk_model: crate::config::default_cursor_sdk_model(),
+            sdk_model_params: Vec::new(),
             sdk_runner_ok: false,
             cli_path: crate::config::default_cursor_agent_cli_path(),
             cli_model: String::new(),
             cli_runner_url: String::new(),
             timeout_secs: 3600,
             tmux_enabled: true,
+            mcp_tools_enabled: true,
+            mcp_expose_send_message: false,
+            delegation_slim_prompt: true,
+            delegation_resume_delta: true,
         }
     }
 }
@@ -56,6 +117,7 @@ impl CursorEngineSettings {
         Self {
             sdk_runner_url,
             sdk_model: config.cursor_sdk_model.trim().to_string(),
+            sdk_model_params: Vec::new(),
             sdk_runner_ok: false,
             cli_path: config.cursor_agent_cli_path.trim().to_string(),
             cli_model: config.cursor_agent_model.trim().to_string(),
@@ -67,6 +129,10 @@ impl CursorEngineSettings {
                 .to_string(),
             timeout_secs: config.cursor_agent_timeout_secs,
             tmux_enabled: config.cursor_agent_tmux_enabled,
+            mcp_tools_enabled: true,
+            mcp_expose_send_message: false,
+            delegation_slim_prompt: true,
+            delegation_resume_delta: true,
         }
     }
 
@@ -124,6 +190,14 @@ pub fn load_from_db(
     if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_SDK_MODEL) {
         cfg.sdk_model = v;
     }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_SDK_MODEL_PARAMS) {
+        if let Ok(parsed) = serde_json::from_str::<Vec<CursorModelParam>>(&v) {
+            cfg.sdk_model_params = parsed
+                .into_iter()
+                .filter(|p| !p.id.trim().is_empty() && !p.value.trim().is_empty())
+                .collect();
+        }
+    }
     if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_SDK_RUNNER_OK) {
         cfg.sdk_runner_ok = parse_bool(&v);
     }
@@ -143,6 +217,18 @@ pub fn load_from_db(
     }
     if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_AGENT_TMUX_ENABLED) {
         cfg.tmux_enabled = parse_bool(&v);
+    }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_MCP_TOOLS_ENABLED) {
+        cfg.mcp_tools_enabled = parse_bool(&v);
+    }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_MCP_EXPOSE_SEND_MESSAGE) {
+        cfg.mcp_expose_send_message = parse_bool(&v);
+    }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_DELEGATION_SLIM_PROMPT) {
+        cfg.delegation_slim_prompt = parse_bool(&v);
+    }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA) {
+        cfg.delegation_resume_delta = parse_bool(&v);
     }
 
     if cfg.sdk_model.trim().is_empty() {
@@ -165,6 +251,8 @@ pub fn persist_to_db(
 ) -> Result<(), FinallyAValueBotError> {
     db.set_app_setting(APP_SETTING_CURSOR_SDK_RUNNER_URL, cfg.sdk_runner_url.trim())?;
     db.set_app_setting(APP_SETTING_CURSOR_SDK_MODEL, cfg.sdk_model.trim())?;
+    let params_json = serde_json::to_string(&cfg.sdk_model_params).unwrap_or_else(|_| "[]".into());
+    db.set_app_setting(APP_SETTING_CURSOR_SDK_MODEL_PARAMS, &params_json)?;
     db.set_app_setting(
         APP_SETTING_CURSOR_SDK_RUNNER_OK,
         if cfg.sdk_runner_ok { "true" } else { "false" },
@@ -182,6 +270,38 @@ pub fn persist_to_db(
     db.set_app_setting(
         APP_SETTING_CURSOR_AGENT_TMUX_ENABLED,
         if cfg.tmux_enabled { "true" } else { "false" },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_MCP_TOOLS_ENABLED,
+        if cfg.mcp_tools_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_MCP_EXPOSE_SEND_MESSAGE,
+        if cfg.mcp_expose_send_message {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_DELEGATION_SLIM_PROMPT,
+        if cfg.delegation_slim_prompt {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    db.set_app_setting(
+        APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA,
+        if cfg.delegation_resume_delta {
+            "true"
+        } else {
+            "false"
+        },
     )?;
     Ok(())
 }
@@ -260,7 +380,9 @@ pub async fn probe_sidecar_health(base_url: &str) -> SidecarHealth {
     }
 }
 
-pub async fn fetch_sidecar_models(base_url: &str) -> Result<Vec<String>, String> {
+pub async fn fetch_sidecar_model_catalog(
+    base_url: &str,
+) -> Result<Vec<CursorModelCatalogEntry>, String> {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("Runner URL is not configured".into());
@@ -297,16 +419,19 @@ pub async fn fetch_sidecar_models(base_url: &str) -> Result<Vec<String>, String>
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| {
-                    m.get("id")
-                        .and_then(|id| id.as_str())
-                        .map(str::to_string)
-                        .or_else(|| m.as_str().map(str::to_string))
-                })
+                .filter_map(|m| serde_json::from_value::<CursorModelCatalogEntry>(m.clone()).ok())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if models.is_empty() {
+        return Err("No models returned from Cursor API.".into());
+    }
     Ok(models)
+}
+
+pub async fn fetch_sidecar_models(base_url: &str) -> Result<Vec<String>, String> {
+    let catalog = fetch_sidecar_model_catalog(base_url).await?;
+    Ok(catalog.into_iter().map(|m| m.id).collect())
 }
 
 pub fn cli_on_path(cli_path: &str) -> bool {
@@ -328,6 +453,8 @@ pub struct CursorEnginePatchRequest {
     #[serde(default)]
     pub sdk_model: Option<String>,
     #[serde(default)]
+    pub sdk_model_params: Option<Vec<CursorModelParam>>,
+    #[serde(default)]
     pub cli_path: Option<String>,
     #[serde(default)]
     pub cli_model: Option<String>,
@@ -337,6 +464,14 @@ pub struct CursorEnginePatchRequest {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub tmux_enabled: Option<bool>,
+    #[serde(default)]
+    pub mcp_tools_enabled: Option<bool>,
+    #[serde(default)]
+    pub mcp_expose_send_message: Option<bool>,
+    #[serde(default)]
+    pub delegation_slim_prompt: Option<bool>,
+    #[serde(default)]
+    pub delegation_resume_delta: Option<bool>,
 }
 
 #[cfg(test)]

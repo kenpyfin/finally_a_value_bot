@@ -270,9 +270,9 @@ pub fn create_openai_compatible_provider_with_timeout(
     cfg.llm_provider = "llama".into();
     cfg.api_key = String::new();
     cfg.model = model.trim().to_string();
-    cfg.llm_base_url = Some(crate::multimodel::normalize_base_url_for_provider(
+    cfg.llm_base_url = Some(crate::local_delegate::normalize_base_url_for_provider(
         base_url,
-        crate::multimodel::DEFAULT_TIER1_BASE_URL,
+        crate::local_delegate::DEFAULT_LOCAL_BASE_URL,
     ));
     Box::new(OpenAiProvider::new_with_request_timeout(
         &cfg,
@@ -294,10 +294,11 @@ pub struct EvaluatorProviderBundle {
 /// Human-readable backend label for agent history / UI (`local · model @ url` or `perplexity · sonar`).
 pub fn resolve_evaluator_provider_label(
     config: &Config,
-    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    multimodel: Option<&crate::local_delegate::LocalDelegateConfig>,
 ) -> String {
     if let Some(mm) = multimodel {
-        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+        if let Some((base_url, model)) = crate::local_delegate::resolve_local_evaluator_endpoint(mm)
+        {
             return format!("local · {} @ {}", model, base_url);
         }
     }
@@ -316,11 +317,12 @@ pub fn resolve_evaluator_provider_label(
 /// Never used for the main agent loop.
 pub fn create_evaluator_provider(
     config: &Config,
-    multimodel: Option<&crate::multimodel::MultimodelConfig>,
+    multimodel: Option<&crate::local_delegate::LocalDelegateConfig>,
 ) -> Result<EvaluatorProviderBundle, FinallyAValueBotError> {
     let request_timeout = std::time::Duration::from_secs(EVALUATOR_TIMEOUT_SECS);
     if let Some(mm) = multimodel {
-        if let Some((base_url, model)) = crate::multimodel::resolve_local_evaluator_endpoint(mm) {
+        if let Some((base_url, model)) = crate::local_delegate::resolve_local_evaluator_endpoint(mm)
+        {
             let mut eval_config = config.clone();
             eval_config.max_tokens = EVALUATOR_MAX_TOKENS;
             let label = format!("local · {} @ {}", model, base_url);
@@ -362,8 +364,8 @@ pub struct LlmHandle {
     model: std::sync::RwLock<String>,
     provider: std::sync::RwLock<Arc<dyn LlmProvider>>,
     base_config: std::sync::RwLock<Config>,
-    multimodel_config: std::sync::RwLock<crate::multimodel::MultimodelConfig>,
-    multimodel: std::sync::RwLock<Option<crate::multimodel::MultimodelRuntime>>,
+    local_delegate_config: std::sync::RwLock<crate::local_delegate::LocalDelegateConfig>,
+    local_delegate_runtime: std::sync::RwLock<Option<crate::local_delegate::LocalDelegateRuntime>>,
 }
 
 impl LlmHandle {
@@ -376,37 +378,42 @@ impl LlmHandle {
             model: std::sync::RwLock::new(config.model.clone()),
             base_config: std::sync::RwLock::new(config.clone()),
             provider: std::sync::RwLock::new(provider),
-            multimodel_config: std::sync::RwLock::new(
-                crate::multimodel::MultimodelConfig::default(),
+            local_delegate_config: std::sync::RwLock::new(
+                crate::local_delegate::LocalDelegateConfig::default(),
             ),
-            multimodel: std::sync::RwLock::new(None),
+            local_delegate_runtime: std::sync::RwLock::new(None),
         })
     }
 
-    pub fn multimodel_config(&self) -> crate::multimodel::MultimodelConfig {
-        self.multimodel_config
+    pub fn local_delegate_config(&self) -> crate::local_delegate::LocalDelegateConfig {
+        self.local_delegate_config
             .read()
             .ok()
             .map(|cfg| cfg.clone())
             .unwrap_or_default()
     }
 
-    pub fn apply_multimodel_config(
+    /// Backward-compatible alias.
+    pub fn multimodel_config(&self) -> crate::local_delegate::LocalDelegateConfig {
+        self.local_delegate_config()
+    }
+
+    pub fn apply_local_delegate_config(
         &self,
-        config: crate::multimodel::MultimodelConfig,
+        config: crate::local_delegate::LocalDelegateConfig,
     ) -> Result<(), String> {
         let config = config.normalize();
         *self
-            .multimodel_config
+            .local_delegate_config
             .write()
-            .map_err(|_| "multimodel config lock poisoned".to_string())? = config.clone();
+            .map_err(|_| "local delegate config lock poisoned".to_string())? = config.clone();
         let base = self
             .base_config
             .read()
             .map_err(|_| "config lock poisoned".to_string())?
             .clone();
-        let runtime = if config.ready_for_routing() {
-            Some(crate::multimodel::MultimodelRuntime::new(
+        let runtime = if config.local_configured() {
+            Some(crate::local_delegate::LocalDelegateRuntime::new(
                 &base,
                 config.clone(),
             ))
@@ -414,73 +421,68 @@ impl LlmHandle {
             None
         };
         *self
-            .multimodel
+            .local_delegate_runtime
             .write()
-            .map_err(|_| "multimodel lock poisoned".to_string())? = runtime;
+            .map_err(|_| "local delegate runtime lock poisoned".to_string())? = runtime;
         Ok(())
     }
 
-    pub fn resolve_route(
+    /// Backward-compatible alias.
+    pub fn apply_multimodel_config(
         &self,
-        ctx: crate::multimodel::RouteContext<'_>,
-    ) -> crate::multimodel::ModelTier {
-        let cfg = self.multimodel_config();
-        crate::multimodel::resolve_route(&cfg, &ctx)
+        config: crate::local_delegate::LocalDelegateConfig,
+    ) -> Result<(), String> {
+        self.apply_local_delegate_config(config)
     }
 
-    fn provider_for_tier(
+    fn provider_for_target(
         &self,
-        tier: crate::multimodel::ModelTier,
+        target: crate::local_delegate::RouteTarget,
     ) -> Result<Arc<dyn LlmProvider>, FinallyAValueBotError> {
         let strategy = self
             .provider
             .read()
             .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
             .clone();
-        let mm = self
-            .multimodel
-            .read()
-            .map_err(|_| FinallyAValueBotError::LlmApi("multimodel lock poisoned".into()))?;
-        Ok(if let Some(ref runtime) = *mm {
-            if runtime.config.ready_for_routing() {
-                runtime.provider_for_tier(tier, &strategy)
-            } else {
-                strategy
-            }
+        if !target.is_local() {
+            return Ok(strategy);
+        }
+        let rt = self.local_delegate_runtime.read().map_err(|_| {
+            FinallyAValueBotError::LlmApi("local delegate runtime lock poisoned".into())
+        })?;
+        Ok(if let Some(ref runtime) = *rt {
+            runtime.provider_for_target(target, &strategy)
         } else {
             strategy
         })
     }
 
-    pub async fn send_message_for_tier(
+    pub async fn send_message_for_target(
         &self,
-        tier: crate::multimodel::ModelTier,
+        target: crate::local_delegate::RouteTarget,
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
-        let provider = self.provider_for_tier(tier)?;
+        let provider = self.provider_for_target(target)?;
         let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let options = LlmSendOptions {
-            tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+            tool_choice: crate::local_delegate::tool_choice_for_target(target, has_tools),
         };
         provider
             .send_message_with_options(system, messages, tools, options)
             .await
     }
 
-    pub async fn send_message_for_route(
+    pub async fn send_message_for_tier(
         &self,
-        ctx: crate::multimodel::RouteContext<'_>,
+        tier: crate::local_delegate::RouteTarget,
         system: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<(crate::multimodel::ModelTier, MessagesResponse), FinallyAValueBotError> {
-        let tier = self.resolve_route(ctx);
-        let response = self
-            .send_message_for_tier(tier, system, messages, tools)
-            .await?;
-        Ok((tier, response))
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        self.send_message_for_target(tier, system, messages, tools)
+            .await
     }
 
     pub fn current_model(&self) -> String {
@@ -504,6 +506,20 @@ impl LlmHandle {
             .and_then(|c| c.llm_base_url.clone())
     }
 
+    pub fn thinking_enabled(&self) -> bool {
+        self.base_config
+            .read()
+            .map(|c| c.llm_thinking_enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn show_thinking(&self) -> bool {
+        self.base_config
+            .read()
+            .map(|c| c.show_thinking)
+            .unwrap_or(false)
+    }
+
     fn strategy_endpoint(&self) -> String {
         if let Some(url) = self.current_base_url() {
             let t = url.trim();
@@ -522,52 +538,80 @@ impl LlmHandle {
             })
     }
 
-    fn strategy_tier_snapshot(&self) -> crate::multimodel::TierEndpointSnapshot {
-        crate::multimodel::TierEndpointSnapshot {
-            tier: crate::multimodel::ModelTier::Strategy,
+    fn strategy_tier_snapshot(&self) -> crate::local_delegate::RouteEndpointSnapshot {
+        crate::local_delegate::RouteEndpointSnapshot {
+            target: crate::local_delegate::RouteTarget::Strategy,
             provider: self.current_provider(),
             model: self.current_model(),
             endpoint: self.strategy_endpoint(),
         }
     }
 
-    /// Resolved provider/model/endpoint for a tier (for agent history and debugging).
+    /// Resolved provider/model/endpoint for a route target (for agent history and debugging).
     pub fn tier_endpoint_snapshot(
         &self,
-        tier: crate::multimodel::ModelTier,
-    ) -> crate::multimodel::TierEndpointSnapshot {
-        let mm_cfg = self.multimodel_config();
-        if !mm_cfg.enabled || tier == crate::multimodel::ModelTier::Strategy {
+        target: crate::local_delegate::RouteTarget,
+    ) -> crate::local_delegate::RouteEndpointSnapshot {
+        if !target.is_local() {
             return self.strategy_tier_snapshot();
         }
-        if tier.is_local() {
-            crate::multimodel::TierEndpointSnapshot {
-                tier,
-                provider: "llama".into(),
-                model: mm_cfg.local_model.clone(),
-                endpoint: mm_cfg.local_base_url.clone(),
-            }
-        } else {
-            self.strategy_tier_snapshot()
+        let mm_cfg = self.local_delegate_config();
+        crate::local_delegate::RouteEndpointSnapshot {
+            target,
+            provider: "llama".into(),
+            model: mm_cfg.local_model.clone(),
+            endpoint: mm_cfg.local_base_url.clone(),
         }
     }
 
     /// Run-level routing summary for agent history (captured once per run).
-    pub fn multimodel_run_summary(&self) -> crate::multimodel::MultimodelRunSummary {
-        let mm_cfg = self.multimodel_config();
+    pub fn local_delegate_run_summary(
+        &self,
+        cost_routing_active: bool,
+    ) -> crate::local_delegate::LocalDelegateRunSummary {
+        let mm_cfg = self.local_delegate_config();
         let strategy = self.strategy_tier_snapshot();
-        crate::multimodel::MultimodelRunSummary {
-            enabled: mm_cfg.enabled,
+        crate::local_delegate::LocalDelegateRunSummary {
+            cost_routing_active,
             strategy_provider: strategy.provider,
             strategy_model: strategy.model,
             strategy_endpoint: strategy.endpoint,
             local_model: mm_cfg.local_model.clone(),
             local_endpoint: mm_cfg.local_base_url.clone(),
-            tier1_model: mm_cfg.tier1_model,
-            tier1_endpoint: mm_cfg.tier1_base_url,
-            tier2_model: mm_cfg.tier2_model,
-            tier2_endpoint: mm_cfg.tier2_base_url,
         }
+    }
+
+    /// Backward-compatible alias.
+    pub fn multimodel_run_summary(&self) -> crate::local_delegate::LocalDelegateRunSummary {
+        let mm_cfg = self.local_delegate_config();
+        self.local_delegate_run_summary(mm_cfg.ready_for_routing())
+    }
+
+    /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
+    pub fn apply_thinking_settings(
+        &self,
+        thinking_enabled: bool,
+        show_thinking: bool,
+    ) -> Result<(), String> {
+        {
+            let mut cfg = self
+                .base_config
+                .write()
+                .map_err(|_| "config lock poisoned".to_string())?;
+            cfg.llm_thinking_enabled = thinking_enabled;
+            cfg.show_thinking = show_thinking;
+        }
+        let cfg = self
+            .base_config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .clone();
+        let new_provider = Arc::from(create_provider(&cfg));
+        *self
+            .provider
+            .write()
+            .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
+        Ok(())
     }
 
     /// Update active provider and model, rebuild LLM client, return `(provider_id, model)`.
@@ -624,9 +668,9 @@ impl LlmHandle {
             .write()
             .map_err(|_| "provider lock poisoned".to_string())? = new_provider;
         // Clone multimodel config before apply — holding a read guard across
-        // apply_multimodel_config would deadlock (it needs a write lock).
-        let mm_cfg = self.multimodel_config();
-        let _ = self.apply_multimodel_config(mm_cfg);
+        // apply_local_delegate_config would deadlock (it needs a write lock).
+        let mm_cfg = self.local_delegate_config();
+        let _ = self.apply_local_delegate_config(mm_cfg);
         Ok((provider_id, model))
     }
 
@@ -723,6 +767,69 @@ async fn probe_openai_compatible_server(base_url: &str, model: &str) -> Result<(
     Ok(())
 }
 
+/// List model ids from an OpenAI-compatible local server (`GET /v1/models`).
+pub async fn fetch_openai_compatible_models(base_url: &str) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("base_url is required".into());
+    }
+    let models_url = format!("{base}/models");
+    let client = probe_llm_http_client();
+    let resp = client
+        .get(&models_url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach server at {base_url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Server at {base_url} returned HTTP {status}. Response: {}",
+            llm_error_body_preview(&body, 200)
+        ));
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid models JSON: {e}"))?;
+    let mut ids: Vec<String> = parsed
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|data| {
+            data.iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        if let Some(models) = parsed.get("models").and_then(|m| m.as_array()) {
+            ids = models
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                        .or_else(|| entry.as_str().map(str::to_string))
+                })
+                .collect();
+        }
+    }
+    if ids.is_empty() {
+        return Err(format!(
+            "Server at {base_url} returned no models. Response: {}",
+            llm_error_body_preview(&text, 200)
+        ));
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 /// Test that a model override is reachable with the current provider/config.
 /// Returns Ok(()) on success, or an error string suitable for showing to the user.
 pub async fn test_model(config: &Config, model_override: &str) -> Result<(), String> {
@@ -775,10 +882,10 @@ pub async fn test_model(config: &Config, model_override: &str) -> Result<(), Str
 }
 
 /// Probe tool-calling on a local OpenAI-compatible tier (llama.cpp).
-pub async fn test_multimodel_tools(
+pub async fn test_local_delegate_tools(
     config: &Config,
     model: &str,
-    tier: crate::multimodel::ModelTier,
+    tier: crate::local_delegate::ModelTier,
 ) -> Result<(), String> {
     let mut test_config = config.clone();
     test_config.model = model.to_string();
@@ -808,7 +915,7 @@ pub async fn test_multimodel_tools(
     }];
     let has_tools = true;
     let options = LlmSendOptions {
-        tool_choice: crate::multimodel::tool_choice_for_tier(tier, has_tools),
+        tool_choice: crate::local_delegate::tool_choice_for_tier(tier, has_tools),
     };
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(LLM_PROBE_TIMEOUT_SECS.saturating_mul(4)),
@@ -1921,6 +2028,8 @@ pub struct GeminiProvider {
     api_key: String,
     model: String,
     max_tokens: u32,
+    thinking_enabled: bool,
+    show_thinking: bool,
 }
 
 impl GeminiProvider {
@@ -1930,6 +2039,8 @@ impl GeminiProvider {
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
+            thinking_enabled: config.llm_thinking_enabled,
+            show_thinking: config.show_thinking,
         }
     }
 
@@ -1971,7 +2082,15 @@ impl LlmProvider for GeminiProvider {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
-        let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
+        let request_body = build_gemini_request(
+            system,
+            &messages,
+            tools,
+            self.max_tokens,
+            &self.model,
+            self.thinking_enabled,
+            self.show_thinking,
+        );
 
         let mut retries = 0u32;
         let max_retries = 3;
@@ -2006,7 +2125,7 @@ impl LlmProvider for GeminiProvider {
 
             if status.is_success() {
                 let body = response.text().await?;
-                return parse_gemini_response(&body);
+                return parse_gemini_response(&body, self.show_thinking);
             }
 
             let is_transient = status.as_u16() == 429
@@ -2047,7 +2166,15 @@ impl LlmProvider for GeminiProvider {
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, FinallyAValueBotError> {
         let messages = sanitize_messages(messages);
-        let request_body = build_gemini_request(system, &messages, tools, self.max_tokens);
+        let request_body = build_gemini_request(
+            system,
+            &messages,
+            tools,
+            self.max_tokens,
+            &self.model,
+            self.thinking_enabled,
+            self.show_thinking,
+        );
 
         let mut retries = 0u32;
         let max_retries = 3;
@@ -2132,6 +2259,7 @@ impl LlmProvider for GeminiProvider {
                     &mut tool_calls,
                     &mut stop_reason,
                     &mut usage,
+                    self.show_thinking,
                 );
             }
         }
@@ -2143,6 +2271,7 @@ impl LlmProvider for GeminiProvider {
                 &mut tool_calls,
                 &mut stop_reason,
                 &mut usage,
+                self.show_thinking,
             );
         }
 
@@ -2188,6 +2317,7 @@ fn process_gemini_stream_event(
     tool_calls: &mut Vec<(String, String, serde_json::Value, Option<String>)>,
     stop_reason: &mut Option<String>,
     usage: &mut Option<Usage>,
+    show_thinking: bool,
 ) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return;
@@ -2208,10 +2338,18 @@ fn process_gemini_stream_event(
                                 .get("thought")
                                 .and_then(|t| t.as_bool())
                                 .unwrap_or(false);
-                            if !is_thought {
-                                accumulated_text.push_str(text);
+                            if is_thought && !show_thinking {
+                                continue;
+                            }
+                            let chunk = if is_thought {
+                                format!("<think>{text}</think>")
+                            } else {
+                                text.to_string()
+                            };
+                            if !chunk.is_empty() {
+                                accumulated_text.push_str(&chunk);
                                 if let Some(tx) = text_tx {
-                                    let _ = tx.send(text.to_string());
+                                    let _ = tx.send(chunk);
                                 }
                             }
                         }
@@ -2254,18 +2392,52 @@ fn process_gemini_stream_event(
     }
 }
 
+fn gemini_thinking_config(
+    model: &str,
+    thinking_enabled: bool,
+    include_thoughts: bool,
+) -> Option<serde_json::Value> {
+    let m = model.trim().to_ascii_lowercase();
+    if !thinking_enabled {
+        if m.contains("2.5-flash") && !m.contains("pro") {
+            return Some(json!({ "thinkingBudget": 0 }));
+        }
+        return None;
+    }
+    if m.contains("gemini-3") {
+        Some(json!({
+            "thinkingLevel": "MEDIUM",
+            "includeThoughts": include_thoughts,
+        }))
+    } else if m.contains("2.5") {
+        Some(json!({
+            "thinkingBudget": -1,
+            "includeThoughts": include_thoughts,
+        }))
+    } else {
+        None
+    }
+}
+
 fn build_gemini_request(
     system: &str,
     messages: &[Message],
     tools: Option<Vec<ToolDefinition>>,
     max_tokens: u32,
+    model: &str,
+    thinking_enabled: bool,
+    show_thinking: bool,
 ) -> serde_json::Value {
     let contents = translate_messages_to_gemini(messages);
+    let mut generation_config = json!({
+        "maxOutputTokens": max_tokens,
+    });
+    if let Some(thinking_config) = gemini_thinking_config(model, thinking_enabled, show_thinking) {
+        generation_config["thinkingConfig"] = thinking_config;
+    }
     let mut request = json!({
         "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-        }
+        "generationConfig": generation_config,
     });
 
     if !system.is_empty() {
@@ -2412,7 +2584,10 @@ fn translate_messages_to_gemini(messages: &[Message]) -> Vec<serde_json::Value> 
     out
 }
 
-fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBotError> {
+fn parse_gemini_response(
+    body: &str,
+    show_thinking: bool,
+) -> Result<MessagesResponse, FinallyAValueBotError> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
         FinallyAValueBotError::LlmApi(format!(
             "Failed to parse Gemini response: {e}\nBody: {body}"
@@ -2442,10 +2617,16 @@ fn parse_gemini_response(body: &str) -> Result<MessagesResponse, FinallyAValueBo
                             .get("thought")
                             .and_then(|t| t.as_bool())
                             .unwrap_or(false);
-                        if !is_thought && !text.is_empty() {
-                            content.push(ResponseContentBlock::Text {
-                                text: text.to_string(),
-                            });
+                        if is_thought && !show_thinking {
+                            continue;
+                        }
+                        let rendered = if is_thought {
+                            format!("<think>{text}</think>")
+                        } else {
+                            text.to_string()
+                        };
+                        if !rendered.is_empty() {
+                            content.push(ResponseContentBlock::Text { text: rendered });
                         }
                     }
                     // Function call parts
@@ -3693,7 +3874,7 @@ mod tests {
                 "candidatesTokenCount": 5
             }
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
@@ -3724,7 +3905,7 @@ mod tests {
                 "candidatesTokenCount": 10
             }
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
@@ -3763,7 +3944,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(result.content.len(), 2);
         match &result.content[0] {
@@ -3789,7 +3970,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let result = parse_gemini_response(&response.to_string()).unwrap();
+        let result = parse_gemini_response(&response.to_string(), false).unwrap();
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
             ResponseContentBlock::Text { text } => assert_eq!(text, ""),

@@ -275,10 +275,12 @@ pub const APP_SETTING_LLM_MODEL: &str = "LLM_MODEL";
 pub const APP_SETTING_LLM_PROVIDER: &str = "LLM_PROVIDER";
 /// Local provider (Ollama / llama.cpp) OpenAI-compatible base URL — Web UI only, not `.env`.
 pub const APP_SETTING_LLM_BASE_URL: &str = "LLM_BASE_URL";
+pub const APP_SETTING_LLM_THINKING_ENABLED: &str = "LLM_THINKING_ENABLED";
+pub const APP_SETTING_SHOW_THINKING: &str = "SHOW_THINKING";
 
 pub fn normalize_local_base_url(raw: &str, provider_id: &str) -> String {
     let fallback = default_base_url_for_provider(provider_id).unwrap_or("http://127.0.0.1:8080/v1");
-    crate::multimodel::normalize_base_url_for_provider(raw, fallback)
+    crate::local_delegate::normalize_base_url_for_provider(raw, fallback)
 }
 
 pub fn local_base_url_from_app_settings(
