@@ -9,7 +9,9 @@ use crate::channels::telegram::{
 };
 use crate::db::{call_blocking, message_origin_interactive, Database, StoredMessage};
 use crate::final_delivery_dedupe::{plan_agent_final_delivery, AgentFinalDeliveryPlan};
-use crate::final_delivery_media::normalize_assistant_artifact_references;
+use crate::final_delivery_media::{
+    materialize_web_delivery_file_links, normalize_assistant_artifact_references,
+};
 use crate::tools::auth_context_from_input;
 
 /// How a stored outbound message should be classified in `messages.origin`.
@@ -423,12 +425,22 @@ pub async fn deliver_agent_final_to_contact_with_origin(
     session_id: Option<String>,
     message_origin: MessageStoreOrigin,
 ) -> Result<AgentFinalDeliveryOutcome, String> {
-    let cleaned = normalize_final_for_delivery(
+    let mut cleaned = normalize_final_for_delivery(
         raw_final,
         workspace_root.as_deref(),
         canonical_chat_id,
         persona_id,
     );
+    if let Some(root) = workspace_root.as_deref() {
+        cleaned = materialize_web_delivery_file_links(
+            root,
+            None,
+            canonical_chat_id,
+            persona_id,
+            &cleaned,
+        )
+        .await?;
+    }
     let indicated = with_persona_indicator(db.clone(), persona_id, &cleaned).await;
     let plan = plan_agent_final_delivery(None, &indicated);
 
@@ -453,12 +465,22 @@ pub async fn deliver_agent_final_to_contact_with_origin(
             })
         }
         AgentFinalDeliveryPlan::DeliverSuffixOnly(suffix) => {
-            let suffix = normalize_final_for_delivery(
+            let mut suffix = normalize_final_for_delivery(
                 &suffix,
                 workspace_root.as_deref(),
                 canonical_chat_id,
                 persona_id,
             );
+            if let Some(root) = workspace_root.as_deref() {
+                suffix = materialize_web_delivery_file_links(
+                    root,
+                    None,
+                    canonical_chat_id,
+                    persona_id,
+                    &suffix,
+                )
+                .await?;
+            }
             deliver_to_contact_with_origin(
                 db.clone(),
                 telegram_bots,

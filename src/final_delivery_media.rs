@@ -1,9 +1,11 @@
 //! Shared pre-delivery artifact resolution and bare-filename normalization for all channels.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactResolveKind {
@@ -18,6 +20,34 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 fn trim_artifact_ref(raw: &str) -> &str {
     raw.trim()
         .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>')
+}
+
+/// Normalize markdown link targets and path refs for local artifact resolution.
+///
+/// Strips `file://` (including `file://localhost/…`) and URL query/fragment suffixes
+/// so delivery materialization can resolve workspace files.
+pub fn normalize_local_artifact_ref(raw: &str) -> String {
+    let mut t = trim_artifact_ref(raw).to_string();
+    if let Some(rest) = t.strip_prefix("file://") {
+        t = if let Some(path) = rest.strip_prefix("localhost/") {
+            format!("/{path}")
+        } else if rest.starts_with('/') {
+            rest.to_string()
+        } else if let Some(path) = rest.strip_prefix("localhost") {
+            let path = path.trim_start_matches('/');
+            if path.is_empty() {
+                rest.to_string()
+            } else {
+                format!("/{path}")
+            }
+        } else {
+            rest.to_string()
+        };
+    }
+    if let Some(idx) = t.find(['?', '#']) {
+        t.truncate(idx);
+    }
+    t
 }
 
 fn web_delivery_copy_basename_regex() -> &'static Regex {
@@ -198,7 +228,7 @@ pub fn resolve_workspace_artifact_path(
     raw: &str,
     kind: ArtifactResolveKind,
 ) -> Option<PathBuf> {
-    let t = trim_artifact_ref(raw);
+    let t = normalize_local_artifact_ref(raw);
     if t.is_empty()
         || t.starts_with("http://")
         || t.starts_with("https://")
@@ -209,11 +239,11 @@ pub fn resolve_workspace_artifact_path(
     }
 
     if t.starts_with('/') {
-        return path_under_workspace(&PathBuf::from(t), workspace_root, kind);
+        return path_under_workspace(&PathBuf::from(&t), workspace_root, kind);
     }
 
     if let (Some(cid), Some(pid)) = (chat_id, persona_id) {
-        for candidate in collect_artifact_candidates(workspace_root, cid, pid, t) {
+        for candidate in collect_artifact_candidates(workspace_root, cid, pid, &t) {
             if path_matches_kind(&candidate, kind) {
                 if let Some(p) = path_under_workspace(&candidate, workspace_root, kind) {
                     return Some(p);
@@ -221,18 +251,18 @@ pub fn resolve_workspace_artifact_path(
             }
         }
         if !t.contains('/') && !t.contains('\\') {
-            if let Some(p) = unique_persona_basename_match(workspace_root, cid, pid, t, kind) {
+            if let Some(p) = unique_persona_basename_match(workspace_root, cid, pid, &t, kind) {
                 return Some(p);
             }
         }
     }
 
     // Legacy resolution without persona scope.
-    let shared = workspace_root.join("shared").join(t);
+    let shared = workspace_root.join("shared").join(&t);
     let p = if shared.exists() {
         shared
     } else {
-        workspace_root.join(t)
+        workspace_root.join(&t)
     };
     path_under_workspace(&p, workspace_root, kind)
 }
@@ -247,6 +277,11 @@ fn bare_image_line_regex() -> &'static Regex {
     })
 }
 
+fn inline_image_backtick_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"`([^`\n]+\.(?:png|jpg|jpeg|gif|webp|bmp))`").unwrap())
+}
+
 fn line_should_skip_bare_normalize(line: &str) -> bool {
     let t = line.trim();
     t.is_empty()
@@ -254,6 +289,22 @@ fn line_should_skip_bare_normalize(line: &str) -> bool {
         || t.contains("/api/uploads/")
         || t.starts_with("http://")
         || t.starts_with("https://")
+}
+
+fn markdown_image_for_basename(
+    workspace_root: &Path,
+    chat_id: i64,
+    persona_id: i64,
+    basename: &str,
+) -> Option<String> {
+    let path = resolve_workspace_artifact_path(
+        workspace_root,
+        Some(chat_id),
+        Some(persona_id),
+        basename,
+        ArtifactResolveKind::ImageOnly,
+    )?;
+    Some(format!("![{basename}]({})", path.display()))
 }
 
 /// Rewrite bare image filename lines into markdown images with canonical absolute paths.
@@ -275,23 +326,256 @@ pub fn normalize_assistant_artifact_references(
             continue;
         };
         let basename = name_m.as_str();
-        let Some(path) = resolve_workspace_artifact_path(
-            workspace_root,
-            Some(chat_id),
-            Some(persona_id),
-            basename,
-            ArtifactResolveKind::ImageOnly,
-        ) else {
+        let Some(md) = markdown_image_for_basename(workspace_root, chat_id, persona_id, basename)
+        else {
             continue;
         };
-        let md = format!("![{basename}]({})", path.display());
         if line == line.trim() {
             out = out.replace(line, &md);
         } else {
             out = out.replace(line.trim(), &md);
         }
     }
+
+    let mut backtick_rewrites: Vec<(String, String)> = Vec::new();
+    for caps in inline_image_backtick_regex().captures_iter(&out) {
+        let Some(full_match) = caps.get(0) else {
+            continue;
+        };
+        let Some(name_m) = caps.get(1) else {
+            continue;
+        };
+        let token = full_match.as_str();
+        let basename = name_m.as_str();
+        if out.contains(&format!("![{basename}]")) {
+            continue;
+        }
+        let Some(md) = markdown_image_for_basename(workspace_root, chat_id, persona_id, basename)
+        else {
+            continue;
+        };
+        if backtick_rewrites.iter().any(|(from, _)| from == token) {
+            continue;
+        }
+        backtick_rewrites.push((token.to_string(), md));
+    }
+    for (from, to) in backtick_rewrites {
+        out = out.replace(&from, &to);
+    }
+
     out
+}
+
+fn sanitize_delivery_upload_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "web-upload.bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn web_upload_dir_for_persona(workspace_root: &Path, chat_id: i64, persona_id: i64) -> PathBuf {
+    workspace_root
+        .join("shared")
+        .join("upload")
+        .join("web")
+        .join(chat_id.to_string())
+        .join(persona_id.to_string())
+}
+
+fn extract_upload_urls_from_text(text: &str) -> Vec<String> {
+    let Some(re) = Regex::new(r#"/api/uploads/[^\s\)\]\(<>"']+"#).ok() else {
+        return Vec::new();
+    };
+    re.find_iter(text).map(|m| m.as_str().to_string()).collect()
+}
+
+fn upload_rel_url_exists(workspace_root: &Path, working_dir: Option<&str>, rel_url: &str) -> bool {
+    let Some(rel) = rel_url.strip_prefix("/api/uploads/") else {
+        return true;
+    };
+    let shared_path = workspace_root.join("shared").join("upload").join(rel);
+    if shared_path.is_file() {
+        return true;
+    }
+    if let Some(dir) = working_dir {
+        let legacy_path = Path::new(dir).join("uploads").join(rel);
+        if legacy_path.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_delivery_local_file_path(
+    workspace_root: &Path,
+    chat_id: i64,
+    persona_id: i64,
+    raw: &str,
+) -> Option<PathBuf> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
+    if trimmed.starts_with('#') || trimmed.starts_with("mailto:") {
+        return None;
+    }
+    if let Some(path) = resolve_workspace_artifact_path(
+        workspace_root,
+        Some(chat_id),
+        Some(persona_id),
+        trimmed,
+        ArtifactResolveKind::AnyFile,
+    ) {
+        return Some(path);
+    }
+    let basename = Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    for candidate in artifact_basename_fallback_candidates(basename) {
+        if candidate == basename {
+            continue;
+        }
+        if let Some(path) = resolve_workspace_artifact_path(
+            workspace_root,
+            Some(chat_id),
+            Some(persona_id),
+            &candidate,
+            ArtifactResolveKind::AnyFile,
+        ) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn persist_file_for_web_delivery(
+    workspace_root: &Path,
+    chat_id: i64,
+    persona_id: i64,
+    source_path: &Path,
+) -> Result<String, String> {
+    let filename = source_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    let bytes = tokio::fs::read(source_path)
+        .await
+        .map_err(|e| format!("Failed to read {}: {e}", source_path.display()))?;
+    let uploads_dir = web_upload_dir_for_persona(workspace_root, chat_id, persona_id);
+    tokio::fs::create_dir_all(&uploads_dir)
+        .await
+        .map_err(|e| format!("Failed to create upload dir {}: {e}", uploads_dir.display()))?;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let safe_name = sanitize_delivery_upload_filename(&filename);
+    let stored_name = format!("{ts}-bot-{safe_name}");
+    let saved_path = uploads_dir.join(&stored_name);
+    tokio::fs::write(&saved_path, &bytes)
+        .await
+        .map_err(|e| format!("Failed to write {}: {e}", saved_path.display()))?;
+    Ok(format!(
+        "/api/uploads/web/{chat_id}/{persona_id}/{stored_name}"
+    ))
+}
+
+/// Rewrite local markdown link targets to web-servable `/api/uploads/...` URLs.
+///
+/// Interactive web `/api/send` and scheduled/background delivery both need this so
+/// markdown images render in the browser (absolute `/home/...` paths are not fetchable).
+pub async fn materialize_web_delivery_file_links(
+    workspace_root: &Path,
+    working_dir: Option<&str>,
+    chat_id: i64,
+    persona_id: i64,
+    response: &str,
+) -> Result<String, String> {
+    let Some(markdown_link_re) = Regex::new(r#"\]\(([^)\n]+)\)"#).ok() else {
+        return Ok(response.to_string());
+    };
+    let Some(parenthesized_target_re) = Regex::new(r#"\(([^()\n]+)\)"#).ok() else {
+        return Ok(response.to_string());
+    };
+    let mut rewrites: HashMap<String, String> = HashMap::new();
+    for caps in markdown_link_re.captures_iter(response) {
+        let Some(target) = caps.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        if rewrites.contains_key(&target) {
+            continue;
+        }
+        if let Some(local_path) =
+            resolve_delivery_local_file_path(workspace_root, chat_id, persona_id, &target)
+        {
+            let rel = persist_file_for_web_delivery(
+                workspace_root,
+                chat_id,
+                persona_id,
+                &local_path,
+            )
+            .await?;
+            rewrites.insert(target, rel);
+        }
+    }
+    for caps in parenthesized_target_re.captures_iter(response) {
+        let Some(target) = caps.get(1).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        if rewrites.contains_key(&target) {
+            continue;
+        }
+        if let Some(local_path) =
+            resolve_delivery_local_file_path(workspace_root, chat_id, persona_id, &target)
+        {
+            let rel = persist_file_for_web_delivery(
+                workspace_root,
+                chat_id,
+                persona_id,
+                &local_path,
+            )
+            .await?;
+            rewrites.insert(target, rel);
+        }
+    }
+
+    let mut updated = response.to_string();
+    for (target, rel) in &rewrites {
+        updated = updated.replace(&format!("({target})"), &format!("({rel})"));
+    }
+
+    let upload_urls = extract_upload_urls_from_text(&updated);
+    for url in upload_urls {
+        if upload_rel_url_exists(workspace_root, working_dir, &url) {
+            continue;
+        }
+        let fallback_name = url.rsplit('/').next().unwrap_or_default();
+        if fallback_name.is_empty() {
+            warn!(target: "delivery", url = %url, "assistant response referenced missing upload URL");
+            continue;
+        }
+        if let Some(fallback_local) =
+            resolve_delivery_local_file_path(workspace_root, chat_id, persona_id, fallback_name)
+        {
+            let rel = persist_file_for_web_delivery(
+                workspace_root,
+                chat_id,
+                persona_id,
+                &fallback_local,
+            )
+            .await?;
+            updated = updated.replace(&url, &rel);
+        } else {
+            warn!(target: "delivery", url = %url, "assistant response referenced missing upload URL");
+        }
+    }
+
+    Ok(updated)
 }
 
 #[cfg(test)]
@@ -345,6 +629,60 @@ mod tests {
         let input = "![alt](https://example.com/a.png)";
         let out = normalize_assistant_artifact_references(&input, &root, 1, 2);
         assert_eq!(out, input);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalize_backtick_wrapped_filename() {
+        let root = temp_workspace();
+        let img = root.join("shared/personas/1/2/PZ-20260709-LANDSEND-HOTIFY.png");
+        fs::write(&img, [137u8, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let input =
+            "**Lands End (#196)**\n\n`PZ-20260709-LANDSEND-HOTIFY.png`\n\nCoastal overlook.";
+        let out = normalize_assistant_artifact_references(&input, &root, 1, 2);
+        assert!(out.contains("![PZ-20260709-LANDSEND-HOTIFY.png]"));
+        assert!(!out.contains("`PZ-20260709-LANDSEND-HOTIFY.png`"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalize_local_artifact_ref_strips_file_url() {
+        assert_eq!(
+            normalize_local_artifact_ref(
+                "file:///home/user/workspace/shared/personas/1/2/report.md?preview=1"
+            ),
+            "/home/user/workspace/shared/personas/1/2/report.md"
+        );
+        assert_eq!(
+            normalize_local_artifact_ref("file://localhost/home/user/workspace/report.md#section"),
+            "/home/user/workspace/report.md"
+        );
+        assert_eq!(
+            normalize_local_artifact_ref("ORIGIN/Projects/spec.md"),
+            "ORIGIN/Projects/spec.md"
+        );
+    }
+
+    #[test]
+    fn resolve_file_url_markdown_target() {
+        let root = temp_workspace();
+        let spec = root.join("shared/personas/997894126/3/ORIGIN/Projects/spec.md");
+        fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        fs::write(&spec, b"# spec").unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let file_url = format!("file://{}", spec.display());
+        let resolved = resolve_workspace_artifact_path(
+            &root,
+            Some(997894126),
+            Some(3),
+            &file_url,
+            ArtifactResolveKind::AnyFile,
+        );
+        assert!(resolved.is_some());
+        assert!(resolved.unwrap().ends_with(Path::new("spec.md")));
         let _ = fs::remove_dir_all(root);
     }
 

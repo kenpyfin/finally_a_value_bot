@@ -37,6 +37,8 @@ struct SidecarRunRequest<'a> {
     prompt: &'a str,
     cwd: &'a str,
     model: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    session_scope: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +86,27 @@ fn is_stale_cursor_agent_error(message: &str) -> bool {
     lower.contains("not found") && lower.contains("agent")
 }
 
+fn is_cursor_sidecar_recoverable_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if lower.contains("sidecar request failed") || lower.starts_with("sidecar http") {
+        return true;
+    }
+    if lower.contains("bridge request failed") || lower.contains("bridge request timed out") {
+        return true;
+    }
+    if lower.contains("timed out waiting for bridge discovery")
+        || lower.contains("bridge discovery")
+    {
+        return true;
+    }
+    if lower.contains("cursor sdk startup failed")
+        && (lower.contains("bridge") || lower.contains("discovery") || lower.contains("timed out"))
+    {
+        return true;
+    }
+    lower.contains("connection refused") || lower.contains("errno 111")
+}
+
 fn cursor_session_scope(context: &AgentRequestContext<'_>) -> String {
     if let Some(sid) = context.session_id.as_deref() {
         return sid.to_string();
@@ -102,20 +125,19 @@ async fn cursor_engine_classic_fallback(
     cancel: Option<Arc<AtomicBool>>,
     reason: &str,
 ) -> anyhow::Result<AgentProcessResult> {
-    if context.is_scheduled_task {
-        return Err(anyhow::anyhow!(
-            "Scheduled task requires the Cursor engine but it is unavailable ({reason}). \
-             Check Settings → Cursor (CURSOR_SDK_RUNNER_URL) and that the sidecar is running."
-        ));
-    }
-    if context.is_background_job {
+    if context.is_scheduled_task || context.is_background_job {
         let prompt = prep.latest_user_text.trim();
         let override_prompt = if prompt.is_empty() {
             None
         } else {
             Some(prompt)
         };
-        warn!("Cursor engine fallback to classic for background job: {reason}");
+        let kind = if context.is_scheduled_task {
+            "scheduled task"
+        } else {
+            "background job"
+        };
+        warn!("Cursor engine fallback to classic for {kind}: {reason}");
         return process_classic_agent_with_events(
             state,
             context,
@@ -294,6 +316,7 @@ async fn invoke_sidecar_turn(
         prompt,
         cwd,
         model,
+        session_scope,
         agent_id: resume_id.as_deref(),
         model_params,
         mcp_servers: mcp_servers.clone(),
@@ -550,13 +573,7 @@ pub async fn run_cursor_engine(
                     state.cursor_mcp.revoke_run(token);
                 }
                 let msg = e.to_string();
-                if msg.contains("sidecar request failed") {
-                    return cursor_engine_classic_fallback(
-                        state, context, &prep, event_tx, cancel, &msg,
-                    )
-                    .await;
-                }
-                if msg.starts_with("sidecar HTTP") {
+                if is_cursor_sidecar_recoverable_error(&msg) {
                     return cursor_engine_classic_fallback(
                         state, context, &prep, event_tx, cancel, &msg,
                     )
@@ -832,6 +849,23 @@ mod tests {
             "Cursor SDK startup failed: Agent agent-cea12fe8-fdd5-4fa4-880b-d8f7f6225a54 not found"
         ));
         assert!(!is_stale_cursor_agent_error("prompt required"));
+    }
+
+    #[test]
+    fn is_cursor_sidecar_recoverable_error_detects_bridge_failures() {
+        assert!(is_cursor_sidecar_recoverable_error(
+            "Bridge request failed: ConnectError: [Errno 111] Connection refused"
+        ));
+        assert!(is_cursor_sidecar_recoverable_error(
+            "sidecar request failed: connection error"
+        ));
+        assert!(is_cursor_sidecar_recoverable_error(
+            "sidecar HTTP 503: unavailable"
+        ));
+        assert!(is_cursor_sidecar_recoverable_error(
+            "Cursor SDK startup failed: Timed out waiting for bridge discovery"
+        ));
+        assert!(!is_cursor_sidecar_recoverable_error("prompt required"));
     }
 
     #[test]

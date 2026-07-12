@@ -749,11 +749,29 @@ export function App({
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
       run: async function* (options): AsyncGenerator<ChatModelRunResult, void> {
-        const { text: userText, attachments } = await extractLatestUserInput(options.messages, {
-          chatId,
-          signal: options.abortSignal,
-          onUploadProgress: (msg) => setStatusText(msg),
-        })
+        let userText = ''
+        let attachments: SendAttachmentRef[] = []
+        try {
+          const extracted = await extractLatestUserInput(options.messages, {
+            chatId,
+            signal: options.abortSignal,
+            onUploadProgress: (msg) => setStatusText(msg),
+          })
+          userText = extracted.text
+          attachments = extracted.attachments
+        } catch (e) {
+          // Upload failed/stalled/aborted while extracting attachments. Reset the
+          // composer state so the app does not stay stuck on "Uploading…".
+          if (options.abortSignal.aborted) {
+            setStatusText('Idle')
+            return
+          }
+          const msg = e instanceof Error ? e.message : String(e)
+          setError(`Attachment upload failed: ${msg}`)
+          setStatusText('Error')
+          yield { content: [{ type: 'text', text: `Error: ${msg}` }] }
+          return
+        }
         const pendingReply = pendingReplyRef.current
         const messageText = pendingReply ? formatReplyForSend(pendingReply, userText) : userText
         if (!messageText.trim() && attachments.length === 0) return

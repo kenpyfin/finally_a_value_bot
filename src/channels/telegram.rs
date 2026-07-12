@@ -5581,7 +5581,9 @@ The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when 
 
 For serving files to users:
 - Put artifacts in your **final assistant message** using markdown image or file links with **absolute local file paths** (e.g. `![caption](/abs/path/to/file.png)` or `[label](/abs/path/to/doc.pdf)`).
+- Never use `file://` URLs — use plain absolute paths (`/home/.../file.md`) so the web UI can materialize them at delivery.
 - Never fabricate `/api/uploads/...` URLs in plain text; the platform materializes local paths at delivery (web upload URLs, Telegram workspace images).
+- When the user asks for a link to a file you wrote or updated, include a markdown link with the **current** absolute path in the same reply.
 - Include the substantive explanation in the final message together with any attachment paths.
 
 When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. **Identity and Tier 1** (long-term facts, workflow principles) are compiled into the system prompt under **# Identity and long-term memory (Tier 1)**. Tier 2 **`sops`** are vault pointers (`id`, `vault_path`, `summary`) — when an SOP in `[persona_context]` matches the task, read `vault_path` and follow it; do not improvise. There is no `known_steps` field (legacy lines migrate into `sops` or Tier 1 principles on load). **Tier 2**, bulletin focus, operator focus, and bookmarks are in **[persona_context]**; Tier 3 only when needed. Tier 2 holds terminology, **SOPs**, and preferences — not active project status. Bulletin is the operator snapshot of recent focus; your task is always `[current_request]`. Tier 3 is short-lived scratch context and should not duplicate bulletin status lines. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use read_tiered_memory/write_tiered_memory for explicit tier edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
@@ -8247,6 +8249,7 @@ mod tests {
         );
         assert!(prompt.contains("For serving files to users:"));
         assert!(prompt.contains("Never fabricate `/api/uploads/...` URLs"));
+        assert!(prompt.contains("Never use `file://` URLs"));
         assert!(prompt.contains("absolute local file paths"));
     }
 

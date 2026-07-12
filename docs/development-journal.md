@@ -4,6 +4,48 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-10 — Cursor sidecar: global bridge launch queue + scheduled Classic fallback
+
+- **Area:** cursor engine / sidecar / scheduler
+- **Summary:** Scheduled tasks (#6 vault index, etc.) failed with `Timed out waiting for bridge discovery` when multiple crons claimed together and each cold-started a `cursor-sdk-bridge`. Sidecar now: (1) global `asyncio.Semaphore(1)` serializes all `Client.launch_bridge` calls; (2) bridge discovery timeouts are retryable (up to 3 attempts with pool eviction); (3) default launch timeout raised from 30s → **60s** (`CURSOR_BRIDGE_LAUNCH_TIMEOUT_SECS` override); (4) `launch_bridge` runs in `asyncio.to_thread` so the event loop stays responsive while queued. Rust: `is_cursor_sidecar_recoverable_error` matches bridge-discovery failures; **scheduled tasks fall back to Classic** (same as background jobs) when Cursor/sidecar is unavailable instead of hard-failing.
+- **Key files / symbols:** `_BRIDGE_LAUNCH_SEM`, `_bridge_launch_timeout_secs`, `_is_retryable_bridge_error` in `scripts/cursor-sdk-runner.py`; `cursor_engine_classic_fallback`, `is_cursor_sidecar_recoverable_error` in `src/cursor_engine.rs`.
+- **Note:** Sidecar script changes apply on next bot restart (managed sidecar respawns from repo `scripts/cursor-sdk-runner.py`). Rust changes require rebuild/reinstall.
+
+### 2026-07-10 — Web file links: materialize `file://` + Cursor delivery reminder
+
+- **Area:** delivery / final_delivery_media / cursor engine / PEP
+- **Summary:** PEP GN session showed Cursor engine emitting `file://` markdown links and fabricated `/api/uploads/...` paths — both broken in the web UI. Added `normalize_local_artifact_ref` (strip `file://`, `file://localhost/…`, and `?`/`#` suffixes) before artifact resolution so `materialize_response_file_links` rewrites them to fresh upload URLs. Strengthened shared system prompt (never `file://`; include absolute path when user asks for a link) and Cursor delegation (`CURSOR_FILE_DELIVERY_REMINDER` in slim system prompt + resume-delta runtime header).
+- **Key files / symbols:** `normalize_local_artifact_ref`, `resolve_workspace_artifact_path` in `src/final_delivery_media.rs`; `CURSOR_FILE_DELIVERY_REMINDER`, `slim_delegation_system_prompt`, `build_minimal_runtime_header` in `src/cursor_delegation_prompt.rs`; `test_materialize_response_file_links_rewrites_file_url_target` in `src/web.rs`.
+- **Note:** Requires rebuild + bot restart. Re-ask for a file link after deploy — stored messages with old `file://` text stay broken until a new reply.
+
+### 2026-07-09 — Web image display: backtick-wrapped persona filenames
+
+- **Area:** delivery / final_delivery_media / Influencer_PZ_3
+- **Summary:** History review for persona 24 (`Influencer_PZ_3`) showed repeated “show me the image” turns where the assistant named `PZ-….png` in backticks or prose but the web thread had no `<img>` — delivery normalization only rewrote **bare filename lines**, not `` `PZ-foo.png` `` inline. Jul 8 Crissy thread: first reply had zero markdown images (text only); second reply after user complaint included `/api/uploads/…` URLs that do exist on disk. Jul 9 Lands End: `` `PZ-20260709-LANDSEND-HOTIFY.png` `` never materialized because of the backtick gap. Extended `normalize_assistant_artifact_references` with backtick filename pass → markdown image before `materialize_response_file_links`.
+- **Key files / symbols:** `inline_image_backtick_regex`, `markdown_image_for_basename` in `src/final_delivery_media.rs`.
+- **Note:** Stored messages without image markup stay text-only until user asks again (post-rebuild). Rebuild + restart bot.
+
+### 2026-07-08 — Cursor engine: session-scoped bridge pool per persona
+
+- **Area:** cursor engine / sidecar
+- **Summary:** Bridge pool is now keyed by **persona cwd + session_scope** (not persona alone). Rust sends `session_scope` on each sidecar `/run` (matches `cursor_engine_agents` DB key). Each focused session gets its own warm `cursor-sdk-bridge` subprocess and on-disk `state_root`, so `agent_id` resume and resume-delta prompts stay isolated per session. Main chat uses empty scope (`main`). Per-pool `asyncio.Lock` serializes turns within one session; different sessions/personas run concurrently.
+- **Key files / symbols:** `SidecarRunRequest.session_scope` in `src/cursor_engine.rs`; `_bridge_pool_key`, `_get_pooled_bridge` in `scripts/cursor-sdk-runner.py`.
+- **Note:** Sidecar script + Rust changes apply on next bot restart/rebuild.
+
+### 2026-07-08 — Cursor engine: bridge crash recovery + session cleanup
+
+- **Area:** cursor engine / sidecar
+- **Summary:** `Bridge request failed: ConnectError: [Errno 111] Connection refused` came from the Cursor SDK's internal `cursor-sdk-bridge` subprocess dying while the Python sidecar kept a stale singleton client. Fixes: (1) each `/run` now launches an isolated `Client.launch_bridge` with a stable per-cwd `state_root` under `runtime/cursor-sdk-state/`, then tears it down in `finally` via `agent.close()` + `client.close()` + `close_default_client()`; (2) up to 3 retries with backoff on retryable bridge/network errors; (3) serialized `/run` via `asyncio.Lock` so concurrent turns cannot share or kill each other's bridge; (4) Rust `is_cursor_sidecar_recoverable_error` broadens Classic fallback to include bridge failures (not only transport errors to the sidecar); (5) sidecar stderr is appended to `runtime/cursor-sdk-sidecar.stderr.log` instead of `/dev/null`.
+- **Key files / symbols:** `scripts/cursor-sdk-runner.py` (`_release_cursor_bridge`, `_bridge_state_root`, `_RUN_LOCK`, `BRIDGE_RETRY_*`); `is_cursor_sidecar_recoverable_error` in `src/cursor_engine.rs`; `sidecar_stderr_log_path`, `spawn_sidecar_process` in `src/cursor_sdk_sidecar.rs`.
+- **Note:** Sidecar script changes apply on next bot restart (managed sidecar is spawned from repo `scripts/cursor-sdk-runner.py`). Rust changes require rebuild/reinstall.
+
+### 2026-07-08 — Web upload could hang the composer forever
+
+- **Area:** web UI (attachments)
+- **Summary:** Uploading a file could leave the app stuck on `Uploading…` indefinitely and lock the composer. Two causes: (1) `uploadAttachmentFile` used `fetch` with **no timeout**, so a stalled/large upload or a busy server never resolved; (2) in the chat adapter's `run` generator, `extractLatestUserInput` (which performs the multipart upload) ran **before** the `try/catch`, so an upload error/abort never reset `statusText`/`error` and the composer stayed in `isRunning`. Fix: added a safety-net timeout (`DEFAULT_UPLOAD_TIMEOUT_MS = 180s`) that combines an internal `AbortController` with the caller signal, distinguishing timeout vs. user-cancel vs. network errors with actionable messages; wrapped attachment extraction in `try/catch` that resets state (silent on user abort, otherwise surfaces the error and ends the run so the composer unlocks).
+- **Key files / symbols:** `web/src/lib/attachments.ts` (`uploadAttachmentFile`, `linkSignalWithTimeout`, `DEFAULT_UPLOAD_TIMEOUT_MS`); `web/src/app/App.tsx` (chat `adapter.run` extraction guard); `web/src/lib/attachments.test.ts` (timeout + abort coverage).
+- **Note:** Frontend-only; requires a web asset rebuild (`cd web && npm run build`) which is embedded via `include_dir!` at Rust build time.
+
 ### 2026-07-07 — Scheduler resilience: blob-typed prompt broke all task queries
 
 - **Area:** scheduler / db

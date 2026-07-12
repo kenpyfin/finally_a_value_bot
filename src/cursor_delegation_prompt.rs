@@ -18,6 +18,14 @@ Bot tools are exposed via MCP server `finally-a-value-bot` (loopback). Tool name
 
 "#;
 
+const CURSOR_FILE_DELIVERY_REMINDER: &str = r#"## File links (web delivery)
+When sharing files with the user, put markdown links in your **final reply** using **plain absolute local paths** (e.g. `[Spec](/home/.../personas/{chat_id}/{persona_id}/ORIGIN/Projects/spec.md)`).
+- Never use `file://` URLs — the web UI cannot open them.
+- Never fabricate `/api/uploads/...` URLs — the platform materializes absolute paths at delivery.
+- After writing or updating a file, include a markdown link to the **current** absolute path when the user asks for a link.
+
+"#;
+
 const AGENT_SKILLS_INTRO_SLIM: &str = "\n# Agent Skills\n\nMetadata catalog for routing — call **`activate_skill`** to load full `SKILL.md` before procedural steps.\n\n";
 
 const MAX_PROMPT_LEN: usize = 120_000;
@@ -61,6 +69,10 @@ pub fn slim_delegation_system_prompt(full: &str, slim_enabled: bool) -> String {
     }
     let mut out = replace_tool_groups_section(full);
     out = shorten_agent_skills_intro(&out);
+    if !out.contains("## File links (web delivery)") {
+        out.push('\n');
+        out.push_str(CURSOR_FILE_DELIVERY_REMINDER);
+    }
     out
 }
 
@@ -113,9 +125,11 @@ fn build_minimal_runtime_header(header: &DelegationRuntimeHeader) -> String {
          chat_id={} persona_id={}\n\
          {mcp_line}\
          Path discipline: never use `workspace/` prefixes; cwd is persona-scoped under \
-         `shared/personas/{{chat_id}}/{{persona_id}}/`. Primary task: the `[current_request]` below.",
+         `shared/personas/{{chat_id}}/{{persona_id}}/`. Primary task: the `[current_request]` below.\n\n\
+         {file_delivery}",
         header.chat_id,
         header.persona_id,
+        file_delivery = CURSOR_FILE_DELIVERY_REMINDER,
     )
 }
 
@@ -231,6 +245,15 @@ mod tests {
              Long intro about metadata and SKILLS_CATALOG_MODE compact full modes.\n\n\
              <available_skills>\n- name: foo\n</available_skills>"
         )
+    }
+
+    #[test]
+    fn slim_appends_file_delivery_reminder() {
+        let full = fixture_full_system();
+        let slim = slim_delegation_system_prompt(&full, true);
+        assert!(slim.contains("## File links (web delivery)"));
+        assert!(slim.contains("Never use `file://` URLs"));
+        assert!(slim.contains("Never fabricate `/api/uploads/...` URLs"));
     }
 
     #[test]
@@ -353,6 +376,7 @@ mod tests {
         );
         assert!(prompt.contains("resume turn"));
         assert!(prompt.contains("chat_id=1"));
+        assert!(prompt.contains("## File links (web delivery)"));
         assert!(!prompt.contains("# Principles"));
         assert!(prompt.contains("[current_request]"));
     }
