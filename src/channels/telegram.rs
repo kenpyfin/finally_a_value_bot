@@ -38,7 +38,7 @@ use crate::db::{
 };
 use crate::hook_actions::{apply_deterministic_persona_memory_hygiene, apply_hook_memory_effects};
 use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput};
-use crate::llm::LlmProvider;
+use crate::llm::{LlmProvider, LlmSendOptions};
 use crate::memory::MemoryManager;
 use crate::memory::{
     enrich_persona_memory_for_prompt, render_identity_and_tier1_for_system, render_memory_for_llm,
@@ -4282,7 +4282,7 @@ async fn finish_turn_with_quality_gate(
     persona_id: i64,
     stop_reason: &str,
     final_text: &mut String,
-    system_prompt: &str,
+    _system_prompt: &str,
     messages: &mut Vec<Message>,
     protected_message_count: usize,
     pdqe_retries: &mut usize,
@@ -4508,11 +4508,11 @@ async fn finish_turn_with_quality_gate(
             chat_id,
             persona_id,
             context.caller_channel,
-            system_prompt,
             messages,
             final_text.len(),
             had_tool_calls,
             context.is_background_job,
+            is_conversational,
         )
         .await;
     }
@@ -4844,6 +4844,107 @@ fn should_run_focus_sync_llm(
     }
     let last_user_len = latest_user_text(messages).len();
     response_len > 100 || had_tool_calls || last_user_len > 50
+}
+
+/// Task deliveries should update bulletin; short conversational replies may no-op.
+fn focus_sync_task_delivery(
+    is_conversational: bool,
+    response_len: usize,
+    had_tool_calls: bool,
+) -> bool {
+    had_tool_calls || response_len > 200 || !is_conversational
+}
+
+fn build_focus_sync_system_prompt(chat_id: i64, persona_id: i64, timezone: &str) -> String {
+    format!(
+        "You are a post-delivery memory sync sub-agent for FinallyAValueBot.\n\
+         Timezone: {timezone}. chat_id={chat_id} persona_id={persona_id}.\n\
+         Use only the provided tools. Bulletin is the operator-facing episodic focus card.\n\
+         Tier 2 = durable knowledge (terminology, SOPs, preferences) — not active status.\n\
+         Tier 3 = short scratchpad — must not duplicate bulletin status lines.\n\
+         Only write Tier 1 on explicit user-confirmed durable preference."
+    )
+}
+
+fn truncate_focus_sync_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    format!("{}...", text.chars().take(max_chars).collect::<String>())
+}
+
+fn last_assistant_delivery_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(message_to_text)
+        .unwrap_or_default()
+}
+
+fn format_fresh_bulletin_for_sync(focus: Option<&PersonaBulletinFocus>) -> String {
+    let Some(focus) = focus else {
+        return "(no bulletin on file)".to_string();
+    };
+    let title = focus.title.as_deref().unwrap_or("").trim();
+    let content = focus.content.trim();
+    if title.is_empty() {
+        content.to_string()
+    } else {
+        format!("{title}\n{content}")
+    }
+}
+
+fn build_focus_sync_instruction(task_delivery: bool) -> String {
+    if task_delivery {
+        "Post-delivery focus sync: this was a substantive task delivery. \
+         You must call update_bulletin_focus with a concise summary of the current focus \
+         (active goals, blockers, outcomes, next step). \
+         Read read_tiered_memory first if helpful; update Tier 3 only when needed. \
+         Do not end_turn without calling update_bulletin_focus."
+            .to_string()
+    } else {
+        "Post-delivery focus sync: persist context if meaningful. \
+         Use only read_tiered_memory, write_tiered_memory, and update_bulletin_focus. \
+         Write a concise bulletin when focus shifted; otherwise keep existing bulletin."
+            .to_string()
+    }
+}
+
+fn build_focus_sync_messages(
+    messages: &[Message],
+    bulletin: Option<&PersonaBulletinFocus>,
+    task_delivery: bool,
+) -> Vec<Message> {
+    let session_goal = crate::agent_turn_context::extract_session_goal(messages, None);
+    let delivered = truncate_focus_sync_text(&last_assistant_delivery_text(messages), 2_000);
+    let bulletin_text = truncate_focus_sync_text(&format_fresh_bulletin_for_sync(bulletin), 1_500);
+
+    let mut out = Vec::new();
+    out.push(Message {
+        role: "user".into(),
+        content: MessageContent::Text(format!(
+            "[focus_sync_context]\n\
+             Current request:\n{}\n\n\
+             Delivered assistant reply (this turn):\n{delivered}\n\n\
+             Current bulletin (from DB — may be stale until you update):\n{bulletin_text}\n\
+             [/focus_sync_context]",
+            session_goal.current_request,
+        )),
+    });
+    if let Some(ref disambiguation) = session_goal.disambiguation_assistant {
+        out.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text(format!(
+                "[focus_sync_disambiguation]\n{disambiguation}\n[/focus_sync_disambiguation]"
+            )),
+        });
+    }
+    out.push(Message {
+        role: "user".into(),
+        content: MessageContent::Text(build_focus_sync_instruction(task_delivery)),
+    });
+    out
 }
 
 fn estimate_message_tokens(message: &Message) -> usize {
@@ -6610,13 +6711,17 @@ async fn run_persona_focus_sync_after_delivery(
     chat_id: i64,
     persona_id: i64,
     caller_channel: &str,
-    system_prompt: &str,
     messages: &[Message],
     response_len: usize,
     had_tool_calls: bool,
     is_background_job: bool,
+    is_conversational: bool,
 ) {
     if is_background_job {
+        info!(
+            chat_id,
+            persona_id, "focus_sync_skipped reason=background_job"
+        );
         return;
     }
 
@@ -6629,23 +6734,21 @@ async fn run_persona_focus_sync_after_delivery(
     );
 
     if !should_run_focus_sync_llm(false, messages, response_len, had_tool_calls) {
+        info!(chat_id, persona_id, "focus_sync_skipped reason=gate");
         return;
     }
 
-    let mut sync_messages = messages.to_vec();
-    sync_messages.push(Message {
-        role: "user".into(),
-        content: MessageContent::Text(
-            "Post-delivery focus sync hook: persist context now. \
-Use only read_tiered_memory, write_tiered_memory, and update_bulletin_focus. \
-Bulletin is canonical episodic focus for operators. Write a concise bulletin summary for current focus (active goals, blockers, outcomes, next step). \
-Tier 2 is durable knowledge only (terminology, known steps, preferences), not active status tracking. \
-Tier 3 is a short-lived scratchpad and must not duplicate bulletin status lines. \
-Only write Tier 1 on explicit user-confirmed durable preference. \
-If no meaningful update is needed, keep existing memory and bulletin."
-                .into(),
-        ),
-    });
+    let task_delivery = focus_sync_task_delivery(is_conversational, response_len, had_tool_calls);
+    info!(chat_id, persona_id, task_delivery, "focus_sync_started");
+
+    let bulletin = call_blocking(state.db.clone(), move |db| {
+        db.get_persona_bulletin_focus(chat_id, persona_id)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let mut sync_messages = build_focus_sync_messages(messages, bulletin.as_ref(), task_delivery);
 
     let allowed_tools = [
         "read_tiered_memory",
@@ -6659,8 +6762,15 @@ If no meaningful update is needed, keep existing memory and bulletin."
         .filter(|d| allowed_tools.contains(&d.name.as_str()))
         .collect();
     if tool_defs.is_empty() {
+        warn!(
+            chat_id,
+            persona_id, "focus_sync_skipped reason=empty_tool_defs"
+        );
         return;
     }
+
+    let sync_system =
+        build_focus_sync_system_prompt(chat_id, persona_id, state.config.timezone.as_str());
 
     let tool_auth = ToolAuthContext {
         caller_channel: caller_channel.to_string(),
@@ -6670,28 +6780,57 @@ If no meaningful update is needed, keep existing memory and bulletin."
         is_scheduled_task: false,
     };
 
-    for _ in 0..FOCUS_SYNC_MAX_ITERATIONS {
+    let max_iters = if task_delivery {
+        2
+    } else {
+        FOCUS_SYNC_MAX_ITERATIONS
+    };
+    let mut updated_bulletin = false;
+    let mut tools_called: Vec<String> = Vec::new();
+
+    for iteration in 0..max_iters {
+        let options = if task_delivery {
+            LlmSendOptions::default().with_tool_choice("required")
+        } else {
+            LlmSendOptions::default()
+        };
         let response = match state
             .llm
-            .send_message(
-                system_prompt,
+            .send_message_with_options(
+                &sync_system,
                 sync_messages.clone(),
                 Some(tool_defs.clone()),
+                options,
             )
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("Focus sync skipped due to LLM error: {e}");
+                warn!(
+                    chat_id,
+                    persona_id,
+                    error = %e,
+                    "focus_sync_skipped reason=llm_error"
+                );
                 return;
             }
         };
         let stop_reason = response.stop_reason.as_deref().unwrap_or("end_turn");
         if stop_reason == "end_turn" || stop_reason == "max_tokens" {
-            return;
+            if task_delivery && !updated_bulletin && iteration + 1 < max_iters {
+                sync_messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "Reminder: call update_bulletin_focus now with the current focus summary."
+                            .into(),
+                    ),
+                });
+                continue;
+            }
+            break;
         }
         if stop_reason != "tool_use" {
-            return;
+            break;
         }
 
         let assistant_content: Vec<ContentBlock> = response
@@ -6723,16 +6862,32 @@ If no meaningful update is needed, keep existing memory and bulletin."
                 id, name, input, ..
             } = block
             {
+                tools_called.push(name.clone());
+                if name == "update_bulletin_focus"
+                    && input
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|s| s.trim().is_empty())
+                {
+                    warn!(
+                        chat_id,
+                        persona_id, "focus_sync update_bulletin_focus missing content"
+                    );
+                }
                 let result = if !allowed_tools.contains(&name.as_str()) {
                     crate::tools::ToolResult::error(format!(
                         "Tool {} is not allowed during focus sync.",
                         name
                     ))
                 } else {
-                    state
+                    let exec = state
                         .tools
                         .execute_with_auth(name, input.clone(), &tool_auth)
-                        .await
+                        .await;
+                    if name == "update_bulletin_focus" && !exec.is_error {
+                        updated_bulletin = true;
+                    }
+                    exec
                 };
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
@@ -6745,6 +6900,20 @@ If no meaningful update is needed, keep existing memory and bulletin."
             role: "user".into(),
             content: MessageContent::Blocks(tool_results),
         });
+    }
+
+    info!(
+        chat_id,
+        persona_id,
+        updated_bulletin,
+        tools_called = ?tools_called,
+        "focus_sync_completed"
+    );
+    if task_delivery && !updated_bulletin {
+        warn!(
+            chat_id,
+            persona_id, "focus_sync_noop task_delivery_without_bulletin_update"
+        );
     }
 }
 
@@ -8719,5 +8888,55 @@ mod tests {
             &messages,
         );
         assert_eq!(stop, "ask_clarification");
+    }
+
+    #[test]
+    fn test_focus_sync_task_delivery_gate() {
+        assert!(focus_sync_task_delivery(false, 500, true));
+        assert!(focus_sync_task_delivery(true, 250, false));
+        assert!(!focus_sync_task_delivery(true, 100, false));
+        assert!(focus_sync_task_delivery(false, 100, false));
+    }
+
+    #[test]
+    fn test_build_focus_sync_messages_uses_delivery_not_persona_context() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[persona_context]\nStale Instagram bulletin\n[/persona_context]".into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\nplease commit and push\n[/current_request]"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "Fixed /home/ken/big_storage/projects/sourdough/index.html on dev".into(),
+                ),
+            },
+        ];
+        let bulletin = PersonaBulletinFocus {
+            chat_id: 1,
+            persona_id: 26,
+            title: Some("Old".into()),
+            content: "Instagram promo pending".into(),
+            updated_at: "t".into(),
+        };
+        let sync = build_focus_sync_messages(&messages, Some(&bulletin), true);
+        let joined: String = sync
+            .iter()
+            .map(message_to_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("sourdough/index.html"));
+        assert!(joined.contains("Instagram promo pending"));
+        assert!(!joined.contains("Stale Instagram bulletin"));
+        assert!(joined.contains("must call update_bulletin_focus"));
     }
 }

@@ -2067,6 +2067,7 @@ async fn send_and_store_response_with_events(
     Ok(Json(out))
 }
 
+#[cfg(test)]
 fn upload_rel_url_exists(state: &WebState, rel_url: &str) -> bool {
     let Some(rel) = rel_url.strip_prefix("/api/uploads/") else {
         return true;
@@ -2087,6 +2088,7 @@ fn upload_rel_url_exists(state: &WebState, rel_url: &str) -> bool {
     legacy_path.is_file()
 }
 
+#[cfg(test)]
 async fn materialize_response_file_links(
     state: &WebState,
     chat_id: i64,

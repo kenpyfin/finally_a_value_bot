@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-12 — Resume-delta continuation context + PostDelivery focus sync hardening
+
+- **Area:** cursor engine / PostDelivery hooks / persona bulletin
+- **Summary:** Sourdough main-chat incident: resume-delta sent only `[current_request]` (~1.8k chars) so a generic "commit and push to dev" lost the prior sourdough `index.html` fix; PostDelivery focus sync left bulletin stale (Instagram promo) because the strategy LLM sub-call no-op'd. Resume-delta now always injects `[continuation_context]` (last prior_turn user+assistant pair) and Tier 1 anchor + git discipline in the minimal header. Focus sync uses a narrow context (delivered reply + fresh DB bulletin), lightweight sync system prompt, required bulletin update on task deliveries (2 iterations + `tool_choice: required` when supported), and structured logging (`focus_sync_started` / `focus_sync_completed` / `focus_sync_noop`).
+- **Key files / symbols:** `build_resume_delta_messages`, `extract_tier1_anchor`, `extract_last_prior_turn_pair` in `src/cursor_delegation_prompt.rs`; `run_persona_focus_sync_after_delivery`, `build_focus_sync_messages`, `focus_sync_task_delivery` in `src/channels/telegram.rs`; `LlmHandle::send_message_with_options` in `src/llm.rs`.
+- **Note:** Rebuild + restart bot. Gemini focus-sync may still ignore `tool_choice`; narrowed prompt + second iteration mitigates.
+
 ### 2026-07-10 — Cursor sidecar: global bridge launch queue + scheduled Classic fallback
 
 - **Area:** cursor engine / sidecar / scheduler

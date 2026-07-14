@@ -513,13 +513,9 @@ pub async fn materialize_web_delivery_file_links(
         if let Some(local_path) =
             resolve_delivery_local_file_path(workspace_root, chat_id, persona_id, &target)
         {
-            let rel = persist_file_for_web_delivery(
-                workspace_root,
-                chat_id,
-                persona_id,
-                &local_path,
-            )
-            .await?;
+            let rel =
+                persist_file_for_web_delivery(workspace_root, chat_id, persona_id, &local_path)
+                    .await?;
             rewrites.insert(target, rel);
         }
     }
@@ -533,13 +529,9 @@ pub async fn materialize_web_delivery_file_links(
         if let Some(local_path) =
             resolve_delivery_local_file_path(workspace_root, chat_id, persona_id, &target)
         {
-            let rel = persist_file_for_web_delivery(
-                workspace_root,
-                chat_id,
-                persona_id,
-                &local_path,
-            )
-            .await?;
+            let rel =
+                persist_file_for_web_delivery(workspace_root, chat_id, persona_id, &local_path)
+                    .await?;
             rewrites.insert(target, rel);
         }
     }
@@ -562,13 +554,9 @@ pub async fn materialize_web_delivery_file_links(
         if let Some(fallback_local) =
             resolve_delivery_local_file_path(workspace_root, chat_id, persona_id, fallback_name)
         {
-            let rel = persist_file_for_web_delivery(
-                workspace_root,
-                chat_id,
-                persona_id,
-                &fallback_local,
-            )
-            .await?;
+            let rel =
+                persist_file_for_web_delivery(workspace_root, chat_id, persona_id, &fallback_local)
+                    .await?;
             updated = updated.replace(&url, &rel);
         } else {
             warn!(target: "delivery", url = %url, "assistant response referenced missing upload URL");
