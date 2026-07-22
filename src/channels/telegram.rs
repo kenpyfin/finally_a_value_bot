@@ -282,7 +282,8 @@ pub struct AppState {
     pub cursor_settings: Arc<std::sync::RwLock<crate::cursor_engine_config::CursorEngineSettings>>,
     pub pipeline_profile: Arc<std::sync::RwLock<crate::agent_pipeline::PipelineProfile>>,
     pub cursor_sidecar: Arc<crate::cursor_sdk_sidecar::SidecarHandle>,
-    /// Telegram bots keyed by `channel_bot_instances.id` (see `Database::sync_channel_bot_instances_from_config`).
+    pub steel_browser: Arc<crate::steel_browser_sidecar::SteelBrowserHandle>,
+    /// Telegram bots keyed by `channel_bot_instances.id`.
     pub telegram_bots: Arc<HashMap<i64, Bot>>,
     pub db: Arc<Database>,
     pub memory: MemoryManager,
@@ -519,6 +520,7 @@ pub async fn run_bot(
     ));
     let cursor_sidecar =
         crate::cursor_sdk_sidecar::bootstrap(&config, &db, cursor_settings.clone()).await;
+    let steel_browser = crate::steel_browser_sidecar::bootstrap(&config).await;
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
         Arc::new(std::sync::OnceLock::new());
     let env_redactor = Arc::new(EnvSecretRedactor::discover(&config));
@@ -612,6 +614,7 @@ pub async fn run_bot(
         cursor_settings,
         pipeline_profile,
         cursor_sidecar,
+        steel_browser,
         telegram_bots: Arc::new(telegram_bots_map),
         db,
         memory,
@@ -1365,6 +1368,24 @@ async fn handle_message(
     };
 
     let chat_title = msg.chat.title().map(|t| t.to_string());
+    let instance_config = {
+        let bid = telegram_bot_instance_id;
+        call_blocking(state.db.clone(), move |db| db.get_channel_bot_instance(bid))
+            .await
+            .ok()
+            .flatten()
+    };
+    let allowed_groups = instance_config
+        .as_ref()
+        .map(|inst| inst.allowed_groups.clone())
+        .unwrap_or_else(|| state.config.allowed_groups.clone());
+    let bot_username = instance_config
+        .as_ref()
+        .and_then(|inst| {
+            let username = inst.bot_username.trim();
+            (!username.is_empty()).then(|| username.to_string())
+        })
+        .unwrap_or_else(|| state.config.bot_username.clone());
 
     // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
     let text_for_resolve = text.clone();
@@ -1401,8 +1422,8 @@ async fn handle_message(
 
     // Check group allowlist (by Telegram chat id)
     if (db_chat_type == "telegram_group" || db_chat_type == "telegram_supergroup")
-        && !state.config.allowed_groups.is_empty()
-        && !state.config.allowed_groups.contains(&chat_id)
+        && !allowed_groups.is_empty()
+        && !allowed_groups.contains(&chat_id)
     {
         // Store message but don't process
         let chat_title_owned = chat_title.clone();
@@ -1495,7 +1516,7 @@ async fn handle_message(
     let should_respond = match runtime_chat_type {
         "private" => true,
         _ => {
-            let bot_mention = format!("@{}", state.config.bot_username);
+            let bot_mention = format!("@{}", bot_username);
             text.contains(&bot_mention)
         }
     };
@@ -5642,7 +5663,7 @@ pub(super) fn build_system_prompt(
     let caps = format!(
         r#"## Tool groups (names only; use tool schemas for parameters)
 - **Shell:** bash — follow **Path discipline (strict)**; never use `workspace/` prefixes or `workspace/skills/` in shell paths (tool cwd is persona-scoped under `shared/personas/{chat_id}/{persona_id}/`)
-- **Browser:** browser (agent-browser CLI only; never via bash)
+- **Browser:** `steel-browser` skill (`activate_skill` + `run_skill_script`; human-in-the-loop via session viewer)
 - **Files / repo:** read_file, write_file, edit_file, apply_search_replace, read_repo_map, symbol_edit (when enabled), glob, grep
 - **Web:** web_search, web_fetch
 - **Scheduling:** schedule_task, update_scheduled_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history (runtime enforces `schedule-job` activation before create/update)
@@ -5714,12 +5735,13 @@ For long-running jobs:
 - When a shell background job fails, the server may enqueue an automatic agent retry with the failure output; fix the command and use `spawn_background_command` again (no placeholders)
 - Avoid "(Checking ...)" placeholders: either call the tool in the same turn or clearly state what is missing and stop.
 
-## Browser
-Browser automation uses the **browser** tool, which runs the command `agent-browser` from the user's PATH (the npm agent-browser CLI). The tool does not use finally_a_value_bot-browser or any hardcoded path. Use only the **browser** tool; do not run agent-browser or other browser executables via the bash tool.
-- Call the **browser** tool with a command string (e.g. open, snapshot, click, fill). Workflow: open URL → `snapshot -i` to get interactive elements and refs (@e1, @e2, …) → use `click`, `fill`, or `get text` with those refs → run `snapshot -i` again after navigation or interaction to see updated state.
-- If the browser tool reports that agent-browser was not found: tell the user to install with `npm install -g agent-browser` and `agent-browser install`. AGENT_BROWSER_PATH is only for Docker (the image sets it). Do not suggest symlinks to finally_a_value_bot-browser.
-- Many public search/result pages (Google, Bing, DuckDuckGo, ImportYeti, qcc, etc.) are Cloudflare/CAPTCHA/anti-bot gated. Prefer `web_search` + `web_fetch` for discovery and extraction. Use browser mostly for interactive flows that cannot be fetched directly.
-- If browser stderr says profile was ignored because a daemon is already running, keep using the active session or restart the daemon before retrying profile-specific steps.
+## Browser (Steel)
+Browser automation uses the built-in **`steel-browser`** skill — not bash or a dedicated browser tool.
+- Activate `steel-browser`, then `run_skill_script` with `steel_tool.py` (`session create`, `browse goto`, `browse snapshot`, etc.).
+- Human-in-the-loop: after `session create`, give the user **`session_viewer_url`** so they can log in manually; then run browse commands on the same `session_id`.
+- Always `session release` when done.
+- For public pages, prefer `web_search` + `web_fetch`. For anti-bot public scraping without login, use `scrapling-skill`.
+- If Steel API is unreachable: run `bash builtin_skills/steel-browser/setup_steel_env.sh`, set `BROWSER_MANAGED=true` (or start Steel Docker on ports 13920/13923).
 
 ## Web search strategy
 - Start broad before narrowing: begin with 1-2 simple queries (for entities, usually legal English name and full Chinese name), then add constraints.

@@ -10,13 +10,18 @@ cp .env.example .env
 cargo run -- start
 ```
 
-Then open `http://127.0.0.1:10961` and finish runtime configuration in Web UI Settings. CLI `config` and `setup` are retired.
+Then open `http://127.0.0.1:10961` and finish configuration in Web UI Settings:
+- **LLM** — provider and model (API keys stay in `.env`)
+- **Integrations** — Telegram / Discord / WhatsApp bot credentials and platform access settings (saved in SQLite)
+- **Channels** — per-contact persona routing for those integrations. WhatsApp is single-persona because this gateway supports one WhatsApp Business number/webhook.
+
+CLI `config` and `setup` are retired.
 
 ## Prerequisites
 
 - Rust 1.70+ (2021 edition)
-- A Telegram bot token (from @BotFather)
-- An Anthropic API key
+- Optional: Telegram / Discord / WhatsApp bots (configure in Web UI → Integrations)
+- At least one LLM API key in `.env` (or a local provider)
 
 No other external dependencies. SQLite is bundled via `rusqlite`.
 
@@ -25,7 +30,8 @@ No other external dependencies. SQLite is bundled via `rusqlite`.
 ```
 src/
     main.rs              # Entry point. Parses CLI args, initializes subsystems, starts bot.
-    config.rs            # Config struct. Bootstrap from .env (no startup merge from app_settings).
+    config.rs            # Config struct. Bootstrap from .env; channel settings merged from DB.
+    channel_integration_config.rs  # Telegram/Discord/WhatsApp integration merge/migration.
     error.rs             # FinallyAValueBotError enum (thiserror). Centralized error types.
     telegram.rs          # Core orchestration:
                          #   - Telegram message handler

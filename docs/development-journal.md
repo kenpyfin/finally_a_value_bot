@@ -4,6 +4,20 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-15 — Integrations tab unified around bot instances
+
+- **Area:** channels / web settings / config
+- **Summary:** Settings → Integrations no longer shows separate primary Telegram/Discord/WhatsApp forms plus a duplicate all-bots list. `channel_bot_instances` now carries per-instance platform options (`bot_username`, Telegram group allowlist, Discord channel allowlist, WhatsApp phone/verify/webhook settings); `CONTROL_CHAT_IDS` stays global shared access. Telegram/Discord runtime reads allowlists from the active bot instance. Settings → Channels remains the persona-routing surface and now includes WhatsApp; WhatsApp is single-persona by default because this gateway supports one WhatsApp Business number, not multiple independent WhatsApp dispatchers.
+- **Key files / symbols:** `ChannelBotInstance` / `migrate_channel_bot_instances_and_policy` in `src/db.rs`; `GET/PATCH /api/channels/integration` and `/api/channel_bot_instances` in `src/web.rs`; `SettingsIntegrationsPanel` in `web/src/components/settings-integrations.tsx`; `resolve_incoming_run_persona_for_channel` in `src/persona.rs`; `deliver_and_store_bot_message` in `src/channel.rs`.
+- **Note:** Restart gateway after changing bot tokens or webhook fields. Legacy app settings/env values are migrated/backfilled to primary instance rows; extra WhatsApp rows are not created by the UI because only one WhatsApp number is supported.
+
+### 2026-07-14 — Channel integrations configured in Web UI (not .env)
+
+- **Area:** channels / web settings / config
+- **Summary:** Telegram, Discord, and WhatsApp tokens plus platform options (`BOT_USERNAME`, allowlists, WhatsApp phone/verify/port, control chats) are now configured in Settings → Integrations and persisted in SQLite (`channel_bot_instances` + `app_settings`). Startup one-time-migrates legacy channel env vars when `CHANNEL_INTEGRATION_SEEDED` is unset, then merges DB into `Config`. Env sync no longer overwrites primary bot rows every boot. Bootstrap (`WEB_*`, `WORKSPACE_DIR`) and LLM API keys stay in `.env`.
+- **Key files / symbols:** `src/channel_integration_config.rs` (`migrate_from_env_if_empty`, `merge_into_config`, `GET/PATCH /api/channels/integration`); `web/src/components/settings-integrations.tsx`; `main.rs` startup sequence; `is_channel_ready` DB-aware in `web.rs`.
+- **Note:** Restart gateway after saving tokens. Remove channel secrets from `.env` after confirming Integrations. Headless installs need a prior migrate or DB seed.
+
 ### 2026-07-12 — Resume-delta continuation context + PostDelivery focus sync hardening
 
 - **Area:** cursor engine / PostDelivery hooks / persona bulletin

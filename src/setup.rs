@@ -491,15 +491,38 @@ impl SetupApp {
                 // ── Browser ──
                 Field {
                     key: "BROWSER_MANAGED",
-                    label: "Managed browser (auto-launch)",
+                    label: "Managed Steel browser (auto-start Docker on bot boot)",
                     value: existing.get("BROWSER_MANAGED").cloned().unwrap_or_else(|| "false".into()),
                     required: false,
                     secret: false,
                 },
                 Field {
-                    key: "AGENT_BROWSER_PATH",
-                    label: "agent-browser CLI path",
-                    value: existing.get("AGENT_BROWSER_PATH").cloned().unwrap_or_default(),
+                    key: "STEEL_API_PORT",
+                    label: "Steel API host port",
+                    value: existing
+                        .get("STEEL_API_PORT")
+                        .cloned()
+                        .unwrap_or_else(|| "13920".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "STEEL_CDP_PORT",
+                    label: "Steel CDP host port",
+                    value: existing
+                        .get("STEEL_CDP_PORT")
+                        .cloned()
+                        .unwrap_or_else(|| "13923".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "STEEL_API_URL",
+                    label: "Steel API URL",
+                    value: existing
+                        .get("STEEL_API_URL")
+                        .cloned()
+                        .unwrap_or_else(|| "http://127.0.0.1:13920".into()),
                     required: false,
                     secret: false,
                 },
@@ -1010,7 +1033,7 @@ impl SetupApp {
                 | "WHATSAPP_VERIFY_TOKEN"
                 | "WHATSAPP_WEBHOOK_PORT" => "WhatsApp",
                 "WEB_ENABLED" | "WEB_HOST" | "WEB_PORT" | "WEB_AUTH_TOKEN" => "Web UI",
-                "BROWSER_MANAGED" | "AGENT_BROWSER_PATH" => "Browser",
+                "BROWSER_MANAGED" | "STEEL_API_URL" | "STEEL_API_PORT" | "STEEL_CDP_PORT" => "Browser",
                 "CURSOR_AGENT_CLI_PATH" | "CURSOR_AGENT_MODEL" | "CURSOR_AGENT_RUNNER_URL" => {
                     "Cursor Agent"
                 }
@@ -1353,8 +1376,10 @@ fn save_config_env(
     emit!("", "WEB_AUTH_TOKEN", get("WEB_AUTH_TOKEN"), false);
 
     // Browser
-    emit!("Browser", "BROWSER_MANAGED", get("BROWSER_MANAGED"), false);
-    emit!("", "AGENT_BROWSER_PATH", get("AGENT_BROWSER_PATH"), false);
+  emit!("Browser", "BROWSER_MANAGED", get("BROWSER_MANAGED"), false);
+  emit!("", "STEEL_API_PORT", get("STEEL_API_PORT"), false);
+  emit!("", "STEEL_CDP_PORT", get("STEEL_CDP_PORT"), false);
+  emit!("", "STEEL_API_URL", get("STEEL_API_URL"), false);
 
     // Cursor Agent
     emit!(

@@ -153,15 +153,20 @@ impl EventHandler for Handler {
                 return;
             }
         };
+        let allowed_channels = {
+            let inst_id = self.discord_bot_instance_id;
+            call_blocking(self.app_state.db.clone(), move |db| {
+                db.get_channel_bot_instance(inst_id)
+            })
+            .await
+            .ok()
+            .flatten()
+            .map(|inst| inst.discord_allowed_channels)
+            .unwrap_or_else(|| self.app_state.config.discord_allowed_channels.clone())
+        };
 
         // Check allowed channels (empty = all)
-        if !self.app_state.config.discord_allowed_channels.is_empty()
-            && !self
-                .app_state
-                .config
-                .discord_allowed_channels
-                .contains(&(channel_id as u64))
-        {
+        if !allowed_channels.is_empty() && !allowed_channels.contains(&(channel_id as u64)) {
             return;
         }
 

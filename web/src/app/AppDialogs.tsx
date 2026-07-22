@@ -18,6 +18,7 @@ import { SettingsLocalDelegatePanel } from '../components/settings-local-delegat
 import { SettingsCursorPanel } from '../components/settings-cursor'
 import { SettingsDeterministicPipelinePanel } from '../components/settings-deterministic-pipeline'
 import { SettingsHooksSkillsPanel } from '../components/settings-hooks-skills'
+import { SettingsIntegrationsPanel } from '../components/settings-integrations'
 import { SettingsRuntimePanel } from '../components/settings-runtime'
 import { TerminalPane } from '../components/terminal-pane'
 import { InitialRunPromptView } from '../components/initial-run-prompt-view'
@@ -39,7 +40,6 @@ import {
 import type {
   ArtifactItem,
   BackgroundJobItem,
-  BotInstanceRow,
   ChannelBinding,
   InstallationStatus,
   Persona,
@@ -58,23 +58,13 @@ export interface AppDialogsSettingsProps {
   installationStatus: InstallationStatus | null
   restartBusy: boolean
   requestRestart: () => Promise<void>
-  integrationsNotice: string | null
-  botInstances: BotInstanceRow[]
-  botFormBusy: boolean
-  removeBotInstance: (id: number) => void
-  addBotInstance: () => Promise<void>
-  newBotPlatform: 'telegram' | 'discord'
-  setNewBotPlatform: (v: 'telegram' | 'discord') => void
-  newBotLabel: string
-  setNewBotLabel: (v: string) => void
-  newBotToken: string
-  setNewBotToken: (v: string) => void
   bindings: ChannelBinding[]
   updateChannelPersonaPolicy: (
     botInstanceId: number,
     mode: 'all' | 'single',
     personaId?: number,
   ) => Promise<void>
+  reloadInstallationStatus: () => Promise<void>
 }
 
 export interface AppDialogsQueueProps {
@@ -513,19 +503,9 @@ export function AppDialogs({
   const installationStatus = settings.installationStatus
   const restartBusy = settings.restartBusy
   const requestRestart = settings.requestRestart
-  const integrationsNotice = settings.integrationsNotice
-  const botInstances = settings.botInstances
-  const botFormBusy = settings.botFormBusy
-  const removeBotInstance = settings.removeBotInstance
-  const addBotInstance = settings.addBotInstance
-  const newBotPlatform = settings.newBotPlatform
-  const setNewBotPlatform = settings.setNewBotPlatform
-  const newBotLabel = settings.newBotLabel
-  const setNewBotLabel = settings.setNewBotLabel
-  const newBotToken = settings.newBotToken
-  const setNewBotToken = settings.setNewBotToken
   const bindings = settings.bindings
   const updateChannelPersonaPolicy = settings.updateChannelPersonaPolicy
+  const reloadInstallationStatus = settings.reloadInstallationStatus
 
   const queueDialogOpen = queue.open
   const setQueueDialogOpen = queue.onOpenChange
@@ -647,8 +627,8 @@ export function AppDialogs({
     <Dialog.Description size="2" mb="3">
       Put LLM API keys in repo-root <code className="text-xs">.env</code> (e.g.{' '}
       <code className="text-xs">ANTHROPIC_API_KEY</code>, <code className="text-xs">OPENAI_API_KEY</code>).
-      Choose provider and model under the LLM tab (saved in the app, not in <code className="text-xs">.env</code>).
-      Restart the process after changing API keys in <code className="text-xs">.env</code>.
+      Configure Telegram, Discord, and WhatsApp under the Integrations tab (saved in the app database).
+      Restart the gateway after changing API keys or channel tokens.
     </Dialog.Description>
     {settingsError ? (
       <Callout.Root color="red" size="1" variant="soft" className="mb-2">
@@ -757,96 +737,14 @@ export function AppDialogs({
         />
       </Tabs.Content>
       <Tabs.Content value="integrations">
-    <div
-      className="rounded-md border p-3"
-      style={appearance === 'dark'
-        ? { borderColor: 'var(--mc-border-soft)', background: 'var(--mc-bg-panel)' }
-        : { borderColor: 'var(--gray-6)', background: 'var(--gray-2)' }}
-    >
-      <Text size="2" weight="bold" className="mb-1">Bot integrations</Text>
-      <Text size="1" color="gray" className="mb-2 block">
-        Additional Telegram or Discord bots beyond env-seeded instances. Tokens are stored in the database; primary instances from config may be read-only here. Restart the gateway after adding a bot.
-      </Text>
-      {integrationsNotice ? (
-        <Callout.Root color="green" size="1" variant="soft" className="mb-2">
-          <Callout.Text>{integrationsNotice}</Callout.Text>
-        </Callout.Root>
-      ) : null}
-      <div className="mb-3 space-y-1">
-        {botInstances.length === 0 ? (
-          <Text size="1" color="gray">No instances loaded (check auth).</Text>
-        ) : (
-          botInstances.map((row) => (
-            <Flex
-              key={row.id}
-              gap="2"
-              align="center"
-              wrap="wrap"
-              className="border-t border-[color:var(--gray-6)] pt-2 first:border-t-0 first:pt-0"
-            >
-              <Text size="1" className="min-w-[120px] font-mono">
-                #{row.id} {row.platform}
-              </Text>
-              <Text size="1" className="min-w-[100px]">
-                {row.label}
-              </Text>
-              <Text size="1" color="gray">
-                {row.token_redacted}
-              </Text>
-              {row.env_primary ? (
-                <Text size="1" color="gray">(from env)</Text>
-              ) : (
-                <Button
-                  size="1"
-                  color="red"
-                  variant="soft"
-                  disabled={botFormBusy}
-                  onClick={() => void removeBotInstance(row.id)}
-                >
-                  Delete
-                </Button>
-              )}
-            </Flex>
-          ))
-        )}
-      </div>
-      <Text size="1" weight="bold" className="mb-1 block">Add bot instance</Text>
-      <Flex gap="2" wrap="wrap" align="end">
-        <div>
-          <Text size="1" color="gray" className="mb-1 block">Platform</Text>
-          <Select.Root
-            value={newBotPlatform}
-            onValueChange={(v) => setNewBotPlatform(v === 'discord' ? 'discord' : 'telegram')}
-          >
-            <Select.Trigger className="w-[140px]" />
-            <Select.Content>
-              <Select.Item value="telegram">telegram</Select.Item>
-              <Select.Item value="discord">discord</Select.Item>
-            </Select.Content>
-          </Select.Root>
-        </div>
-        <TextField.Root
-          className="min-w-[160px] flex-1"
-          placeholder="Label"
-          value={newBotLabel}
-          onChange={(e) => setNewBotLabel(e.target.value)}
+        <SettingsIntegrationsPanel
+          api={api}
+          appearance={appearance}
+          onError={setSettingsError}
+          onSaved={() => void reloadInstallationStatus()}
+          requestRestart={requestRestart}
+          restartBusy={restartBusy}
         />
-        <TextField.Root
-          className="min-w-[200px] flex-1"
-          type="password"
-          placeholder="Bot token"
-          value={newBotToken}
-          onChange={(e) => setNewBotToken(e.target.value)}
-        />
-        <Button
-          size="1"
-          disabled={botFormBusy}
-          onClick={() => void addBotInstance()}
-        >
-          {botFormBusy ? '…' : 'Add'}
-        </Button>
-      </Flex>
-    </div>
       </Tabs.Content>
       <Tabs.Content value="channels">
     <div
@@ -857,15 +755,17 @@ export function AppDialogs({
     >
       <Text size="2" weight="bold">External channel persona mode</Text>
       <Text size="1" color="gray" className="mb-2 block">
-        Every Telegram/Discord bot integration appears here immediately. Handles auto-link from existing chats on the same contact when you add a bot under Integrations (restart required). Web chat uses the persona selector in the main UI.
+        Bot integrations appear here for this contact. Telegram and Discord can use all personas or a single persona. WhatsApp is single-persona by design; Web chat uses the persona selector in the main UI.
       </Text>
       <div className="space-y-2">
         {bindings.length === 0 ? (
           <Text size="1" color="gray">No bot integrations configured. Add bots under the Integrations tab.</Text>
         ) : bindings.map((b) => {
-          const currentMode = b.persona_mode === 'single' ? 'single' : 'all'
-          const currentPersonaId = b.persona_id ?? activePersonaId ?? personas[0]?.id ?? null
           const platform = b.platform ?? b.channel_type
+          const currentMode = platform === 'whatsapp'
+            ? 'single'
+            : b.persona_mode === 'single' ? 'single' : 'all'
+          const currentPersonaId = b.persona_id ?? activePersonaId ?? personas[0]?.id ?? null
           const handleLabel = b.linked && b.channel_handle
             ? b.channel_handle
             : 'pending link'
@@ -879,11 +779,17 @@ export function AppDialogs({
           return (
             <Flex key={`${b.bot_instance_id}:${b.channel_type}:${b.channel_handle ?? 'pending'}`} gap="2" align="center" wrap="wrap">
               <Text size="1" className="min-w-[220px]">
-                {b.label ? `${b.label} ' ` : ''}{platform} (bot #{b.bot_instance_id}): {handleLabel}
+                {b.label ? `${b.label} · ` : ''}{platform} (bot #{b.bot_instance_id}): {handleLabel}
               </Text>
               <Select.Root
                 value={currentMode}
                 onValueChange={(mode) => {
+                  if (platform === 'whatsapp') {
+                    if (currentPersonaId != null) {
+                      void updateChannelPersonaPolicy(b.bot_instance_id, 'single', currentPersonaId)
+                    }
+                    return
+                  }
                   if (mode === 'all') {
                     if (allPersonasDisabled) {
                       setSettingsError(
@@ -899,10 +805,17 @@ export function AppDialogs({
               >
                 <Select.Trigger className="w-[140px]" />
                 <Select.Content>
-                  <Select.Item value="all" disabled={allPersonasDisabled}>
-                    All personas
-                  </Select.Item>
-                  <Select.Item value="single">Single persona</Select.Item>
+                  {platform === 'whatsapp' ? null : (
+                    <Select.Item value="all" disabled={allPersonasDisabled}>
+                      All personas
+                    </Select.Item>
+                  )}
+                  {platform === 'whatsapp' ? null : (
+                    <Select.Item value="single">Single persona</Select.Item>
+                  )}
+                  {platform === 'whatsapp' ? (
+                    <Select.Item value="single">Single persona</Select.Item>
+                  ) : null}
                 </Select.Content>
               </Select.Root>
               {currentMode === 'single' ? (

@@ -3,7 +3,6 @@ pub mod agent_history;
 pub mod apply_search_replace;
 pub mod bash;
 pub mod bash_safety;
-pub mod browser;
 pub mod bulletin;
 pub mod command_runner;
 pub mod cursor_agent;
@@ -580,11 +579,6 @@ impl ToolRegistry {
                 config.safety_risky_categories.clone(),
                 runtime_toggles.clone(),
                 env_redactor.clone(),
-            )),
-            Box::new(browser::BrowserTool::new(
-                &config.runtime_data_dir(),
-                config.working_dir(),
-                config.agent_browser_path.clone(),
             )),
             Box::new(read_file::ReadFileTool::new(config.working_dir())),
             Box::new(read_repo_map::ReadRepoMapTool::new(config.working_dir())),

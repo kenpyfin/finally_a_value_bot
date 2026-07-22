@@ -4836,8 +4836,8 @@ fn is_llm_ready(cfg: &Config) -> bool {
         || crate::llm_catalog::any_provider_api_key_configured()
 }
 
-fn is_channel_ready(cfg: &Config) -> bool {
-    !cfg.telegram_bot_token.trim().is_empty() || cfg.discord_bot_token.is_some()
+fn is_channel_ready(db: &crate::db::Database) -> bool {
+    crate::channel_integration_config::has_any_messaging_bot_token(db).unwrap_or(false)
 }
 
 async fn api_contacts_bindings(
@@ -5916,6 +5916,19 @@ async fn api_settings_get(
                 crate::runtime_toggles::APP_SETTING_RESPONSE_QUALITY_EVALUATOR_ENABLED,
             )
         })
+        .filter(|s| {
+            !matches!(
+                s.key.trim().to_ascii_uppercase().as_str(),
+                crate::channel_integration_config::APP_SETTING_BOT_USERNAME
+                    | crate::channel_integration_config::APP_SETTING_ALLOWED_GROUPS
+                    | crate::channel_integration_config::APP_SETTING_CONTROL_CHAT_IDS
+                    | crate::channel_integration_config::APP_SETTING_DISCORD_ALLOWED_CHANNELS
+                    | crate::channel_integration_config::APP_SETTING_WHATSAPP_PHONE_NUMBER_ID
+                    | crate::channel_integration_config::APP_SETTING_WHATSAPP_VERIFY_TOKEN
+                    | crate::channel_integration_config::APP_SETTING_WHATSAPP_WEBHOOK_PORT
+                    | crate::channel_integration_config::APP_SETTING_CHANNEL_INTEGRATION_SEEDED
+            )
+        })
         .map(|s| {
             let secret = setting_is_secret(&s.key);
             json!({
@@ -5942,6 +5955,11 @@ async fn api_settings_get(
         ak.cmp(&bk)
     });
 
+    let channel_ready = call_blocking(state.app_state.db.clone(), |db| {
+        Ok::<bool, crate::error::FinallyAValueBotError>(is_channel_ready(db))
+    })
+    .await
+    .unwrap_or(false);
     let cfg = &state.app_state.config;
     let cursor_cfg = state
         .app_state
@@ -5965,7 +5983,7 @@ async fn api_settings_get(
         },
         "installation_status": {
             "llm_ready": is_llm_ready(cfg),
-            "channel_ready": is_channel_ready(cfg),
+            "channel_ready": channel_ready,
             "cursor_engine_ready": cursor_engine_ready,
             "local_delegate_ready": local_delegate_ready,
             "agent_engine": agent_engine.as_str(),
@@ -6036,9 +6054,27 @@ fn json_channel_bot_instance_redacted(inst: &ChannelBotInstance) -> serde_json::
         "id": inst.id,
         "platform": inst.platform,
         "label": inst.label,
+        "token_set": !inst.token.trim().is_empty(),
         "token_redacted": masked,
+        "bot_username": inst.bot_username,
+        "allowed_groups": inst.allowed_groups.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+        "discord_allowed_channels": inst.discord_allowed_channels.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+        "whatsapp_phone_number_id": inst.whatsapp_phone_number_id,
+        "whatsapp_verify_token_set": !inst.whatsapp_verify_token.trim().is_empty(),
+        "whatsapp_verify_token_redacted": if inst.whatsapp_verify_token.trim().is_empty() {
+            String::new()
+        } else {
+            mask_setting_value(&inst.whatsapp_verify_token)
+        },
+        "whatsapp_webhook_port": inst.whatsapp_webhook_port,
         "created_at": inst.created_at,
-        "env_primary": (1..=3).contains(&inst.id),
+        "env_primary": false,
+        "is_primary": matches!(
+            inst.id,
+            crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY
+                | crate::db::BOT_INSTANCE_DISCORD_PRIMARY
+                | crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY
+        ),
     })
 }
 
@@ -6047,12 +6083,54 @@ struct ChannelBotInstanceCreateRequest {
     platform: String,
     label: String,
     token: String,
+    #[serde(default)]
+    bot_username: Option<String>,
+    #[serde(default)]
+    allowed_groups: Option<String>,
+    #[serde(default)]
+    discord_allowed_channels: Option<String>,
+    #[serde(default)]
+    whatsapp_phone_number_id: Option<String>,
+    #[serde(default)]
+    whatsapp_verify_token: Option<String>,
+    #[serde(default)]
+    whatsapp_webhook_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChannelBotInstanceUpdateRequest {
     label: String,
-    token: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    bot_username: Option<String>,
+    #[serde(default)]
+    allowed_groups: Option<String>,
+    #[serde(default)]
+    discord_allowed_channels: Option<String>,
+    #[serde(default)]
+    whatsapp_phone_number_id: Option<String>,
+    #[serde(default)]
+    whatsapp_verify_token: Option<String>,
+    #[serde(default)]
+    whatsapp_webhook_port: Option<u16>,
+}
+
+fn parse_csv_i64_lossy(raw: &str) -> Vec<i64> {
+    raw.split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect()
+}
+
+fn parse_csv_u64_lossy(raw: &str) -> Vec<u64> {
+    raw.split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect()
+}
+
+fn looks_like_masked_secret(value: &str) -> bool {
+    let v = value.trim();
+    v.contains("***") || v == "***"
 }
 
 async fn api_channel_bot_instances_get(
@@ -6082,9 +6160,33 @@ async fn api_channel_bot_instances_post(
     let platform_for_provision = platform.clone();
     let label = body.label;
     let token = body.token;
+    let bot_username = body.bot_username.map(|v| v.trim().to_string());
+    let allowed_groups = body
+        .allowed_groups
+        .as_deref()
+        .map(parse_csv_i64_lossy)
+        .unwrap_or_default();
+    let discord_allowed_channels = body
+        .discord_allowed_channels
+        .as_deref()
+        .map(parse_csv_u64_lossy)
+        .unwrap_or_default();
+    let whatsapp_phone_number_id = body.whatsapp_phone_number_id.map(|v| v.trim().to_string());
+    let whatsapp_verify_token = body.whatsapp_verify_token.map(|v| v.trim().to_string());
+    let whatsapp_webhook_port = body.whatsapp_webhook_port;
     let db = state.app_state.db.clone();
     let id = call_blocking(db.clone(), move |db| {
-        db.create_channel_bot_instance(&platform, &label, &token)
+        let id = db.create_channel_bot_instance(&platform, &label, &token)?;
+        db.update_channel_bot_instance_options(
+            id,
+            bot_username.as_deref(),
+            Some(&allowed_groups),
+            Some(&discord_allowed_channels),
+            whatsapp_phone_number_id.as_deref(),
+            whatsapp_verify_token.as_deref(),
+            whatsapp_webhook_port,
+        )?;
+        Ok(id)
     })
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -6110,8 +6212,42 @@ async fn api_channel_bot_instances_patch(
     require_auth(&headers, state.auth_token.as_deref())?;
     let label = body.label;
     let token = body.token;
+    let bot_username = body.bot_username.map(|v| v.trim().to_string());
+    let allowed_groups = body.allowed_groups.as_deref().map(parse_csv_i64_lossy);
+    let discord_allowed_channels = body
+        .discord_allowed_channels
+        .as_deref()
+        .map(parse_csv_u64_lossy);
+    let whatsapp_phone_number_id = body.whatsapp_phone_number_id.map(|v| v.trim().to_string());
+    let whatsapp_verify_token = body.whatsapp_verify_token.and_then(|v| {
+        if looks_like_masked_secret(&v) {
+            None
+        } else {
+            Some(v.trim().to_string())
+        }
+    });
+    let whatsapp_webhook_port = body.whatsapp_webhook_port;
     let updated = call_blocking(state.app_state.db.clone(), move |db| {
-        db.update_channel_bot_instance(id, &label, &token)
+        let Some(current) = db.get_channel_bot_instance(id)? else {
+            return Ok(false);
+        };
+        let next_token = token
+            .as_deref()
+            .filter(|t| !looks_like_masked_secret(t))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(current.token.as_str());
+        db.update_channel_bot_instance(id, &label, next_token)?;
+        db.update_channel_bot_instance_options(
+            id,
+            bot_username.as_deref(),
+            allowed_groups.as_deref(),
+            discord_allowed_channels.as_deref(),
+            whatsapp_phone_number_id.as_deref(),
+            whatsapp_verify_token.as_deref(),
+            whatsapp_webhook_port,
+        )?;
+        Ok(true)
     })
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -6138,6 +6274,89 @@ async fn api_channel_bot_instances_delete(
         return Err((StatusCode::NOT_FOUND, "Not found or cannot delete".into()));
     }
     Ok(Json(json!({ "ok": true, "removed": true })))
+}
+
+fn json_channel_integration_response(
+    settings: &crate::channel_integration_config::ChannelIntegrationSettings,
+    instances: &[ChannelBotInstance],
+) -> serde_json::Value {
+    let tg = instances
+        .iter()
+        .find(|i| i.id == crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY);
+    let dc = instances
+        .iter()
+        .find(|i| i.id == crate::db::BOT_INSTANCE_DISCORD_PRIMARY);
+    let wa = instances
+        .iter()
+        .find(|i| i.id == crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY);
+    json!({
+        "ok": true,
+        "bot_username": settings.bot_username,
+        "allowed_groups": settings.allowed_groups.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+        "control_chat_ids": settings.control_chat_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+        "discord_allowed_channels": settings.discord_allowed_channels.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+        "whatsapp_phone_number_id": settings.whatsapp_phone_number_id,
+        "whatsapp_verify_token_set": !settings.whatsapp_verify_token.trim().is_empty(),
+        "whatsapp_verify_token_redacted": if settings.whatsapp_verify_token.trim().is_empty() {
+            String::new()
+        } else {
+            mask_setting_value(&settings.whatsapp_verify_token)
+        },
+        "whatsapp_webhook_port": settings.whatsapp_webhook_port,
+        "telegram_token_set": tg.map(|i| !i.token.trim().is_empty()).unwrap_or(false),
+        "telegram_token_redacted": tg.map(|i| mask_setting_value(&i.token)).unwrap_or_default(),
+        "telegram_label": tg.map(|i| i.label.clone()).unwrap_or_else(|| "Primary Telegram".into()),
+        "discord_token_set": dc.map(|i| !i.token.trim().is_empty()).unwrap_or(false),
+        "discord_token_redacted": dc.map(|i| mask_setting_value(&i.token)).unwrap_or_default(),
+        "discord_label": dc.map(|i| i.label.clone()).unwrap_or_else(|| "Primary Discord".into()),
+        "whatsapp_access_token_set": wa.map(|i| !i.token.trim().is_empty()).unwrap_or(false),
+        "whatsapp_access_token_redacted": wa.map(|i| mask_setting_value(&i.token)).unwrap_or_default(),
+        "whatsapp_label": wa.map(|i| i.label.clone()).unwrap_or_else(|| "Primary WhatsApp".into()),
+        "instances": instances.iter().map(json_channel_bot_instance_redacted).collect::<Vec<_>>(),
+        "requires_restart": true,
+    })
+}
+
+async fn api_channels_integration_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let config = state.app_state.config.clone();
+    let (settings, instances) = call_blocking(state.app_state.db.clone(), move |db| {
+        let settings = crate::channel_integration_config::load_from_db(db, &config)?;
+        let instances = db.list_all_channel_bot_instances()?;
+        Ok::<_, crate::error::FinallyAValueBotError>((settings, instances))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json_channel_integration_response(
+        &settings, &instances,
+    )))
+}
+
+async fn api_channels_integration_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<crate::channel_integration_config::ChannelIntegrationPatch>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let config = state.app_state.config.clone();
+    let (settings, instances) = call_blocking(state.app_state.db.clone(), move |db| {
+        let settings = body.apply_and_save(db, &config)?;
+        let instances = db.list_all_channel_bot_instances()?;
+        Ok::<_, crate::error::FinallyAValueBotError>((settings, instances))
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut resp = json_channel_integration_response(&settings, &instances);
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert(
+            "message".into(),
+            json!("Saved. Restart the gateway to apply token and dispatcher changes."),
+        );
+    }
+    Ok(Json(resp))
 }
 
 async fn api_channel_persona_policy_upsert(
@@ -6617,6 +6836,10 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route("/api/restart", post(api_restart_post))
         .route(
+            "/api/channels/integration",
+            get(api_channels_integration_get).patch(api_channels_integration_patch),
+        )
+        .route(
             "/api/channel_bot_instances",
             get(api_channel_bot_instances_get).post(api_channel_bot_instances_post),
         )
@@ -7068,6 +7291,7 @@ mod tests {
             crate::agent_pipeline::profile::PipelineProfile::default_profile(),
         ));
         let cursor_sidecar = crate::cursor_sdk_sidecar::SidecarHandle::inactive();
+        let steel_browser = crate::steel_browser_sidecar::SteelBrowserHandle::inactive();
         let state = AppState {
             config: cfg.clone(),
             env_redactor: env_redactor.clone(),
@@ -7075,6 +7299,7 @@ mod tests {
             cursor_settings,
             pipeline_profile,
             cursor_sidecar,
+            steel_browser,
             telegram_bots: Arc::new(telegram_bots),
             db: db.clone(),
             memory: MemoryManager::new(&runtime_dir, cfg.working_dir()),

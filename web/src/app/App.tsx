@@ -42,7 +42,6 @@ import {
   type AgentHistoryOptimizeRequest,
   type AgentHistoryOptimizeResponse,
   type BackgroundJobItem,
-  type BotInstanceRow,
   type ChannelBinding,
   type InstallationStatus,
   type QueueItem,
@@ -479,14 +478,8 @@ export function App({
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [settingsError, setSettingsError] = useState('')
   const [installationStatus, setInstallationStatus] = useState<InstallationStatus | null>(null)
-  const [botInstances, setBotInstances] = useState<BotInstanceRow[]>([])
   const [restartBusy, setRestartBusy] = useState(false)
-  const [botFormBusy, setBotFormBusy] = useState(false)
-  const [newBotPlatform, setNewBotPlatform] = useState<'telegram' | 'discord'>('telegram')
-  const [newBotLabel, setNewBotLabel] = useState('')
-  const [newBotToken, setNewBotToken] = useState('')
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
-  const [integrationsNotice, setIntegrationsNotice] = useState<string | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
@@ -1177,7 +1170,6 @@ export function App({
   useEffect(() => {
     if (!settingsDialogOpen) return
     void loadSettings()
-    void loadBotInstances()
     if (chatId != null) {
       void loadBindings(chatId)
     }
@@ -1225,14 +1217,6 @@ export function App({
     }
   }
 
-  async function loadBotInstances(): Promise<void> {
-    try {
-      const data = await api<{ instances?: BotInstanceRow[] }>('/api/channel_bot_instances')
-      setBotInstances(Array.isArray(data.instances) ? data.instances : [])
-    } catch {
-      setBotInstances([])
-    }
-  }
 
   async function requestRestart(): Promise<void> {
     setSettingsError('')
@@ -1248,62 +1232,7 @@ export function App({
     }
   }
 
-  async function addBotInstance(): Promise<void> {
-    const label = newBotLabel.trim()
-    const token = newBotToken.trim()
-    if (!label || !token) {
-      setSettingsError('Label and token are required.')
-      return
-    }
-    setSettingsError('')
-    setIntegrationsNotice(null)
-    setBotFormBusy(true)
-    try {
-      const data = await api<{ message?: string }>('/api/channel_bot_instances', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          platform: newBotPlatform,
-          label,
-          token,
-        }),
-      })
-      setNewBotLabel('')
-      setNewBotToken('')
-      setIntegrationsNotice(data.message ?? 'Bot instance created. Restart the gateway to activate dispatchers.')
-      await loadBotInstances()
-      if (chatId != null) {
-        await loadBindings(chatId)
-      }
-    } catch (e) {
-      setSettingsError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBotFormBusy(false)
-    }
-  }
 
-  function removeBotInstance(id: number): void {
-    requestConfirm({
-      title: 'Delete bot instance',
-      description: 'This permanently removes the bot integration and its channel bindings. This cannot be undone.',
-      confirmLabel: 'Delete bot',
-      destructive: true,
-      onConfirm: async () => {
-        setSettingsError('')
-        setBotFormBusy(true)
-        try {
-          await api(`/api/channel_bot_instances/${id}`, { method: 'DELETE' })
-          await loadBotInstances()
-          setError('')
-        } catch (e) {
-          setSettingsError(e instanceof Error ? e.message : String(e))
-          throw e
-        } finally {
-          setBotFormBusy(false)
-        }
-      },
-    })
-  }
 
   async function updateChannelPersonaPolicy(
     botInstanceId: number,
@@ -1930,19 +1859,9 @@ export function App({
           installationStatus,
           restartBusy,
           requestRestart,
-          integrationsNotice,
-          botInstances,
-          botFormBusy,
-          removeBotInstance,
-          addBotInstance,
-          newBotPlatform,
-          setNewBotPlatform,
-          newBotLabel,
-          setNewBotLabel,
-          newBotToken,
-          setNewBotToken,
           bindings,
           updateChannelPersonaPolicy,
+          reloadInstallationStatus: loadSettings,
         }}
         queue={{
           open: queueDialogOpen,

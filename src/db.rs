@@ -234,6 +234,12 @@ pub struct ChannelBotInstance {
     pub platform: String,
     pub label: String,
     pub token: String,
+    pub bot_username: String,
+    pub allowed_groups: Vec<i64>,
+    pub discord_allowed_channels: Vec<u64>,
+    pub whatsapp_phone_number_id: String,
+    pub whatsapp_verify_token: String,
+    pub whatsapp_webhook_port: u16,
     pub created_at: String,
 }
 
@@ -807,6 +813,73 @@ impl Database {
         Ok(false)
     }
 
+    fn parse_csv_i64(raw: &str) -> Vec<i64> {
+        raw.split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect()
+    }
+
+    fn parse_csv_u64(raw: &str) -> Vec<u64> {
+        raw.split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect()
+    }
+
+    fn format_csv_i64(ids: &[i64]) -> String {
+        ids.iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn format_csv_u64(ids: &[u64]) -> String {
+        ids.iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn setting_value_conn(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM app_settings WHERE lower(key) = lower(?1)",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .map(|v| v.trim().to_string())
+    }
+
+    fn channel_bot_instance_select() -> &'static str {
+        "SELECT id, platform, label, token, bot_username, allowed_groups, discord_allowed_channels,
+                whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port, created_at
+         FROM channel_bot_instances"
+    }
+
+    fn map_channel_bot_instance_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ChannelBotInstance> {
+        let whatsapp_port_raw: i64 = row.get(9)?;
+        let whatsapp_webhook_port = u16::try_from(whatsapp_port_raw)
+            .ok()
+            .filter(|p| *p > 0)
+            .unwrap_or(8080);
+        let allowed_groups_raw: String = row.get(5)?;
+        let discord_allowed_raw: String = row.get(6)?;
+        Ok(ChannelBotInstance {
+            id: row.get(0)?,
+            platform: row.get(1)?,
+            label: row.get(2)?,
+            token: row.get(3)?,
+            bot_username: row.get(4)?,
+            allowed_groups: Self::parse_csv_i64(&allowed_groups_raw),
+            discord_allowed_channels: Self::parse_csv_u64(&discord_allowed_raw),
+            whatsapp_phone_number_id: row.get(7)?,
+            whatsapp_verify_token: row.get(8)?,
+            whatsapp_webhook_port,
+            created_at: row.get(10)?,
+        })
+    }
+
     fn migrate_channel_bot_instances_and_policy(
         conn: &Connection,
     ) -> Result<(), FinallyAValueBotError> {
@@ -816,11 +889,34 @@ impl Database {
                 platform TEXT NOT NULL,
                 label TEXT NOT NULL DEFAULT '',
                 token TEXT NOT NULL,
+                bot_username TEXT NOT NULL DEFAULT '',
+                allowed_groups TEXT NOT NULL DEFAULT '',
+                discord_allowed_channels TEXT NOT NULL DEFAULT '',
+                whatsapp_phone_number_id TEXT NOT NULL DEFAULT '',
+                whatsapp_verify_token TEXT NOT NULL DEFAULT '',
+                whatsapp_webhook_port INTEGER NOT NULL DEFAULT 8080,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_channel_bot_instances_platform
                 ON channel_bot_instances(platform);",
         )?;
+        for (column, definition) in [
+            ("bot_username", "TEXT NOT NULL DEFAULT ''"),
+            ("allowed_groups", "TEXT NOT NULL DEFAULT ''"),
+            ("discord_allowed_channels", "TEXT NOT NULL DEFAULT ''"),
+            ("whatsapp_phone_number_id", "TEXT NOT NULL DEFAULT ''"),
+            ("whatsapp_verify_token", "TEXT NOT NULL DEFAULT ''"),
+            ("whatsapp_webhook_port", "INTEGER NOT NULL DEFAULT 8080"),
+        ] {
+            if !Self::column_exists(conn, "channel_bot_instances", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE channel_bot_instances ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+
+        Self::backfill_channel_instance_options_from_app_settings(conn)?;
 
         let has_bi = Self::column_exists(conn, "channel_bindings", "bot_instance_id")?;
         if !has_bi {
@@ -903,6 +999,70 @@ impl Database {
         Ok(())
     }
 
+    fn backfill_channel_instance_options_from_app_settings(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if let Some(v) = Self::setting_value_conn(conn, "BOT_USERNAME").filter(|v| !v.is_empty()) {
+            conn.execute(
+                "UPDATE channel_bot_instances
+                 SET bot_username = ?1
+                 WHERE id = ?2 AND platform = 'telegram' AND bot_username = ''",
+                params![v, BOT_INSTANCE_TELEGRAM_PRIMARY],
+            )?;
+        }
+        if let Some(v) = Self::setting_value_conn(conn, "ALLOWED_GROUPS") {
+            conn.execute(
+                "UPDATE channel_bot_instances
+                 SET allowed_groups = ?1
+                 WHERE id = ?2 AND platform = 'telegram' AND allowed_groups = ''",
+                params![v, BOT_INSTANCE_TELEGRAM_PRIMARY],
+            )?;
+        }
+        if let Some(v) = Self::setting_value_conn(conn, "DISCORD_ALLOWED_CHANNELS") {
+            conn.execute(
+                "UPDATE channel_bot_instances
+                 SET discord_allowed_channels = ?1
+                 WHERE id = ?2 AND platform = 'discord' AND discord_allowed_channels = ''",
+                params![v, BOT_INSTANCE_DISCORD_PRIMARY],
+            )?;
+        }
+        if let Some(v) =
+            Self::setting_value_conn(conn, "WHATSAPP_PHONE_NUMBER_ID").filter(|v| !v.is_empty())
+        {
+            conn.execute(
+                "UPDATE channel_bot_instances
+                 SET whatsapp_phone_number_id = ?1
+                 WHERE id = ?2 AND platform = 'whatsapp' AND whatsapp_phone_number_id = ''",
+                params![v, BOT_INSTANCE_WHATSAPP_PRIMARY],
+            )?;
+        }
+        if let Some(v) =
+            Self::setting_value_conn(conn, "WHATSAPP_VERIFY_TOKEN").filter(|v| !v.is_empty())
+        {
+            conn.execute(
+                "UPDATE channel_bot_instances
+                 SET whatsapp_verify_token = ?1
+                 WHERE id = ?2 AND platform = 'whatsapp' AND whatsapp_verify_token = ''",
+                params![v, BOT_INSTANCE_WHATSAPP_PRIMARY],
+            )?;
+        }
+        if let Some(v) =
+            Self::setting_value_conn(conn, "WHATSAPP_WEBHOOK_PORT").filter(|v| !v.is_empty())
+        {
+            if let Ok(port) = v.parse::<u16>() {
+                if port > 0 {
+                    conn.execute(
+                        "UPDATE channel_bot_instances
+                         SET whatsapp_webhook_port = ?1
+                         WHERE id = ?2 AND platform = 'whatsapp' AND whatsapp_webhook_port = 8080",
+                        params![port, BOT_INSTANCE_WHATSAPP_PRIMARY],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reassign extra bot rows that occupy reserved primary ids 2 (Discord) or 3 (WhatsApp).
     fn migrate_misplaced_channel_bot_instance_ids(
         conn: &Connection,
@@ -952,15 +1112,33 @@ impl Database {
         old_id: i64,
         new_id: i64,
     ) -> Result<(), FinallyAValueBotError> {
-        let row: (String, String, String, String) = conn.query_row(
-            "SELECT platform, label, token, created_at FROM channel_bot_instances WHERE id = ?1",
+        let row: (String, String, String, String, String, String, String, String, i64, String) = conn.query_row(
+            "SELECT platform, label, token, bot_username, allowed_groups, discord_allowed_channels,
+                    whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port, created_at
+             FROM channel_bot_instances WHERE id = ?1",
             params![old_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
         )?;
         conn.execute(
-            "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![new_id, row.0, row.1, row.2, row.3],
+            "INSERT INTO channel_bot_instances (
+                id, platform, label, token, bot_username, allowed_groups, discord_allowed_channels,
+                whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port, created_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![new_id, row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9],
         )?;
         conn.execute(
             "UPDATE channel_bindings SET bot_instance_id = ?1 WHERE bot_instance_id = ?2",
@@ -1979,53 +2157,16 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Upsert primary bot rows from `.env` so Telegram/Discord/WhatsApp dispatchers can list tokens.
+    /// Deprecated: env no longer overwrites DB. Prefer
+    /// [`crate::channel_integration_config::migrate_from_env_if_empty`].
+    #[deprecated(
+        note = "use channel_integration_config::migrate_from_env_if_empty — DB is source of truth"
+    )]
     pub fn sync_channel_bot_instances_from_config(
         &self,
         config: &crate::config::Config,
     ) -> Result<(), FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        if !config.telegram_bot_token.trim().is_empty() {
-            conn.execute(
-                "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
-                 VALUES (1, 'telegram', 'Primary (TELEGRAM_BOT_TOKEN)', ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET
-                    platform=excluded.platform,
-                    label=excluded.label,
-                    token=excluded.token,
-                    created_at=excluded.created_at",
-                params![config.telegram_bot_token.trim(), now],
-            )?;
-        }
-        if let Some(ref t) = config.discord_bot_token {
-            if !t.trim().is_empty() {
-                conn.execute(
-                    "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
-                     VALUES (2, 'discord', 'Primary (DISCORD_BOT_TOKEN)', ?1, ?2)
-                     ON CONFLICT(id) DO UPDATE SET
-                        platform=excluded.platform,
-                        label=excluded.label,
-                        token=excluded.token,
-                        created_at=excluded.created_at",
-                    params![t.trim(), now],
-                )?;
-            }
-        }
-        let wa = config.whatsapp_access_token.as_deref().unwrap_or("").trim();
-        if !wa.is_empty() {
-            conn.execute(
-                "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
-                 VALUES (3, 'whatsapp', 'Primary (WHATSAPP_ACCESS_TOKEN)', ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET
-                    platform=excluded.platform,
-                    label=excluded.label,
-                    token=excluded.token,
-                    created_at=excluded.created_at",
-                params![wa, now],
-            )?;
-        }
-        Ok(())
+        crate::channel_integration_config::migrate_from_env_if_empty(self, config)
     }
 
     pub fn list_channel_bot_instances_by_platform(
@@ -2033,18 +2174,12 @@ impl Database {
         platform: &str,
     ) -> Result<Vec<ChannelBotInstance>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, platform, label, token, created_at FROM channel_bot_instances
-             WHERE platform = ?1 ORDER BY id ASC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE platform = ?1 ORDER BY id ASC",
+            Self::channel_bot_instance_select()
+        ))?;
         let rows = stmt.query_map(params![platform], |row| {
-            Ok(ChannelBotInstance {
-                id: row.get(0)?,
-                platform: row.get(1)?,
-                label: row.get(2)?,
-                token: row.get(3)?,
-                created_at: row.get(4)?,
-            })
+            Self::map_channel_bot_instance_row(row)
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -2055,17 +2190,9 @@ impl Database {
     ) -> Result<Option<ChannelBotInstance>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let row = conn.query_row(
-            "SELECT id, platform, label, token, created_at FROM channel_bot_instances WHERE id = ?1",
+            &format!("{} WHERE id = ?1", Self::channel_bot_instance_select()),
             params![id],
-            |row| {
-                Ok(ChannelBotInstance {
-                    id: row.get(0)?,
-                    platform: row.get(1)?,
-                    label: row.get(2)?,
-                    token: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            },
+            Self::map_channel_bot_instance_row,
         );
         match row {
             Ok(v) => Ok(Some(v)),
@@ -2079,22 +2206,130 @@ impl Database {
         &self,
     ) -> Result<Vec<ChannelBotInstance>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, platform, label, token, created_at FROM channel_bot_instances ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(ChannelBotInstance {
-                id: row.get(0)?,
-                platform: row.get(1)?,
-                label: row.get(2)?,
-                token: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
+        let mut stmt = conn.prepare(&format!(
+            "{} ORDER BY id ASC",
+            Self::channel_bot_instance_select()
+        ))?;
+        let rows = stmt.query_map([], Self::map_channel_bot_instance_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Insert a non-primary bot instance. Ids 1–3 are reserved for env sync; extras use id >= 4.
+    /// Upsert a primary bot row (ids 1–3) or any fixed id used as the platform primary.
+    pub fn upsert_primary_channel_bot_instance(
+        &self,
+        id: i64,
+        platform: &str,
+        label: &str,
+        token: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let p = platform.trim().to_ascii_lowercase();
+        if !matches!(p.as_str(), "telegram" | "discord" | "whatsapp") {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "platform must be telegram, discord, or whatsapp".into(),
+            ));
+        }
+        if token.trim().is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "token cannot be empty".into(),
+            ));
+        }
+        let expected_id = match p.as_str() {
+            "telegram" => BOT_INSTANCE_TELEGRAM_PRIMARY,
+            "discord" => BOT_INSTANCE_DISCORD_PRIMARY,
+            "whatsapp" => BOT_INSTANCE_WHATSAPP_PRIMARY,
+            _ => id,
+        };
+        if id != expected_id {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "primary {p} instance must use id {expected_id}"
+            )));
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO channel_bot_instances (id, platform, label, token, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                platform=excluded.platform,
+                label=excluded.label,
+                token=excluded.token",
+            params![id, p, label.trim(), token.trim(), now],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_channel_bot_instance_options(
+        &self,
+        id: i64,
+        bot_username: Option<&str>,
+        allowed_groups: Option<&[i64]>,
+        discord_allowed_channels: Option<&[u64]>,
+        whatsapp_phone_number_id: Option<&str>,
+        whatsapp_verify_token: Option<&str>,
+        whatsapp_webhook_port: Option<u16>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        if matches!(whatsapp_webhook_port, Some(0)) {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "whatsapp_webhook_port must be between 1 and 65535".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let current = conn.query_row(
+            "SELECT bot_username, allowed_groups, discord_allowed_channels,
+                    whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port
+             FROM channel_bot_instances WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        );
+        let Ok(current) = current else {
+            return Ok(false);
+        };
+        let port = whatsapp_webhook_port
+            .map(i64::from)
+            .unwrap_or(current.5)
+            .max(1);
+        let allowed_groups_csv = allowed_groups
+            .map(Self::format_csv_i64)
+            .unwrap_or(current.1);
+        let discord_allowed_csv = discord_allowed_channels
+            .map(Self::format_csv_u64)
+            .unwrap_or(current.2);
+        conn.execute(
+            "UPDATE channel_bot_instances
+             SET bot_username = ?1,
+                 allowed_groups = ?2,
+                 discord_allowed_channels = ?3,
+                 whatsapp_phone_number_id = ?4,
+                 whatsapp_verify_token = ?5,
+                 whatsapp_webhook_port = ?6
+             WHERE id = ?7",
+            params![
+                bot_username.map(str::trim).unwrap_or(current.0.as_str()),
+                allowed_groups_csv,
+                discord_allowed_csv,
+                whatsapp_phone_number_id
+                    .map(str::trim)
+                    .unwrap_or(current.3.as_str()),
+                whatsapp_verify_token
+                    .map(str::trim)
+                    .unwrap_or(current.4.as_str()),
+                port,
+                id
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Insert a non-primary bot instance. Ids 1–3 are reserved for primaries; extras use id >= 4.
     pub fn create_channel_bot_instance(
         &self,
         platform: &str,
@@ -2102,15 +2337,32 @@ impl Database {
         token: &str,
     ) -> Result<i64, FinallyAValueBotError> {
         let p = platform.trim().to_ascii_lowercase();
-        if !matches!(p.as_str(), "telegram" | "discord") {
+        if !matches!(p.as_str(), "telegram" | "discord" | "whatsapp") {
             return Err(FinallyAValueBotError::ToolExecution(
-                "platform must be telegram or discord".into(),
+                "platform must be telegram, discord, or whatsapp".into(),
             ));
         }
         if token.trim().is_empty() {
             return Err(FinallyAValueBotError::ToolExecution(
                 "token cannot be empty".into(),
             ));
+        }
+        if p == "whatsapp" {
+            if !self
+                .list_channel_bot_instances_by_platform("whatsapp")?
+                .is_empty()
+            {
+                return Err(FinallyAValueBotError::ToolExecution(
+                    "Only one WhatsApp Cloud API number is supported. Edit or delete the existing WhatsApp instance.".into(),
+                ));
+            }
+            self.upsert_primary_channel_bot_instance(
+                BOT_INSTANCE_WHATSAPP_PRIMARY,
+                "whatsapp",
+                label,
+                token,
+            )?;
+            return Ok(BOT_INSTANCE_WHATSAPP_PRIMARY);
         }
         let conn = self.conn.lock().unwrap();
         let new_id = Self::next_extra_bot_instance_id_conn(&conn)?;
@@ -2186,7 +2438,7 @@ impl Database {
         let instances = self.list_all_channel_bot_instances()?;
         let mut total = 0u32;
         for inst in instances {
-            if !matches!(inst.platform.as_str(), "telegram" | "discord") {
+            if !matches!(inst.platform.as_str(), "telegram" | "discord" | "whatsapp") {
                 continue;
             }
             total += self.provision_bindings_for_instance(&inst.platform, inst.id)?;
@@ -2194,7 +2446,7 @@ impl Database {
         Ok(total)
     }
 
-    /// Rows for Settings → Channels: every telegram/discord instance plus binding/policy state for a contact.
+    /// Rows for Settings → Channels: every external chat instance plus binding/policy state for a contact.
     pub fn list_contact_channel_integration_rows(
         &self,
         canonical_chat_id: i64,
@@ -2213,7 +2465,7 @@ impl Database {
             binding_by_instance.insert(b.bot_instance_id, b);
         }
         let mut rows = Vec::new();
-        for platform in ["telegram", "discord"] {
+        for platform in ["telegram", "discord", "whatsapp"] {
             for inst in self.list_channel_bot_instances_by_platform(platform)? {
                 let binding = binding_by_instance.get(&inst.id);
                 let (persona_mode, persona_id) = policy_by_instance
@@ -2301,14 +2553,18 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Deletes a bot instance. Ids 1–3 are reserved for primary env-backed rows and cannot be deleted here.
+    /// Deletes a bot instance. Primary ids 1–3 may be deleted to disable that platform.
     pub fn delete_channel_bot_instance(&self, id: i64) -> Result<bool, FinallyAValueBotError> {
-        if (1..=3).contains(&id) {
-            return Err(FinallyAValueBotError::ToolExecution(
-                "Cannot delete primary bot instances (ids 1–3) managed from .env".into(),
-            ));
-        }
         let conn = self.conn.lock().unwrap();
+        // Drop related persona policy rows for this instance (bindings stay for contact history).
+        let _ = conn.execute(
+            "DELETE FROM channel_persona_policy WHERE bot_instance_id = ?1",
+            params![id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM channel_bindings WHERE bot_instance_id = ?1",
+            params![id],
+        );
         let rows = conn.execute(
             "DELETE FROM channel_bot_instances WHERE id = ?1",
             params![id],

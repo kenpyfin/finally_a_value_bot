@@ -375,11 +375,45 @@ export type AgentHistoryOptimizeRequest = {
 /** Redacted row from `GET /api/channel_bot_instances`. */
 export type BotInstanceRow = {
   id: number
-  platform: string
+  platform: 'telegram' | 'discord' | 'whatsapp' | string
   label: string
+  token_set?: boolean
   token_redacted: string
+  bot_username?: string
+  allowed_groups?: string
+  discord_allowed_channels?: string
+  whatsapp_phone_number_id?: string
+  whatsapp_verify_token_set?: boolean
+  whatsapp_verify_token_redacted?: string
+  whatsapp_webhook_port?: number
   created_at: string
-  env_primary: boolean
+  env_primary?: boolean
+  is_primary?: boolean
+}
+
+/** Response from `GET/PATCH /api/channels/integration`. */
+export type ChannelIntegrationSettings = {
+  ok?: boolean
+  message?: string
+  bot_username: string
+  allowed_groups: string
+  control_chat_ids: string
+  discord_allowed_channels: string
+  whatsapp_phone_number_id: string
+  whatsapp_verify_token_set: boolean
+  whatsapp_verify_token_redacted: string
+  whatsapp_webhook_port: number
+  telegram_token_set: boolean
+  telegram_token_redacted: string
+  telegram_label: string
+  discord_token_set: boolean
+  discord_token_redacted: string
+  discord_label: string
+  whatsapp_access_token_set: boolean
+  whatsapp_access_token_redacted: string
+  whatsapp_label: string
+  instances?: BotInstanceRow[]
+  requires_restart?: boolean
 }
 
 export type ScheduleTask = {

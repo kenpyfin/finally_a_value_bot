@@ -264,6 +264,11 @@ pub async fn deliver_to_contact_with_origin(
     for p in policies {
         policy_by_instance.insert(p.bot_instance_id, (p.mode, p.persona_id));
     }
+    let active_persona_id = call_blocking(db.clone(), move |d| {
+        d.get_current_persona_id(canonical_chat_id)
+    })
+    .await
+    .ok();
 
     let mut delivered_targets: HashSet<(String, String)> = HashSet::new();
     if matches!(scope, DeliveryScope::StoreOnly) {
@@ -286,6 +291,8 @@ pub async fn deliver_to_contact_with_origin(
             {
                 continue;
             }
+        } else if b.channel_type == "whatsapp" && active_persona_id != Some(persona_id) {
+            continue;
         }
         let target_key = (b.channel_type.clone(), b.channel_handle.clone());
         if !delivered_targets.insert(target_key) {
