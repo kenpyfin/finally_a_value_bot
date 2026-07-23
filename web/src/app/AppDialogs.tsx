@@ -13,14 +13,7 @@ import {
 } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
-import { SettingsLlmPanel } from '../components/settings-llm'
-import { SettingsLocalDelegatePanel } from '../components/settings-local-delegate'
-import { SettingsCursorPanel } from '../components/settings-cursor'
-import { SettingsDeterministicPipelinePanel } from '../components/settings-deterministic-pipeline'
-import { SettingsHooksSkillsPanel } from '../components/settings-hooks-skills'
-import { SettingsIntegrationsPanel } from '../components/settings-integrations'
-import { SettingsRuntimePanel } from '../components/settings-runtime'
-import { TerminalPane } from '../components/terminal-pane'
+import { InboxPanel } from '../components/inbox-panel'
 import { InitialRunPromptView } from '../components/initial-run-prompt-view'
 import {
   ArtifactListSkeleton,
@@ -47,6 +40,32 @@ import type {
   ScheduleTask,
 } from '../types'
 
+const SettingsLlmPanel = React.lazy(() =>
+  import('../components/settings-llm').then((m) => ({ default: m.SettingsLlmPanel })),
+)
+const SettingsLocalDelegatePanel = React.lazy(() =>
+  import('../components/settings-local-delegate').then((m) => ({ default: m.SettingsLocalDelegatePanel })),
+)
+const SettingsCursorPanel = React.lazy(() =>
+  import('../components/settings-cursor').then((m) => ({ default: m.SettingsCursorPanel })),
+)
+const SettingsDeterministicPipelinePanel = React.lazy(() =>
+  import('../components/settings-deterministic-pipeline').then((m) => ({
+    default: m.SettingsDeterministicPipelinePanel,
+  })),
+)
+const SettingsHooksSkillsPanel = React.lazy(() =>
+  import('../components/settings-hooks-skills').then((m) => ({ default: m.SettingsHooksSkillsPanel })),
+)
+const SettingsIntegrationsPanel = React.lazy(() =>
+  import('../components/settings-integrations').then((m) => ({ default: m.SettingsIntegrationsPanel })),
+)
+const SettingsRuntimePanel = React.lazy(() =>
+  import('../components/settings-runtime').then((m) => ({ default: m.SettingsRuntimePanel })),
+)
+const TerminalPane = React.lazy(() =>
+  import('../components/terminal-pane').then((m) => ({ default: m.TerminalPane })),
+)
 export type Appearance = 'dark' | 'light'
 
 export interface AppDialogsSettingsProps {
@@ -105,6 +124,18 @@ export interface AppDialogsSchedulesProps {
   ) => Promise<void>
   updateSchedule: (id: number, patch: Partial<ScheduleTask>) => Promise<void>
   openDetail: (task: ScheduleTask) => void
+}
+
+export interface AppDialogsInboxProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  unread: { personaId: number; personaName: string; lastBotMessageAt: string | null }[]
+  todos: import('../types').PersonaTodo[]
+  loading: boolean
+  busyTodoId: number | null
+  onRefresh: () => void
+  onOpenPersona: (personaId: number) => void
+  onCompleteTodo: (todoId: number) => void
 }
 
 export interface AppDialogsScheduleDetailProps {
@@ -210,6 +241,7 @@ export interface AppDialogsProps {
   settings: AppDialogsSettingsProps
   queue: AppDialogsQueueProps
   schedules: AppDialogsSchedulesProps
+  inbox: AppDialogsInboxProps
   scheduleDetail: AppDialogsScheduleDetailProps
   agentsMd: AppDialogsAgentsMdProps
   artifacts: AppDialogsArtifactsProps
@@ -488,6 +520,7 @@ export function AppDialogs({
   settings,
   queue,
   schedules,
+  inbox,
   scheduleDetail,
   agentsMd,
   artifacts,
@@ -622,6 +655,7 @@ export function AppDialogs({
   return (
     <>
 <Dialog.Root open={settingsDialogOpen} onOpenChange={setSettingsDialogOpen}>
+{settingsDialogOpen ? (
 <Dialog.Content style={{ maxWidth: 920 }}>
     <Dialog.Title>Web UI configuration</Dialog.Title>
     <Dialog.Description size="2" mb="3">
@@ -651,6 +685,7 @@ export function AppDialogs({
         <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
         <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
       </Tabs.List>
+      <React.Suspense fallback={<SettingsPanelSkeleton />}>
       <Tabs.Content value="overview">
         {installationStatus ? (
           <Flex direction="column" gap="2" mb="2">
@@ -844,6 +879,7 @@ export function AppDialogs({
       </div>
     </div>
       </Tabs.Content>
+      </React.Suspense>
     </Tabs.Root>
     <Flex justify="end" mt="4">
       <Dialog.Close>
@@ -851,9 +887,11 @@ export function AppDialogs({
       </Dialog.Close>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
 <Dialog.Root open={queueDialogOpen} onOpenChange={setQueueDialogOpen}>
-  <Dialog.Content style={{ maxWidth: 920 }}>
+{queueDialogOpen ? (
+<Dialog.Content style={{ maxWidth: 920 }}>
     <Dialog.Title>Run queue</Dialog.Title>
     <Dialog.Description size="2" mb="3">
       Pending and running agent work (FIFO per persona). Queued items can be removed immediately; running items can be stopped.
@@ -1092,12 +1130,28 @@ export function AppDialogs({
       </Dialog.Close>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
+
+<InboxPanel
+  appearance={appearance}
+  open={inbox.open}
+  onOpenChange={inbox.onOpenChange}
+  unread={inbox.unread}
+  todos={inbox.todos}
+  personas={personas}
+  loading={inbox.loading}
+  busyTodoId={inbox.busyTodoId}
+  onRefresh={inbox.onRefresh}
+  onOpenPersona={inbox.onOpenPersona}
+  onCompleteTodo={inbox.onCompleteTodo}
+/>
 
 <Dialog.Root
   open={schedulesDialogOpen}
   onOpenChange={(open) => setSchedulesDialogOpen(open)}
 >
+{schedulesDialogOpen ? (
 <Dialog.Content style={{ maxWidth: 820 }}>
     <Dialog.Title>Schedules</Dialog.Title>
     <Dialog.Description size="2" mb="3">
@@ -1236,13 +1290,15 @@ export function AppDialogs({
       </Dialog.Close>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
 
 <Dialog.Root
   open={scheduleDetailTask != null}
   onOpenChange={scheduleDetail.onOpenChange}
 >
-  <Dialog.Content style={{ maxWidth: 720 }}>
+{scheduleDetailTask != null ? (
+<Dialog.Content style={{ maxWidth: 720 }}>
     <Dialog.Title>
       {scheduleDetailTask != null ? `Schedule #${scheduleDetailTask.id}` : 'Schedule'}
     </Dialog.Title>
@@ -1356,12 +1412,14 @@ export function AppDialogs({
       </>
     ) : null}
   </Dialog.Content>
+) : null}
 </Dialog.Root>
 
 <Dialog.Root
   open={agentsMdOpen}
   onOpenChange={agentsMd.onOpenChange}
 >
+{agentsMdOpen ? (
 <Dialog.Content style={{ maxWidth: 900 }}>
     <Dialog.Title>Workspace principles (AGENTS.md)</Dialog.Title>
     <Dialog.Description size="2" mb="3">
@@ -1402,12 +1460,14 @@ export function AppDialogs({
       </Flex>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
 
 <Dialog.Root
   open={artifactsDialogOpen}
   onOpenChange={artifacts.onOpenChange}
 >
+{artifactsDialogOpen ? (
 <Dialog.Content style={{ maxWidth: 980 }}>
     <Dialog.Title>Artifacts</Dialog.Title>
     <Dialog.Description size="2" mb="3">
@@ -1546,12 +1606,14 @@ export function AppDialogs({
       </Dialog.Close>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
 
 <Dialog.Root
   open={memoryDialogOpen}
   onOpenChange={memory.onOpenChange}
 >
+{memoryDialogOpen ? (
 <Dialog.Content style={{ maxWidth: 900 }}>
     <Dialog.Title>Persona memory</Dialog.Title>
     <Dialog.Description size="2" mb="3">
@@ -1609,12 +1671,14 @@ export function AppDialogs({
       </Flex>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
 
 <Dialog.Root
   open={agentHistoryDialogOpen}
   onOpenChange={agentHistory.onOpenChange}
 >
+{agentHistoryDialogOpen ? (
 <Dialog.Content style={{ maxWidth: 960 }}>
     <Dialog.Title>Agent run debug</Dialog.Title>
     <Dialog.Description size="2" mb="3">
@@ -1826,10 +1890,12 @@ export function AppDialogs({
       </Dialog.Close>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
 
 <Dialog.Root open={terminalDialogOpen} onOpenChange={setTerminalDialogOpen}>
-  <Dialog.Content style={{ maxWidth: 1080, width: 'min(96vw, 1080px)' }} className="flex max-h-[min(88vh,900px)] flex-col">
+{terminalDialogOpen ? (
+<Dialog.Content style={{ maxWidth: 1080, width: 'min(96vw, 1080px)' }} className="flex max-h-[min(88vh,900px)] flex-col">
     <Dialog.Title>Terminal</Dialog.Title>
     <Dialog.Description size="2" mb="3">
       Interactive shell in the gateway workspace. Operator-only; requires WEB_AUTH_TOKEN and WEB_TERMINAL_ENABLED.
@@ -1839,16 +1905,19 @@ export function AppDialogs({
         <Callout.Text>{terminalError}</Callout.Text>
       </Callout.Root>
     ) : null}
-    <TerminalPane
-      active={terminalDialogOpen}
-      onError={(message) => setTerminalError(message)}
-    />
+    <React.Suspense fallback={<SettingsPanelSkeleton />}>
+      <TerminalPane
+        active={terminalDialogOpen}
+        onError={(message) => setTerminalError(message)}
+      />
+    </React.Suspense>
     <Flex justify="end" mt="3" className="shrink-0">
       <Dialog.Close>
         <Button size="1" variant="soft">Close</Button>
       </Dialog.Close>
     </Flex>
   </Dialog.Content>
+) : null}
 </Dialog.Root>
     </>
   )

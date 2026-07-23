@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod memory;
 pub mod memory_state;
 pub mod path_guard;
+pub mod persona_todo;
 pub mod read_file;
 pub mod read_repo_map;
 pub mod register_hook;
@@ -665,6 +666,9 @@ impl ToolRegistry {
                 &config.runtime_data_dir(),
             )),
             Box::new(bulletin::UpdateBulletinFocusTool::new(db.clone())),
+            Box::new(persona_todo::AddTodoTool::new(db.clone())),
+            Box::new(persona_todo::ListTodosTool::new(db.clone())),
+            Box::new(persona_todo::CompleteTodoTool::new(db.clone())),
             Box::new(search_history::SearchHistoryTool::new(db.clone())),
             Box::new(agent_history::ReadAgentHistoryTool::new(
                 &config.runtime_data_dir(),
@@ -785,6 +789,7 @@ impl ToolRegistry {
                         | "read_agent_history"
                         | "list_scheduled_tasks"
                         | "get_task_history"
+                        | "list_todos"
                 );
                 if allowed {
                     Some(t.definition())

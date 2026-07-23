@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import type { BackgroundJobItem, Persona, QueueLane } from '../types'
 import {
   fetchOpsPollBundle,
@@ -14,6 +14,24 @@ type UseOpsPollArgs = {
   docVisible: boolean
   pendingRunsForActivePersona: number
   setPersonas: React.Dispatch<React.SetStateAction<Persona[]>>
+}
+
+/** Compare persona list fields that drive sidebar UI; skip setState when poll data is unchanged. */
+export function personasSnapshotEqual(a: Persona[], b: Persona[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i]
+    const y = b[i]
+    if (
+      x.id !== y.id
+      || x.name !== y.name
+      || x.is_active !== y.is_active
+      || (x.last_bot_message_at ?? null) !== (y.last_bot_message_at ?? null)
+    ) {
+      return false
+    }
+  }
+  return true
 }
 
 /**
@@ -35,6 +53,8 @@ export function useOpsPoll({
   invalidateOps: (chatIdOverride?: number | null) => Promise<void>
 } {
   const queryClient = useQueryClient()
+  const lastPersonasRef = useRef<Persona[] | null>(null)
+  const lastPersonasFetchMsRef = useRef(0)
 
   const query = useQuery({
     queryKey: ['opsPoll', chatId],
@@ -42,9 +62,16 @@ export function useOpsPoll({
       if (chatId == null) {
         throw new Error('opsPoll: missing chatId')
       }
-      return fetchOpsPollBundle(chatId)
+      // Queue/background stay on the fast interval; personas only every 10s (sidebar unread dots).
+      const now = Date.now()
+      const includePersonas = now - lastPersonasFetchMsRef.current >= 10000
+      const bundle = await fetchOpsPollBundle(chatId, { includePersonas })
+      if (includePersonas) lastPersonasFetchMsRef.current = now
+      return bundle
     },
     enabled: chatId != null,
+    // Align with the slowest idle poll so React Query does not mark data stale between ticks.
+    staleTime: 2500,
     refetchInterval: (q) => {
       if (chatId == null) return false
       const d = q.state.data
@@ -64,10 +91,13 @@ export function useOpsPoll({
 
   useEffect(() => {
     const snap = query.data?.personasSnapshot
-    if (snap && snap.length >= 0) {
-      setPersonas(snap)
+    if (!snap || query.data?.personasIncluded === false) return
+    if (lastPersonasRef.current && personasSnapshotEqual(lastPersonasRef.current, snap)) {
+      return
     }
-  }, [query.data?.personasSnapshot, setPersonas])
+    lastPersonasRef.current = snap
+    setPersonas(snap)
+  }, [query.data?.personasSnapshot, query.data?.personasIncluded, setPersonas])
 
   const queueLanesAll = query.data?.queueLanes ?? []
   const queueLane = useMemo(

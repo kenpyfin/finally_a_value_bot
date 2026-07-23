@@ -479,6 +479,20 @@ pub struct PersonaMessageBookmark {
     pub updated_at: String,
 }
 
+/// Operator action item created by the agent (web Inbox); not Tier 3 memory.
+#[derive(Debug, Clone)]
+pub struct PersonaTodo {
+    pub id: i64,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    pub title: String,
+    pub status: String,
+    pub source_hint: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
@@ -780,6 +794,7 @@ impl Database {
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
         Self::migrate_drop_project_artifacts(&conn)?;
         Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
+        Self::migrate_persona_todos(&conn)?;
         Self::migrate_workflow_learning_schema(&conn)?;
         Self::migrate_background_jobs_lease_schema(&conn)?;
         Self::migrate_background_jobs_shell_schema(&conn)?;
@@ -1709,6 +1724,27 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_persona_message_bookmarks_persona_time
                 ON persona_message_bookmarks(chat_id, persona_id, updated_at DESC);",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_persona_todos(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS persona_todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source_hint TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_todos_chat_status_time
+                ON persona_todos(chat_id, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_persona_todos_persona_status
+                ON persona_todos(chat_id, persona_id, status);",
         )?;
         Ok(())
     }
@@ -4240,6 +4276,234 @@ impl Database {
         Ok(items)
     }
 
+    pub fn add_persona_todo(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        title: &str,
+        source_hint: Option<&str>,
+    ) -> Result<PersonaTodo, FinallyAValueBotError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Todo title must not be empty".into(),
+            ));
+        }
+        let clipped_title: String = title.chars().take(500).collect();
+        let clipped_hint = source_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(1000).collect::<String>());
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO persona_todos (
+                chat_id, persona_id, title, status, source_hint, created_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?5, NULL)",
+            params![chat_id, persona_id, clipped_title, clipped_hint, now],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(PersonaTodo {
+            id,
+            chat_id,
+            persona_id,
+            title: clipped_title,
+            status: "open".into(),
+            source_hint: clipped_hint,
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+        })
+    }
+
+    pub fn list_persona_todos(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        status_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PersonaTodo>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 200) as i64;
+        let mut out = Vec::new();
+        if let Some(status) = status_filter {
+            let mut stmt = conn.prepare(
+                "SELECT id, chat_id, persona_id, title, status, source_hint, created_at, updated_at, completed_at
+                 FROM persona_todos
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND status = ?3
+                 ORDER BY updated_at DESC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(params![chat_id, persona_id, status, limit], |row| {
+                Ok(PersonaTodo {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    source_hint: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                })
+            })?;
+            for r in rows {
+                out.push(r?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, chat_id, persona_id, title, status, source_hint, created_at, updated_at, completed_at
+                 FROM persona_todos
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                 ORDER BY
+                   CASE status WHEN 'open' THEN 0 ELSE 1 END,
+                   updated_at DESC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![chat_id, persona_id, limit], |row| {
+                Ok(PersonaTodo {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    source_hint: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                })
+            })?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn list_todos_for_chat(
+        &self,
+        chat_id: i64,
+        status_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PersonaTodo>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500) as i64;
+        let mut out = Vec::new();
+        if let Some(status) = status_filter {
+            let mut stmt = conn.prepare(
+                "SELECT id, chat_id, persona_id, title, status, source_hint, created_at, updated_at, completed_at
+                 FROM persona_todos
+                 WHERE chat_id = ?1 AND status = ?2
+                 ORDER BY updated_at DESC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![chat_id, status, limit], |row| {
+                Ok(PersonaTodo {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    source_hint: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                })
+            })?;
+            for r in rows {
+                out.push(r?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, chat_id, persona_id, title, status, source_hint, created_at, updated_at, completed_at
+                 FROM persona_todos
+                 WHERE chat_id = ?1
+                 ORDER BY
+                   CASE status WHEN 'open' THEN 0 ELSE 1 END,
+                   updated_at DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![chat_id, limit], |row| {
+                Ok(PersonaTodo {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    source_hint: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                })
+            })?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_persona_todo(
+        &self,
+        todo_id: i64,
+    ) -> Result<Option<PersonaTodo>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, chat_id, persona_id, title, status, source_hint, created_at, updated_at, completed_at
+             FROM persona_todos WHERE id = ?1",
+            params![todo_id],
+            |row| {
+                Ok(PersonaTodo {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    persona_id: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    source_hint: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                })
+            },
+        );
+        match result {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_persona_todo_status(
+        &self,
+        todo_id: i64,
+        status: &str,
+    ) -> Result<Option<PersonaTodo>, FinallyAValueBotError> {
+        let status = status.trim();
+        if status != "open" && status != "done" {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Todo status must be 'open' or 'done'".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let completed_at: Option<String> = if status == "done" {
+            Some(now.clone())
+        } else {
+            None
+        };
+        let rows = conn.execute(
+            "UPDATE persona_todos
+             SET status = ?1, updated_at = ?2, completed_at = ?3
+             WHERE id = ?4",
+            params![status, now, completed_at, todo_id],
+        )?;
+        if rows == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_persona_todo(todo_id)
+    }
+
     pub fn message_exists_in_persona(
         &self,
         chat_id: i64,
@@ -5717,6 +5981,10 @@ impl Database {
         )?;
         let _ = tx.execute(
             "DELETE FROM persona_message_bookmarks WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let _ = tx.execute(
+            "DELETE FROM persona_todos WHERE chat_id = ?1 AND persona_id = ?2",
             params![chat_id, persona_id],
         )?;
         let rows = tx.execute(

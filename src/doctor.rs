@@ -615,10 +615,7 @@ fn check_node_and_browser(report: &mut DoctorReport) {
     let steel_cdp_port = Config::load()
         .map(|c| c.steel_cdp_port)
         .unwrap_or(crate::config::default_steel_cdp_port());
-    let steel_health_url = format!(
-        "{}/api/health",
-        steel_url.trim_end_matches('/')
-    );
+    let steel_health_url = format!("{}/api/health", steel_url.trim_end_matches('/'));
     let steel_ok = std::process::Command::new("curl")
         .args(["-sf", "--max-time", "3", &steel_health_url])
         .stdout(std::process::Stdio::null())

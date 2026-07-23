@@ -5672,7 +5672,7 @@ pub(super) fn build_system_prompt(
 - **Cursor CLI:** cursor_agent, cursor_agent_send, list_cursor_agent_runs (use detach: true for long work)
 - **Skills:** `activate_skill` loads full `SKILL.md`; **`run_skill_script`** runs bundled skill scripts (prefer over bash); **new** skills → activate `create-skill` then **`build_skill`**; **existing** skill changes are runtime-gated to require **`modify-skill`** activation in the same turn
 {sops_caps_line}- **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). **`register_tracked_job`** records an external id (e.g. ComfyUI `prompt_id`) so it appears in the same queue as shell jobs without blocking another background slot. Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
-- **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, read_agent_history
+- **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, add_todo, list_todos, complete_todo, read_agent_history
 
 ## Conversation Memory
 - **Primary task**: Your goal for this turn is the `[current_request]` message at the end of the conversation. Answer that first; do not expand scope using bulletin, memory, or history unless `[current_request]` references those topics or needs recall to answer.

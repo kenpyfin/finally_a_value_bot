@@ -82,19 +82,52 @@ export type OpsPollBundle = {
   backgroundActiveCount: number
   backgroundJobs: BackgroundJobItem[]
   personasSnapshot: Persona[]
+  /** False when this tick skipped the personas HTTP call (caller should keep prior snapshot). */
+  personasIncluded: boolean
 }
 
-export async function fetchOpsPollBundle(chatId: number): Promise<OpsPollBundle> {
-  const [queueLanes, background, personasSnapshot] = await Promise.all([
-    fetchQueueLanesForChat(chatId),
-    fetchBackgroundJobsSnapshot(chatId),
-    fetchPersonasSnapshot(chatId),
-  ])
+export type OpsPollApiResponse = {
+  lanes?: QueueLane[]
+  jobs?: BackgroundJobItem[]
+  active_count?: number
+  personas_included?: boolean
+  personas?: {
+    id: number
+    name: string
+    is_active: boolean
+    last_bot_message_at?: string | null
+  }[]
+}
+
+export async function fetchOpsPollBundle(
+  chatId: number,
+  opts?: { includePersonas?: boolean },
+): Promise<OpsPollBundle> {
+  const includePersonas = opts?.includePersonas !== false
+  const q = new URLSearchParams({ chat_id: String(chatId) })
+  if (!includePersonas) q.set('include_personas', '0')
+  const data = await api<OpsPollApiResponse>(`/api/ops_poll?${q.toString()}`)
+  const jobs: BackgroundJobItem[] = Array.isArray(data.jobs) ? data.jobs : []
+  const activeCountFromApi =
+    typeof data.active_count === 'number' && Number.isFinite(data.active_count)
+      ? Math.max(0, Math.floor(data.active_count))
+      : null
+  const activeByStatus = jobs.filter((j) =>
+    ['pending', 'running', 'completed_raw', 'main_agent_processing'].includes(j.status),
+  ).length
+  const personasIncluded = data.personas_included !== false
+  const list = Array.isArray(data.personas) ? data.personas : []
   return {
-    queueLanes,
-    backgroundActiveCount: background.activeCount,
-    backgroundJobs: background.jobs,
-    personasSnapshot,
+    queueLanes: Array.isArray(data.lanes) ? data.lanes : [],
+    backgroundActiveCount: activeCountFromApi ?? activeByStatus,
+    backgroundJobs: jobs,
+    personasSnapshot: list.map((p) => ({
+      id: p.id,
+      name: p.name,
+      is_active: p.is_active,
+      last_bot_message_at: p.last_bot_message_at ?? null,
+    })),
+    personasIncluded,
   }
 }
 

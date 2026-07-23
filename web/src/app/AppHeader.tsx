@@ -34,6 +34,8 @@ export type AppHeaderToolbarProps = {
   statusText: string
   onExpandCockpit: () => void
   onOpenSettings: () => void
+  onOpenInbox: () => void
+  inboxBadgeCount?: number
   onOpenSchedules: () => void
   onOpenQueue: () => void
   onOpenPrinciples: () => void
@@ -55,7 +57,7 @@ export type AppHeaderProps = {
   onOpenMobileOps: () => void
 }
 
-export function AppHeader({
+export const AppHeader = React.memo(function AppHeader({
   appearance,
   mobileChatHeaderCollapsed,
   nav,
@@ -89,6 +91,8 @@ export function AppHeader({
     statusText,
     onExpandCockpit,
     onOpenSettings,
+    onOpenInbox,
+    inboxBadgeCount = 0,
     onOpenSchedules,
     onOpenQueue,
     onOpenPrinciples,
@@ -188,6 +192,25 @@ export function AppHeader({
               />
             ) : null}
             <div className="ml-auto flex shrink-0 items-center gap-1 md:hidden">
+              <button
+                type="button"
+                className={`mc-inbox-launch mc-inbox-launch--icon cursor-pointer ${
+                  mobileChatHeaderCollapsed ? 'min-h-9 min-w-9' : 'min-h-10 min-w-10'
+                }`}
+                data-has-items={inboxBadgeCount > 0 ? 'true' : 'false'}
+                aria-label={
+                  inboxBadgeCount > 0 ? `Inbox, ${inboxBadgeCount} items` : 'Inbox'
+                }
+                title="Inbox"
+                onClick={onOpenInbox}
+              >
+                Inbox
+                {inboxBadgeCount > 0 ? (
+                  <span className="mc-inbox-launch__badge" aria-hidden>
+                    {inboxBadgeCount > 99 ? '99+' : inboxBadgeCount}
+                  </span>
+                ) : null}
+              </button>
               <IconButton
                 size="2"
                 variant="soft"
@@ -222,6 +245,24 @@ export function AppHeader({
               statusText={statusText}
               onClick={onExpandCockpit}
             />
+            <button
+              type="button"
+              className="mc-inbox-launch !hidden md:!inline-flex"
+              data-has-items={inboxBadgeCount > 0 ? 'true' : 'false'}
+              aria-label={
+                inboxBadgeCount > 0 ? `Inbox, ${inboxBadgeCount} items` : 'Open Inbox'
+              }
+              title="Inbox — new messages and todos"
+              onClick={onOpenInbox}
+            >
+              Inbox
+              {inboxBadgeCount > 0 ? (
+                <span className="mc-inbox-launch__badge" aria-hidden>
+                  {inboxBadgeCount > 99 ? '99+' : inboxBadgeCount}
+                </span>
+              ) : null}
+            </button>
+            <span className="mc-toolbar-divider !hidden md:!inline-block" aria-hidden />
             <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenSettings}>
               Settings
             </Button>
@@ -259,4 +300,4 @@ export function AppHeader({
       </div>
     </header>
   )
-}
+})

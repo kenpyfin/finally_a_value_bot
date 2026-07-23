@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import { Button, Dialog, Flex, Text, TextField } from '@radix-ui/themes'
-import { AUTH_REQUIRED_EVENT, sanitizeHttpHeaderValue, WEB_AUTH_STORAGE_KEY } from '../api/client'
+import { AUTH_REQUIRED_EVENT, sanitizeHttpHeaderValue, setStoredAuthToken } from '../api/client'
 
 type AuthContextValue = {
   authRequired: boolean
@@ -35,7 +35,7 @@ export function AuthProvider({
       onAuthError('Invalid API token: unsupported header characters.')
       return
     }
-    sessionStorage.setItem(WEB_AUTH_STORAGE_KEY, token)
+    setStoredAuthToken(token)
     setAuthRequired(false)
     setAuthTokenInput('')
     window.location.reload()

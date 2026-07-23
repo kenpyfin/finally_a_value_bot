@@ -1033,7 +1033,9 @@ impl SetupApp {
                 | "WHATSAPP_VERIFY_TOKEN"
                 | "WHATSAPP_WEBHOOK_PORT" => "WhatsApp",
                 "WEB_ENABLED" | "WEB_HOST" | "WEB_PORT" | "WEB_AUTH_TOKEN" => "Web UI",
-                "BROWSER_MANAGED" | "STEEL_API_URL" | "STEEL_API_PORT" | "STEEL_CDP_PORT" => "Browser",
+                "BROWSER_MANAGED" | "STEEL_API_URL" | "STEEL_API_PORT" | "STEEL_CDP_PORT" => {
+                    "Browser"
+                }
                 "CURSOR_AGENT_CLI_PATH" | "CURSOR_AGENT_MODEL" | "CURSOR_AGENT_RUNNER_URL" => {
                     "Cursor Agent"
                 }
@@ -1376,10 +1378,10 @@ fn save_config_env(
     emit!("", "WEB_AUTH_TOKEN", get("WEB_AUTH_TOKEN"), false);
 
     // Browser
-  emit!("Browser", "BROWSER_MANAGED", get("BROWSER_MANAGED"), false);
-  emit!("", "STEEL_API_PORT", get("STEEL_API_PORT"), false);
-  emit!("", "STEEL_CDP_PORT", get("STEEL_CDP_PORT"), false);
-  emit!("", "STEEL_API_URL", get("STEEL_API_URL"), false);
+    emit!("Browser", "BROWSER_MANAGED", get("BROWSER_MANAGED"), false);
+    emit!("", "STEEL_API_PORT", get("STEEL_API_PORT"), false);
+    emit!("", "STEEL_CDP_PORT", get("STEEL_CDP_PORT"), false);
+    emit!("", "STEEL_API_URL", get("STEEL_API_URL"), false);
 
     // Cursor Agent
     emit!(

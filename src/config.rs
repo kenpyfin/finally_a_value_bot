@@ -783,8 +783,9 @@ impl Config {
 
     /// Resolved Steel API URL (`STEEL_API_URL` env override, else local managed port).
     pub fn steel_api_url(&self) -> String {
-        Self::env("STEEL_API_URL")
-            .unwrap_or_else(|| crate::steel_browser_sidecar::default_local_steel_api_url(self.steel_api_port))
+        Self::env("STEEL_API_URL").unwrap_or_else(|| {
+            crate::steel_browser_sidecar::default_local_steel_api_url(self.steel_api_port)
+        })
     }
 
     /// Resolve path to .env file. FINALLY_A_VALUE_BOT_CONFIG can override (points to .env).

@@ -15,19 +15,48 @@ function sanitizeHttpHeaderValue(value: string): string | null {
   return trimmed
 }
 
+/** Persist auth across browser restarts (migrates legacy sessionStorage once). */
 export function getStoredAuthToken(): string | null {
-  if (typeof sessionStorage === 'undefined') return null
+  if (typeof localStorage === 'undefined') return null
   try {
-    const t = sessionStorage.getItem(WEB_AUTH_STORAGE_KEY)
+    let t = localStorage.getItem(WEB_AUTH_STORAGE_KEY)
+    if (!t && typeof sessionStorage !== 'undefined') {
+      try {
+        const legacy = sessionStorage.getItem(WEB_AUTH_STORAGE_KEY)
+        if (legacy) {
+          localStorage.setItem(WEB_AUTH_STORAGE_KEY, legacy)
+          sessionStorage.removeItem(WEB_AUTH_STORAGE_KEY)
+          t = legacy
+        }
+      } catch {
+        // ignore migration failures
+      }
+    }
     if (!t) return null
     const sanitized = sanitizeHttpHeaderValue(t)
     if (!sanitized) {
-      sessionStorage.removeItem(WEB_AUTH_STORAGE_KEY)
+      localStorage.removeItem(WEB_AUTH_STORAGE_KEY)
       return null
     }
     return sanitized
   } catch {
     return null
+  }
+}
+
+export function setStoredAuthToken(token: string): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem(WEB_AUTH_STORAGE_KEY, token)
+    if (typeof sessionStorage !== 'undefined') {
+      try {
+        sessionStorage.removeItem(WEB_AUTH_STORAGE_KEY)
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
   }
 }
 

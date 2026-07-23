@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { HISTORY_PAGE_SIZE } from '../app/constants'
 import {
+  baselinePersonaLastReadIfMissing,
   readPersonaLastReadAt,
   readStoredPersonaId,
   resolveStoredSessionId,
@@ -73,9 +74,10 @@ export function usePersonaSession({
   }, [chatId, personas, activePersonaId, personaReadNonce])
 
   const markPersonaRead = useCallback(
-    (personaId: number) => {
-      if (chatId == null) return
-      writePersonaLastReadAt(chatId, personaId, new Date().toISOString())
+    (personaId: number, chatIdOverride?: number | null) => {
+      const cid = chatIdOverride ?? chatId
+      if (cid == null) return
+      writePersonaLastReadAt(cid, personaId, new Date().toISOString())
       setPersonaReadNonce((x) => x + 1)
     },
     [chatId],
@@ -101,6 +103,9 @@ export function usePersonaSession({
           is_active: p.is_active,
           last_bot_message_at: p.last_bot_message_at ?? null,
         }))
+        if (baselinePersonaLastReadIfMissing(cid, personaList)) {
+          setPersonaReadNonce((x) => x + 1)
+        }
         setPersonas(personaList)
         const active = list.find((p) => p.is_active)
         const defaultChoice = active ?? list[0]

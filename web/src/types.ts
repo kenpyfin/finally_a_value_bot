@@ -429,6 +429,18 @@ export type ScheduleTask = {
   created_at: string | null
 }
 
+export type PersonaTodo = {
+  id: number
+  chat_id: number
+  persona_id: number
+  title: string
+  status: string
+  source_hint?: string | null
+  created_at: string
+  updated_at: string
+  completed_at?: string | null
+}
+
 export type MessageItem = {
   id: string
   sender_name: string

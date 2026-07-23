@@ -4,6 +4,20 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-23 — Web UI performance: ThreadPane isolation, poll churn, bundle split, ops_poll
+
+- **Area:** web frontend / web API
+- **Summary:** Fixed idle jank from ops/history polling defeating chat isolation. Stabilized ThreadPane callbacks (`useCallback`), hoisted `makeMarkdownText` to module scope, equality-gated `setPersonas` (`personasSnapshotEqual`), memoized Header/Sidebar/Cockpit, lazy-loaded settings/terminal panels, Vite `manualChunks` + `font-display: optional`. Ops poll refreshes personas only every 10s. Phase 4: SSE delta yield throttle 50→80ms; new `GET /api/ops_poll` returns lanes + background jobs (+ optional personas) so the client no longer fans out three GETs per tick. Message-list virtualization deferred unless residual jank remains.
+- **Key files / symbols:** `ThreadPane` / `MarkdownText` in `web/src/components/thread-pane.tsx`; `personasSnapshotEqual` / `useOpsPoll` in `web/src/hooks/use-ops-poll.ts`; `fetchOpsPollBundle` in `web/src/api/ops-fetch.ts`; `api_ops_poll` in `src/web.rs`; `manualChunks` in `web/vite.config.ts`; SSE flush in `web/src/app/App.tsx`.
+- **Note:** Rebuild web (`cd web && npm run build`) and restart bot so embedded assets + `/api/ops_poll` are live.
+
+### 2026-07-22 — Web persistent auth + Inbox (unread + agent todos)
+
+- **Area:** web UI / auth / personas / agent tools
+- **Summary:** Web auth token now persists in `localStorage` (with one-time migrate from `sessionStorage`) so closing the browser no longer forces re-entry. Persona unread dots no longer light up for all history: missing last-read is baselined on persona load, and boot `markPersonaRead` accepts an explicit chat id. Added per-persona operator todos (`persona_todos` SQLite) with agent tools `add_todo` / `list_todos` / `complete_todo`, `GET/PATCH /api/todos`, and an Inbox dialog (new messages + open todos) with header/mobile badge.
+- **Key files / symbols:** `getStoredAuthToken` / `setStoredAuthToken` in `web/src/api/client.ts`; `baselinePersonaLastReadIfMissing` in `web/src/lib/persona-storage.ts`; `markPersonaRead` in `use-persona-session.ts`; `PersonaTodo` + `migrate_persona_todos` in `src/db.rs`; `src/tools/persona_todo.rs`; `api_todos_list` / `api_todos_patch` in `src/web.rs`; `InboxPanel` in `web/src/components/inbox-panel.tsx`.
+- **Note:** Rebuild web assets + restart bot. Distinct from removed `todo_*` / `TODO.json` and from Tier 3 memory. Operator completes todos in Inbox; agent creates them.
+
 ### 2026-07-15 — Integrations tab unified around bot instances
 
 - **Area:** channels / web settings / config
