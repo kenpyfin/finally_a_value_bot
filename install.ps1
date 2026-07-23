@@ -110,10 +110,8 @@ try {
     Write-Info "If 'finally-a-value-bot' is not found, open a new terminal and run: finally-a-value-bot help"
   }
 
-  if (-not (Get-Command agent-browser.cmd -ErrorAction SilentlyContinue) -and -not (Get-Command agent-browser -ErrorAction SilentlyContinue)) {
-    Write-Info "Optional: install browser automation support with:"
-    Write-Info "  npm install -g agent-browser"
-    Write-Info "  agent-browser install"
+  if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    Write-Info "Optional: install Docker for Steel browser automation (steel-browser skill)."
   }
 
   Write-Info ""

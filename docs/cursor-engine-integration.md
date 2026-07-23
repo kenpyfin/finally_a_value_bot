@@ -217,13 +217,15 @@ Classic and Deterministic engines still receive the full `build_system_prompt` o
 | Mode | When | Sidecar receives |
 | --- | --- | --- |
 | **Full slim** | First turn, scheduled tasks, stale-agent retry, or resume-delta disabled | Slim system prompt (tool catalog stripped when MCP on) + full `hook_messages` flatten |
-| **Resume delta** | Resumed Cursor session (`agent_id` in DB) on interactive turns | Minimal runtime header + trusted delta messages only (`[system_runtime_context]`, `[persona_context]`, `[session_context]`, `[current_request]`, `[hook_context]`) |
+| **Resume delta** | Resumed Cursor session (`agent_id` in DB) on interactive turns | Minimal runtime header (Tier 1 anchor + git discipline when applicable) + trusted delta messages (`[system_runtime_context]`, `[persona_context]`, `[session_context]`, `[hook_context]`, **`[continuation_context]`** last prior turn pair, `[current_request]`) |
 
 **Unchanged for finish path:** `prep.system_prompt` (full) still feeds `pipeline_finish_turn`, PDQE, and agent history.
 
 **Slim prompt** (`delegation_slim_prompt`, default on): when MCP is live, replaces the `## Tool groups` prose block with a short MCP delegation section pointing at `finally-a-value-bot`. Shortens the `# Agent Skills` intro but keeps `<available_skills>` metadata for routing.
 
-**Resume delta** (`delegation_resume_delta`, default on): avoids re-sending principles + full chat history when Cursor retains session memory via `agent_id`. Scheduled jobs always use full slim.
+**Resume delta** (`delegation_resume_delta`, default on): avoids re-sending principles + full chat history when Cursor retains session memory via `agent_id`. Always includes the **last prior_turn user+assistant pair** as `[continuation_context]` so follow-ups like "commit and push" retain repo/task context. Tier 1 identity/repo facts are extracted from the full delegation system prompt into the minimal header. Scheduled jobs always use full slim.
+
+**PostDelivery focus sync** (`postdelivery-persona-focus-sync`): after delivery, a lightweight strategy LLM sub-call syncs bulletin/Tier 3. Task deliveries (`had_tool_calls`, long replies, or non-conversational) require `update_bulletin_focus`; sync context uses the delivered assistant text and a **fresh DB bulletin read** (not stale prep `[persona_context]`). Logs: `focus_sync_started`, `focus_sync_completed`, `focus_sync_noop`.
 
 **Stale agent id:** if the sidecar reports a missing `agent_id`, the DB id is cleared and the turn retries once with a **full slim** prompt (not delta).
 

@@ -38,7 +38,7 @@ use crate::db::{
 };
 use crate::hook_actions::{apply_deterministic_persona_memory_hygiene, apply_hook_memory_effects};
 use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput};
-use crate::llm::LlmProvider;
+use crate::llm::{LlmProvider, LlmSendOptions};
 use crate::memory::MemoryManager;
 use crate::memory::{
     enrich_persona_memory_for_prompt, render_identity_and_tier1_for_system, render_memory_for_llm,
@@ -282,7 +282,8 @@ pub struct AppState {
     pub cursor_settings: Arc<std::sync::RwLock<crate::cursor_engine_config::CursorEngineSettings>>,
     pub pipeline_profile: Arc<std::sync::RwLock<crate::agent_pipeline::PipelineProfile>>,
     pub cursor_sidecar: Arc<crate::cursor_sdk_sidecar::SidecarHandle>,
-    /// Telegram bots keyed by `channel_bot_instances.id` (see `Database::sync_channel_bot_instances_from_config`).
+    pub steel_browser: Arc<crate::steel_browser_sidecar::SteelBrowserHandle>,
+    /// Telegram bots keyed by `channel_bot_instances.id`.
     pub telegram_bots: Arc<HashMap<i64, Bot>>,
     pub db: Arc<Database>,
     pub memory: MemoryManager,
@@ -519,6 +520,7 @@ pub async fn run_bot(
     ));
     let cursor_sidecar =
         crate::cursor_sdk_sidecar::bootstrap(&config, &db, cursor_settings.clone()).await;
+    let steel_browser = crate::steel_browser_sidecar::bootstrap(&config).await;
     let app_state_slot: Arc<std::sync::OnceLock<Arc<AppState>>> =
         Arc::new(std::sync::OnceLock::new());
     let env_redactor = Arc::new(EnvSecretRedactor::discover(&config));
@@ -612,6 +614,7 @@ pub async fn run_bot(
         cursor_settings,
         pipeline_profile,
         cursor_sidecar,
+        steel_browser,
         telegram_bots: Arc::new(telegram_bots_map),
         db,
         memory,
@@ -1365,6 +1368,24 @@ async fn handle_message(
     };
 
     let chat_title = msg.chat.title().map(|t| t.to_string());
+    let instance_config = {
+        let bid = telegram_bot_instance_id;
+        call_blocking(state.db.clone(), move |db| db.get_channel_bot_instance(bid))
+            .await
+            .ok()
+            .flatten()
+    };
+    let allowed_groups = instance_config
+        .as_ref()
+        .map(|inst| inst.allowed_groups.clone())
+        .unwrap_or_else(|| state.config.allowed_groups.clone());
+    let bot_username = instance_config
+        .as_ref()
+        .and_then(|inst| {
+            let username = inst.bot_username.trim();
+            (!username.is_empty()).then(|| username.to_string())
+        })
+        .unwrap_or_else(|| state.config.bot_username.clone());
 
     // Resolve run persona: optional `[PersonaName]` prefix; does not change DB active.
     let text_for_resolve = text.clone();
@@ -1401,8 +1422,8 @@ async fn handle_message(
 
     // Check group allowlist (by Telegram chat id)
     if (db_chat_type == "telegram_group" || db_chat_type == "telegram_supergroup")
-        && !state.config.allowed_groups.is_empty()
-        && !state.config.allowed_groups.contains(&chat_id)
+        && !allowed_groups.is_empty()
+        && !allowed_groups.contains(&chat_id)
     {
         // Store message but don't process
         let chat_title_owned = chat_title.clone();
@@ -1495,7 +1516,7 @@ async fn handle_message(
     let should_respond = match runtime_chat_type {
         "private" => true,
         _ => {
-            let bot_mention = format!("@{}", state.config.bot_username);
+            let bot_mention = format!("@{}", bot_username);
             text.contains(&bot_mention)
         }
     };
@@ -4282,7 +4303,7 @@ async fn finish_turn_with_quality_gate(
     persona_id: i64,
     stop_reason: &str,
     final_text: &mut String,
-    system_prompt: &str,
+    _system_prompt: &str,
     messages: &mut Vec<Message>,
     protected_message_count: usize,
     pdqe_retries: &mut usize,
@@ -4508,11 +4529,11 @@ async fn finish_turn_with_quality_gate(
             chat_id,
             persona_id,
             context.caller_channel,
-            system_prompt,
             messages,
             final_text.len(),
             had_tool_calls,
             context.is_background_job,
+            is_conversational,
         )
         .await;
     }
@@ -4844,6 +4865,107 @@ fn should_run_focus_sync_llm(
     }
     let last_user_len = latest_user_text(messages).len();
     response_len > 100 || had_tool_calls || last_user_len > 50
+}
+
+/// Task deliveries should update bulletin; short conversational replies may no-op.
+fn focus_sync_task_delivery(
+    is_conversational: bool,
+    response_len: usize,
+    had_tool_calls: bool,
+) -> bool {
+    had_tool_calls || response_len > 200 || !is_conversational
+}
+
+fn build_focus_sync_system_prompt(chat_id: i64, persona_id: i64, timezone: &str) -> String {
+    format!(
+        "You are a post-delivery memory sync sub-agent for FinallyAValueBot.\n\
+         Timezone: {timezone}. chat_id={chat_id} persona_id={persona_id}.\n\
+         Use only the provided tools. Bulletin is the operator-facing episodic focus card.\n\
+         Tier 2 = durable knowledge (terminology, SOPs, preferences) — not active status.\n\
+         Tier 3 = short scratchpad — must not duplicate bulletin status lines.\n\
+         Only write Tier 1 on explicit user-confirmed durable preference."
+    )
+}
+
+fn truncate_focus_sync_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    format!("{}...", text.chars().take(max_chars).collect::<String>())
+}
+
+fn last_assistant_delivery_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(message_to_text)
+        .unwrap_or_default()
+}
+
+fn format_fresh_bulletin_for_sync(focus: Option<&PersonaBulletinFocus>) -> String {
+    let Some(focus) = focus else {
+        return "(no bulletin on file)".to_string();
+    };
+    let title = focus.title.as_deref().unwrap_or("").trim();
+    let content = focus.content.trim();
+    if title.is_empty() {
+        content.to_string()
+    } else {
+        format!("{title}\n{content}")
+    }
+}
+
+fn build_focus_sync_instruction(task_delivery: bool) -> String {
+    if task_delivery {
+        "Post-delivery focus sync: this was a substantive task delivery. \
+         You must call update_bulletin_focus with a concise summary of the current focus \
+         (active goals, blockers, outcomes, next step). \
+         Read read_tiered_memory first if helpful; update Tier 3 only when needed. \
+         Do not end_turn without calling update_bulletin_focus."
+            .to_string()
+    } else {
+        "Post-delivery focus sync: persist context if meaningful. \
+         Use only read_tiered_memory, write_tiered_memory, and update_bulletin_focus. \
+         Write a concise bulletin when focus shifted; otherwise keep existing bulletin."
+            .to_string()
+    }
+}
+
+fn build_focus_sync_messages(
+    messages: &[Message],
+    bulletin: Option<&PersonaBulletinFocus>,
+    task_delivery: bool,
+) -> Vec<Message> {
+    let session_goal = crate::agent_turn_context::extract_session_goal(messages, None);
+    let delivered = truncate_focus_sync_text(&last_assistant_delivery_text(messages), 2_000);
+    let bulletin_text = truncate_focus_sync_text(&format_fresh_bulletin_for_sync(bulletin), 1_500);
+
+    let mut out = Vec::new();
+    out.push(Message {
+        role: "user".into(),
+        content: MessageContent::Text(format!(
+            "[focus_sync_context]\n\
+             Current request:\n{}\n\n\
+             Delivered assistant reply (this turn):\n{delivered}\n\n\
+             Current bulletin (from DB — may be stale until you update):\n{bulletin_text}\n\
+             [/focus_sync_context]",
+            session_goal.current_request,
+        )),
+    });
+    if let Some(ref disambiguation) = session_goal.disambiguation_assistant {
+        out.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text(format!(
+                "[focus_sync_disambiguation]\n{disambiguation}\n[/focus_sync_disambiguation]"
+            )),
+        });
+    }
+    out.push(Message {
+        role: "user".into(),
+        content: MessageContent::Text(build_focus_sync_instruction(task_delivery)),
+    });
+    out
 }
 
 fn estimate_message_tokens(message: &Message) -> usize {
@@ -5541,7 +5663,7 @@ pub(super) fn build_system_prompt(
     let caps = format!(
         r#"## Tool groups (names only; use tool schemas for parameters)
 - **Shell:** bash — follow **Path discipline (strict)**; never use `workspace/` prefixes or `workspace/skills/` in shell paths (tool cwd is persona-scoped under `shared/personas/{chat_id}/{persona_id}/`)
-- **Browser:** browser (agent-browser CLI only; never via bash)
+- **Browser:** `steel-browser` skill (`activate_skill` + `run_skill_script`; human-in-the-loop via session viewer)
 - **Files / repo:** read_file, write_file, edit_file, apply_search_replace, read_repo_map, symbol_edit (when enabled), glob, grep
 - **Web:** web_search, web_fetch
 - **Scheduling:** schedule_task, update_scheduled_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history (runtime enforces `schedule-job` activation before create/update)
@@ -5550,7 +5672,7 @@ pub(super) fn build_system_prompt(
 - **Cursor CLI:** cursor_agent, cursor_agent_send, list_cursor_agent_runs (use detach: true for long work)
 - **Skills:** `activate_skill` loads full `SKILL.md`; **`run_skill_script`** runs bundled skill scripts (prefer over bash); **new** skills → activate `create-skill` then **`build_skill`**; **existing** skill changes are runtime-gated to require **`modify-skill`** activation in the same turn
 {sops_caps_line}- **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). **`register_tracked_job`** records an external id (e.g. ComfyUI `prompt_id`) so it appears in the same queue as shell jobs without blocking another background slot. Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
-- **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, read_agent_history
+- **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, add_todo, list_todos, complete_todo, read_agent_history
 
 ## Conversation Memory
 - **Primary task**: Your goal for this turn is the `[current_request]` message at the end of the conversation. Answer that first; do not expand scope using bulletin, memory, or history unless `[current_request]` references those topics or needs recall to answer.
@@ -5581,7 +5703,9 @@ The current chat_id is {chat_id} and persona_id is {persona_id}. Use these when 
 
 For serving files to users:
 - Put artifacts in your **final assistant message** using markdown image or file links with **absolute local file paths** (e.g. `![caption](/abs/path/to/file.png)` or `[label](/abs/path/to/doc.pdf)`).
+- Never use `file://` URLs — use plain absolute paths (`/home/.../file.md`) so the web UI can materialize them at delivery.
 - Never fabricate `/api/uploads/...` URLs in plain text; the platform materializes local paths at delivery (web upload URLs, Telegram workspace images).
+- When the user asks for a link to a file you wrote or updated, include a markdown link with the **current** absolute path in the same reply.
 - Include the substantive explanation in the final message together with any attachment paths.
 
 When using memory: canonical persona memory is in groups/{{chat_id}}/{{persona_id}}/memory_state.json, with append-only events in memory_events.jsonl. **Identity and Tier 1** (long-term facts, workflow principles) are compiled into the system prompt under **# Identity and long-term memory (Tier 1)**. Tier 2 **`sops`** are vault pointers (`id`, `vault_path`, `summary`) — when an SOP in `[persona_context]` matches the task, read `vault_path` and follow it; do not improvise. There is no `known_steps` field (legacy lines migrate into `sops` or Tier 1 principles on load). **Tier 2**, bulletin focus, operator focus, and bookmarks are in **[persona_context]**; Tier 3 only when needed. Tier 2 holds terminology, **SOPs**, and preferences — not active project status. Bulletin is the operator snapshot of recent focus; your task is always `[current_request]`. Tier 3 is short-lived scratch context and should not duplicate bulletin status lines. Memory is passive context: never proactively resume, check on, or continue work mentioned in memory unless the user explicitly asks about it. Use read_tiered_memory/write_tiered_memory for explicit tier edits and read_memory_state/validate_memory_state/write_memory_state/patch_memory_state for structured JSON edits. Use write_memory with scope 'chat_daily' to append to the daily log. Principles are in AGENTS.md at workspace root; do not overwrite them.
@@ -5611,12 +5735,13 @@ For long-running jobs:
 - When a shell background job fails, the server may enqueue an automatic agent retry with the failure output; fix the command and use `spawn_background_command` again (no placeholders)
 - Avoid "(Checking ...)" placeholders: either call the tool in the same turn or clearly state what is missing and stop.
 
-## Browser
-Browser automation uses the **browser** tool, which runs the command `agent-browser` from the user's PATH (the npm agent-browser CLI). The tool does not use finally_a_value_bot-browser or any hardcoded path. Use only the **browser** tool; do not run agent-browser or other browser executables via the bash tool.
-- Call the **browser** tool with a command string (e.g. open, snapshot, click, fill). Workflow: open URL → `snapshot -i` to get interactive elements and refs (@e1, @e2, …) → use `click`, `fill`, or `get text` with those refs → run `snapshot -i` again after navigation or interaction to see updated state.
-- If the browser tool reports that agent-browser was not found: tell the user to install with `npm install -g agent-browser` and `agent-browser install`. AGENT_BROWSER_PATH is only for Docker (the image sets it). Do not suggest symlinks to finally_a_value_bot-browser.
-- Many public search/result pages (Google, Bing, DuckDuckGo, ImportYeti, qcc, etc.) are Cloudflare/CAPTCHA/anti-bot gated. Prefer `web_search` + `web_fetch` for discovery and extraction. Use browser mostly for interactive flows that cannot be fetched directly.
-- If browser stderr says profile was ignored because a daemon is already running, keep using the active session or restart the daemon before retrying profile-specific steps.
+## Browser (Steel)
+Browser automation uses the built-in **`steel-browser`** skill — not bash or a dedicated browser tool.
+- Activate `steel-browser`, then `run_skill_script` with `steel_tool.py` (`session create`, `browse goto`, `browse snapshot`, etc.).
+- Human-in-the-loop: after `session create`, give the user **`session_viewer_url`** so they can log in manually; then run browse commands on the same `session_id`.
+- Always `session release` when done.
+- For public pages, prefer `web_search` + `web_fetch`. For anti-bot public scraping without login, use `scrapling-skill`.
+- If Steel API is unreachable: run `bash builtin_skills/steel-browser/setup_steel_env.sh`, set `BROWSER_MANAGED=true` (or start Steel Docker on ports 13920/13923).
 
 ## Web search strategy
 - Start broad before narrowing: begin with 1-2 simple queries (for entities, usually legal English name and full Chinese name), then add constraints.
@@ -6608,13 +6733,17 @@ async fn run_persona_focus_sync_after_delivery(
     chat_id: i64,
     persona_id: i64,
     caller_channel: &str,
-    system_prompt: &str,
     messages: &[Message],
     response_len: usize,
     had_tool_calls: bool,
     is_background_job: bool,
+    is_conversational: bool,
 ) {
     if is_background_job {
+        info!(
+            chat_id,
+            persona_id, "focus_sync_skipped reason=background_job"
+        );
         return;
     }
 
@@ -6627,23 +6756,21 @@ async fn run_persona_focus_sync_after_delivery(
     );
 
     if !should_run_focus_sync_llm(false, messages, response_len, had_tool_calls) {
+        info!(chat_id, persona_id, "focus_sync_skipped reason=gate");
         return;
     }
 
-    let mut sync_messages = messages.to_vec();
-    sync_messages.push(Message {
-        role: "user".into(),
-        content: MessageContent::Text(
-            "Post-delivery focus sync hook: persist context now. \
-Use only read_tiered_memory, write_tiered_memory, and update_bulletin_focus. \
-Bulletin is canonical episodic focus for operators. Write a concise bulletin summary for current focus (active goals, blockers, outcomes, next step). \
-Tier 2 is durable knowledge only (terminology, known steps, preferences), not active status tracking. \
-Tier 3 is a short-lived scratchpad and must not duplicate bulletin status lines. \
-Only write Tier 1 on explicit user-confirmed durable preference. \
-If no meaningful update is needed, keep existing memory and bulletin."
-                .into(),
-        ),
-    });
+    let task_delivery = focus_sync_task_delivery(is_conversational, response_len, had_tool_calls);
+    info!(chat_id, persona_id, task_delivery, "focus_sync_started");
+
+    let bulletin = call_blocking(state.db.clone(), move |db| {
+        db.get_persona_bulletin_focus(chat_id, persona_id)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let mut sync_messages = build_focus_sync_messages(messages, bulletin.as_ref(), task_delivery);
 
     let allowed_tools = [
         "read_tiered_memory",
@@ -6657,8 +6784,15 @@ If no meaningful update is needed, keep existing memory and bulletin."
         .filter(|d| allowed_tools.contains(&d.name.as_str()))
         .collect();
     if tool_defs.is_empty() {
+        warn!(
+            chat_id,
+            persona_id, "focus_sync_skipped reason=empty_tool_defs"
+        );
         return;
     }
+
+    let sync_system =
+        build_focus_sync_system_prompt(chat_id, persona_id, state.config.timezone.as_str());
 
     let tool_auth = ToolAuthContext {
         caller_channel: caller_channel.to_string(),
@@ -6668,28 +6802,57 @@ If no meaningful update is needed, keep existing memory and bulletin."
         is_scheduled_task: false,
     };
 
-    for _ in 0..FOCUS_SYNC_MAX_ITERATIONS {
+    let max_iters = if task_delivery {
+        2
+    } else {
+        FOCUS_SYNC_MAX_ITERATIONS
+    };
+    let mut updated_bulletin = false;
+    let mut tools_called: Vec<String> = Vec::new();
+
+    for iteration in 0..max_iters {
+        let options = if task_delivery {
+            LlmSendOptions::default().with_tool_choice("required")
+        } else {
+            LlmSendOptions::default()
+        };
         let response = match state
             .llm
-            .send_message(
-                system_prompt,
+            .send_message_with_options(
+                &sync_system,
                 sync_messages.clone(),
                 Some(tool_defs.clone()),
+                options,
             )
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("Focus sync skipped due to LLM error: {e}");
+                warn!(
+                    chat_id,
+                    persona_id,
+                    error = %e,
+                    "focus_sync_skipped reason=llm_error"
+                );
                 return;
             }
         };
         let stop_reason = response.stop_reason.as_deref().unwrap_or("end_turn");
         if stop_reason == "end_turn" || stop_reason == "max_tokens" {
-            return;
+            if task_delivery && !updated_bulletin && iteration + 1 < max_iters {
+                sync_messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "Reminder: call update_bulletin_focus now with the current focus summary."
+                            .into(),
+                    ),
+                });
+                continue;
+            }
+            break;
         }
         if stop_reason != "tool_use" {
-            return;
+            break;
         }
 
         let assistant_content: Vec<ContentBlock> = response
@@ -6721,16 +6884,32 @@ If no meaningful update is needed, keep existing memory and bulletin."
                 id, name, input, ..
             } = block
             {
+                tools_called.push(name.clone());
+                if name == "update_bulletin_focus"
+                    && input
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|s| s.trim().is_empty())
+                {
+                    warn!(
+                        chat_id,
+                        persona_id, "focus_sync update_bulletin_focus missing content"
+                    );
+                }
                 let result = if !allowed_tools.contains(&name.as_str()) {
                     crate::tools::ToolResult::error(format!(
                         "Tool {} is not allowed during focus sync.",
                         name
                     ))
                 } else {
-                    state
+                    let exec = state
                         .tools
                         .execute_with_auth(name, input.clone(), &tool_auth)
-                        .await
+                        .await;
+                    if name == "update_bulletin_focus" && !exec.is_error {
+                        updated_bulletin = true;
+                    }
+                    exec
                 };
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
@@ -6743,6 +6922,20 @@ If no meaningful update is needed, keep existing memory and bulletin."
             role: "user".into(),
             content: MessageContent::Blocks(tool_results),
         });
+    }
+
+    info!(
+        chat_id,
+        persona_id,
+        updated_bulletin,
+        tools_called = ?tools_called,
+        "focus_sync_completed"
+    );
+    if task_delivery && !updated_bulletin {
+        warn!(
+            chat_id,
+            persona_id, "focus_sync_noop task_delivery_without_bulletin_update"
+        );
     }
 }
 
@@ -8247,6 +8440,7 @@ mod tests {
         );
         assert!(prompt.contains("For serving files to users:"));
         assert!(prompt.contains("Never fabricate `/api/uploads/...` URLs"));
+        assert!(prompt.contains("Never use `file://` URLs"));
         assert!(prompt.contains("absolute local file paths"));
     }
 
@@ -8716,5 +8910,55 @@ mod tests {
             &messages,
         );
         assert_eq!(stop, "ask_clarification");
+    }
+
+    #[test]
+    fn test_focus_sync_task_delivery_gate() {
+        assert!(focus_sync_task_delivery(false, 500, true));
+        assert!(focus_sync_task_delivery(true, 250, false));
+        assert!(!focus_sync_task_delivery(true, 100, false));
+        assert!(focus_sync_task_delivery(false, 100, false));
+    }
+
+    #[test]
+    fn test_build_focus_sync_messages_uses_delivery_not_persona_context() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[persona_context]\nStale Instagram bulletin\n[/persona_context]".into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\nplease commit and push\n[/current_request]"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "Fixed /home/ken/big_storage/projects/sourdough/index.html on dev".into(),
+                ),
+            },
+        ];
+        let bulletin = PersonaBulletinFocus {
+            chat_id: 1,
+            persona_id: 26,
+            title: Some("Old".into()),
+            content: "Instagram promo pending".into(),
+            updated_at: "t".into(),
+        };
+        let sync = build_focus_sync_messages(&messages, Some(&bulletin), true);
+        let joined: String = sync
+            .iter()
+            .map(message_to_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("sourdough/index.html"));
+        assert!(joined.contains("Instagram promo pending"));
+        assert!(!joined.contains("Stale Instagram bulletin"));
+        assert!(joined.contains("must call update_bulletin_focus"));
     }
 }

@@ -20,6 +20,7 @@ const HEALTH_POLL_INTERVAL_MS: u64 = 250;
 const HEALTH_WAIT_MAX_SECS: u64 = 45;
 const SIDECAR_VENV_DIR_NAME: &str = "cursor-sdk-venv";
 const SIDECAR_PID_FILE: &str = "cursor-sdk-sidecar.pid";
+const SIDECAR_STDERR_LOG: &str = "cursor-sdk-sidecar.stderr.log";
 const SIDECAR_PYTHON_PACKAGES: &[&str] = &["cursor-sdk", "aiohttp"];
 const VENV_CREATE_TIMEOUT_SECS: u64 = 120;
 const PIP_INSTALL_TIMEOUT_SECS: u64 = 180;
@@ -73,6 +74,10 @@ fn sidecar_venv_dir(config: &Config) -> PathBuf {
 
 fn sidecar_pid_path(config: &Config) -> PathBuf {
     PathBuf::from(config.runtime_data_dir()).join(SIDECAR_PID_FILE)
+}
+
+fn sidecar_stderr_log_path(config: &Config) -> PathBuf {
+    PathBuf::from(config.runtime_data_dir()).join(SIDECAR_STDERR_LOG)
 }
 
 fn venv_python_executable(venv_dir: &Path) -> PathBuf {
@@ -287,14 +292,35 @@ impl SidecarHandle {
     }
 }
 
-async fn spawn_sidecar_process(script: &Path, port: u16, python: &Path) -> Result<Child, String> {
+async fn spawn_sidecar_process(
+    script: &Path,
+    port: u16,
+    python: &Path,
+    stderr_log: &Path,
+    runtime_data_dir: &str,
+) -> Result<Child, String> {
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(stderr_log)
+        .map_err(|e| {
+            format!(
+                "failed to open Cursor SDK sidecar stderr log {}: {e}",
+                stderr_log.display()
+            )
+        })?;
+
     let mut cmd = Command::new(python);
     cmd.arg(script)
         .arg(port.to_string())
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr_file);
+
+    if !runtime_data_dir.trim().is_empty() {
+        cmd.env("FINALLY_A_VALUE_BOT_RUNTIME_DATA", runtime_data_dir.trim());
+    }
 
     if let Ok(key) = std::env::var("CURSOR_API_KEY") {
         let key = key.trim();
@@ -370,7 +396,16 @@ pub async fn bootstrap(
 
             if sidecar_needs_restart(&health) {
                 if let Some(script) = resolve_sidecar_script() {
-                    match spawn_sidecar_process(&script, port, &sidecar_python).await {
+                    let stderr_log = sidecar_stderr_log_path(config);
+                    match spawn_sidecar_process(
+                        &script,
+                        port,
+                        &sidecar_python,
+                        &stderr_log,
+                        &config.runtime_data_dir(),
+                    )
+                    .await
+                    {
                         Ok(proc) => {
                             if let Some(pid) = proc.id() {
                                 write_sidecar_pid(config, pid);

@@ -85,7 +85,7 @@ export type CockpitBarProps = {
  * Operational strip: session activity, queue, background jobs, setup readiness.
  * Collapsed by default; expand from the centered control. Separate from tooling (Settings, etc.).
  */
-export function CockpitBar({
+export const CockpitBar = React.memo(function CockpitBar({
   appearance,
   statusText,
   queueLane,
@@ -739,4 +739,4 @@ export function CockpitBar({
       </div>
     </>
   )
-}
+})

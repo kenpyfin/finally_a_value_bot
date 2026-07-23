@@ -35,6 +35,30 @@ import { historiesEqual, isHistoryPrepend } from '../lib/history-sync'
 import { messageTextForClipboard, parseReplyForDisplay, type DisplayReplyQuote, type PendingReplyQuote } from '../lib/reply-quote'
 import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 
+/** Module-scoped so ThreadPane re-renders do not remount every markdown message. */
+const MarkdownText = makeMarkdownText({
+  remarkPlugins: [remarkGfm],
+  components: {
+    img: ({ alt, className, ...props }) => (
+      <img
+        {...props}
+        alt={alt ?? ''}
+        className={['my-2 max-h-[70vh] max-w-full rounded-lg', className].filter(Boolean).join(' ')}
+        loading="lazy"
+      />
+    ),
+    a: (props) => {
+      const mergedRel = [props.rel, 'noopener', 'noreferrer'].filter(Boolean).join(' ')
+      return <a {...props} target="_blank" rel={mergedRel} />
+    },
+    table: ({ className, ...props }) => (
+      <div className="mc-md-table-scroll">
+        <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
+      </div>
+    ),
+  },
+})
+
 function asObject(value: unknown): Record<string, unknown> {
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
     return value as Record<string, unknown>
@@ -107,8 +131,8 @@ function MessageTimestamp({ align }: { align: 'left' | 'right' }) {
 type ThreadPaneUiContextValue = {
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
-  onReplyToMessage?: (messageId: string) => void
-  onDeleteMessage?: (messageId: string) => void
+  onReplyToMessage?: (messageId: string) => void | Promise<void>
+  onDeleteMessage?: (messageId: string) => void | Promise<void>
   pendingReply?: PendingReplyQuote | null
   onDismissPendingReply?: () => void
   draftText: string
@@ -517,12 +541,12 @@ export type ThreadPaneProps = {
   /** When true, older messages exist above the current window. */
   historyHasMore?: boolean
   historyLoadingMore?: boolean
-  onLoadMoreHistory?: () => void
+  onLoadMoreHistory?: () => void | Promise<void>
   onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
-  onReplyToMessage?: (messageId: string) => void
-  onDeleteMessage?: (messageId: string) => void
+  onReplyToMessage?: (messageId: string) => void | Promise<void>
+  onDeleteMessage?: (messageId: string) => void | Promise<void>
   pendingReply?: PendingReplyQuote | null
   onDismissPendingReply?: () => void
   /** Mobile (max-width 767px): report scroll direction so the app shell can collapse the main header. */
@@ -595,28 +619,6 @@ export const ThreadPane = React.memo(function ThreadPane({
   const onMobileMessageTap = React.useCallback((messageId: string) => {
     setMobileActionMessageId((prev) => (messageId && prev === messageId ? null : messageId || null))
   }, [])
-  const MarkdownText = makeMarkdownText({
-    remarkPlugins: [remarkGfm],
-    components: {
-      img: ({ alt, className, ...props }) => (
-        <img
-          {...props}
-          alt={alt ?? ''}
-          className={['my-2 max-h-[70vh] max-w-full rounded-lg', className].filter(Boolean).join(' ')}
-          loading="lazy"
-        />
-      ),
-      a: (props) => {
-        const mergedRel = [props.rel, 'noopener', 'noreferrer'].filter(Boolean).join(' ')
-        return <a {...props} target="_blank" rel={mergedRel} />
-      },
-      table: ({ className, ...props }) => (
-        <div className="mc-md-table-scroll">
-          <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
-        </div>
-      ),
-    },
-  })
   const runtime = useLocalRuntime(adapter, {
     initialMessages,
     maxSteps: 100,

@@ -69,6 +69,15 @@ pub fn resolve_incoming_run_persona_for_channel(
         }
     }
 
+    if channel_type == "whatsapp" {
+        let forced = db.get_current_persona_id(chat_id)?;
+        let trimmed = text.trim_start();
+        if let Some((_, rest)) = parse_leading_token(trimmed) {
+            return Ok((forced, rest.trim_start().to_string()));
+        }
+        return Ok((forced, text.to_string()));
+    }
+
     resolve_incoming_run_persona_all_personas(db, chat_id, text)
 }
 

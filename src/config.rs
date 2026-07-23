@@ -83,6 +83,18 @@ fn default_web_terminal_idle_timeout_secs() -> u64 {
 fn default_browser_managed() -> bool {
     false
 }
+pub fn default_steel_api_port() -> u16 {
+    13_920
+}
+pub fn default_steel_cdp_port() -> u16 {
+    13_923
+}
+pub fn default_steel_docker_image() -> String {
+    "ghcr.io/steel-dev/steel-browser:latest".into()
+}
+pub fn default_steel_docker_container_name() -> String {
+    "finally-a-value-bot-steel".into()
+}
 fn default_browser_cdp_port_base() -> u16 {
     9222
 }
@@ -507,6 +519,18 @@ pub struct Config {
     pub universal_chat_id: Option<i64>,
     #[serde(default = "default_browser_managed")]
     pub browser_managed: bool,
+    /// Local Steel API port when `BROWSER_MANAGED=true`. Env: `STEEL_API_PORT`.
+    #[serde(default = "default_steel_api_port")]
+    pub steel_api_port: u16,
+    /// Host-mapped Steel CDP/debug port. Env: `STEEL_CDP_PORT`.
+    #[serde(default = "default_steel_cdp_port")]
+    pub steel_cdp_port: u16,
+    /// Docker image for managed Steel browser. Env: `STEEL_DOCKER_IMAGE`.
+    #[serde(default = "default_steel_docker_image")]
+    pub steel_docker_image: String,
+    /// Docker container name for managed Steel browser. Env: `STEEL_DOCKER_CONTAINER_NAME`.
+    #[serde(default = "default_steel_docker_container_name")]
+    pub steel_docker_container_name: String,
     #[serde(default)]
     pub browser_executable_path: Option<String>,
     #[serde(default = "default_browser_cdp_port_base")]
@@ -531,9 +555,6 @@ pub struct Config {
     /// Risky command categories monitored by execution safety.
     #[serde(default = "default_safety_risky_categories")]
     pub safety_risky_categories: Vec<String>,
-    /// Full path to the agent-browser CLI (npm). If set, the browser tool uses this instead of looking up "agent-browser" on PATH. Use when the process PATH doesn't include agent-browser (e.g. when run as a service).
-    #[serde(default)]
-    pub agent_browser_path: Option<String>,
     /// Optional Tavily API key for web_search. When set, web_search uses Tavily (https://api.tavily.com/search) instead of SearXNG or DuckDuckGo. Env: TAVILY_API_KEY.
     #[serde(default)]
     pub tavily_api_key: Option<String>,
@@ -758,6 +779,13 @@ impl Config {
                 .web_auth_token
                 .as_ref()
                 .is_some_and(|t| !t.trim().is_empty())
+    }
+
+    /// Resolved Steel API URL (`STEEL_API_URL` env override, else local managed port).
+    pub fn steel_api_url(&self) -> String {
+        Self::env("STEEL_API_URL").unwrap_or_else(|| {
+            crate::steel_browser_sidecar::default_local_steel_api_url(self.steel_api_port)
+        })
     }
 
     /// Resolve path to .env file. FINALLY_A_VALUE_BOT_CONFIG can override (points to .env).
@@ -1011,6 +1039,12 @@ impl Config {
             web_terminal_allow_in_docker: Self::env_bool("WEB_TERMINAL_ALLOW_IN_DOCKER", false),
             universal_chat_id: Self::env("UNIVERSAL_CHAT_ID").and_then(|s| s.parse().ok()),
             browser_managed: Self::env_bool("BROWSER_MANAGED", default_browser_managed()),
+            steel_api_port: Self::env_u16("STEEL_API_PORT", default_steel_api_port()),
+            steel_cdp_port: Self::env_u16("STEEL_CDP_PORT", default_steel_cdp_port()),
+            steel_docker_image: Self::env("STEEL_DOCKER_IMAGE")
+                .unwrap_or_else(default_steel_docker_image),
+            steel_docker_container_name: Self::env("STEEL_DOCKER_CONTAINER_NAME")
+                .unwrap_or_else(default_steel_docker_container_name),
             browser_executable_path: Self::env("BROWSER_EXECUTABLE_PATH"),
             browser_cdp_port_base: Self::env_u16(
                 "BROWSER_CDP_PORT_BASE",
@@ -1039,7 +1073,6 @@ impl Config {
                     parsed
                 }
             },
-            agent_browser_path: Self::env("AGENT_BROWSER_PATH"),
             tavily_api_key: Self::env("TAVILY_API_KEY"),
             web_search_searxng_url: Self::env("SEARXNG_URL"),
             cursor_agent_cli_path: Self::env("CURSOR_AGENT_CLI_PATH")
@@ -1187,6 +1220,14 @@ impl Config {
             project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
                 .unwrap_or_else(default_project_auto_association_strictness),
         }
+    }
+
+    /// Apply Web UI channel integration settings from SQLite onto this config.
+    pub fn merge_channel_integration_from_db(
+        &mut self,
+        db: &crate::db::Database,
+    ) -> Result<(), FinallyAValueBotError> {
+        crate::channel_integration_config::merge_into_config(self, db)
     }
 
     /// Apply Web UI `LLM_PROVIDER` / `LLM_MODEL` / local `LLM_BASE_URL` from `app_settings`.
@@ -1546,20 +1587,6 @@ impl Config {
                 self.post_edit_validation_commands = None;
             }
         }
-        // Expand ~ in agent_browser_path if present
-        if let Some(ref p) = self.agent_browser_path {
-            let trimmed = p.trim();
-            if !trimmed.is_empty() && (trimmed == "~" || trimmed.starts_with("~/")) {
-                if let Ok(home) = std::env::var("HOME") {
-                    let expanded = if trimmed == "~" {
-                        home
-                    } else {
-                        format!("{}{}", home, &trimmed[1..])
-                    };
-                    self.agent_browser_path = Some(expanded);
-                }
-            }
-        }
         if let Some(ref mut social) = self.social {
             for platform_cfg in [
                 &mut social.tiktok,
@@ -1579,13 +1606,8 @@ impl Config {
             }
         }
 
-        // Validate required fields
-        let has_channel = !self.telegram_bot_token.is_empty() || self.discord_bot_token.is_some();
-        if !has_channel && !self.web_enabled {
-            return Err(FinallyAValueBotError::Config(
-                "At least one of telegram_bot_token or discord_bot_token must be set (unless web_enabled=true)".into(),
-            ));
-        }
+        // Channel tokens are optional at .env load time — validated after DB merge
+        // (see channel_integration_config::validate_runtime_channel_or_web).
         if !self.web_enabled
             && !crate::llm_catalog::any_provider_api_key_configured()
             && !matches!(self.llm_provider.as_str(), "ollama" | "llama" | "llamacpp")
@@ -1842,6 +1864,10 @@ pub fn test_config() -> Config {
         web_terminal_allow_in_docker: false,
         universal_chat_id: None,
         browser_managed: false,
+        steel_api_port: default_steel_api_port(),
+        steel_cdp_port: default_steel_cdp_port(),
+        steel_docker_image: default_steel_docker_image(),
+        steel_docker_container_name: default_steel_docker_container_name(),
         browser_executable_path: None,
         browser_cdp_port_base: 9222,
         browser_idle_timeout_secs: None,
@@ -1856,7 +1882,6 @@ pub fn test_config() -> Config {
             "network".into(),
             "package".into(),
         ],
-        agent_browser_path: None,
         tavily_api_key: None,
         web_search_searxng_url: None,
         cursor_agent_cli_path: default_cursor_agent_cli_path(),
@@ -2042,14 +2067,13 @@ mod tests {
     }
 
     #[test]
-    fn test_post_deserialize_missing_bot_tokens() {
-        // A channel token is only required when web is disabled (web_enabled
-        // defaults to true), so disable web to exercise the validation.
-        let yaml = "bot_username: bot\napi_key: key\nweb_enabled: false\n";
+    fn test_post_deserialize_missing_bot_tokens_allowed_with_web() {
+        // Channel tokens are validated after DB merge, not at .env load. Web-only is OK.
+        let yaml = "bot_username: bot\napi_key: key\nweb_enabled: true\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = config.post_deserialize().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("telegram_bot_token or discord_bot_token"));
+        config.post_deserialize().unwrap();
+        assert!(config.telegram_bot_token.is_empty());
+        assert!(config.discord_bot_token.is_none());
     }
 
     #[test]

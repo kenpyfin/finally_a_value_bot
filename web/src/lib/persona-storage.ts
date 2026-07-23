@@ -100,6 +100,25 @@ export function writePersonaLastReadAt(chatId: number, personaId: number, isoTim
   }
 }
 
+/**
+ * Seed last-read for personas that have never been stamped so historical bot
+ * messages are not treated as "new". Only later messages light the unread dot.
+ */
+export function baselinePersonaLastReadIfMissing(
+  chatId: number,
+  personas: { id: number; last_bot_message_at?: string | null }[],
+): boolean {
+  if (typeof window === 'undefined') return false
+  let changed = false
+  const nowIso = new Date().toISOString()
+  for (const p of personas) {
+    if (readPersonaLastReadAt(chatId, p.id) != null) continue
+    writePersonaLastReadAt(chatId, p.id, p.last_bot_message_at ?? nowIso)
+    changed = true
+  }
+  return changed
+}
+
 export function toMs(iso: string | null | undefined): number | null {
   if (!iso) return null
   const ms = Date.parse(iso)

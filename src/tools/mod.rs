@@ -3,7 +3,6 @@ pub mod agent_history;
 pub mod apply_search_replace;
 pub mod bash;
 pub mod bash_safety;
-pub mod browser;
 pub mod bulletin;
 pub mod command_runner;
 pub mod cursor_agent;
@@ -16,6 +15,7 @@ pub mod mcp;
 pub mod memory;
 pub mod memory_state;
 pub mod path_guard;
+pub mod persona_todo;
 pub mod read_file;
 pub mod read_repo_map;
 pub mod register_hook;
@@ -581,11 +581,6 @@ impl ToolRegistry {
                 runtime_toggles.clone(),
                 env_redactor.clone(),
             )),
-            Box::new(browser::BrowserTool::new(
-                &config.runtime_data_dir(),
-                config.working_dir(),
-                config.agent_browser_path.clone(),
-            )),
             Box::new(read_file::ReadFileTool::new(config.working_dir())),
             Box::new(read_repo_map::ReadRepoMapTool::new(config.working_dir())),
             Box::new(write_file::WriteFileTool::new(config.working_dir())),
@@ -671,6 +666,9 @@ impl ToolRegistry {
                 &config.runtime_data_dir(),
             )),
             Box::new(bulletin::UpdateBulletinFocusTool::new(db.clone())),
+            Box::new(persona_todo::AddTodoTool::new(db.clone())),
+            Box::new(persona_todo::ListTodosTool::new(db.clone())),
+            Box::new(persona_todo::CompleteTodoTool::new(db.clone())),
             Box::new(search_history::SearchHistoryTool::new(db.clone())),
             Box::new(agent_history::ReadAgentHistoryTool::new(
                 &config.runtime_data_dir(),
@@ -791,6 +789,7 @@ impl ToolRegistry {
                         | "read_agent_history"
                         | "list_scheduled_tasks"
                         | "get_task_history"
+                        | "list_todos"
                 );
                 if allowed {
                     Some(t.definition())

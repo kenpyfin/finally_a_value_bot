@@ -42,11 +42,11 @@ import {
   type AgentHistoryOptimizeRequest,
   type AgentHistoryOptimizeResponse,
   type BackgroundJobItem,
-  type BotInstanceRow,
   type ChannelBinding,
   type InstallationStatus,
   type QueueItem,
   type ScheduleTask,
+  type PersonaTodo,
 } from '../types'
 
 type Appearance = 'dark' | 'light'
@@ -427,6 +427,10 @@ export function App({
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
   const [schedulesDialogOpen, setSchedulesDialogOpen] = useState<boolean>(false)
   const [schedulesShowArchived, setSchedulesShowArchived] = useState(false)
+  const [inboxDialogOpen, setInboxDialogOpen] = useState(false)
+  const [inboxTodos, setInboxTodos] = useState<PersonaTodo[]>([])
+  const [inboxLoading, setInboxLoading] = useState(false)
+  const [inboxBusyTodoId, setInboxBusyTodoId] = useState<number | null>(null)
   const [memoryDialogOpen, setMemoryDialogOpen] = useState<boolean>(false)
   const [artifactsDialogOpen, setArtifactsDialogOpen] = useState<boolean>(false)
   const [terminalDialogOpen, setTerminalDialogOpen] = useState<boolean>(false)
@@ -479,14 +483,8 @@ export function App({
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [settingsError, setSettingsError] = useState('')
   const [installationStatus, setInstallationStatus] = useState<InstallationStatus | null>(null)
-  const [botInstances, setBotInstances] = useState<BotInstanceRow[]>([])
   const [restartBusy, setRestartBusy] = useState(false)
-  const [botFormBusy, setBotFormBusy] = useState(false)
-  const [newBotPlatform, setNewBotPlatform] = useState<'telegram' | 'discord'>('telegram')
-  const [newBotLabel, setNewBotLabel] = useState('')
-  const [newBotToken, setNewBotToken] = useState('')
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
-  const [integrationsNotice, setIntegrationsNotice] = useState<string | null>(null)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
@@ -584,6 +582,18 @@ export function App({
     if (schedulesShowArchived) return schedules
     return schedules.filter((t) => t.status !== 'completed' && t.status !== 'cancelled')
   }, [schedules, schedulesShowArchived])
+
+  const inboxUnread = useMemo(() => {
+    return personas
+      .filter((p) => personaHasNew[p.id])
+      .map((p) => ({
+        personaId: p.id,
+        personaName: p.name,
+        lastBotMessageAt: p.last_bot_message_at ?? null,
+      }))
+  }, [personas, personaHasNew])
+
+  const inboxBadgeCount = inboxUnread.length + inboxTodos.length
 
   const backgroundJobsVisible = useMemo<BackgroundJobItem[]>(() => backgroundJobs.slice(0, 20), [backgroundJobs])
 
@@ -749,11 +759,29 @@ export function App({
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
       run: async function* (options): AsyncGenerator<ChatModelRunResult, void> {
-        const { text: userText, attachments } = await extractLatestUserInput(options.messages, {
-          chatId,
-          signal: options.abortSignal,
-          onUploadProgress: (msg) => setStatusText(msg),
-        })
+        let userText = ''
+        let attachments: SendAttachmentRef[] = []
+        try {
+          const extracted = await extractLatestUserInput(options.messages, {
+            chatId,
+            signal: options.abortSignal,
+            onUploadProgress: (msg) => setStatusText(msg),
+          })
+          userText = extracted.text
+          attachments = extracted.attachments
+        } catch (e) {
+          // Upload failed/stalled/aborted while extracting attachments. Reset the
+          // composer state so the app does not stay stuck on "Uploading…".
+          if (options.abortSignal.aborted) {
+            setStatusText('Idle')
+            return
+          }
+          const msg = e instanceof Error ? e.message : String(e)
+          setError(`Attachment upload failed: ${msg}`)
+          setStatusText('Error')
+          yield { content: [{ type: 'text', text: `Error: ${msg}` }] }
+          return
+        }
         const pendingReply = pendingReplyRef.current
         const messageText = pendingReply ? formatReplyForSend(pendingReply, userText) : userText
         if (!messageText.trim() && attachments.length === 0) return
@@ -925,7 +953,7 @@ export function App({
 
                 // Throttle yields to avoid token-by-token re-renders.
                 const nowMs = Date.now()
-                if (nowMs - lastFlushMs >= 50) {
+                if (nowMs - lastFlushMs >= 80) {
                   yield { content: [{ type: 'text', text: pendingDelta }] }
                   pendingDelta = ''
                   lastFlushMs = nowMs
@@ -1029,9 +1057,9 @@ export function App({
     [chatId, selectedSessionReadOnly, activePersonaId, formatReplyForSend, loadHistory, loadPersonaBulletin],
   )
 
-  function toggleAppearance(): void {
+  const toggleAppearance = useCallback((): void => {
     setAppearance((prev) => (prev === 'dark' ? 'light' : 'dark'))
-  }
+  }, [])
 
   useEffect(() => {
     saveAppearance(appearance)
@@ -1058,6 +1086,7 @@ export function App({
           const chosen = await loadPersonas(cid)
           loadBindings(cid).catch(() => { })
           loadSchedules(cid).catch(() => { })
+          loadInboxTodos(cid).catch(() => { })
           void invalidateOps(cid)
           const personaForSession = chosen?.id ?? pid ?? null
           const sessions = await loadSessions(cid, personaForSession)
@@ -1076,7 +1105,7 @@ export function App({
             await loadPersonaBulletin(pid)
           }
           const readId = chosen?.id ?? pid ?? null
-          if (readId != null) markPersonaRead(readId)
+          if (readId != null) markPersonaRead(readId, cid)
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
@@ -1098,11 +1127,58 @@ export function App({
     }
   }
 
+  async function loadInboxTodos(cid: number | null = chatId): Promise<void> {
+    if (cid == null) {
+      setInboxTodos([])
+      return
+    }
+    setInboxLoading(true)
+    try {
+      const query = new URLSearchParams({ chat_id: String(cid), status: 'open' })
+      const data = await api<{ todos?: PersonaTodo[] }>(`/api/todos?${query.toString()}`)
+      setInboxTodos(Array.isArray(data.todos) ? data.todos : [])
+    } catch {
+      setInboxTodos([])
+    } finally {
+      setInboxLoading(false)
+    }
+  }
+
+  async function completeInboxTodo(todoId: number): Promise<void> {
+    setInboxBusyTodoId(todoId)
+    try {
+      await api(`/api/todos/${todoId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'done' }),
+      })
+      setInboxTodos((prev) => prev.filter((t) => t.id !== todoId))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setInboxBusyTodoId(null)
+    }
+  }
+
   useEffect(() => {
     if (!schedulesDialogOpen) return
     void loadSchedules(chatId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [schedulesDialogOpen])
+
+  useEffect(() => {
+    if (!inboxDialogOpen) return
+    void loadInboxTodos(chatId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inboxDialogOpen])
+
+  useEffect(() => {
+    if (chatId == null) {
+      setInboxTodos([])
+      return
+    }
+    void loadInboxTodos(chatId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId])
 
   useEffect(() => {
     if (!memoryDialogOpen) return
@@ -1159,7 +1235,6 @@ export function App({
   useEffect(() => {
     if (!settingsDialogOpen) return
     void loadSettings()
-    void loadBotInstances()
     if (chatId != null) {
       void loadBindings(chatId)
     }
@@ -1207,14 +1282,6 @@ export function App({
     }
   }
 
-  async function loadBotInstances(): Promise<void> {
-    try {
-      const data = await api<{ instances?: BotInstanceRow[] }>('/api/channel_bot_instances')
-      setBotInstances(Array.isArray(data.instances) ? data.instances : [])
-    } catch {
-      setBotInstances([])
-    }
-  }
 
   async function requestRestart(): Promise<void> {
     setSettingsError('')
@@ -1230,62 +1297,7 @@ export function App({
     }
   }
 
-  async function addBotInstance(): Promise<void> {
-    const label = newBotLabel.trim()
-    const token = newBotToken.trim()
-    if (!label || !token) {
-      setSettingsError('Label and token are required.')
-      return
-    }
-    setSettingsError('')
-    setIntegrationsNotice(null)
-    setBotFormBusy(true)
-    try {
-      const data = await api<{ message?: string }>('/api/channel_bot_instances', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          platform: newBotPlatform,
-          label,
-          token,
-        }),
-      })
-      setNewBotLabel('')
-      setNewBotToken('')
-      setIntegrationsNotice(data.message ?? 'Bot instance created. Restart the gateway to activate dispatchers.')
-      await loadBotInstances()
-      if (chatId != null) {
-        await loadBindings(chatId)
-      }
-    } catch (e) {
-      setSettingsError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBotFormBusy(false)
-    }
-  }
 
-  function removeBotInstance(id: number): void {
-    requestConfirm({
-      title: 'Delete bot instance',
-      description: 'This permanently removes the bot integration and its channel bindings. This cannot be undone.',
-      confirmLabel: 'Delete bot',
-      destructive: true,
-      onConfirm: async () => {
-        setSettingsError('')
-        setBotFormBusy(true)
-        try {
-          await api(`/api/channel_bot_instances/${id}`, { method: 'DELETE' })
-          await loadBotInstances()
-          setError('')
-        } catch (e) {
-          setSettingsError(e instanceof Error ? e.message : String(e))
-          throw e
-        } finally {
-          setBotFormBusy(false)
-        }
-      },
-    })
-  }
 
   async function updateChannelPersonaPolicy(
     botInstanceId: number,
@@ -1492,6 +1504,7 @@ export function App({
       if (cancelled) return
       loadBindings(chatId).catch(() => { })
       loadSchedules(chatId).catch(() => { })
+      loadInboxTodos(chatId).catch(() => { })
       void invalidateOps(chatId)
       if (chosen) {
         try {
@@ -1602,6 +1615,100 @@ export function App({
     setMobileChatHeaderCollapsed((prev) => (prev === opts.collapseHeader ? prev : opts.collapseHeader))
   }, [])
 
+  const handleShowShortcuts = useCallback(() => {
+    setShortcutsOpen(true)
+  }, [])
+
+  const handleOpenSettings = useCallback(() => {
+    setSettingsDialogOpen(true)
+  }, [])
+
+  const handleOpenQueue = useCallback(() => {
+    setQueueDialogOpen(true)
+  }, [])
+
+  const handleOpenInbox = useCallback(() => {
+    setInboxDialogOpen(true)
+  }, [])
+
+  const handleOpenSchedules = useCallback(() => {
+    setSchedulesDialogOpen(true)
+  }, [])
+
+  const handleOpenPrinciples = useCallback(() => {
+    setAgentsMdOpen(true)
+  }, [])
+
+  const handleOpenArtifacts = useCallback(() => {
+    setArtifactsDialogOpen(true)
+  }, [])
+
+  const handleOpenTerminal = useCallback(() => {
+    setTerminalError('')
+    setTerminalDialogOpen(true)
+  }, [])
+
+  const handleOpenMemory = useCallback(() => {
+    setMemoryDialogOpen(true)
+  }, [])
+
+  const handleOpenAgentHistory = useCallback(() => {
+    setAgentHistoryDialogOpen(true)
+  }, [])
+
+  const handleExpandCockpit = useCallback(() => {
+    setCockpitExpanded(true)
+  }, [])
+
+  const handleOpenMobileNav = useCallback(() => {
+    setMobileNavOpen(true)
+  }, [])
+
+  const handleToggleDesktopSidebar = useCallback(() => {
+    setDesktopSidebarOpen((v) => !v)
+  }, [])
+
+  const handleOpenMobileOps = useCallback(() => {
+    setMobileOpsOpen(true)
+  }, [])
+
+  const handleUiThemeChange = useCallback((theme: string) => {
+    setUiTheme(theme as UiTheme)
+  }, [])
+
+  const handleCreatePersonaClick = useCallback(() => {
+    void onCreatePersona()
+  }, [onCreatePersona])
+
+  const handleDeletePersonaClick = useCallback((id: number) => {
+    void onDeletePersona(id)
+  }, [onDeletePersona])
+
+  const handlePersonaSelect = useCallback((name: string) => {
+    void switchPersona(name)
+  }, [switchPersona])
+
+  const handleQueueClick = useCallback(() => {
+    setQueueDialogOpen(true)
+  }, [])
+
+  const handleBulletinStatus = useCallback((msg: string) => {
+    setStatusText(msg)
+  }, [])
+
+  const handleDismissError = useCallback(() => {
+    setError('')
+  }, [])
+
+  const handleDismissOnboarding = useCallback(() => {
+    try {
+      sessionStorage.setItem('finally-a-value-bot_onboarding_banner_dismissed', '1')
+    } catch {
+      /* ignore */
+    }
+    setOnboardingDismissed(true)
+  }, [])
+
   useEffect(() => {
     setMobileChatHeaderCollapsed(false)
   }, [runtimeKey])
@@ -1631,8 +1738,97 @@ export function App({
     settingsDialogOpen,
     mobileOpsOpen,
     shortcutsOpen,
-    onOpenShortcuts: () => setShortcutsOpen(true),
+    onOpenShortcuts: handleShowShortcuts,
   })
+
+  const handleCloseMobileNav = useCallback(() => {
+    setMobileNavOpen(false)
+  }, [])
+
+  const handleSelectSessionStable = useCallback((sid: string | null) => {
+    void handleSelectSession(sid)
+  }, [handleSelectSession])
+
+  const appHeaderNav = useMemo(
+    () => ({
+      mobileNavOpen,
+      onOpenMobileNav: handleOpenMobileNav,
+      desktopSidebarOpen,
+      onToggleDesktopSidebar: handleToggleDesktopSidebar,
+    }),
+    [mobileNavOpen, handleOpenMobileNav, desktopSidebarOpen, handleToggleDesktopSidebar],
+  )
+
+  const appHeaderSession = useMemo(
+    () => ({
+      activePersonaId,
+      activePersonaName,
+      chatSessions,
+      activeSessionId,
+      historyLoading,
+      onSelectSession: handleSelectSessionStable,
+      onCreateSession: handleCreateSession,
+      onArchiveSession: handleArchiveSession,
+      onReopenSession: handleReopenSession,
+      onDeleteSession: handleDeleteSession,
+    }),
+    [
+      activePersonaId,
+      activePersonaName,
+      chatSessions,
+      activeSessionId,
+      historyLoading,
+      handleSelectSessionStable,
+      handleCreateSession,
+      handleArchiveSession,
+      handleReopenSession,
+      handleDeleteSession,
+    ],
+  )
+
+  const terminalAvailable = installationStatus?.terminal?.web_terminal_available === true
+  const agentHistoryDisabled = activePersonaId == null
+
+  const appHeaderToolbar = useMemo(
+    () => ({
+      queueLane,
+      backgroundActiveCount,
+      installationStatus,
+      statusText,
+      onExpandCockpit: handleExpandCockpit,
+      onOpenSettings: handleOpenSettings,
+      onOpenInbox: handleOpenInbox,
+      inboxBadgeCount,
+      onOpenSchedules: handleOpenSchedules,
+      onOpenQueue: handleOpenQueue,
+      onOpenPrinciples: handleOpenPrinciples,
+      onOpenArtifacts: handleOpenArtifacts,
+      onOpenTerminal: handleOpenTerminal,
+      terminalAvailable,
+      onOpenMemory: handleOpenMemory,
+      onOpenAgentHistory: handleOpenAgentHistory,
+      agentHistoryDisabled,
+    }),
+    [
+      queueLane,
+      backgroundActiveCount,
+      installationStatus,
+      statusText,
+      handleExpandCockpit,
+      handleOpenSettings,
+      handleOpenInbox,
+      inboxBadgeCount,
+      handleOpenSchedules,
+      handleOpenQueue,
+      handleOpenPrinciples,
+      handleOpenArtifacts,
+      handleOpenTerminal,
+      terminalAvailable,
+      handleOpenMemory,
+      handleOpenAgentHistory,
+      agentHistoryDisabled,
+    ],
+  )
 
   const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
 
@@ -1675,15 +1871,15 @@ export function App({
                 appearance={appearance}
                 onToggleAppearance={toggleAppearance}
                 uiTheme={uiTheme}
-                onUiThemeChange={(theme) => setUiTheme(theme as UiTheme)}
+                onUiThemeChange={handleUiThemeChange}
                 uiThemeOptions={UI_THEME_OPTIONS}
                 personas={personas}
                 personaHasNew={personaHasNew}
                 selectedPersonaId={activePersonaId}
-                onPersonaSelect={(name) => void switchPersona(name)}
-                onCreatePersona={() => void onCreatePersona()}
-                onDeletePersona={(id) => void onDeletePersona(id)}
-                onCloseRequest={() => setMobileNavOpen(false)}
+                onPersonaSelect={handlePersonaSelect}
+                onCreatePersona={handleCreatePersonaClick}
+                onDeletePersona={handleDeletePersonaClick}
+                onCloseRequest={handleCloseMobileNav}
               />
             </div>
           </div>
@@ -1699,14 +1895,14 @@ export function App({
                 appearance={appearance}
                 onToggleAppearance={toggleAppearance}
                 uiTheme={uiTheme}
-                onUiThemeChange={(theme) => setUiTheme(theme as UiTheme)}
+                onUiThemeChange={handleUiThemeChange}
                 uiThemeOptions={UI_THEME_OPTIONS}
                 personas={personas}
                 personaHasNew={personaHasNew}
                 selectedPersonaId={activePersonaId}
-                onPersonaSelect={(name) => void switchPersona(name)}
-                onCreatePersona={() => void onCreatePersona()}
-                onDeletePersona={(id) => void onDeletePersona(id)}
+                onPersonaSelect={handlePersonaSelect}
+                onCreatePersona={handleCreatePersonaClick}
+                onDeletePersona={handleDeletePersonaClick}
               />
               <div
                 role="separator"
@@ -1738,46 +1934,11 @@ export function App({
             <AppHeader
               appearance={appearance}
               mobileChatHeaderCollapsed={mobileChatHeaderCollapsed}
-              nav={{
-                mobileNavOpen,
-                onOpenMobileNav: () => setMobileNavOpen(true),
-                desktopSidebarOpen,
-                onToggleDesktopSidebar: () => setDesktopSidebarOpen((v) => !v),
-              }}
-              session={{
-                activePersonaId,
-                activePersonaName,
-                chatSessions,
-                activeSessionId,
-                historyLoading,
-                onSelectSession: (sid) => void handleSelectSession(sid),
-                onCreateSession: handleCreateSession,
-                onArchiveSession: handleArchiveSession,
-                onReopenSession: handleReopenSession,
-                onDeleteSession: handleDeleteSession,
-              }}
-              toolbar={{
-                queueLane,
-                backgroundActiveCount,
-                installationStatus,
-                statusText,
-                onExpandCockpit: () => setCockpitExpanded(true),
-                onOpenSettings: () => setSettingsDialogOpen(true),
-                onOpenSchedules: () => setSchedulesDialogOpen(true),
-                onOpenQueue: () => setQueueDialogOpen(true),
-                onOpenPrinciples: () => setAgentsMdOpen(true),
-                onOpenArtifacts: () => setArtifactsDialogOpen(true),
-                onOpenTerminal: () => {
-                  setTerminalError('')
-                  setTerminalDialogOpen(true)
-                },
-                terminalAvailable: installationStatus?.terminal?.web_terminal_available === true,
-                onOpenMemory: () => setMemoryDialogOpen(true),
-                onOpenAgentHistory: () => setAgentHistoryDialogOpen(true),
-                agentHistoryDisabled: activePersonaId == null,
-              }}
-              onOpenMobileSettings={() => setSettingsDialogOpen(true)}
-              onOpenMobileOps={() => setMobileOpsOpen(true)}
+              nav={appHeaderNav}
+              session={appHeaderSession}
+              toolbar={appHeaderToolbar}
+              onOpenMobileSettings={handleOpenSettings}
+              onOpenMobileOps={handleOpenMobileOps}
             />
             <div
               className={
@@ -1801,7 +1962,7 @@ export function App({
                     otherPersonasPending={otherPersonasPending}
                     backgroundActiveCount={backgroundActiveCount}
                     installationStatus={installationStatus}
-                    onQueueClick={() => setQueueDialogOpen(true)}
+                    onQueueClick={handleQueueClick}
                     bulletinFocus={bulletinFocus}
                     bookmarks={personaBookmarks}
                     activePersonaId={activePersonaId}
@@ -1809,7 +1970,7 @@ export function App({
                     historySuffix={bulletinHistorySuffix}
                     operatorMemoServer={bulletinOperatorMemo}
                     reloadBulletin={reloadPersonaBulletin}
-                    onBulletinStatus={(msg) => setStatusText(msg)}
+                    onBulletinStatus={handleBulletinStatus}
                     onExpandedChange={setCockpitExpanded}
                     expanded={cockpitExpanded}
                     floating
@@ -1827,20 +1988,13 @@ export function App({
                         Finish setup: configure <code className="text-xs">.env</code> with at least one channel (Telegram or Discord) and LLM keys, then restart the gateway if needed. See Settings for status.
                       </Callout.Text>
                       <Flex gap="2" align="center" wrap="wrap">
-                        <Button size="1" variant="solid" onClick={() => setSettingsDialogOpen(true)}>
+                        <Button size="1" variant="solid" onClick={handleOpenSettings}>
                           Open Settings
                         </Button>
                         <Button
                           size="1"
                           variant="soft"
-                          onClick={() => {
-                            try {
-                              sessionStorage.setItem('finally-a-value-bot_onboarding_banner_dismissed', '1')
-                            } catch {
-                              /* ignore */
-                            }
-                            setOnboardingDismissed(true)
-                          }}
+                          onClick={handleDismissOnboarding}
                         >
                           Dismiss
                         </Button>
@@ -1857,7 +2011,7 @@ export function App({
                   <ErrorBanner
                     message={error}
                     className={replayNotice ? 'mt-2' : ''}
-                    onDismiss={() => setError('')}
+                    onDismiss={handleDismissError}
                   />
                 ) : null}
               </div>
@@ -1873,17 +2027,17 @@ export function App({
                     historyLoading={historyLoading}
                     historyHasMore={historyHasMore}
                     historyLoadingMore={historyLoadingMore}
-                    onLoadMoreHistory={() => void loadMoreHistory()}
+                    onLoadMoreHistory={loadMoreHistory}
                     draftText={activeDraftText}
                     onDraftTextChange={handleDraftTextChange}
                     bookmarkedMessageIds={bookmarkedMessageIds}
                     onToggleBookmark={toggleMessageBookmark}
-                    onReplyToMessage={(id) => void handleReplyToMessage(id)}
-                    onDeleteMessage={(id) => void handleDeleteMessage(id)}
+                    onReplyToMessage={handleReplyToMessage}
+                    onDeleteMessage={handleDeleteMessage}
                     pendingReply={activePendingReply}
                     onDismissPendingReply={handleDismissPendingReply}
                     onMobileThreadScroll={handleMobileThreadScroll}
-                    onShowShortcuts={() => setShortcutsOpen(true)}
+                    onShowShortcuts={handleShowShortcuts}
                     uploadHint={
                       statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
                         ? statusText
@@ -1912,19 +2066,9 @@ export function App({
           installationStatus,
           restartBusy,
           requestRestart,
-          integrationsNotice,
-          botInstances,
-          botFormBusy,
-          removeBotInstance,
-          addBotInstance,
-          newBotPlatform,
-          setNewBotPlatform,
-          newBotLabel,
-          setNewBotLabel,
-          newBotToken,
-          setNewBotToken,
           bindings,
           updateChannelPersonaPolicy,
+          reloadInstallationStatus: loadSettings,
         }}
         queue={{
           open: queueDialogOpen,
@@ -1962,6 +2106,25 @@ export function App({
             setScheduleDetailPrompt(t.prompt)
             setScheduleDetailScheduleType(t.schedule_type === 'once' ? 'once' : 'cron')
             setScheduleDetailScheduleValue(t.schedule_value)
+          },
+        }}
+        inbox={{
+          open: inboxDialogOpen,
+          onOpenChange: setInboxDialogOpen,
+          unread: inboxUnread,
+          todos: inboxTodos,
+          loading: inboxLoading,
+          busyTodoId: inboxBusyTodoId,
+          onRefresh: () => {
+            void loadPersonas(chatId)
+            void loadInboxTodos(chatId)
+          },
+          onOpenPersona: (personaId) => {
+            const p = personas.find((x) => x.id === personaId)
+            if (p) void switchPersona(p.name)
+          },
+          onCompleteTodo: (todoId) => {
+            void completeInboxTodo(todoId)
           },
         }}
         scheduleDetail={{
@@ -2094,6 +2257,8 @@ export function App({
         open={mobileOpsOpen}
         onOpenChange={setMobileOpsOpen}
         onOpenQueue={() => setQueueDialogOpen(true)}
+        onOpenInbox={() => setInboxDialogOpen(true)}
+        inboxBadgeCount={inboxBadgeCount}
         onOpenSchedules={() => setSchedulesDialogOpen(true)}
         onOpenPrinciples={() => setAgentsMdOpen(true)}
         onOpenArtifacts={() => setArtifactsDialogOpen(true)}

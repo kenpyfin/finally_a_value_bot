@@ -343,6 +343,8 @@ fn is_progress_tool_use(tool_name: &str) -> bool {
             | "schedule_task"
             | "register_tracked_job"
             | "update_bulletin_focus"
+            | "add_todo"
+            | "list_todos"
     )
 }
 

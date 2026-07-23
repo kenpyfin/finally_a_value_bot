@@ -12,15 +12,27 @@ const AGENT_SKILLS_HEADING: &str = "# Agent Skills";
 
 const MCP_TOOLS_DELEGATION_SECTION: &str = r#"## Tool groups (MCP delegation)
 Bot tools are exposed via MCP server `finally-a-value-bot` (loopback). Tool names and parameter schemas come from MCP `tools/list` — do not rely on prose catalogs here.
-- **Prefer MCP** for persona-scoped files (`read_file`, `write_file`, `grep`, …), vault (`search_vault`, `read_file`), scheduler, bulletin (`update_bulletin_focus`), channel delivery, and skills (`activate_skill`, `run_skill_script`).
-- Cursor built-ins (shell, search) exist; use MCP file tools for paths under the persona cwd and for vault/scheduler/bulletin workflows.
+- **Prefer MCP** for persona-scoped files (`read_file`, `write_file`, `grep`, …), vault (`search_vault`, `read_file`), scheduler, bulletin (`update_bulletin_focus`), operator todos (`add_todo` / `list_todos` / `complete_todo`), channel delivery, and skills (`activate_skill`, `run_skill_script`).
+- Cursor built-ins (shell, search) exist; use MCP file tools for paths under the persona cwd and for vault/scheduler/bulletin/todo workflows.
 - **Skills:** metadata in the Agent Skills section below is routing only; call `activate_skill` before following procedural skill steps.
+
+"#;
+
+const CURSOR_FILE_DELIVERY_REMINDER: &str = r#"## File links (web delivery)
+When sharing files with the user, put markdown links in your **final reply** using **plain absolute local paths** (e.g. `[Spec](/home/.../personas/{chat_id}/{persona_id}/ORIGIN/Projects/spec.md)`).
+- Never use `file://` URLs — the web UI cannot open them.
+- Never fabricate `/api/uploads/...` URLs — the platform materializes absolute paths at delivery.
+- After writing or updating a file, include a markdown link to the **current** absolute path when the user asks for a link.
 
 "#;
 
 const AGENT_SKILLS_INTRO_SLIM: &str = "\n# Agent Skills\n\nMetadata catalog for routing — call **`activate_skill`** to load full `SKILL.md` before procedural steps.\n\n";
 
 const MAX_PROMPT_LEN: usize = 120_000;
+const TIER1_HEADING: &str = "# Identity and long-term memory (Tier 1)";
+const MAX_TIER1_ANCHOR_CHARS: usize = 4_096;
+const GIT_DISCIPLINE_LINE: &str = "Git discipline: persona cwd is not the project git root. \
+For commit/push/merge, cd to the Tier 1 project repo path first; do not rely on git discovering the bot checkout.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationPromptMode {
@@ -61,6 +73,10 @@ pub fn slim_delegation_system_prompt(full: &str, slim_enabled: bool) -> String {
     }
     let mut out = replace_tool_groups_section(full);
     out = shorten_agent_skills_intro(&out);
+    if !out.contains("## File links (web delivery)") {
+        out.push('\n');
+        out.push_str(CURSOR_FILE_DELIVERY_REMINDER);
+    }
     out
 }
 
@@ -102,21 +118,60 @@ pub struct DelegationRuntimeHeader {
     pub mcp_enabled: bool,
 }
 
-fn build_minimal_runtime_header(header: &DelegationRuntimeHeader) -> String {
+fn build_minimal_runtime_header(
+    header: &DelegationRuntimeHeader,
+    tier1_anchor: Option<&str>,
+) -> String {
     let mcp_line = if header.mcp_enabled {
         format!("Tools: MCP server `{MCP_SERVER_NAME}` (authoritative schemas via tools/list).\n")
     } else {
         String::new()
     };
-    format!(
+    let mut out = format!(
         "## Cursor delegation (resume turn)\n\
          chat_id={} persona_id={}\n\
          {mcp_line}\
          Path discipline: never use `workspace/` prefixes; cwd is persona-scoped under \
-         `shared/personas/{{chat_id}}/{{persona_id}}/`. Primary task: the `[current_request]` below.",
+         `shared/personas/{{chat_id}}/{{persona_id}}/`. Primary task: the `[current_request]` below.\n\n\
+         {file_delivery}",
         header.chat_id,
         header.persona_id,
-    )
+        file_delivery = CURSOR_FILE_DELIVERY_REMINDER,
+    );
+    if let Some(tier1) = tier1_anchor.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(tier1);
+        out.push_str("\n\n");
+        if tier1_has_project_repo_path(tier1) {
+            out.push_str(GIT_DISCIPLINE_LINE);
+        }
+    }
+    out
+}
+
+/// Slice Tier 1 identity/facts from the full delegation system prompt for resume-delta anchoring.
+pub fn extract_tier1_anchor(delegation_system: &str) -> Option<String> {
+    let start = delegation_system.find(TIER1_HEADING)?;
+    let after = &delegation_system[start..];
+    let rest = &after[TIER1_HEADING.len()..];
+    let end = rest
+        .find("\n# ")
+        .map(|i| TIER1_HEADING.len() + i)
+        .unwrap_or(after.len());
+    let slice = after[..end].trim();
+    if slice.is_empty() {
+        return None;
+    }
+    if slice.chars().count() <= MAX_TIER1_ANCHOR_CHARS {
+        return Some(slice.to_string());
+    }
+    let truncated: String = slice.chars().take(MAX_TIER1_ANCHOR_CHARS).collect();
+    Some(format!(
+        "{truncated}\n\n(Tier 1 anchor truncated for resume delta)"
+    ))
+}
+
+fn tier1_has_project_repo_path(tier1: &str) -> bool {
+    tier1.contains("Repo:") || tier1.contains("/home/")
 }
 
 fn is_prior_turn_message(text: &str) -> bool {
@@ -130,6 +185,64 @@ fn is_trusted_delta_message(text: &str) -> bool {
         || t.starts_with("[session_context")
         || t.starts_with("[current_request")
         || t.starts_with("[hook_context]")
+        || t.starts_with("[continuation_context]")
+}
+
+/// Last `prior_turn` user message and its immediately following assistant reply before `[current_request]`.
+pub fn extract_last_prior_turn_pair(messages: &[Message]) -> Option<(Message, Message)> {
+    let current_idx = messages.iter().rposition(|m| {
+        m.role == "user" && message_text(m).trim().starts_with("[current_request")
+    })?;
+    let before = &messages[..current_idx];
+    let user_idx = before
+        .iter()
+        .rposition(|m| m.role == "user" && is_prior_turn_message(&message_text(m)))?;
+    let user_msg = before[user_idx].clone();
+    let assistant_msg = before
+        .get(user_idx + 1)
+        .filter(|m| m.role == "assistant")?
+        .clone();
+    Some((user_msg, assistant_msg))
+}
+
+fn build_continuation_context_message(user: &Message, assistant: &Message) -> Message {
+    let body = format!(
+        "[continuation_context]\n\
+         Immediately preceding turn — use for disambiguation when [current_request] is a follow-up; \
+         [current_request] remains primary.\n\n\
+         ## user\n{}\n\n\
+         ## assistant\n{}\n\
+         [/continuation_context]",
+        message_text(user),
+        message_text(assistant),
+    );
+    Message {
+        role: "user".into(),
+        content: MessageContent::Text(body),
+    }
+}
+
+fn insert_continuation_before_current_request(delta: &mut Vec<Message>, continuation: Message) {
+    if let Some(idx) = delta
+        .iter()
+        .position(|m| message_text(m).trim().starts_with("[current_request"))
+    {
+        delta.insert(idx, continuation);
+    } else {
+        delta.push(continuation);
+    }
+}
+
+/// Trusted delta messages plus the last prior turn pair for continuation disambiguation.
+pub fn build_resume_delta_messages(messages: &[Message]) -> Vec<Message> {
+    let mut delta = extract_resume_delta_messages(messages);
+    if let Some((user, assistant)) = extract_last_prior_turn_pair(messages) {
+        insert_continuation_before_current_request(
+            &mut delta,
+            build_continuation_context_message(&user, &assistant),
+        );
+    }
+    delta
 }
 
 /// Messages for a resumed Cursor session: runtime/persona/session context, hook steering, current request.
@@ -161,8 +274,9 @@ pub fn build_cursor_delegation_prompt(
     let mut prompt = match mode {
         DelegationPromptMode::FullSlim => flatten_turn_prompt(delegation_system, messages),
         DelegationPromptMode::ResumeDelta => {
-            let delta_messages = extract_resume_delta_messages(messages);
-            let runtime_header = build_minimal_runtime_header(header);
+            let tier1_anchor = extract_tier1_anchor(delegation_system);
+            let delta_messages = build_resume_delta_messages(messages);
+            let runtime_header = build_minimal_runtime_header(header, tier1_anchor.as_deref());
             flatten_turn_prompt(&runtime_header, &delta_messages)
         }
     };
@@ -231,6 +345,15 @@ mod tests {
              Long intro about metadata and SKILLS_CATALOG_MODE compact full modes.\n\n\
              <available_skills>\n- name: foo\n</available_skills>"
         )
+    }
+
+    #[test]
+    fn slim_appends_file_delivery_reminder() {
+        let full = fixture_full_system();
+        let slim = slim_delegation_system_prompt(&full, true);
+        assert!(slim.contains("## File links (web delivery)"));
+        assert!(slim.contains("Never use `file://` URLs"));
+        assert!(slim.contains("Never fabricate `/api/uploads/...` URLs"));
     }
 
     #[test]
@@ -353,7 +476,128 @@ mod tests {
         );
         assert!(prompt.contains("resume turn"));
         assert!(prompt.contains("chat_id=1"));
+        assert!(prompt.contains("## File links (web delivery)"));
         assert!(!prompt.contains("# Principles"));
         assert!(prompt.contains("[current_request]"));
+    }
+
+    fn fixture_tier1_system() -> String {
+        format!(
+            "# Principles\n\nBe helpful.\n\n{TIER1_HEADING}\n\n\
+             ### Identity\n\n**Name:** sourdough\n\n\
+             ### Long-term context (Tier 1)\n\n\
+             - Sourdough and Bread website Repo: /home/ken/big_storage/projects/sourdough\n\n\
+             # Vault and Vector DB Paths\n\n- path: /tmp\n"
+        )
+    }
+
+    #[test]
+    fn resume_delta_header_includes_tier1_anchor() {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Text(
+                "[current_request sender=\"u\"]\nhi\n[/current_request]".into(),
+            ),
+        }];
+        let header = DelegationRuntimeHeader {
+            chat_id: 997894126,
+            persona_id: 26,
+            mcp_enabled: true,
+        };
+        let prompt = build_cursor_delegation_prompt(
+            DelegationPromptMode::ResumeDelta,
+            &fixture_tier1_system(),
+            &messages,
+            &header,
+            false,
+            false,
+        );
+        assert!(prompt.contains(TIER1_HEADING));
+        assert!(prompt.contains("/home/ken/big_storage/projects/sourdough"));
+        assert!(prompt.contains("Git discipline"));
+    }
+
+    #[test]
+    fn resume_delta_always_includes_last_prior_pair() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "<user_message context=\"prior_turn\" sender=\"u\" at=\"t1\">old task</user_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\" at=\"t2\">old reply</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "<user_message context=\"prior_turn\" sender=\"u\" at=\"t3\">fix index.html on dev</user_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\" at=\"t4\">Fixed /home/ken/big_storage/projects/sourdough/index.html</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\nplease commit and push to origin for dev branch\n[/current_request]"
+                        .into(),
+                ),
+            },
+        ];
+        let delta = build_resume_delta_messages(&messages);
+        let joined: String = delta
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("[continuation_context]"));
+        assert!(joined.contains("fix index.html on dev"));
+        assert!(joined.contains("sourdough/index.html"));
+        assert!(!joined.contains("old task"));
+    }
+
+    #[test]
+    fn resume_delta_continuation_before_current_request() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "<user_message context=\"prior_turn\">prior</user_message>".into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("done".into()),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\ngo\n[/current_request]".into(),
+                ),
+            },
+        ];
+        let delta = build_resume_delta_messages(&messages);
+        let texts: Vec<String> = delta.iter().map(message_text).collect();
+        let cont_idx = texts
+            .iter()
+            .position(|t| t.starts_with("[continuation_context]"))
+            .expect("continuation");
+        let req_idx = texts
+            .iter()
+            .position(|t| t.starts_with("[current_request"))
+            .expect("current_request");
+        assert!(cont_idx < req_idx);
     }
 }

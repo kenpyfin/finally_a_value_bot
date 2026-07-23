@@ -703,6 +703,23 @@ impl LlmProvider for LlmHandle {
         provider.send_message(system, messages, tools).await
     }
 
+    async fn send_message_with_options(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: LlmSendOptions,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        let provider = self
+            .provider
+            .read()
+            .map_err(|_| FinallyAValueBotError::LlmApi("LLM provider lock poisoned".into()))?
+            .clone();
+        provider
+            .send_message_with_options(system, messages, tools, options)
+            .await
+    }
+
     async fn send_message_stream(
         &self,
         system: &str,

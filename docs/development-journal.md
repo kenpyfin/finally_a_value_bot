@@ -4,6 +4,83 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-23 — Web UI performance: ThreadPane isolation, poll churn, bundle split, ops_poll
+
+- **Area:** web frontend / web API
+- **Summary:** Fixed idle jank from ops/history polling defeating chat isolation. Stabilized ThreadPane callbacks (`useCallback`), hoisted `makeMarkdownText` to module scope, equality-gated `setPersonas` (`personasSnapshotEqual`), memoized Header/Sidebar/Cockpit, lazy-loaded settings/terminal panels, Vite `manualChunks` + `font-display: optional`. Ops poll refreshes personas only every 10s. Phase 4: SSE delta yield throttle 50→80ms; new `GET /api/ops_poll` returns lanes + background jobs (+ optional personas) so the client no longer fans out three GETs per tick. Message-list virtualization deferred unless residual jank remains.
+- **Key files / symbols:** `ThreadPane` / `MarkdownText` in `web/src/components/thread-pane.tsx`; `personasSnapshotEqual` / `useOpsPoll` in `web/src/hooks/use-ops-poll.ts`; `fetchOpsPollBundle` in `web/src/api/ops-fetch.ts`; `api_ops_poll` in `src/web.rs`; `manualChunks` in `web/vite.config.ts`; SSE flush in `web/src/app/App.tsx`.
+- **Note:** Rebuild web (`cd web && npm run build`) and restart bot so embedded assets + `/api/ops_poll` are live.
+
+### 2026-07-22 — Web persistent auth + Inbox (unread + agent todos)
+
+- **Area:** web UI / auth / personas / agent tools
+- **Summary:** Web auth token now persists in `localStorage` (with one-time migrate from `sessionStorage`) so closing the browser no longer forces re-entry. Persona unread dots no longer light up for all history: missing last-read is baselined on persona load, and boot `markPersonaRead` accepts an explicit chat id. Added per-persona operator todos (`persona_todos` SQLite) with agent tools `add_todo` / `list_todos` / `complete_todo`, `GET/PATCH /api/todos`, and an Inbox dialog (new messages + open todos) with header/mobile badge.
+- **Key files / symbols:** `getStoredAuthToken` / `setStoredAuthToken` in `web/src/api/client.ts`; `baselinePersonaLastReadIfMissing` in `web/src/lib/persona-storage.ts`; `markPersonaRead` in `use-persona-session.ts`; `PersonaTodo` + `migrate_persona_todos` in `src/db.rs`; `src/tools/persona_todo.rs`; `api_todos_list` / `api_todos_patch` in `src/web.rs`; `InboxPanel` in `web/src/components/inbox-panel.tsx`.
+- **Note:** Rebuild web assets + restart bot. Distinct from removed `todo_*` / `TODO.json` and from Tier 3 memory. Operator completes todos in Inbox; agent creates them.
+
+### 2026-07-15 — Integrations tab unified around bot instances
+
+- **Area:** channels / web settings / config
+- **Summary:** Settings → Integrations no longer shows separate primary Telegram/Discord/WhatsApp forms plus a duplicate all-bots list. `channel_bot_instances` now carries per-instance platform options (`bot_username`, Telegram group allowlist, Discord channel allowlist, WhatsApp phone/verify/webhook settings); `CONTROL_CHAT_IDS` stays global shared access. Telegram/Discord runtime reads allowlists from the active bot instance. Settings → Channels remains the persona-routing surface and now includes WhatsApp; WhatsApp is single-persona by default because this gateway supports one WhatsApp Business number, not multiple independent WhatsApp dispatchers.
+- **Key files / symbols:** `ChannelBotInstance` / `migrate_channel_bot_instances_and_policy` in `src/db.rs`; `GET/PATCH /api/channels/integration` and `/api/channel_bot_instances` in `src/web.rs`; `SettingsIntegrationsPanel` in `web/src/components/settings-integrations.tsx`; `resolve_incoming_run_persona_for_channel` in `src/persona.rs`; `deliver_and_store_bot_message` in `src/channel.rs`.
+- **Note:** Restart gateway after changing bot tokens or webhook fields. Legacy app settings/env values are migrated/backfilled to primary instance rows; extra WhatsApp rows are not created by the UI because only one WhatsApp number is supported.
+
+### 2026-07-14 — Channel integrations configured in Web UI (not .env)
+
+- **Area:** channels / web settings / config
+- **Summary:** Telegram, Discord, and WhatsApp tokens plus platform options (`BOT_USERNAME`, allowlists, WhatsApp phone/verify/port, control chats) are now configured in Settings → Integrations and persisted in SQLite (`channel_bot_instances` + `app_settings`). Startup one-time-migrates legacy channel env vars when `CHANNEL_INTEGRATION_SEEDED` is unset, then merges DB into `Config`. Env sync no longer overwrites primary bot rows every boot. Bootstrap (`WEB_*`, `WORKSPACE_DIR`) and LLM API keys stay in `.env`.
+- **Key files / symbols:** `src/channel_integration_config.rs` (`migrate_from_env_if_empty`, `merge_into_config`, `GET/PATCH /api/channels/integration`); `web/src/components/settings-integrations.tsx`; `main.rs` startup sequence; `is_channel_ready` DB-aware in `web.rs`.
+- **Note:** Restart gateway after saving tokens. Remove channel secrets from `.env` after confirming Integrations. Headless installs need a prior migrate or DB seed.
+
+### 2026-07-12 — Resume-delta continuation context + PostDelivery focus sync hardening
+
+- **Area:** cursor engine / PostDelivery hooks / persona bulletin
+- **Summary:** Sourdough main-chat incident: resume-delta sent only `[current_request]` (~1.8k chars) so a generic "commit and push to dev" lost the prior sourdough `index.html` fix; PostDelivery focus sync left bulletin stale (Instagram promo) because the strategy LLM sub-call no-op'd. Resume-delta now always injects `[continuation_context]` (last prior_turn user+assistant pair) and Tier 1 anchor + git discipline in the minimal header. Focus sync uses a narrow context (delivered reply + fresh DB bulletin), lightweight sync system prompt, required bulletin update on task deliveries (2 iterations + `tool_choice: required` when supported), and structured logging (`focus_sync_started` / `focus_sync_completed` / `focus_sync_noop`).
+- **Key files / symbols:** `build_resume_delta_messages`, `extract_tier1_anchor`, `extract_last_prior_turn_pair` in `src/cursor_delegation_prompt.rs`; `run_persona_focus_sync_after_delivery`, `build_focus_sync_messages`, `focus_sync_task_delivery` in `src/channels/telegram.rs`; `LlmHandle::send_message_with_options` in `src/llm.rs`.
+- **Note:** Rebuild + restart bot. Gemini focus-sync may still ignore `tool_choice`; narrowed prompt + second iteration mitigates.
+
+### 2026-07-10 — Cursor sidecar: global bridge launch queue + scheduled Classic fallback
+
+- **Area:** cursor engine / sidecar / scheduler
+- **Summary:** Scheduled tasks (#6 vault index, etc.) failed with `Timed out waiting for bridge discovery` when multiple crons claimed together and each cold-started a `cursor-sdk-bridge`. Sidecar now: (1) global `asyncio.Semaphore(1)` serializes all `Client.launch_bridge` calls; (2) bridge discovery timeouts are retryable (up to 3 attempts with pool eviction); (3) default launch timeout raised from 30s → **60s** (`CURSOR_BRIDGE_LAUNCH_TIMEOUT_SECS` override); (4) `launch_bridge` runs in `asyncio.to_thread` so the event loop stays responsive while queued. Rust: `is_cursor_sidecar_recoverable_error` matches bridge-discovery failures; **scheduled tasks fall back to Classic** (same as background jobs) when Cursor/sidecar is unavailable instead of hard-failing.
+- **Key files / symbols:** `_BRIDGE_LAUNCH_SEM`, `_bridge_launch_timeout_secs`, `_is_retryable_bridge_error` in `scripts/cursor-sdk-runner.py`; `cursor_engine_classic_fallback`, `is_cursor_sidecar_recoverable_error` in `src/cursor_engine.rs`.
+- **Note:** Sidecar script changes apply on next bot restart (managed sidecar respawns from repo `scripts/cursor-sdk-runner.py`). Rust changes require rebuild/reinstall.
+
+### 2026-07-10 — Web file links: materialize `file://` + Cursor delivery reminder
+
+- **Area:** delivery / final_delivery_media / cursor engine / PEP
+- **Summary:** PEP GN session showed Cursor engine emitting `file://` markdown links and fabricated `/api/uploads/...` paths — both broken in the web UI. Added `normalize_local_artifact_ref` (strip `file://`, `file://localhost/…`, and `?`/`#` suffixes) before artifact resolution so `materialize_response_file_links` rewrites them to fresh upload URLs. Strengthened shared system prompt (never `file://`; include absolute path when user asks for a link) and Cursor delegation (`CURSOR_FILE_DELIVERY_REMINDER` in slim system prompt + resume-delta runtime header).
+- **Key files / symbols:** `normalize_local_artifact_ref`, `resolve_workspace_artifact_path` in `src/final_delivery_media.rs`; `CURSOR_FILE_DELIVERY_REMINDER`, `slim_delegation_system_prompt`, `build_minimal_runtime_header` in `src/cursor_delegation_prompt.rs`; `test_materialize_response_file_links_rewrites_file_url_target` in `src/web.rs`.
+- **Note:** Requires rebuild + bot restart. Re-ask for a file link after deploy — stored messages with old `file://` text stay broken until a new reply.
+
+### 2026-07-09 — Web image display: backtick-wrapped persona filenames
+
+- **Area:** delivery / final_delivery_media / Influencer_PZ_3
+- **Summary:** History review for persona 24 (`Influencer_PZ_3`) showed repeated “show me the image” turns where the assistant named `PZ-….png` in backticks or prose but the web thread had no `<img>` — delivery normalization only rewrote **bare filename lines**, not `` `PZ-foo.png` `` inline. Jul 8 Crissy thread: first reply had zero markdown images (text only); second reply after user complaint included `/api/uploads/…` URLs that do exist on disk. Jul 9 Lands End: `` `PZ-20260709-LANDSEND-HOTIFY.png` `` never materialized because of the backtick gap. Extended `normalize_assistant_artifact_references` with backtick filename pass → markdown image before `materialize_response_file_links`.
+- **Key files / symbols:** `inline_image_backtick_regex`, `markdown_image_for_basename` in `src/final_delivery_media.rs`.
+- **Note:** Stored messages without image markup stay text-only until user asks again (post-rebuild). Rebuild + restart bot.
+
+### 2026-07-08 — Cursor engine: session-scoped bridge pool per persona
+
+- **Area:** cursor engine / sidecar
+- **Summary:** Bridge pool is now keyed by **persona cwd + session_scope** (not persona alone). Rust sends `session_scope` on each sidecar `/run` (matches `cursor_engine_agents` DB key). Each focused session gets its own warm `cursor-sdk-bridge` subprocess and on-disk `state_root`, so `agent_id` resume and resume-delta prompts stay isolated per session. Main chat uses empty scope (`main`). Per-pool `asyncio.Lock` serializes turns within one session; different sessions/personas run concurrently.
+- **Key files / symbols:** `SidecarRunRequest.session_scope` in `src/cursor_engine.rs`; `_bridge_pool_key`, `_get_pooled_bridge` in `scripts/cursor-sdk-runner.py`.
+- **Note:** Sidecar script + Rust changes apply on next bot restart/rebuild.
+
+### 2026-07-08 — Cursor engine: bridge crash recovery + session cleanup
+
+- **Area:** cursor engine / sidecar
+- **Summary:** `Bridge request failed: ConnectError: [Errno 111] Connection refused` came from the Cursor SDK's internal `cursor-sdk-bridge` subprocess dying while the Python sidecar kept a stale singleton client. Fixes: (1) each `/run` now launches an isolated `Client.launch_bridge` with a stable per-cwd `state_root` under `runtime/cursor-sdk-state/`, then tears it down in `finally` via `agent.close()` + `client.close()` + `close_default_client()`; (2) up to 3 retries with backoff on retryable bridge/network errors; (3) serialized `/run` via `asyncio.Lock` so concurrent turns cannot share or kill each other's bridge; (4) Rust `is_cursor_sidecar_recoverable_error` broadens Classic fallback to include bridge failures (not only transport errors to the sidecar); (5) sidecar stderr is appended to `runtime/cursor-sdk-sidecar.stderr.log` instead of `/dev/null`.
+- **Key files / symbols:** `scripts/cursor-sdk-runner.py` (`_release_cursor_bridge`, `_bridge_state_root`, `_RUN_LOCK`, `BRIDGE_RETRY_*`); `is_cursor_sidecar_recoverable_error` in `src/cursor_engine.rs`; `sidecar_stderr_log_path`, `spawn_sidecar_process` in `src/cursor_sdk_sidecar.rs`.
+- **Note:** Sidecar script changes apply on next bot restart (managed sidecar is spawned from repo `scripts/cursor-sdk-runner.py`). Rust changes require rebuild/reinstall.
+
+### 2026-07-08 — Web upload could hang the composer forever
+
+- **Area:** web UI (attachments)
+- **Summary:** Uploading a file could leave the app stuck on `Uploading…` indefinitely and lock the composer. Two causes: (1) `uploadAttachmentFile` used `fetch` with **no timeout**, so a stalled/large upload or a busy server never resolved; (2) in the chat adapter's `run` generator, `extractLatestUserInput` (which performs the multipart upload) ran **before** the `try/catch`, so an upload error/abort never reset `statusText`/`error` and the composer stayed in `isRunning`. Fix: added a safety-net timeout (`DEFAULT_UPLOAD_TIMEOUT_MS = 180s`) that combines an internal `AbortController` with the caller signal, distinguishing timeout vs. user-cancel vs. network errors with actionable messages; wrapped attachment extraction in `try/catch` that resets state (silent on user abort, otherwise surfaces the error and ends the run so the composer unlocks).
+- **Key files / symbols:** `web/src/lib/attachments.ts` (`uploadAttachmentFile`, `linkSignalWithTimeout`, `DEFAULT_UPLOAD_TIMEOUT_MS`); `web/src/app/App.tsx` (chat `adapter.run` extraction guard); `web/src/lib/attachments.test.ts` (timeout + abort coverage).
+- **Note:** Frontend-only; requires a web asset rebuild (`cd web && npm run build`) which is embedded via `include_dir!` at Rust build time.
+
 ### 2026-07-07 — Scheduler resilience: blob-typed prompt broke all task queries
 
 - **Area:** scheduler / db

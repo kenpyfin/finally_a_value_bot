@@ -62,20 +62,86 @@ export async function fileToBase64(file: File): Promise<string> {
   return btoa(binary)
 }
 
+/** Safety-net timeout so a stalled upload cannot hang the composer forever. */
+export const DEFAULT_UPLOAD_TIMEOUT_MS = 180_000
+
+/**
+ * Combine an optional caller `AbortSignal` with an internal timeout into a single
+ * signal. The returned `cleanup` must be called once the request settles so the
+ * timer and abort listener do not leak. `timedOut()` reports whether the timeout
+ * (rather than the caller) triggered the abort, enabling a clearer error message.
+ */
+function linkSignalWithTimeout(
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): { signal: AbortSignal; cleanup: () => void; timedOut: () => boolean } {
+  const controller = new AbortController()
+  let didTimeout = false
+
+  const onAbort = () => controller.abort((signal as AbortSignal | undefined)?.reason)
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort(signal.reason)
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+  }
+
+  const timer =
+    timeoutMs > 0 && !controller.signal.aborted
+      ? setTimeout(() => {
+          didTimeout = true
+          controller.abort(new DOMException('Upload timed out', 'TimeoutError'))
+        }, timeoutMs)
+      : null
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timer) clearTimeout(timer)
+      if (signal) signal.removeEventListener('abort', onAbort)
+    },
+    timedOut: () => didTimeout,
+  }
+}
+
 export async function uploadAttachmentFile(
   file: File,
   chatId: number | null,
-  options?: { signal?: AbortSignal; onProgress?: (message: string) => void },
+  options?: { signal?: AbortSignal; onProgress?: (message: string) => void; timeoutMs?: number },
 ): Promise<SendAttachmentRef> {
   const form = new FormData()
   form.append('file', file, file.name || 'upload')
   const query = chatId != null ? `?chat_id=${encodeURIComponent(String(chatId))}` : ''
   options?.onProgress?.(`Uploading ${file.name || 'file'} (${formatUploadBytes(file.size)})…`)
-  const data = await apiForm<UploadAttachmentResponse>(`/api/uploads${query}`, {
-    method: 'POST',
-    body: form,
-    signal: options?.signal,
-  })
+
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS
+  const linked = linkSignalWithTimeout(options?.signal, timeoutMs)
+  let data: UploadAttachmentResponse
+  try {
+    data = await apiForm<UploadAttachmentResponse>(`/api/uploads${query}`, {
+      method: 'POST',
+      body: form,
+      signal: linked.signal,
+    })
+  } catch (err) {
+    // Distinguish a safety-net timeout from a user cancellation and from
+    // ordinary network/server errors so callers can surface actionable text.
+    if (linked.timedOut()) {
+      throw new Error(
+        `Upload timed out after ${Math.round(timeoutMs / 1000)}s for ${file.name || 'file'} (${formatUploadBytes(
+          file.size,
+        )}). Check your connection or try a smaller file.`,
+      )
+    }
+    if (options?.signal?.aborted) {
+      throw err instanceof Error ? err : new Error('upload aborted')
+    }
+    throw err instanceof Error ? err : new Error(String(err))
+  } finally {
+    linked.cleanup()
+  }
+
   if (!data.tool_path || !data.url) {
     throw new Error('upload response missing tool_path or url')
   }

@@ -20,7 +20,7 @@ struct ServiceContext {
     working_dir: PathBuf,
     config_path: Option<PathBuf>,
     runtime_logs_dir: PathBuf,
-    /// PATH at install time, so the service can find agent-browser, MCP commands, etc.
+    /// PATH at install time, so the service can find MCP commands, etc.
     path_env: Option<String>,
     /// HOME at install time, so config paths like ~/... resolve correctly.
     home_env: Option<String>,
@@ -67,7 +67,7 @@ ACTIONS:
     help         Show this message
 
 NOTE: install captures your current PATH and HOME so the service can find
-agent-browser, MCP commands, etc. If you add new executables to PATH later,
+MCP commands, etc. If you add new executables to PATH later,
 run: finally_a_value_bot gateway uninstall && finally_a_value_bot gateway install
 "#
     );

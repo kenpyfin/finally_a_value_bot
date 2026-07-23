@@ -2,7 +2,8 @@ use finally_a_value_bot::claude::{Message, MessageContent};
 use finally_a_value_bot::config::Config;
 use finally_a_value_bot::error::FinallyAValueBotError;
 use finally_a_value_bot::{
-    builtin_skills, db, doctor, gateway, logging, mcp, memory, skills, telegram,
+    builtin_skills, channel_integration_config, db, doctor, gateway, logging, mcp, memory, skills,
+    telegram,
 };
 use std::path::Path;
 use tracing::info;
@@ -69,20 +70,10 @@ CONFIG FILE (.env):
       openai_api_key         OpenAI key for voice transcription (optional)
       timezone               IANA timezone for scheduling (default: UTC)
 
-    Telegram (optional):
-      telegram_bot_token         Telegram bot token from @BotFather
-      bot_username               Telegram mention username (without @)
-      allowed_groups             Group allowlist by chat ID (empty = all groups)
-
-    WhatsApp (optional):
-      whatsapp_access_token       Meta API access token
-      whatsapp_phone_number_id    Phone number ID from Meta dashboard
-      whatsapp_verify_token       Webhook verification token
-      whatsapp_webhook_port       Webhook server port (default: 8080)
-
-    Discord (optional):
-      discord_bot_token           Discord bot token from Discord Developer Portal
-      discord_allowed_channels    List of channel IDs to respond in (empty = all)
+    Channels (Web UI → Settings → Integrations; stored in SQLite):
+      Telegram / Discord / WhatsApp tokens and platform options
+      (bot username, allowed groups/channels, WhatsApp webhook fields).
+      Legacy channel env vars are one-time-imported on first boot after upgrade.
 
 MCP (optional):
     Place a mcp.json file in workspace_dir to connect MCP servers.
@@ -431,8 +422,16 @@ fn is_llm_ready(config: &Config) -> bool {
         )
 }
 
-fn has_any_realtime_channel(config: &Config) -> bool {
-    !config.telegram_bot_token.trim().is_empty() || config.discord_bot_token.is_some()
+fn has_any_realtime_channel(config: &Config, db: &db::Database) -> bool {
+    channel_integration_config::has_any_messaging_bot_token(db).unwrap_or_else(|_| {
+        !config.telegram_bot_token.trim().is_empty()
+            || config.discord_bot_token.is_some()
+            || config
+                .whatsapp_access_token
+                .as_deref()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false)
+    })
 }
 
 #[tokio::main]
@@ -537,7 +536,9 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Persona shared migration skipped: {}", e),
     }
 
-    db.sync_channel_bot_instances_from_config(&config)?;
+    channel_integration_config::migrate_from_env_if_empty(&db, &config)?;
+    config.merge_channel_integration_from_db(&db)?;
+    channel_integration_config::validate_runtime_channel_or_web(&config, &db)?;
     match db.provision_all_missing_sibling_bindings() {
         Ok(n) if n > 0 => {
             info!("Auto-provisioned {n} sibling channel binding(s) for bot instances")
@@ -547,7 +548,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Seed onboarding task for fresh installations
-    if is_llm_ready(&config) && has_any_realtime_channel(&config) {
+    if is_llm_ready(&config) && has_any_realtime_channel(&config, &db) {
         let seed_chat_id = config.universal_chat_id.unwrap_or(997894126);
         let seed_persona_id = db.get_current_persona_id(seed_chat_id)?;
         let intro_name = if config.agent_display_name.trim().is_empty() {

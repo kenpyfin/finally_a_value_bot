@@ -601,36 +601,64 @@ fn check_node_and_browser(report: &mut DoctorReport) {
         },
     );
 
-    let browser_cmd = Config::load()
-        .ok()
-        .and_then(|c| c.agent_browser_path.clone())
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| std::path::Path::new(&p).is_file())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                command_exists("agent-browser.cmd") || command_exists("agent-browser")
-            } else {
-                command_exists("agent-browser")
-            }
+    let steel_url = Config::load()
+        .map(|c| c.steel_api_url())
+        .unwrap_or_else(|_| {
+            std::env::var("STEEL_API_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:13920".to_string())
         });
+    let steel_api_port = Config::load()
+        .map(|c| c.steel_api_port)
+        .unwrap_or(crate::config::default_steel_api_port());
+    let steel_cdp_port = Config::load()
+        .map(|c| c.steel_cdp_port)
+        .unwrap_or(crate::config::default_steel_cdp_port());
+    let steel_health_url = format!("{}/api/health", steel_url.trim_end_matches('/'));
+    let steel_ok = std::process::Command::new("curl")
+        .args(["-sf", "--max-time", "3", &steel_health_url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let steel_venv = Config::load()
+        .ok()
+        .map(|c| {
+            let workspace = c.working_dir();
+            std::path::Path::new(&workspace)
+                .join("shared")
+                .join(".venv-steel")
+                .join("bin")
+                .join("python3")
+                .is_file()
+        })
+        .unwrap_or(false);
 
     report.push(
-        "deps.agent_browser",
-        "agent-browser",
-        if browser_cmd {
+        "deps.steel_browser",
+        "steel-browser",
+        if steel_ok || steel_venv {
             CheckStatus::Pass
         } else {
             CheckStatus::Warn
         },
-        if browser_cmd {
-            "agent-browser command found".to_string()
+        if steel_ok {
+            format!("Steel API reachable at {steel_url}")
+        } else if steel_venv {
+            "Steel Python venv found; API not reachable (start Steel Docker)".to_string()
         } else {
-            "agent-browser command not found".to_string()
+            "Steel browser not configured".to_string()
         },
-        if browser_cmd {
+        if steel_ok {
             None
         } else {
-            Some("Run `npm install -g agent-browser && agent-browser install`. In Docker the image sets AGENT_BROWSER_PATH.".to_string())
+            Some(
+                format!(
+                    "Run `bash builtin_skills/steel-browser/setup_steel_env.sh`, set `BROWSER_MANAGED=true` to auto-start Steel on bot boot, then start manually: `docker run -d --name finally-a-value-bot-steel -p {steel_api_port}:3000 -p {steel_cdp_port}:9223 -v finally-a-value-bot-steel-cache:/app/.cache -v finally-a-value-bot-steel-profile:/app/api/user-data-dir -e DOMAIN=127.0.0.1:{steel_api_port} -e CDP_DOMAIN=127.0.0.1:{steel_cdp_port} ghcr.io/steel-dev/steel-browser:latest`"
+                ),
+            )
         },
     );
 

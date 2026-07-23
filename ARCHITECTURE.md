@@ -116,7 +116,7 @@ The main agent no longer exposes a `send_message` tool; user-visible output is t
 
 | Main agent | Sub-agent |
 |------------|-----------|
-| bash, browser, read/write/edit file, glob, grep | bash, browser, read/write/edit file, glob, grep |
+| bash, read/write/edit file, glob, grep, skills (e.g. steel-browser) | bash, read/write/edit file, glob, grep |
 | read/write memory, web_fetch, web_search | read_memory, web_fetch, web_search |
 | send_message, schedule_*, export_chat | *(none)* |
 | sub_agent, cursor_agent, cursor_agent_send, build_skill, activate_skill, sync_skills, spawn_background_command, register_tracked_job | *(none)* |
@@ -181,7 +181,7 @@ The former plan-first orchestrator could run sub-agents before the main agent an
 ### Sub-Agent Characteristics
 
 - **Isolated context**: No access to main chat; only `task` and `context`.
-- **Limited tools**: bash, browser, file ops, glob, grep, read_memory, web_fetch, web_search, search_history.
+- **Limited tools**: bash, file ops, glob, grep, read_memory, web_fetch, web_search, search_history, skills (e.g. steel-browser).
 - **Auth propagation**: Caller’s auth context is passed through to sub-agent tool calls when present.
 - **Iteration cap**: 10 iterations per sub-agent.
 - **Single return**: Final text is the tool result; no streaming or mid-task updates.
@@ -240,17 +240,17 @@ Web has no native identity. To sync with Telegram/Discord, the user **binds** th
 `AppState` (Arc-wrapped) holds:
 
 - `config`, `db`, `llm`, `tools`, `memory`, `skills`, `mcp` (via tools), `chat_queue`
-- `telegram_bots`: `HashMap<i64, Bot>` — one Telegram `Bot` per row in `channel_bot_instances` (platform `telegram`)
+- `telegram_bots`: `HashMap<i64, Bot>` — one Telegram `Bot` per `channel_bot_instances` row (platform `telegram`)
 - `discord_http`: `HashMap<i64, Arc<Http>>` — one Discord HTTP client per `channel_bot_instances` row (platform `discord`)
 
 It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which picks the correct `Bot` / Discord client per binding’s `bot_instance_id`.
 
 ## 8. Configuration and settings
 
-- **Effective config** is built from repo-root `.env` (or `FINALLY_A_VALUE_BOT_CONFIG`) plus process environment — see `Config::load` / `load_from_env` in `src/config.rs`.
-- **LLM and secrets** (e.g. `LLM_*`, API keys, primary bot tokens) are **env-only**, not merged from SQLite.
-- The legacy `app_settings` table may still contain old rows; it is **not** merged into the environment at startup. `PATCH /api/settings` is disabled (501); use `.env` for configuration.
-- **Bot instances** (including extra Telegram/Discord bots) are stored in `channel_bot_instances`, seeded from env for primary ids 1–3 and extended via `/api/channel_bot_instances`. **Restart** the process after adding instances so new dispatchers start.
+- **Bootstrap** (`WEB_*`, `WORKSPACE_DIR`, LLM API keys, vault, social OAuth) comes from repo-root `.env` (or `FINALLY_A_VALUE_BOT_CONFIG`) plus process environment — see `Config::load` / `load_from_env` in `src/config.rs`.
+- **Chat integrations** (Telegram / Discord / WhatsApp tokens and platform access settings) are configured in **Web UI → Settings → Integrations** and persisted in SQLite. `channel_bot_instances` is the source of truth for per-bot settings such as Telegram `BOT_USERNAME` / group allowlist, Discord channel allowlist, and WhatsApp phone/verify/webhook fields; `CONTROL_CHAT_IDS` remains a global `app_settings` value. First boot may one-time-import legacy channel env vars; afterward the DB is authoritative. **Restart** after token changes so dispatchers reload.
+- **Channel persona routing** is configured separately in **Settings → Channels** via `channel_persona_policy`. Telegram and Discord instances can use all personas or a single persona for a contact. WhatsApp is intentionally single-persona because this gateway supports one WhatsApp Business number/webhook.
+- LLM provider/model selection, runtime toggles, Cursor engine, and local-delegate settings also live in `app_settings` and are merged at startup / hot-reloaded where supported. `PATCH /api/settings` remains disabled (501); use dedicated Settings APIs.
 - **Restart hook:** set `FINALLY_A_VALUE_BOT_RESTART_COMMAND` to a fixed supervisor command; authenticated `POST /api/restart` runs it (optional one-click from Web UI).
 
 ### Universal chat id (`997894126` / `UNIVERSAL_CHAT_ID`)

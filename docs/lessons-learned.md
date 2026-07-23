@@ -15,6 +15,14 @@ Template:
 
 ---
 
+### 2026-07-23 — Unstable props defeated ThreadPane React.memo (idle UI jank)
+
+- **Symptom:** Web UI felt laggy while idle (typing/scroll/menus); chat remounted or re-rendered on the 2.5–10s ops poll cadence.
+- **Root cause:** `React.memo(ThreadPane)` was load-bearing (journal 2026-04-10) but App passed **new inline callback identities** every render (`onLoadMoreHistory={() => …}`, etc.). Ops poll also called `setPersonas` whenever React Query data identity changed, even when persona fields were unchanged, so App re-rendered often and ThreadPane always followed.
+- **Fix:** Pass stable `useCallback` handlers into ThreadPane; hoist `makeMarkdownText(...)` to module scope (avoid remounting markdown types); gate `setPersonas` with `personasSnapshotEqual`; memoize shell chrome; add `/api/ops_poll` + client single-fetch bundle; mild SSE yield throttle (80ms).
+- **Prevention:** Never wrap memoized leaf props in fresh lambdas at the parent call site. When adding poll-driven `setState`, compare the fields that actually drive UI before updating. Prefer one combined poll endpoint over N parallel GETs on a short interval.
+- **Files/refs:** `web/src/app/App.tsx` (ThreadPane props, SSE flush); `web/src/components/thread-pane.tsx` (`React.memo`, `MarkdownText`); `web/src/hooks/use-ops-poll.ts` (`personasSnapshotEqual`); `src/web.rs` (`api_ops_poll`); plan `web_ui_performance_920afed4`.
+
 ### 2026-07-07 — Scheduled tasks "disappeared" and stopped running
 
 - **Symptom:** Web Schedules tab showed no tasks; scheduled jobs did not run for a day. Data was actually intact (193 rows, 14 active).

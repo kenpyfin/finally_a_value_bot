@@ -52,6 +52,8 @@ export type MobileOpsSheetProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
   onOpenQueue: () => void
+  onOpenInbox: () => void
+  inboxBadgeCount?: number
   onOpenSchedules: () => void
   onOpenPrinciples: () => void
   onOpenArtifacts: () => void
@@ -66,6 +68,8 @@ export function MobileOpsSheet({
   open,
   onOpenChange,
   onOpenQueue,
+  onOpenInbox,
+  inboxBadgeCount = 0,
   onOpenSchedules,
   onOpenPrinciples,
   onOpenArtifacts,
@@ -88,6 +92,19 @@ export function MobileOpsSheet({
           Queue, schedules, memory, and diagnostics.
         </Dialog.Description>
         <Flex direction="column" gap="2">
+          <button
+            type="button"
+            className="mc-inbox-launch mc-inbox-launch--sheet cursor-pointer"
+            data-has-items={inboxBadgeCount > 0 ? 'true' : 'false'}
+            onClick={pick(onOpenInbox)}
+          >
+            Inbox
+            {inboxBadgeCount > 0 ? (
+              <span className="mc-inbox-launch__badge" aria-hidden>
+                {inboxBadgeCount > 99 ? '99+' : inboxBadgeCount}
+              </span>
+            ) : null}
+          </button>
           <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenQueue)}>
             Queue
           </Button>

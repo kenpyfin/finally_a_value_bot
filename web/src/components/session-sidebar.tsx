@@ -95,7 +95,7 @@ function ThemeSwatchButton({
   )
 }
 
-export function SessionSidebar({
+export const SessionSidebar = React.memo(function SessionSidebar({
   appearance,
   onToggleAppearance,
   uiTheme,
@@ -336,4 +336,4 @@ export function SessionSidebar({
       </div>
     </aside>
   )
-}
+})

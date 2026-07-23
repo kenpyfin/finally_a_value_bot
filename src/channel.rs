@@ -9,7 +9,9 @@ use crate::channels::telegram::{
 };
 use crate::db::{call_blocking, message_origin_interactive, Database, StoredMessage};
 use crate::final_delivery_dedupe::{plan_agent_final_delivery, AgentFinalDeliveryPlan};
-use crate::final_delivery_media::normalize_assistant_artifact_references;
+use crate::final_delivery_media::{
+    materialize_web_delivery_file_links, normalize_assistant_artifact_references,
+};
 use crate::tools::auth_context_from_input;
 
 /// How a stored outbound message should be classified in `messages.origin`.
@@ -262,6 +264,11 @@ pub async fn deliver_to_contact_with_origin(
     for p in policies {
         policy_by_instance.insert(p.bot_instance_id, (p.mode, p.persona_id));
     }
+    let active_persona_id = call_blocking(db.clone(), move |d| {
+        d.get_current_persona_id(canonical_chat_id)
+    })
+    .await
+    .ok();
 
     let mut delivered_targets: HashSet<(String, String)> = HashSet::new();
     if matches!(scope, DeliveryScope::StoreOnly) {
@@ -284,6 +291,8 @@ pub async fn deliver_to_contact_with_origin(
             {
                 continue;
             }
+        } else if b.channel_type == "whatsapp" && active_persona_id != Some(persona_id) {
+            continue;
         }
         let target_key = (b.channel_type.clone(), b.channel_handle.clone());
         if !delivered_targets.insert(target_key) {
@@ -423,12 +432,22 @@ pub async fn deliver_agent_final_to_contact_with_origin(
     session_id: Option<String>,
     message_origin: MessageStoreOrigin,
 ) -> Result<AgentFinalDeliveryOutcome, String> {
-    let cleaned = normalize_final_for_delivery(
+    let mut cleaned = normalize_final_for_delivery(
         raw_final,
         workspace_root.as_deref(),
         canonical_chat_id,
         persona_id,
     );
+    if let Some(root) = workspace_root.as_deref() {
+        cleaned = materialize_web_delivery_file_links(
+            root,
+            None,
+            canonical_chat_id,
+            persona_id,
+            &cleaned,
+        )
+        .await?;
+    }
     let indicated = with_persona_indicator(db.clone(), persona_id, &cleaned).await;
     let plan = plan_agent_final_delivery(None, &indicated);
 
@@ -453,12 +472,22 @@ pub async fn deliver_agent_final_to_contact_with_origin(
             })
         }
         AgentFinalDeliveryPlan::DeliverSuffixOnly(suffix) => {
-            let suffix = normalize_final_for_delivery(
+            let mut suffix = normalize_final_for_delivery(
                 &suffix,
                 workspace_root.as_deref(),
                 canonical_chat_id,
                 persona_id,
             );
+            if let Some(root) = workspace_root.as_deref() {
+                suffix = materialize_web_delivery_file_links(
+                    root,
+                    None,
+                    canonical_chat_id,
+                    persona_id,
+                    &suffix,
+                )
+                .await?;
+            }
             deliver_to_contact_with_origin(
                 db.clone(),
                 telegram_bots,
