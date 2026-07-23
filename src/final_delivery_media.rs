@@ -44,8 +44,14 @@ pub fn normalize_local_artifact_ref(raw: &str) -> String {
             rest.to_string()
         };
     }
-    if let Some(idx) = t.find(['?', '#']) {
+    if let Some(idx) = t.find('#') {
         t.truncate(idx);
+    }
+    // Strip URL query (?preview=1) but preserve Windows extended-path prefix \\?\.
+    if !t.starts_with(r"\\?\") {
+        if let Some(idx) = t.find('?') {
+            t.truncate(idx);
+        }
     }
     t
 }
@@ -652,6 +658,12 @@ mod tests {
             normalize_local_artifact_ref("ORIGIN/Projects/spec.md"),
             "ORIGIN/Projects/spec.md"
         );
+    }
+
+    #[test]
+    fn normalize_local_artifact_ref_preserves_windows_verbatim_prefix() {
+        let path = r"\\?\C:\workspace\shared\mark.png";
+        assert_eq!(normalize_local_artifact_ref(path), path);
     }
 
     #[test]
