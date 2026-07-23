@@ -238,8 +238,9 @@ pub fn resolve_workspace_artifact_path(
         return None;
     }
 
-    if t.starts_with('/') {
-        return path_under_workspace(&PathBuf::from(&t), workspace_root, kind);
+    let candidate = Path::new(&t);
+    if candidate.is_absolute() {
+        return path_under_workspace(candidate, workspace_root, kind);
     }
 
     if let (Some(cid), Some(pid)) = (chat_id, persona_id) {
