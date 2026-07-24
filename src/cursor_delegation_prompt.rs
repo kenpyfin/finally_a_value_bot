@@ -387,10 +387,16 @@ mod tests {
     }
 
     #[test]
-    fn slim_is_identity_when_disabled() {
+    fn slim_disabled_preserves_body_and_ensures_self_repo_ban() {
         let full = fixture_full_system();
-        let slim = slim_delegation_system_prompt(&full, false);
-        assert_eq!(slim, full);
+        let out = slim_delegation_system_prompt(&full, false);
+        assert!(
+            out.starts_with(&full),
+            "slim-disabled path must keep the full system prompt body"
+        );
+        assert!(out.contains("Self-repo ban"));
+        // Already-present ban must stay identity (no duplicate append).
+        assert_eq!(slim_delegation_system_prompt(&out, false), out);
     }
 
     #[test]
