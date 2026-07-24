@@ -94,6 +94,8 @@ export function usePersonaSession({
             name: string
             is_active: boolean
             last_bot_message_at?: string | null
+            last_bot_message_session_id?: string | null
+            last_bot_message_session_title?: string | null
           }[]
         }>(`/api/personas?${query.toString()}`)
         const list = Array.isArray(data.personas) ? data.personas : []
@@ -102,6 +104,8 @@ export function usePersonaSession({
           name: p.name,
           is_active: p.is_active,
           last_bot_message_at: p.last_bot_message_at ?? null,
+          last_bot_message_session_id: p.last_bot_message_session_id ?? null,
+          last_bot_message_session_title: p.last_bot_message_session_title ?? null,
         }))
         if (baselinePersonaLastReadIfMissing(cid, personaList)) {
           setPersonaReadNonce((x) => x + 1)
@@ -158,7 +162,10 @@ export function usePersonaSession({
   )
 
   const switchPersona = useCallback(
-    async (personaName: string): Promise<void> => {
+    async (
+      personaName: string,
+      opts?: { sessionId?: string | null },
+    ): Promise<void> => {
       if (chatId == null) return
       setHistoryLoading(true)
       try {
@@ -170,13 +177,25 @@ export function usePersonaSession({
         if (p) writeStoredPersonaId(p.id)
         await loadPersonas(chatId)
         const sessions = await loadSessions(chatId, p?.id)
-        const restoredSessionId = p ? resolveStoredSessionId(sessions, p.id) : null
-        setActiveSessionId(restoredSessionId)
+        let targetSessionId: string | null
+        if (opts !== undefined && 'sessionId' in opts) {
+          const want = opts.sessionId ?? null
+          if (want == null) {
+            targetSessionId = null
+          } else {
+            const match = sessions.find((s) => s.id === want && s.status === 'active')
+            targetSessionId = match ? match.id : null
+          }
+        } else {
+          targetSessionId = p ? resolveStoredSessionId(sessions, p.id) : null
+        }
+        setActiveSessionId(targetSessionId)
+        if (p) writeStoredSessionForPersona(p.id, targetSessionId)
         resetHistoryPagination()
         await loadHistory(chatId, p?.id ?? undefined, null, {
           force: true,
           limitOverride: HISTORY_PAGE_SIZE,
-          sessionId: restoredSessionId,
+          sessionId: targetSessionId,
         })
         if (p) markPersonaRead(p.id)
         if (p) await loadPersonaBulletin(p.id)
@@ -199,69 +218,79 @@ export function usePersonaSession({
 
   const handleSelectSession = useCallback(
     async (sessionId: string | null) => {
-      setActiveSessionId(sessionId)
-      if (activePersonaId != null) {
-        writeStoredSessionForPersona(activePersonaId, sessionId)
+      setHistoryLoading(true)
+      try {
+        setActiveSessionId(sessionId)
+        if (activePersonaId != null) {
+          writeStoredSessionForPersona(activePersonaId, sessionId)
+        }
+        resetHistoryPagination()
+        await loadHistory(chatId, activePersonaId ?? undefined, null, {
+          force: true,
+          limitOverride: HISTORY_PAGE_SIZE,
+          sessionId,
+        })
+      } finally {
+        setHistoryLoading(false)
       }
-      resetHistoryPagination()
-      await loadHistory(chatId, activePersonaId ?? undefined, null, {
-        force: true,
-        limitOverride: HISTORY_PAGE_SIZE,
-        sessionId,
-      })
     },
-    [activePersonaId, chatId, loadHistory, resetHistoryPagination],
+    [activePersonaId, chatId, loadHistory, resetHistoryPagination, setHistoryLoading],
   )
 
   const handleCreateSession = useCallback(
     async (intent: string, mirrorMainChat = false) => {
       if (chatId == null || activePersonaId == null) return
-      const data = await api<{
-        session?: ChatSession
-        session_id?: string
-        title?: string
-      }>('/api/chat_sessions', {
-        method: 'POST',
-        body: JSON.stringify({
-          chat_id: chatId,
-          persona_id: activePersonaId,
-          intent,
-          mirror_main_chat: mirrorMainChat,
-        }),
-      })
-      const session =
-        data.session ??
-        (data.session_id
-          ? {
-              id: data.session_id,
-              chat_id: chatId,
-              persona_id: activePersonaId,
-              title: data.title ?? intent.slice(0, 60),
-              intent,
-              status: 'active' as const,
-              created_at: new Date().toISOString(),
-              last_active_at: new Date().toISOString(),
-              ttl_hours: 72,
-              mirror_main_chat: mirrorMainChat,
-            }
-          : null)
-      if (!session) return
+      setHistoryLoading(true)
+      try {
+        const data = await api<{
+          session?: ChatSession
+          session_id?: string
+          title?: string
+        }>('/api/chat_sessions', {
+          method: 'POST',
+          body: JSON.stringify({
+            chat_id: chatId,
+            persona_id: activePersonaId,
+            intent,
+            mirror_main_chat: mirrorMainChat,
+          }),
+        })
+        const session =
+          data.session ??
+          (data.session_id
+            ? {
+                id: data.session_id,
+                chat_id: chatId,
+                persona_id: activePersonaId,
+                title: data.title ?? intent.slice(0, 60),
+                intent,
+                status: 'active' as const,
+                created_at: new Date().toISOString(),
+                last_active_at: new Date().toISOString(),
+                ttl_hours: 72,
+                mirror_main_chat: mirrorMainChat,
+              }
+            : null)
+        if (!session) return
 
-      setChatSessions((prev) => {
-        if (prev.some((s) => s.id === session.id)) return prev
-        return [session, ...prev]
-      })
-      setActiveSessionId(session.id)
-      writeStoredSessionForPersona(activePersonaId, session.id)
-      resetHistoryPagination()
-      await loadHistory(chatId, activePersonaId, null, {
-        force: true,
-        limitOverride: HISTORY_PAGE_SIZE,
-        sessionId: session.id,
-      })
-      void loadSessions()
+        setChatSessions((prev) => {
+          if (prev.some((s) => s.id === session.id)) return prev
+          return [session, ...prev]
+        })
+        setActiveSessionId(session.id)
+        writeStoredSessionForPersona(activePersonaId, session.id)
+        resetHistoryPagination()
+        await loadHistory(chatId, activePersonaId, null, {
+          force: true,
+          limitOverride: HISTORY_PAGE_SIZE,
+          sessionId: session.id,
+        })
+        void loadSessions()
+      } finally {
+        setHistoryLoading(false)
+      }
     },
-    [activePersonaId, chatId, loadHistory, loadSessions, resetHistoryPagination],
+    [activePersonaId, chatId, loadHistory, loadSessions, resetHistoryPagination, setHistoryLoading],
   )
 
   const handleArchiveSession = useCallback(
@@ -271,61 +300,92 @@ export function usePersonaSession({
         body: JSON.stringify({ status: 'archived' }),
       })
       if (activeSessionId === sessionId) {
-        setActiveSessionId(null)
-        if (activePersonaId != null) {
-          writeStoredSessionForPersona(activePersonaId, null)
+        setHistoryLoading(true)
+        try {
+          setActiveSessionId(null)
+          if (activePersonaId != null) {
+            writeStoredSessionForPersona(activePersonaId, null)
+          }
+          resetHistoryPagination()
+          await loadHistory(chatId, activePersonaId ?? undefined, null, {
+            force: true,
+            limitOverride: HISTORY_PAGE_SIZE,
+            sessionId: null,
+          })
+        } finally {
+          setHistoryLoading(false)
         }
-        resetHistoryPagination()
-        await loadHistory(chatId, activePersonaId ?? undefined, null, {
-          force: true,
-          limitOverride: HISTORY_PAGE_SIZE,
-          sessionId: null,
-        })
       }
       await loadSessions()
     },
-    [activePersonaId, activeSessionId, chatId, loadHistory, loadSessions, resetHistoryPagination],
+    [
+      activePersonaId,
+      activeSessionId,
+      chatId,
+      loadHistory,
+      loadSessions,
+      resetHistoryPagination,
+      setHistoryLoading,
+    ],
   )
 
   const handleReopenSession = useCallback(
     async (sessionId: string) => {
-      await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'active' }),
-      })
-      setActiveSessionId(sessionId)
-      if (activePersonaId != null) {
-        writeStoredSessionForPersona(activePersonaId, sessionId)
+      setHistoryLoading(true)
+      try {
+        await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'active' }),
+        })
+        setActiveSessionId(sessionId)
+        if (activePersonaId != null) {
+          writeStoredSessionForPersona(activePersonaId, sessionId)
+        }
+        await loadSessions()
+        resetHistoryPagination()
+        await loadHistory(chatId, activePersonaId ?? undefined, null, {
+          force: true,
+          limitOverride: HISTORY_PAGE_SIZE,
+          sessionId,
+        })
+      } finally {
+        setHistoryLoading(false)
       }
-      await loadSessions()
-      resetHistoryPagination()
-      await loadHistory(chatId, activePersonaId ?? undefined, null, {
-        force: true,
-        limitOverride: HISTORY_PAGE_SIZE,
-        sessionId,
-      })
     },
-    [activePersonaId, chatId, loadHistory, loadSessions, resetHistoryPagination],
+    [activePersonaId, chatId, loadHistory, loadSessions, resetHistoryPagination, setHistoryLoading],
   )
 
   const handleDeleteSession = useCallback(
     async (sessionId: string) => {
       await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
       if (activeSessionId === sessionId) {
-        setActiveSessionId(null)
-        if (activePersonaId != null) {
-          writeStoredSessionForPersona(activePersonaId, null)
+        setHistoryLoading(true)
+        try {
+          setActiveSessionId(null)
+          if (activePersonaId != null) {
+            writeStoredSessionForPersona(activePersonaId, null)
+          }
+          resetHistoryPagination()
+          await loadHistory(chatId, activePersonaId ?? undefined, null, {
+            force: true,
+            limitOverride: HISTORY_PAGE_SIZE,
+            sessionId: null,
+          })
+        } finally {
+          setHistoryLoading(false)
         }
-        resetHistoryPagination()
-        await loadHistory(chatId, activePersonaId ?? undefined, null, {
-          force: true,
-          limitOverride: HISTORY_PAGE_SIZE,
-          sessionId: null,
-        })
       }
       await loadSessions()
     },
-    [activePersonaId, activeSessionId, chatId, loadHistory, loadSessions, resetHistoryPagination],
+    [
+      activePersonaId,
+      activeSessionId,
+      chatId,
+      loadHistory,
+      loadSessions,
+      resetHistoryPagination,
+      setHistoryLoading,
+    ],
   )
 
   const onCreatePersona = useCallback(async () => {

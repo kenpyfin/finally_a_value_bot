@@ -57,7 +57,11 @@ export function ContentPreviewSkeleton() {
 
 export function ThreadHistorySkeleton() {
   return (
-    <div className="mc-thread-skeleton flex flex-col gap-4 px-3 py-6" aria-busy="true" aria-label="Loading conversation">
+    <div
+      className="mc-thread-skeleton flex min-h-0 flex-1 flex-col gap-4 overflow-hidden px-3 py-6"
+      aria-busy="true"
+      aria-label="Loading conversation"
+    >
       <div className="flex justify-end">
         <Skeleton className="mc-thread-skeleton-bubble mc-thread-skeleton-user h-12 w-[min(72%,280px)]" />
       </div>

@@ -579,7 +579,13 @@ function DraftAwareComposer() {
   return (
     <ComposerPrimitive.AttachmentDropzone className="mc-composer-dropzone">
       <ComposerQuotePreview />
-      <Composer />
+      {/* Custom composer so scroll-to-latest does not focus the textarea (opens mobile keyboard). */}
+      <Composer.Root>
+        <Composer.Attachments />
+        <Composer.AddAttachment />
+        <Composer.Input autoFocus unstable_focusOnScrollToBottom={false} />
+        <Composer.Action />
+      </Composer.Root>
       {uploadHint ? (
         <div className="mc-upload-hint" aria-live="polite">
           {uploadHint}
@@ -809,7 +815,7 @@ export const ThreadPane = React.memo(function ThreadPane({
           className="h-full min-h-0 min-w-0"
         >
           <div className="mc-thread-shell flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
-            {historyLoading && initialMessages.length === 0 ? (
+            {historyLoading ? (
               <ThreadHistorySkeleton />
             ) : (
             <Thread.Viewport ref={bindThreadViewport} className="aui-thread-viewport mc-thread-viewport">
@@ -829,17 +835,21 @@ export const ThreadPane = React.memo(function ThreadPane({
               <Thread.FollowupSuggestions />
             </Thread.Viewport>
             )}
-            <div
-              className="mc-thread-composer-dock"
-              onFocusCapture={() =>
-                onMobileThreadScroll?.({ collapseHeader: false, source: 'focus' })
-              }
-            >
-              <div className="relative mx-auto w-full max-w-[var(--aui-thread-max-width)] px-2 pb-1 pt-1 md:px-3">
+            <div className="mc-thread-composer-stack">
+              {!historyLoading ? (
                 <div className="mc-scroll-to-latest-wrap">
                   <ScrollToLatest />
                 </div>
-                <DraftAwareComposer />
+              ) : null}
+              <div
+                className="mc-thread-composer-dock"
+                onFocusCapture={() =>
+                  onMobileThreadScroll?.({ collapseHeader: false, source: 'focus' })
+                }
+              >
+                <div className="relative mx-auto w-full max-w-[var(--aui-thread-max-width)] px-2 pb-1 pt-1 md:px-3">
+                  <DraftAwareComposer />
+                </div>
               </div>
             </div>
           </div>

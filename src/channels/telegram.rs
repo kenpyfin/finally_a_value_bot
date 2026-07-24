@@ -5780,11 +5780,18 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         timezone = timezone,
         workspace_data_root_display = workspace_data_root_display,
         config_env_summary = config_env_summary,
-        path_discipline = crate::agent_path_discipline::strict_path_discipline_section(
-            workspace_path,
-            workspace_data_root_display,
-            skills_dir_display,
-        ),
+        path_discipline = {
+            let mut section = crate::agent_path_discipline::strict_path_discipline_section(
+                workspace_path,
+                workspace_data_root_display,
+                skills_dir_display,
+            );
+            section.push('\n');
+            section.push_str(&crate::self_repo::self_repo_ban_prompt_section(
+                &std::path::PathBuf::from(workspace_data_root_display),
+            ));
+            section
+        },
     );
 
     // Agent Skills (section 2: immediately after capabilities)

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
@@ -210,6 +210,7 @@ impl CursorAgentTool {
             )
         };
         let cli_path = self.config.cursor_agent_cli_path.trim();
+        let ceiling = crate::self_repo::git_ceiling_value(Path::new(self.config.working_dir()));
         let mut tmux_cmd = tokio::process::Command::new("tmux");
         tmux_cmd
             .args([
@@ -220,6 +221,8 @@ impl CursorAgentTool {
                 "-c",
                 workdir_str,
                 "--",
+                "env",
+                &format!("{}={}", crate::self_repo::ENV_GIT_CEILING, ceiling),
             ])
             .arg(cli_path)
             .arg("-p")
@@ -229,6 +232,10 @@ impl CursorAgentTool {
         if !model.is_empty() {
             tmux_cmd.arg("--model").arg(model);
         }
+        crate::self_repo::apply_git_ceiling_env(
+            &mut tmux_cmd,
+            Path::new(self.config.working_dir()),
+        );
         let spawn_result = tmux_cmd.spawn();
         let (ok, msg) = match spawn_result {
             Ok(_) => {
@@ -352,6 +359,9 @@ impl Tool for CursorAgentTool {
         if let Err(msg) = crate::tools::path_guard::check_path(&workdir_str_storage) {
             return ToolResult::error(msg);
         }
+        if let Err(msg) = crate::self_repo::check_agent_cwd_allowed(&workspace_root, &working_dir) {
+            return ToolResult::error(msg).with_error_type("blocked_by_policy");
+        }
 
         let timeout_secs = input
             .get("timeout_secs")
@@ -405,6 +415,7 @@ impl Tool for CursorAgentTool {
         }
         cmd.arg("--output-format").arg("text");
         cmd.current_dir(&working_dir);
+        crate::self_repo::apply_git_ceiling_env(&mut cmd, &workspace_root);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;

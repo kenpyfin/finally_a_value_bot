@@ -1,5 +1,7 @@
 //! Shared bash safety checks for `bash` and `spawn_background_command`.
 
+use std::path::Path;
+
 use super::ToolResult;
 
 /// Max runtime for expensive shell searches when explicitly confirmed via `CONFIRM_EXECUTE`.
@@ -149,6 +151,19 @@ pub fn check_expensive_shell_search(command: &str, confirmed: bool) -> Option<To
     Some(
         ToolResult::error(EXPENSIVE_SEARCH_BLOCK_MESSAGE.to_string())
             .with_error_type("blocked_by_policy"),
+    )
+}
+
+/// Block git that explicitly targets the bot's own checkout. Tier-1 target repos stay allowed.
+pub fn check_self_repo_git(command: &str, workspace_root: &Path) -> Option<ToolResult> {
+    if !crate::self_repo::command_targets_self_repo_git(command, workspace_root) {
+        return None;
+    }
+    Some(
+        ToolResult::error(crate::self_repo::self_repo_git_block_message(
+            workspace_root,
+        ))
+        .with_error_type("blocked_by_policy"),
     )
 }
 

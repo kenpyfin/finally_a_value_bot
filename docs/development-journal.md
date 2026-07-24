@@ -4,6 +4,27 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-24 — Fix Cursor MCP tool discovery (protocol version)
+
+- **Area:** cursor engine / MCP bridge
+- **Summary:** Cursor SDK live tool discovery for `finally-a-value-bot` failed because `initialize` returned non-existent protocol `2025-11-05`. Bridge now negotiates official versions (default/echo `2025-11-25`), exposes Streamable HTTP GET as `405`, and logs initialize/`tools/list`. Verified on persona 24: `GetMcpTools` → `MCP_OK` / `serverStatus=ready`.
+- **Key files / symbols:** `negotiate_protocol_version` / `handle_cursor_mcp` / `handle_cursor_mcp_get` in `src/cursor_mcp_bridge.rs`; `GET|POST /internal/cursor-mcp` in `src/web.rs`; default in `src/mcp.rs`.
+- **Note:** Restart gateway after deploying the binary so in-memory MCP registry and the new negotiation code load together.
+
+### 2026-07-23 — Web UI: mobile inbox icon, chat switch loading, inbox→session, scroll-to-latest
+
+- **Area:** web UI / inbox / chat sessions
+- **Summary:** Mobile header Inbox is icon-only (badge kept) so session controls are not crowded. Persona/session switches show a full thread skeleton while history loads instead of leaving the previous chat visible. Inbox Open jumps to the session of the latest bot message (main vs focused), using new `last_bot_message_session_id` / `_title` from personas/`ops_poll`. Scroll-to-latest is centered above the composer; `Composer.Input` sets `unstable_focusOnScrollToBottom={false}` so assistant-ui does not focus the textarea (which opened the mobile keyboard).
+- **Key files / symbols:** `AppHeader` + `IconInbox`; `ThreadHistorySkeleton` when `historyLoading`; `InboxPanel.onOpenTarget` / `switchPersona(..., { sessionId })`; `PersonaLastBotInfo` / `list_persona_last_bot_message_at` in `src/db.rs`; `DraftAwareComposer` + `ScrollToLatest` + `.mc-thread-composer-stack`.
+- **Note:** Rebuild web assets + restart bot so API session fields and UI ship together.
+
+### 2026-07-23 — Ban Cursor/agent from self-repo; allow Tier-1 target repos
+
+- **Area:** security / cursor engine / bash
+- **Summary:** Prevent Cursor SDK, `cursor_agent`, and agent shells from treating the finally-a-value-bot checkout as a project repo (git discovery from persona cwd under `WORKSPACE_DIR`). Set `GIT_CEILING_DIRECTORIES` to the workspace root on sidecar and agent commands; block bash/background git that explicitly targets the self-repo; refuse Cursor cwd on self-repo source paths. Persona Tier-1 `Repo: /absolute/path` targets remain fully allowed. Override via `FINALLY_A_VALUE_BOT_SELF_REPO`.
+- **Key files / symbols:** `src/self_repo.rs`; `apply_git_ceiling_env` / `check_agent_cwd_allowed` / `command_targets_self_repo_git`; `src/cursor_sdk_sidecar.rs`; `src/tools/{bash_safety,bash,cursor_agent,command_runner}.rs`; `src/cursor_engine.rs`; `src/cursor_delegation_prompt.rs`; `scripts/cursor-agent-runner.py`.
+- **Note:** Restart bot so the Cursor sidecar is respawned with the new ceiling env.
+
 ### 2026-07-23 — Web UI performance: ThreadPane isolation, poll churn, bundle split, ops_poll
 
 - **Area:** web frontend / web API

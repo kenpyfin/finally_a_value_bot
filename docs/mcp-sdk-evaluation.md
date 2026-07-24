@@ -8,7 +8,7 @@ FinallyAValueBot currently implements MCP client logic directly in `src/mcp.rs` 
 
 - `stdio` transport
 - `streamable_http` transport (JSON-RPC over HTTP endpoint)
-- Protocol negotiation at initialize time (default `2025-11-05`, configurable)
+- Protocol negotiation at initialize time (default `2025-11-25`, configurable)
 
 ## Why evaluate official Rust MCP SDK
 

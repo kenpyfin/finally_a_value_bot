@@ -448,6 +448,9 @@ pub async fn run_cursor_engine(
     if let Err(msg) = tools::path_guard::check_path(&cwd) {
         return Err(anyhow::anyhow!(msg));
     }
+    if let Err(msg) = crate::self_repo::check_agent_cwd_allowed(&workspace_root, &working_dir) {
+        return Err(anyhow::anyhow!(msg));
+    }
 
     let model = settings.sdk_model.trim();
     let model = if model.is_empty() {

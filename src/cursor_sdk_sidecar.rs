@@ -298,6 +298,7 @@ async fn spawn_sidecar_process(
     python: &Path,
     stderr_log: &Path,
     runtime_data_dir: &str,
+    workspace_root: &Path,
 ) -> Result<Child, String> {
     let stderr_file = std::fs::OpenOptions::new()
         .create(true)
@@ -328,6 +329,10 @@ async fn spawn_sidecar_process(
             cmd.env("CURSOR_API_KEY", key);
         }
     }
+
+    // Inherited by cursor-sdk-bridge shell tools so git does not bind the bot checkout
+    // when cwd is under WORKSPACE_DIR. Tier-1 target repos remain usable via explicit cd.
+    crate::self_repo::apply_git_ceiling_env(&mut cmd, workspace_root);
 
     cmd.spawn().map_err(|e| {
         format!(
@@ -403,6 +408,7 @@ pub async fn bootstrap(
                         &sidecar_python,
                         &stderr_log,
                         &config.runtime_data_dir(),
+                        &config.workspace_root_absolute(),
                     )
                     .await
                     {

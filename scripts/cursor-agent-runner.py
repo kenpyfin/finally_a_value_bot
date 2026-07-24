@@ -20,14 +20,30 @@ SESSION_PREFIX = "finally-a-value-bot-cursor"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Container path prefix that maps to <PROJECT_ROOT>/workspace on the host
 CONTAINER_WORKSPACE_PREFIX = "/app/workspace"
+# Host workspace root (git ceiling so agent shells do not bind the bot checkout)
+HOST_WORKSPACE = os.path.join(PROJECT_ROOT, "workspace")
 
 
 def translate_path(container_path: str) -> str:
     """Translate a Docker container path to the equivalent host path."""
     if container_path.startswith(CONTAINER_WORKSPACE_PREFIX):
         suffix = container_path[len(CONTAINER_WORKSPACE_PREFIX):]
-        return os.path.join(PROJECT_ROOT, "workspace") + suffix
+        return HOST_WORKSPACE + suffix
     return container_path
+
+
+def spawn_env():
+    """Env for cursor-agent: inherit host env + git ceiling at workspace."""
+    env = os.environ.copy()
+    ceiling = os.path.realpath(HOST_WORKSPACE)
+    existing = env.get("GIT_CEILING_DIRECTORIES", "").strip()
+    if existing:
+        parts = existing.split(os.pathsep)
+        if ceiling not in parts:
+            env["GIT_CEILING_DIRECTORIES"] = existing + os.pathsep + ceiling
+    else:
+        env["GIT_CEILING_DIRECTORIES"] = ceiling
+    return env
 
 
 class SpawnHandler(BaseHTTPRequestHandler):
@@ -61,15 +77,33 @@ class SpawnHandler(BaseHTTPRequestHandler):
                 if model:
                     ca_args.extend(["--model", model])
                 ca_args.extend(["--output-format", "text"])
-                cmd = ["tmux", "new-session", "-d", "-s", session_name, "-c", workdir, "--"] + ca_args
-                subprocess.run(cmd, check=True, capture_output=True, timeout=10)
+                # Use env so GIT_CEILING applies even when tmux server is already running.
+                ceiling = os.path.realpath(HOST_WORKSPACE)
+                cmd = [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    session_name,
+                    "-c",
+                    workdir,
+                    "--",
+                    "env",
+                    f"GIT_CEILING_DIRECTORIES={ceiling}",
+                ] + ca_args
+                subprocess.run(cmd, check=True, capture_output=True, timeout=10, env=spawn_env())
                 self.send_json(200, {"success": True, "session_name": session_name})
             else:
                 cmd = [CURSOR_AGENT, "-p", prompt, "--trust", "--output-format", "text"]
                 if model:
                     cmd.extend(["--model", model])
                 result = subprocess.run(
-                    cmd, cwd=workdir, capture_output=True, text=True, timeout=600
+                    cmd,
+                    cwd=workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    env=spawn_env(),
                 )
                 output = result.stdout or ""
                 if result.stderr:

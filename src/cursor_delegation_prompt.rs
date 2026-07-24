@@ -32,7 +32,13 @@ const MAX_PROMPT_LEN: usize = 120_000;
 const TIER1_HEADING: &str = "# Identity and long-term memory (Tier 1)";
 const MAX_TIER1_ANCHOR_CHARS: usize = 4_096;
 const GIT_DISCIPLINE_LINE: &str = "Git discipline: persona cwd is not the project git root. \
-For commit/push/merge, cd to the Tier 1 project repo path first; do not rely on git discovering the bot checkout.\n";
+For commit/push/merge, cd to the Tier 1 project repo path first (`Repo: …` — fully allowed). \
+Never use git against the finally-a-value-bot install/source checkout.\n";
+
+const SELF_REPO_BAN_LINE: &str =
+    "Self-repo ban: never treat the finally-a-value-bot source/install \
+git checkout as a development project (no branch deletes, force-push, reset, or edits there). \
+Persona Tier-1 target repos (`Repo: /absolute/path`) are fully allowed.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationPromptMode {
@@ -69,7 +75,7 @@ pub fn select_delegation_prompt_mode(
 /// When MCP is live and slim is enabled, replace the long tool-groups block with MCP delegation prose.
 pub fn slim_delegation_system_prompt(full: &str, slim_enabled: bool) -> String {
     if !slim_enabled {
-        return full.to_string();
+        return ensure_self_repo_ban_in_prompt(full.to_string());
     }
     let mut out = replace_tool_groups_section(full);
     out = shorten_agent_skills_intro(&out);
@@ -77,6 +83,17 @@ pub fn slim_delegation_system_prompt(full: &str, slim_enabled: bool) -> String {
         out.push('\n');
         out.push_str(CURSOR_FILE_DELIVERY_REMINDER);
     }
+    ensure_self_repo_ban_in_prompt(out)
+}
+
+fn ensure_self_repo_ban_in_prompt(mut out: String) -> String {
+    if out.contains("## Self-repo ban") || out.contains("Self-repo ban:") {
+        return out;
+    }
+    out.push('\n');
+    out.push_str("## Self-repo ban (mandatory)\n");
+    out.push_str(SELF_REPO_BAN_LINE);
+    out.push('\n');
     out
 }
 
@@ -132,10 +149,13 @@ fn build_minimal_runtime_header(
          chat_id={} persona_id={}\n\
          {mcp_line}\
          Path discipline: never use `workspace/` prefixes; cwd is persona-scoped under \
-         `shared/personas/{{chat_id}}/{{persona_id}}/`. Primary task: the `[current_request]` below.\n\n\
+         `shared/personas/{{chat_id}}/{{persona_id}}/`.\n\
+         {self_repo_ban}\
+         Primary task: the `[current_request]` below.\n\n\
          {file_delivery}",
         header.chat_id,
         header.persona_id,
+        self_repo_ban = SELF_REPO_BAN_LINE,
         file_delivery = CURSOR_FILE_DELIVERY_REMINDER,
     );
     if let Some(tier1) = tier1_anchor.map(str::trim).filter(|s| !s.is_empty()) {
@@ -367,10 +387,16 @@ mod tests {
     }
 
     #[test]
-    fn slim_is_identity_when_disabled() {
+    fn slim_disabled_preserves_body_and_ensures_self_repo_ban() {
         let full = fixture_full_system();
-        let slim = slim_delegation_system_prompt(&full, false);
-        assert_eq!(slim, full);
+        let out = slim_delegation_system_prompt(&full, false);
+        assert!(
+            out.starts_with(&full),
+            "slim-disabled path must keep the full system prompt body"
+        );
+        assert!(out.contains("Self-repo ban"));
+        // Already-present ban must stay identity (no duplicate append).
+        assert_eq!(slim_delegation_system_prompt(&out, false), out);
     }
 
     #[test]
@@ -477,6 +503,8 @@ mod tests {
         assert!(prompt.contains("resume turn"));
         assert!(prompt.contains("chat_id=1"));
         assert!(prompt.contains("## File links (web delivery)"));
+        assert!(prompt.contains("Self-repo ban"));
+        assert!(prompt.contains("fully allowed"));
         assert!(!prompt.contains("# Principles"));
         assert!(prompt.contains("[current_request]"));
     }
