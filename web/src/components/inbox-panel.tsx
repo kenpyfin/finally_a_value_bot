@@ -6,6 +6,14 @@ export type InboxUnreadItem = {
   personaId: number
   personaName: string
   lastBotMessageAt: string | null
+  /** Null = main chat for that persona. */
+  sessionId: string | null
+  sessionTitle: string | null
+}
+
+export type InboxOpenTarget = {
+  personaId: number
+  sessionId: string | null
 }
 
 export type InboxPanelProps = {
@@ -18,12 +26,22 @@ export type InboxPanelProps = {
   loading: boolean
   busyTodoId: number | null
   onRefresh: () => void
-  onOpenPersona: (personaId: number) => void
+  onOpenTarget: (target: InboxOpenTarget) => void
   onCompleteTodo: (todoId: number) => void
 }
 
+function personaMeta(personas: Persona[], personaId: number): Persona | undefined {
+  return personas.find((p) => p.id === personaId)
+}
+
 function personaName(personas: Persona[], personaId: number): string {
-  return personas.find((p) => p.id === personaId)?.name ?? `Persona ${personaId}`
+  return personaMeta(personas, personaId)?.name ?? `Persona ${personaId}`
+}
+
+function sessionLabel(sessionId: string | null, sessionTitle: string | null): string {
+  if (sessionId == null) return 'Main chat'
+  const title = sessionTitle?.trim()
+  return title && title.length > 0 ? title : 'Focused session'
 }
 
 function formatWhen(iso: string | null | undefined): string {
@@ -47,7 +65,7 @@ export function InboxPanel({
   loading,
   busyTodoId,
   onRefresh,
-  onOpenPersona,
+  onOpenTarget,
   onCompleteTodo,
 }: InboxPanelProps) {
   const borderStyle =
@@ -88,19 +106,25 @@ export function InboxPanel({
                 <ul className="list-none space-y-2">
                   {unread.map((item) => (
                     <li
-                      key={item.personaId}
+                      key={`${item.personaId}:${item.sessionId ?? 'main'}`}
                       className="flex flex-wrap items-center gap-2 rounded-lg border p-2"
                       style={itemBorder}
                     >
-                      <span className="min-w-0 flex-1 truncate font-medium">{item.personaName}</span>
-                      <Text size="1" color="gray">
-                        {formatWhen(item.lastBotMessageAt) || 'recent'}
-                      </Text>
+                      <div className="min-w-0 flex-1">
+                        <span className="block truncate font-medium">{item.personaName}</span>
+                        <Text size="1" color="gray" className="block truncate">
+                          {sessionLabel(item.sessionId, item.sessionTitle)}
+                          {item.lastBotMessageAt ? ` · ${formatWhen(item.lastBotMessageAt)}` : ' · recent'}
+                        </Text>
+                      </div>
                       <Button
                         size="1"
                         variant="soft"
                         onClick={() => {
-                          onOpenPersona(item.personaId)
+                          onOpenTarget({
+                            personaId: item.personaId,
+                            sessionId: item.sessionId,
+                          })
                           onOpenChange(false)
                         }}
                       >
@@ -124,42 +148,51 @@ export function InboxPanel({
                 </Text>
               ) : (
                 <ul className="list-none space-y-2">
-                  {todos.map((todo) => (
-                    <li
-                      key={todo.id}
-                      className="flex flex-wrap items-start gap-2 rounded-lg border p-2"
-                      style={itemBorder}
-                    >
-                      <div className="min-w-0 flex-1">
-                        <Text size="2" weight="medium" className="block">
-                          {todo.title}
-                        </Text>
-                        <Text size="1" color="gray" className="block">
-                          {personaName(personas, todo.persona_id)}
-                          {todo.source_hint ? ` · ${todo.source_hint}` : ''}
-                          {todo.updated_at ? ` · ${formatWhen(todo.updated_at)}` : ''}
-                        </Text>
-                      </div>
-                      <Button
-                        size="1"
-                        variant="soft"
-                        onClick={() => {
-                          onOpenPersona(todo.persona_id)
-                          onOpenChange(false)
-                        }}
+                  {todos.map((todo) => {
+                    const persona = personaMeta(personas, todo.persona_id)
+                    const sessionId = persona?.last_bot_message_session_id ?? null
+                    const sessionTitle = persona?.last_bot_message_session_title ?? null
+                    return (
+                      <li
+                        key={todo.id}
+                        className="flex flex-wrap items-start gap-2 rounded-lg border p-2"
+                        style={itemBorder}
                       >
-                        Open
-                      </Button>
-                      <Button
-                        size="1"
-                        variant="solid"
-                        disabled={busyTodoId === todo.id}
-                        onClick={() => onCompleteTodo(todo.id)}
-                      >
-                        {busyTodoId === todo.id ? '…' : 'Complete'}
-                      </Button>
-                    </li>
-                  ))}
+                        <div className="min-w-0 flex-1">
+                          <Text size="2" weight="medium" className="block">
+                            {todo.title}
+                          </Text>
+                          <Text size="1" color="gray" className="block">
+                            {personaName(personas, todo.persona_id)}
+                            {` · ${sessionLabel(sessionId, sessionTitle)}`}
+                            {todo.source_hint ? ` · ${todo.source_hint}` : ''}
+                            {todo.updated_at ? ` · ${formatWhen(todo.updated_at)}` : ''}
+                          </Text>
+                        </div>
+                        <Button
+                          size="1"
+                          variant="soft"
+                          onClick={() => {
+                            onOpenTarget({
+                              personaId: todo.persona_id,
+                              sessionId,
+                            })
+                            onOpenChange(false)
+                          }}
+                        >
+                          Open
+                        </Button>
+                        <Button
+                          size="1"
+                          variant="solid"
+                          disabled={busyTodoId === todo.id}
+                          onClick={() => onCompleteTodo(todo.id)}
+                        >
+                          {busyTodoId === todo.id ? '…' : 'Complete'}
+                        </Button>
+                      </li>
+                    )
+                  })}
                 </ul>
               )}
             </div>

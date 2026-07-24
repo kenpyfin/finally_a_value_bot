@@ -42,6 +42,7 @@ pub mod run_optimizer;
 pub mod runtime_toggles;
 pub mod safety_redaction;
 pub mod scheduler;
+pub mod self_repo;
 pub mod setup;
 pub mod skill_activation_gate;
 pub mod skills;

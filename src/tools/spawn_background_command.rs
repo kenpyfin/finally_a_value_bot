@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -87,6 +87,11 @@ impl Tool for SpawnBackgroundCommandTool {
             &self.config.safety_execution_mode,
             &self.config.safety_risky_categories,
         ) {
+            return blocked;
+        }
+        if let Some(blocked) =
+            super::bash_safety::check_self_repo_git(&command, Path::new(self.config.working_dir()))
+        {
             return blocked;
         }
 

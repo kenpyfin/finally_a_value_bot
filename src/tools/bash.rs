@@ -11,8 +11,8 @@ use crate::safety_redaction::EnvSecretRedactor;
 use crate::tools::command_runner::{build_command_with_env, shell_command};
 
 use super::bash_safety::{
-    check_bash_safety, check_expensive_shell_search, is_expensive_shell_search,
-    parse_confirmation_prefix, EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS,
+    check_bash_safety, check_expensive_shell_search, check_self_repo_git,
+    is_expensive_shell_search, parse_confirmation_prefix, EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS,
 };
 use super::{schema_object, Tool, ToolResult};
 
@@ -141,6 +141,9 @@ impl Tool for BashTool {
         if let Some(blocked) = check_expensive_shell_search(&command, confirmed) {
             return blocked;
         }
+        if let Some(blocked) = check_self_repo_git(&command, &self.working_dir) {
+            return blocked;
+        }
         let command = maybe_rewrite_leading_tool_path(&self.working_dir, &working_dir, &command)
             .unwrap_or(command);
 
@@ -153,6 +156,7 @@ impl Tool for BashTool {
                 &spec,
                 Some(&working_dir),
                 self.runtime_toggles.tool_output_debug(),
+                Some(self.working_dir.as_path()),
             )
             .output(),
         )

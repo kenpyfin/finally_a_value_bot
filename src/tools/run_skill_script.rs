@@ -488,6 +488,7 @@ impl Tool for RunSkillScriptTool {
             },
             Some(&meta.dir_path),
             self.runtime_toggles.tool_output_debug(),
+            None,
         );
 
         let result =

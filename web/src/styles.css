@@ -845,12 +845,18 @@ html:not(.dark) .mc-upload-hint {
   color: color-mix(in srgb, var(--mc-accent) 70%, #475569);
 }
 
+.mc-thread-composer-stack {
+  position: relative;
+  flex-shrink: 0;
+}
+
 .mc-scroll-to-latest-wrap {
   position: absolute;
-  right: 0.75rem;
+  left: 50%;
+  right: auto;
   top: 0;
-  z-index: 2;
-  transform: translateY(calc(-100% - 0.5rem));
+  z-index: 3;
+  transform: translate(-50%, calc(-100% - 0.75rem));
   pointer-events: none;
 }
 
@@ -877,6 +883,9 @@ html:not(.dark) .mc-upload-hint {
     transform 150ms ease,
     opacity 150ms ease;
   animation: mc-scroll-to-latest-in 180ms ease-out;
+  /* Avoid stealing focus from / into the composer (opens mobile keyboard). */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .mc-scroll-to-latest-btn:hover {
@@ -918,8 +927,8 @@ html:not(.dark) .mc-upload-hint {
 
 @media (max-width: 767px) {
   .mc-scroll-to-latest-wrap {
-    right: 0.5rem;
-    transform: translateY(calc(-100% - 0.4rem));
+    /* Sit higher above the composer so the tap target is not next to the input. */
+    transform: translate(-50%, calc(-100% - 1.35rem));
   }
 
   .mc-scroll-to-latest-btn {
@@ -1500,10 +1509,23 @@ html.dark *::-webkit-scrollbar-thumb:hover {
 }
 
 .mc-inbox-launch--icon {
+  position: relative;
   min-height: 2.25rem;
   min-width: 2.25rem;
-  padding: 0 0.55rem;
+  padding: 0;
   justify-content: center;
+  gap: 0;
+  aspect-ratio: 1;
+}
+
+.mc-inbox-launch--icon .mc-inbox-launch__badge {
+  position: absolute;
+  top: -0.2rem;
+  right: -0.25rem;
+  min-width: 1.05rem;
+  height: 1.05rem;
+  padding: 0 0.28rem;
+  font-size: 0.62rem;
 }
 
 .mc-toolbar-divider {

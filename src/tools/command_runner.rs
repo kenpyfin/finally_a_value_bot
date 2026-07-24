@@ -29,13 +29,14 @@ pub fn shell_command(command: &str) -> CommandSpec {
 }
 
 pub fn build_command(spec: &CommandSpec, working_dir: Option<&Path>) -> tokio::process::Command {
-    build_command_with_env(spec, working_dir, false)
+    build_command_with_env(spec, working_dir, false, None)
 }
 
 pub fn build_command_with_env(
     spec: &CommandSpec,
     working_dir: Option<&Path>,
     tool_output_debug: bool,
+    git_ceiling_workspace: Option<&Path>,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args);
@@ -43,6 +44,9 @@ pub fn build_command_with_env(
         cmd.current_dir(dir);
     }
     apply_tool_output_debug_env(&mut cmd, tool_output_debug);
+    if let Some(workspace_root) = git_ceiling_workspace {
+        crate::self_repo::apply_git_ceiling_env(&mut cmd, workspace_root);
+    }
     cmd
 }
 

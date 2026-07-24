@@ -129,12 +129,18 @@ export interface AppDialogsSchedulesProps {
 export interface AppDialogsInboxProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  unread: { personaId: number; personaName: string; lastBotMessageAt: string | null }[]
+  unread: {
+    personaId: number
+    personaName: string
+    lastBotMessageAt: string | null
+    sessionId: string | null
+    sessionTitle: string | null
+  }[]
   todos: import('../types').PersonaTodo[]
   loading: boolean
   busyTodoId: number | null
   onRefresh: () => void
-  onOpenPersona: (personaId: number) => void
+  onOpenTarget: (target: { personaId: number; sessionId: string | null }) => void
   onCompleteTodo: (todoId: number) => void
 }
 
@@ -1143,7 +1149,7 @@ export function AppDialogs({
   loading={inbox.loading}
   busyTodoId={inbox.busyTodoId}
   onRefresh={inbox.onRefresh}
-  onOpenPersona={inbox.onOpenPersona}
+  onOpenTarget={inbox.onOpenTarget}
   onCompleteTodo={inbox.onCompleteTodo}
 />
 

@@ -26,6 +26,25 @@ use crate::tools::ToolAuthContext;
 pub const MCP_SERVER_NAME: &str = "finally-a-value-bot";
 const AUTH_CONTEXT_KEY: &str = "__finally_a_value_bot_auth";
 const RUN_TTL_SECS: u64 = 3600;
+/// Official MCP protocol versions we speak (newest first).
+/// Note: `2025-11-05` is **not** a real MCP version (common mix-up of `2024-11-05` + `2025-11-25`).
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+
+fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    let requested = requested.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(req) = requested {
+        if let Some(matched) = SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .find(|v| *v == req)
+        {
+            return matched;
+        }
+    }
+    DEFAULT_PROTOCOL_VERSION
+}
 
 pub const DEFAULT_DENIED_TOOLS: &[&str] = &[
     "cursor_agent",
@@ -343,6 +362,32 @@ pub fn build_mcp_servers_config(url: &str, token: &str) -> serde_json::Value {
     })
 }
 
+/// Streamable HTTP GET: we do not open a long-lived SSE listen stream.
+/// Spec allows `405 Method Not Allowed` for this case.
+pub async fn handle_cursor_mcp_get(peer: SocketAddr, headers: HeaderMap) -> Response {
+    if !is_loopback(&peer) {
+        warn!(peer = %peer, "Rejected Cursor MCP GET from non-loopback peer");
+        return (StatusCode::FORBIDDEN, "loopback only").into_response();
+    }
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !origin_is_allowed(origin) {
+            warn!(%origin, "Rejected Cursor MCP GET with invalid Origin");
+            return (StatusCode::FORBIDDEN, "invalid origin").into_response();
+        }
+    }
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+fn origin_is_allowed(origin: &str) -> bool {
+    let o = origin.trim().to_ascii_lowercase();
+    o.is_empty()
+        || o == "null"
+        || o.starts_with("http://127.0.0.1")
+        || o.starts_with("http://localhost")
+        || o.starts_with("https://127.0.0.1")
+        || o.starts_with("https://localhost")
+}
+
 pub async fn handle_cursor_mcp(
     peer: SocketAddr,
     State(state): State<Arc<AppState>>,
@@ -352,6 +397,13 @@ pub async fn handle_cursor_mcp(
     if !is_loopback(&peer) {
         warn!(peer = %peer, "Rejected Cursor MCP request from non-loopback peer");
         return (StatusCode::FORBIDDEN, "loopback only").into_response();
+    }
+
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !origin_is_allowed(origin) {
+            warn!(%origin, "Rejected Cursor MCP request with invalid Origin");
+            return (StatusCode::FORBIDDEN, "invalid origin").into_response();
+        }
     }
 
     let token = match extract_bearer(&headers) {
@@ -368,29 +420,50 @@ pub async fn handle_cursor_mcp(
         }
     };
 
+    let method = request.method.clone();
     let run_arc = match state.cursor_mcp.get_run(&token) {
         Some(r) => r,
         None => {
+            warn!(
+                method = %method,
+                "Cursor MCP rejected: invalid or expired run token"
+            );
             return json_rpc_error(request.id, -32001, "Invalid or expired run token");
         }
     };
 
-    match request.method.as_str() {
-        "initialize" => json_rpc_result(
-            request.id,
-            json!({
-                "protocolVersion": "2025-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "finally_a_value_bot",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        ),
+    match method.as_str() {
+        "initialize" => {
+            let requested = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str());
+            let negotiated = negotiate_protocol_version(requested);
+            info!(
+                requested = requested.unwrap_or(""),
+                negotiated, "Cursor MCP initialize"
+            );
+            json_rpc_result(
+                request.id,
+                json!({
+                    "protocolVersion": negotiated,
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "finally_a_value_bot",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+        }
         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
-        "tools/list" => handle_tools_list(&state, &run_arc, request.id),
+        "tools/list" => {
+            let resp = handle_tools_list(&state, &run_arc, request.id);
+            info!("Cursor MCP tools/list completed");
+            resp
+        }
         "tools/call" => handle_tools_call(&state, &run_arc, request.id, request.params).await,
         "ping" => json_rpc_result(request.id, json!({})),
         other => json_rpc_error(request.id, -32601, format!("Method not found: {other}")),
@@ -581,7 +654,7 @@ pub async fn probe_mcp_health(web_port: u16) -> bool {
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-11-05",
+            "protocolVersion": DEFAULT_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "doctor", "version": "1" }
         }
@@ -636,5 +709,17 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("tok"));
+    }
+
+    #[test]
+    fn negotiate_protocol_version_echoes_cursor_request() {
+        assert_eq!(negotiate_protocol_version(Some("2025-11-25")), "2025-11-25");
+        assert_eq!(negotiate_protocol_version(Some("2025-06-18")), "2025-06-18");
+        // Bogus / typo versions must not be echoed (Cursor disconnects).
+        assert_eq!(
+            negotiate_protocol_version(Some("2025-11-05")),
+            DEFAULT_PROTOCOL_VERSION
+        );
+        assert_eq!(negotiate_protocol_version(None), DEFAULT_PROTOCOL_VERSION);
     }
 }

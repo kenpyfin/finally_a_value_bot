@@ -15,6 +15,9 @@ export type Persona = {
   name: string
   is_active: boolean
   last_bot_message_at?: string | null
+  /** Session that produced the latest bot message; null/undefined = main chat. */
+  last_bot_message_session_id?: string | null
+  last_bot_message_session_title?: string | null
 }
 
 export type ChannelBinding = {

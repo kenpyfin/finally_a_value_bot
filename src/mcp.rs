@@ -8,7 +8,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-05";
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 60;
@@ -899,7 +899,7 @@ mod tests {
     #[test]
     fn test_mcp_http_config_parse() {
         let json = r#"{
-          "default_protocol_version": "2025-11-05",
+          "default_protocol_version": "2025-11-25",
           "mcpServers": {
             "remote": {
               "transport": "streamable_http",
@@ -912,7 +912,7 @@ mod tests {
         }"#;
 
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.default_protocol_version.unwrap(), "2025-11-05");
+        assert_eq!(cfg.default_protocol_version.unwrap(), "2025-11-25");
         let remote = cfg.mcp_servers.get("remote").unwrap();
         assert_eq!(remote.transport, "streamable_http");
         assert_eq!(remote.endpoint, "http://127.0.0.1:8080/mcp");

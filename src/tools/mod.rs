@@ -475,6 +475,14 @@ pub fn assert_persona_tool_path_allowed(
     auth: Option<&ToolAuthContext>,
     is_write: bool,
 ) -> Result<(), String> {
+    if is_write && crate::self_repo::is_self_repo_source_path(workspace_root, resolved_path) {
+        return Err(format!(
+            "Write blocked: '{}' is inside the bot's own source checkout. \
+             Persona Tier-1 target repos (`Repo: …`) are allowed; the finally-a-value-bot \
+             install/source tree is not.",
+            resolved_path.display()
+        ));
+    }
     if !has_persona_scope(auth) {
         return Ok(());
     }

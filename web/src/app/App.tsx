@@ -590,6 +590,8 @@ export function App({
         personaId: p.id,
         personaName: p.name,
         lastBotMessageAt: p.last_bot_message_at ?? null,
+        sessionId: p.last_bot_message_session_id ?? null,
+        sessionTitle: p.last_bot_message_session_title ?? null,
       }))
   }, [personas, personaHasNew])
 
@@ -2119,9 +2121,9 @@ export function App({
             void loadPersonas(chatId)
             void loadInboxTodos(chatId)
           },
-          onOpenPersona: (personaId) => {
-            const p = personas.find((x) => x.id === personaId)
-            if (p) void switchPersona(p.name)
+          onOpenTarget: (target) => {
+            const p = personas.find((x) => x.id === target.personaId)
+            if (p) void switchPersona(p.name, { sessionId: target.sessionId })
           },
           onCompleteTodo: (todoId) => {
             void completeInboxTodo(todoId)

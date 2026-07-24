@@ -188,8 +188,18 @@ Run the bot on a host with tmux, or use inline bash for short commands."
     } else {
         ""
     };
+    let ceiling = crate::self_repo::git_ceiling_value(&state.config.workspace_root_absolute());
+    let git_ceiling_export = if ceiling.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "export {}={}\n",
+            crate::self_repo::ENV_GIT_CEILING,
+            shell_escape_single(&ceiling)
+        )
+    };
     let command_body = format!(
-        "#!/usr/bin/env bash\nset -uo pipefail\n{debug_export}cd {}\n{}\n",
+        "#!/usr/bin/env bash\nset -uo pipefail\n{debug_export}{git_ceiling_export}cd {}\n{}\n",
         shell_escape_single(&workdir_abs.to_string_lossy()),
         command.trim()
     );

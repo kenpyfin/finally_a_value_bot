@@ -66,7 +66,14 @@ export async function fetchBackgroundJobsSnapshot(chatId: number): Promise<Backg
 export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> {
   const query = new URLSearchParams({ chat_id: String(chatId) })
   const data = await api<{
-    personas?: { id: number; name: string; is_active: boolean; last_bot_message_at?: string | null }[]
+    personas?: {
+      id: number
+      name: string
+      is_active: boolean
+      last_bot_message_at?: string | null
+      last_bot_message_session_id?: string | null
+      last_bot_message_session_title?: string | null
+    }[]
   }>(`/api/personas?${query.toString()}`)
   const list = Array.isArray(data.personas) ? data.personas : []
   return list.map((p) => ({
@@ -74,6 +81,8 @@ export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> 
     name: p.name,
     is_active: p.is_active,
     last_bot_message_at: p.last_bot_message_at ?? null,
+    last_bot_message_session_id: p.last_bot_message_session_id ?? null,
+    last_bot_message_session_title: p.last_bot_message_session_title ?? null,
   }))
 }
 
@@ -96,6 +105,8 @@ export type OpsPollApiResponse = {
     name: string
     is_active: boolean
     last_bot_message_at?: string | null
+    last_bot_message_session_id?: string | null
+    last_bot_message_session_title?: string | null
   }[]
 }
 
@@ -126,6 +137,8 @@ export async function fetchOpsPollBundle(
       name: p.name,
       is_active: p.is_active,
       last_bot_message_at: p.last_bot_message_at ?? null,
+      last_bot_message_session_id: p.last_bot_message_session_id ?? null,
+      last_bot_message_session_title: p.last_bot_message_session_title ?? null,
     })),
     personasIncluded,
   }

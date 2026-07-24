@@ -2,7 +2,7 @@ import React from 'react'
 import { Button, Flex, Heading, IconButton } from '@radix-ui/themes'
 import { SessionPicker } from '../components/session-picker'
 import { CockpitStatusChip } from '../components/ops-ui'
-import { IconOps, IconSettings } from '../components/icons'
+import { IconInbox, IconOps, IconSettings } from '../components/icons'
 import type { ChatSession, InstallationStatus, QueueLane } from '../types'
 
 type Appearance = 'dark' | 'light'
@@ -204,7 +204,7 @@ export const AppHeader = React.memo(function AppHeader({
                 title="Inbox"
                 onClick={onOpenInbox}
               >
-                Inbox
+                <IconInbox className="size-5 shrink-0" />
                 {inboxBadgeCount > 0 ? (
                   <span className="mc-inbox-launch__badge" aria-hidden>
                     {inboxBadgeCount > 99 ? '99+' : inboxBadgeCount}

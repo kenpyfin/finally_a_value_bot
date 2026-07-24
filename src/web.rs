@@ -1796,16 +1796,22 @@ async fn api_ops_poll(
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let last_bot_by_persona: HashMap<i64, String> = last_bot_rows.into_iter().collect();
+        let last_bot_by_persona: HashMap<i64, crate::db::PersonaLastBotInfo> = last_bot_rows
+            .into_iter()
+            .map(|row| (row.persona_id, row))
+            .collect();
         Some(
             persona_rows
                 .iter()
                 .map(|p| {
+                    let last = last_bot_by_persona.get(&p.id);
                     json!({
                         "id": p.id,
                         "name": p.name,
                         "is_active": active_id == Some(p.id),
-                        "last_bot_message_at": last_bot_by_persona.get(&p.id).cloned(),
+                        "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
+                        "last_bot_message_session_id": last.and_then(|r| r.session_id.clone()),
+                        "last_bot_message_session_title": last.and_then(|r| r.session_title.clone()),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -2734,17 +2740,23 @@ async fn api_personas(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let last_bot_by_persona: HashMap<i64, String> = last_bot_rows.into_iter().collect();
+    let last_bot_by_persona: HashMap<i64, crate::db::PersonaLastBotInfo> = last_bot_rows
+        .into_iter()
+        .map(|row| (row.persona_id, row))
+        .collect();
 
     let items: Vec<serde_json::Value> = personas
         .iter()
         .map(|p| {
+            let last = last_bot_by_persona.get(&p.id);
             json!({
                 "id": p.id,
                 "name": p.name,
                 "model_override": p.model_override,
                 "is_active": active_id == Some(p.id),
-                "last_bot_message_at": last_bot_by_persona.get(&p.id).cloned(),
+                "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
+                "last_bot_message_session_id": last.and_then(|r| r.session_id.clone()),
+                "last_bot_message_session_title": last.and_then(|r| r.session_title.clone()),
             })
         })
         .collect();
@@ -6151,6 +6163,13 @@ async fn api_cursor_mcp_post(
         .await
 }
 
+async fn api_cursor_mcp_get(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    crate::cursor_mcp_bridge::handle_cursor_mcp_get(addr, headers).await
+}
+
 async fn api_cursor_engine_models_get(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -7104,7 +7123,10 @@ fn build_router(web_state: WebState) -> Router {
             "/api/cursor-engine/models",
             get(api_cursor_engine_models_get),
         )
-        .route("/internal/cursor-mcp", post(api_cursor_mcp_post))
+        .route(
+            "/internal/cursor-mcp",
+            get(api_cursor_mcp_get).post(api_cursor_mcp_post),
+        )
         .route(
             "/api/runtime",
             get(api_runtime_get).patch(api_runtime_patch),

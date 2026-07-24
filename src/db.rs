@@ -493,6 +493,15 @@ pub struct PersonaTodo {
     pub completed_at: Option<String>,
 }
 
+/// Latest bot message metadata for inbox / unread indicators.
+#[derive(Debug, Clone)]
+pub struct PersonaLastBotInfo {
+    pub persona_id: i64,
+    pub last_bot_message_at: String,
+    pub session_id: Option<String>,
+    pub session_title: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CursorAgentRun {
     pub id: i64,
@@ -5859,21 +5868,38 @@ impl Database {
         Ok(personas)
     }
 
-    /// Returns a `(persona_id, last_bot_message_at)` row for each persona that has at least one bot message.
-    /// `last_bot_message_at` is the max `messages.timestamp` for rows where `is_from_bot = 1`.
+    /// Latest bot message per persona in a chat: timestamp plus the session that message belongs to
+    /// (`session_id` / title are `None` for main-chat messages).
     pub fn list_persona_last_bot_message_at(
         &self,
         chat_id: i64,
-    ) -> Result<Vec<(i64, String)>, FinallyAValueBotError> {
+    ) -> Result<Vec<PersonaLastBotInfo>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT persona_id, MAX(timestamp) AS last_at
-             FROM messages
-             WHERE chat_id = ?1 AND is_from_bot = 1
-             GROUP BY persona_id",
+            "SELECT m.persona_id, m.timestamp, m.session_id, cs.title
+             FROM messages m
+             LEFT JOIN chat_sessions cs ON cs.id = m.session_id
+             WHERE m.chat_id = ?1
+               AND m.is_from_bot = 1
+               AND m.rowid = (
+                 SELECT m2.rowid
+                 FROM messages m2
+                 WHERE m2.chat_id = m.chat_id
+                   AND m2.persona_id = m.persona_id
+                   AND m2.is_from_bot = 1
+                 ORDER BY m2.timestamp DESC, m2.rowid DESC
+                 LIMIT 1
+               )",
         )?;
         let rows = stmt
-            .query_map(params![chat_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params![chat_id], |row| {
+                Ok(PersonaLastBotInfo {
+                    persona_id: row.get(0)?,
+                    last_bot_message_at: row.get(1)?,
+                    session_id: row.get(2)?,
+                    session_title: row.get(3)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }

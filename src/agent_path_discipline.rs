@@ -34,6 +34,7 @@ Follow these rules on **every** turn for `read_file`, `write_file`, `edit_file`,
 - `../` chains to reach skills or runtime (e.g. `../../../../skills/...`) — use `skills/<name>/...` in file tools or **`run_skill_script`** for execution.
 - Bash to run skill scripts when **`run_skill_script`** applies (e.g. `python3 ../../../../skills/foo/bar.py`).
 - Treating `shared/workspace/` as `WORKSPACE_DIR` or as a canonical skills location.
+- **Self-repo:** never use the finally-a-value-bot install/source git checkout as a project (no git branch deletes, force-push, reset, or source edits there). Persona Tier-1 **`Repo: /absolute/path`** target repos are **fully allowed** — `cd` there for commits and development.
 
 ### Shadow workspace
 
@@ -83,6 +84,8 @@ mod tests {
         assert!(s.contains("/data/skills"));
         assert!(s.contains("run_skill_script"));
         assert!(s.contains("../../../../skills"));
+        assert!(s.contains("Self-repo"));
+        assert!(s.contains("Tier-1"));
     }
 
     #[test]

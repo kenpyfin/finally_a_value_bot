@@ -15,6 +15,22 @@ Template:
 
 ---
 
+### 2026-07-24 — Cursor SDK MCP discovery failed on bogus protocol version
+
+- **Symptom:** Agent evaluation showed `Cursor SDK → MCP tool discovery Broken` / bot tools `Unavailable`. `GetMcpTools` for `finally-a-value-bot` returned *failed during live tool discovery*; only `mcp_auth` appeared. Loopback `POST /internal/cursor-mcp` was up; settings had `CURSOR_MCP_TOOLS_ENABLED=true`.
+- **Root cause:** Bridge answered `initialize` with `protocolVersion: "2025-11-05"` (not a real MCP version — mix of `2024-11-05` + `2025-11-25`). Cursor client requests `2025-11-25` and disconnects when the negotiated version is unsupported.
+- **Fix:** Negotiate real versions (`2025-11-25` default; echo client when supported). Add loopback `GET /internal/cursor-mcp` → `405` (Streamable HTTP). Log initialize/tools/list. Redeploy binary + restart gateway.
+- **Prevention:** Never invent protocol version strings; unit-test negotiation; verify live turns log `Cursor MCP initialize … negotiated="2025-11-25"` and `tools/list completed`.
+- **Files/refs:** `src/cursor_mcp_bridge.rs` (`negotiate_protocol_version`); `src/web.rs` (`api_cursor_mcp_get`); log signature `Cursor MCP initialize requested=… negotiated=…`.
+
+### 2026-07-23 — Cursor/agent git bound the bot checkout from persona cwd
+
+- **Symptom:** Development prompts (e.g. delete main branch) could mutate `finally-a-value-bot` itself when Cursor ran under persona cwd inside `WORKSPACE_DIR`.
+- **Root cause:** Persona dirs live under the bot git tree; `git` walked up from cwd and discovered the bot `.git`. Soft “Git discipline” prompt was not enough.
+- **Fix:** `GIT_CEILING_DIRECTORIES=<WORKSPACE_DIR>` on Cursor sidecar / cursor_agent / bash / background shells; hard-block bash git that names the self-repo path; prompt self-repo ban. Persona Tier-1 `Repo:` paths stay fully allowed via explicit `cd`.
+- **Prevention:** Never clear `GIT_CEILING_DIRECTORIES` for agent shells; do not treat the bot checkout as a project workspace. Set `FINALLY_A_VALUE_BOT_SELF_REPO` if auto-detect fails.
+- **Files/refs:** `src/self_repo.rs`, `src/cursor_sdk_sidecar.rs`, `src/tools/{bash,bash_safety,cursor_agent,command_runner}.rs`, `src/cursor_delegation_prompt.rs`.
+
 ### 2026-07-23 — Unstable props defeated ThreadPane React.memo (idle UI jank)
 
 - **Symptom:** Web UI felt laggy while idle (typing/scroll/menus); chat remounted or re-rendered on the 2.5–10s ops poll cadence.

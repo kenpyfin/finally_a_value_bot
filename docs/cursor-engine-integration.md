@@ -109,7 +109,8 @@ At the start of each Cursor turn (`run_cursor_engine`):
 
 | Method | Handler | Behavior |
 | --- | --- | --- |
-| `initialize` | `cursor_mcp_bridge` | Server capabilities |
+| `initialize` | `cursor_mcp_bridge` | Negotiates protocol version (default `2025-11-25`; never invent versions like `2025-11-05`) |
+| `GET` (same path) | `handle_cursor_mcp_get` | Returns `405` (no long-lived SSE listen stream; allowed by Streamable HTTP) |
 | `tools/list` | Maps `ToolRegistry::definitions()` | Strips internal `__finally_a_value_bot_auth` from schemas; auth injected server-side |
 | `tools/call` | `dispatch_tool_with_hooks` → `execute_with_auth` | Full tool execution with hooks |
 
@@ -128,6 +129,7 @@ These tools are **not** exposed to Cursor MCP (avoid recursion and duplicate del
 - Endpoint accepts **loopback clients only** (`127.0.0.1` / `::1`).
 - Requires valid run-scoped Bearer token; revoked when the turn finishes.
 - Tool args are redacted via `EnvSecretRedactor` in logs.
+- **Self-repo ban:** Cursor/agent shells get `GIT_CEILING_DIRECTORIES=<WORKSPACE_DIR>` so git does not bind the bot's own checkout from persona cwd. Explicit git/`cd` into the finally-a-value-bot source tree is blocked in `bash` / background shell. **Persona Tier-1 target repos** (`Repo: /absolute/path` in identity/memory) remain fully allowed — `cd` there and run git normally. Override detection with `FINALLY_A_VALUE_BOT_SELF_REPO`. See `src/self_repo.rs`.
 
 ### Key files
 
