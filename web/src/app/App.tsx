@@ -1625,10 +1625,6 @@ export function App({
     setSettingsDialogOpen(true)
   }, [])
 
-  const handleOpenQueue = useCallback(() => {
-    setQueueDialogOpen(true)
-  }, [])
-
   const handleOpenInbox = useCallback(() => {
     setInboxDialogOpen(true)
   }, [])
@@ -1802,7 +1798,6 @@ export function App({
       onOpenInbox: handleOpenInbox,
       inboxBadgeCount,
       onOpenSchedules: handleOpenSchedules,
-      onOpenQueue: handleOpenQueue,
       onOpenPrinciples: handleOpenPrinciples,
       onOpenArtifacts: handleOpenArtifacts,
       onOpenTerminal: handleOpenTerminal,
@@ -1821,7 +1816,6 @@ export function App({
       handleOpenInbox,
       inboxBadgeCount,
       handleOpenSchedules,
-      handleOpenQueue,
       handleOpenPrinciples,
       handleOpenArtifacts,
       handleOpenTerminal,

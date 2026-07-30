@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-07-30 — Web UI: remove redundant toolbar Queue button
+
+- **Area:** web UI / queue
+- **Summary:** Removed the desktop header **Queue** button. Run queue remains reachable from the cockpit strip (Queue / Background links) and from mobile Operator tools.
+- **Key files / symbols:** `AppHeader` toolbar props; `CockpitBar` `onQueueClick`; `MobileOpsSheet` `onOpenQueue`.
+- **Note:** Rebuild web assets to pick up the UI change.
+
 ### 2026-07-24 — Fix Cursor MCP tool discovery (protocol version)
 
 - **Area:** cursor engine / MCP bridge

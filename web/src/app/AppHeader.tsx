@@ -37,7 +37,6 @@ export type AppHeaderToolbarProps = {
   onOpenInbox: () => void
   inboxBadgeCount?: number
   onOpenSchedules: () => void
-  onOpenQueue: () => void
   onOpenPrinciples: () => void
   onOpenArtifacts: () => void
   onOpenMemory: () => void
@@ -94,7 +93,6 @@ export const AppHeader = React.memo(function AppHeader({
     onOpenInbox,
     inboxBadgeCount = 0,
     onOpenSchedules,
-    onOpenQueue,
     onOpenPrinciples,
     onOpenArtifacts,
     onOpenMemory,
@@ -265,9 +263,6 @@ export const AppHeader = React.memo(function AppHeader({
             <span className="mc-toolbar-divider !hidden md:!inline-block" aria-hidden />
             <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenSettings}>
               Settings
-            </Button>
-            <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenQueue}>
-              Queue
             </Button>
             <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenSchedules}>
               Schedules
