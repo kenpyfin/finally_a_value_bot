@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-12 — Cursor sidecar: close ephemeral bridges (EMFILE fix)
+
+- **Area:** cursor engine / sidecar
+- **Summary:** Sidecar hit `OSError: [Errno 24] Too many open files` (1023/1024 FDs) after ~340 orphan `cursor-sdk-bridge` processes accumulated. Session-scoped pool keyed every scheduled fire as `scheduled:<id>:<ts>` and never evicted. Now: close ephemeral scopes after each `/run`, idle TTL reaper (900s) + pool cap (32), hardened `client.close()` with force-kill fallback, parallel pool drain on shutdown.
+- **Key files / symbols:** `_is_ephemeral_session_scope`, `_evict_idle_and_over_cap_bridges`, `_close_pooled_bridge`, `_bridge_idle_reaper` in `scripts/cursor-sdk-runner.py`.
+- **Note:** Sidecar script is read on process start — recycle `cursor-sdk-runner.py` (or restart the bot) to pick up. Ops recovery killed orphan bridges and restarted the sidecar with `.env` `CURSOR_API_KEY`.
+
 ### 2026-07-30 — Web UI: remove redundant toolbar Queue button
 
 - **Area:** web UI / queue

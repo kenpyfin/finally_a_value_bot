@@ -23,7 +23,10 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -41,6 +44,15 @@ DEFAULT_MODEL = "composer-2.5"
 BRIDGE_RETRY_MAX_ATTEMPTS = 3
 BRIDGE_RETRY_BACKOFF_SECS = (0.5, 1.5, 3.0)
 DEFAULT_BRIDGE_LAUNCH_TIMEOUT_SECS = 60
+# Warm interactive bridges (main / focus sessions). Scheduled + background
+# scopes are one-shot and must not stay pooled.
+DEFAULT_BRIDGE_IDLE_TTL_SECS = 900
+DEFAULT_BRIDGE_POOL_MAX = 32
+DEFAULT_BRIDGE_REAPER_INTERVAL_SECS = 60
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 def _bridge_launch_timeout_secs() -> int:
@@ -53,6 +65,42 @@ def _bridge_launch_timeout_secs() -> int:
         return DEFAULT_BRIDGE_LAUNCH_TIMEOUT_SECS
 
 
+def _bridge_idle_ttl_secs() -> int:
+    raw = os.environ.get("CURSOR_BRIDGE_IDLE_TTL_SECS", "").strip()
+    if not raw:
+        return DEFAULT_BRIDGE_IDLE_TTL_SECS
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return DEFAULT_BRIDGE_IDLE_TTL_SECS
+
+
+def _bridge_pool_max() -> int:
+    raw = os.environ.get("CURSOR_BRIDGE_POOL_MAX", "").strip()
+    if not raw:
+        return DEFAULT_BRIDGE_POOL_MAX
+    try:
+        return max(4, int(raw))
+    except ValueError:
+        return DEFAULT_BRIDGE_POOL_MAX
+
+
+def _is_ephemeral_session_scope(session_scope: str) -> bool:
+    """One-shot scopes that must never keep a warm bridge after /run.
+
+    Scheduled tasks use `scheduled:<task_id>:<iso_ts>` (unique each fire).
+    Background jobs use a UUID run_key. Both leak FDs if pooled forever.
+    """
+    scope = session_scope.strip()
+    if not scope:
+        return False
+    if scope.startswith("scheduled:"):
+        return True
+    if scope.startswith("background:") or scope.startswith("bg:"):
+        return True
+    return bool(_UUID_RE.match(scope))
+
+
 @dataclass
 class _PooledBridge:
     client: Any
@@ -61,12 +109,14 @@ class _PooledBridge:
     pool_key: str
     state_root: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_used_monotonic: float = field(default_factory=time.monotonic)
 
 
 _POOL: dict[str, _PooledBridge] = {}
 _POOL_GUARD = asyncio.Lock()
 # Serialize cold `Client.launch_bridge` across all pools/personas/sessions.
 _BRIDGE_LAUNCH_SEM = asyncio.Semaphore(1)
+_REAPER_TASK: asyncio.Task[None] | None = None
 
 
 def _api_key() -> str:
@@ -128,18 +178,47 @@ def _close_agent_only(agent: Any | None) -> None:
             pass
 
 
-def _close_pooled_bridge(entry: _PooledBridge) -> None:
+def _bridge_process(client: Any) -> Any | None:
+    bridge = getattr(client, "_owned_bridge", None)
+    if bridge is None:
+        return None
+    return getattr(bridge, "process", None)
+
+
+def _force_kill_bridge_process(client: Any) -> None:
+    """Last-resort terminate if Client.close() left the subprocess alive."""
+    proc = _bridge_process(client)
+    if proc is None or proc.poll() is not None:
+        return
     try:
-        entry.client.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
     except Exception:
         pass
 
 
+def _close_pooled_bridge(entry: _PooledBridge) -> None:
+    client = entry.client
+    try:
+        client.close()
+    except Exception:
+        pass
+    _force_kill_bridge_process(client)
+    print(
+        f"[cursor-sdk-runner] closed bridge pool_key={entry.pool_key}",
+        file=sys.stderr,
+    )
+
+
 def _bridge_subprocess_exited(client: Any) -> bool:
-    bridge = getattr(client, "_owned_bridge", None)
-    if bridge is None:
-        return False
-    proc = getattr(bridge, "process", None)
+    proc = _bridge_process(client)
     return proc is not None and proc.poll() is not None
 
 
@@ -157,7 +236,7 @@ async def _evict_pooled_bridge(pool_key: str) -> None:
     async with _POOL_GUARD:
         entry = _POOL.pop(pool_key, None)
     if entry is not None:
-        _close_pooled_bridge(entry)
+        await asyncio.to_thread(_close_pooled_bridge, entry)
 
 
 def _launch_bridge_client(cwd: str, state_root: str, timeout_secs: int) -> Any:
@@ -172,6 +251,66 @@ def _launch_bridge_client(cwd: str, state_root: str, timeout_secs: int) -> Any:
     )
 
 
+async def _evict_idle_and_over_cap_bridges() -> int:
+    """Close idle warm bridges and enforce a hard pool cap (oldest first)."""
+    now = time.monotonic()
+    ttl = float(_bridge_idle_ttl_secs())
+    cap = _bridge_pool_max()
+    to_close: list[_PooledBridge] = []
+
+    async with _POOL_GUARD:
+        # Do not call client.ping() under the lock — it can block all /run traffic.
+        idle_keys = [
+            key
+            for key, entry in _POOL.items()
+            if (now - entry.last_used_monotonic) >= ttl
+            or _bridge_subprocess_exited(entry.client)
+        ]
+        for key in idle_keys:
+            entry = _POOL.pop(key, None)
+            if entry is not None:
+                to_close.append(entry)
+
+        if len(_POOL) > cap:
+            overflow = sorted(
+                _POOL.values(),
+                key=lambda e: e.last_used_monotonic,
+            )[: len(_POOL) - cap]
+            for entry in overflow:
+                removed = _POOL.pop(entry.pool_key, None)
+                if removed is not None:
+                    to_close.append(removed)
+
+    if to_close:
+        await asyncio.to_thread(_close_entries_parallel, to_close)
+    return len(to_close)
+
+
+def _close_entries_parallel(entries: list[_PooledBridge]) -> None:
+    if not entries:
+        return
+    workers = min(32, max(1, len(entries)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_close_pooled_bridge, entries))
+
+
+async def _bridge_idle_reaper() -> None:
+    while True:
+        try:
+            await asyncio.sleep(DEFAULT_BRIDGE_REAPER_INTERVAL_SECS)
+            closed = await _evict_idle_and_over_cap_bridges()
+            if closed:
+                print(
+                    f"[cursor-sdk-runner] reaper closed {closed} bridge(s); "
+                    f"pool_size={len(_POOL)}",
+                    file=sys.stderr,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # pragma: no cover
+            print(f"[cursor-sdk-runner] reaper error: {err}", file=sys.stderr)
+
+
 async def _get_pooled_bridge(cwd: str, session_scope: str = "") -> _PooledBridge:
     pool_key = _bridge_pool_key(cwd, session_scope)
     state_root = _bridge_state_root(cwd, session_scope)
@@ -180,48 +319,60 @@ async def _get_pooled_bridge(cwd: str, session_scope: str = "") -> _PooledBridge
     async with _POOL_GUARD:
         entry = _POOL.get(pool_key)
         if entry is not None and _bridge_is_alive(entry.client):
+            entry.last_used_monotonic = time.monotonic()
             return entry
 
     async with _BRIDGE_LAUNCH_SEM:
         async with _POOL_GUARD:
             entry = _POOL.get(pool_key)
             if entry is not None and _bridge_is_alive(entry.client):
+                entry.last_used_monotonic = time.monotonic()
                 return entry
             if entry is not None:
-                _close_pooled_bridge(entry)
-                _POOL.pop(pool_key, None)
+                stale = _POOL.pop(pool_key, None)
+            else:
+                stale = None
 
-            timeout_secs = _bridge_launch_timeout_secs()
-            client = await asyncio.to_thread(
-                _launch_bridge_client,
-                cwd,
-                state_root,
-                timeout_secs,
-            )
-            entry = _PooledBridge(
-                client=client,
-                cwd=cwd,
-                session_scope=session_scope,
-                pool_key=pool_key,
-                state_root=state_root,
-            )
+        if stale is not None:
+            await asyncio.to_thread(_close_pooled_bridge, stale)
+
+        # Make room before a cold launch so we never grow past cap.
+        await _evict_idle_and_over_cap_bridges()
+        if len(_POOL) >= _bridge_pool_max():
+            await _evict_idle_and_over_cap_bridges()
+
+        timeout_secs = _bridge_launch_timeout_secs()
+        client = await asyncio.to_thread(
+            _launch_bridge_client,
+            cwd,
+            state_root,
+            timeout_secs,
+        )
+        entry = _PooledBridge(
+            client=client,
+            cwd=cwd,
+            session_scope=session_scope,
+            pool_key=pool_key,
+            state_root=state_root,
+        )
+        async with _POOL_GUARD:
             _POOL[pool_key] = entry
-            scope_label = session_scope.strip() or "main"
-            print(
-                "[cursor-sdk-runner] launched bridge for "
-                f"persona={cwd} session={scope_label} "
-                f"(pool_key={pool_key}, timeout={timeout_secs}s)",
-                file=sys.stderr,
-            )
-            return entry
+        scope_label = session_scope.strip() or "main"
+        print(
+            "[cursor-sdk-runner] launched bridge for "
+            f"persona={cwd} session={scope_label} "
+            f"(pool_key={pool_key}, timeout={timeout_secs}s, "
+            f"ephemeral={_is_ephemeral_session_scope(session_scope)})",
+            file=sys.stderr,
+        )
+        return entry
 
 
 async def _close_all_pooled_bridges() -> None:
     async with _POOL_GUARD:
         entries = list(_POOL.values())
         _POOL.clear()
-    for entry in entries:
-        _close_pooled_bridge(entry)
+    await asyncio.to_thread(_close_entries_parallel, entries)
     try:
         from cursor_sdk._client import close_default_client
 
@@ -408,6 +559,7 @@ async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
         try:
             pooled = await _get_pooled_bridge(cwd, session_scope)
             async with pooled.lock:
+                pooled.last_used_monotonic = time.monotonic()
                 agent = _open_agent(
                     pooled.client,
                     agent_id=resume_id,
@@ -464,6 +616,11 @@ async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
             return
         finally:
             _close_agent_only(agent)
+            # One-shot scheduled/background scopes must not keep bridges warm.
+            if pooled is not None and _is_ephemeral_session_scope(session_scope):
+                await _evict_pooled_bridge(pool_key)
+            elif pooled is not None:
+                pooled.last_used_monotonic = time.monotonic()
 
 
 def _stream_agent_turn(
@@ -556,6 +713,8 @@ async def handle_health(_request: web.Request) -> web.Response:
             "mcp_supported": True,
             "persona_bridges_active": len(_POOL),
             "session_scoped_bridges": True,
+            "bridge_idle_ttl_secs": _bridge_idle_ttl_secs(),
+            "bridge_pool_max": _bridge_pool_max(),
         }
     )
 
@@ -609,7 +768,22 @@ async def handle_models(_request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(err)}, status=502)
 
 
+async def _on_startup(app: web.Application) -> None:
+    global _REAPER_TASK
+    _REAPER_TASK = asyncio.create_task(_bridge_idle_reaper())
+    app["bridge_reaper"] = _REAPER_TASK
+
+
 async def _on_cleanup(_app: web.Application) -> None:
+    global _REAPER_TASK
+    task = _REAPER_TASK
+    _REAPER_TASK = None
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await _close_all_pooled_bridges()
 
 
@@ -623,11 +797,20 @@ def _run_self_tests() -> None:
     os.environ["CURSOR_BRIDGE_LAUNCH_TIMEOUT_SECS"] = "45"
     assert _bridge_launch_timeout_secs() == 45
     os.environ.pop("CURSOR_BRIDGE_LAUNCH_TIMEOUT_SECS", None)
+    assert _is_ephemeral_session_scope(
+        "scheduled:17:2026-08-11T07:00:49.089870296+00:00"
+    )
+    assert _is_ephemeral_session_scope("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+    assert not _is_ephemeral_session_scope("")
+    assert not _is_ephemeral_session_scope("focus:project-x")
+    assert _bridge_idle_ttl_secs() >= 60
+    assert _bridge_pool_max() >= 4
 
 
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     app = web.Application()
+    app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/models", handle_models)

@@ -15,6 +15,14 @@ Template:
 
 ---
 
+### 2026-08-12 — Cursor bridge pool leaked until EMFILE
+
+- **Symptom:** Cursor engine / sidecar failed with `OSError: [Errno 24] Too many open files`; `socket.accept() out of system resource` on `:3848`. Hundreds of `cursor-sdk-bridge.js` processes (many days old).
+- **Root cause:** Pool keyed by persona + `session_scope`. Scheduled runs use unique `scheduled:<task_id>:<iso_ts>` scopes, so each fire launched a new warm bridge that was never closed (only on sidecar shutdown or retryable error). Tool-callback listen sockets + CLOSE-WAIT filled the sidecar’s 1024 FD soft limit.
+- **Fix:** Evict ephemeral scopes after each `/run`; idle TTL + max pool size reaper; force-kill subprocess if `Client.close()` leaves it alive. Ops: terminate orphan bridges and restart sidecar.
+- **Prevention:** Never pool one-shot `scheduled:` / UUID background scopes; keep `/health` `persona_bridges_active` bounded; alert if it climbs without bound.
+- **Files/refs:** `scripts/cursor-sdk-runner.py`; `cursor_session_scope` in `src/cursor_engine.rs`; log `socket.accept() out of system resource` / `Too many open files` in `workspace/runtime/cursor-sdk-sidecar.stderr.log`.
+
 ### 2026-07-24 — Cursor SDK MCP discovery failed on bogus protocol version
 
 - **Symptom:** Agent evaluation showed `Cursor SDK → MCP tool discovery Broken` / bot tools `Unavailable`. `GetMcpTools` for `finally-a-value-bot` returned *failed during live tool discovery*; only `mcp_auth` appeared. Loopback `POST /internal/cursor-mcp` was up; settings had `CURSOR_MCP_TOOLS_ENABLED=true`.
