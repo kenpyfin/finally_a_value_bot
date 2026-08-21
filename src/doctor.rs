@@ -131,6 +131,7 @@ fn build_report() -> DoctorReport {
     );
 
     check_config(&mut report);
+    check_wecom_credentials(&mut report);
     check_llm_provider_base_url(&mut report);
     check_evaluator_api_key(&mut report);
     check_cost_routing_local(&mut report);
@@ -183,6 +184,144 @@ fn check_cursor_mcp_bridge(report: &mut DoctorReport) {
         format!("Loopback MCP expected at {endpoint} (enable in Settings → Cursor)"),
         None,
     );
+}
+
+fn check_wecom_credentials(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let env_partial = config.wecom_corp_id.is_some()
+        || config.wecom_corp_secret.is_some()
+        || config.wecom_callback_token.is_some()
+        || config.wecom_encoding_aes_key.is_some()
+        || config.wecom_agent_id > 0
+        || config.wecom_aibot_id.is_some();
+    let runtime_dir = config.runtime_data_dir();
+    let inst = crate::db::Database::new(&runtime_dir).ok().and_then(|db| {
+        db.get_channel_bot_instance(crate::db::BOT_INSTANCE_WECOM_PRIMARY)
+            .ok()
+            .flatten()
+    });
+    if inst.is_none() && !env_partial {
+        return;
+    }
+    let uses_aibot = if let Some(row) = inst.as_ref() {
+        let mode = row.wecom_mode.trim().to_ascii_lowercase();
+        mode == "aibot"
+            || mode == "websocket"
+            || (!row.wecom_aibot_id.trim().is_empty() && mode != "callback")
+    } else {
+        config.wecom_uses_aibot()
+    };
+    if uses_aibot {
+        let (bot_id, secret_set) = if let Some(row) = inst {
+            (
+                row.wecom_aibot_id.trim().to_string(),
+                !row.token.trim().is_empty(),
+            )
+        } else {
+            (
+                config.wecom_aibot_id.clone().unwrap_or_default(),
+                config
+                    .wecom_corp_secret
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false),
+            )
+        };
+        let mut missing = Vec::new();
+        if bot_id.is_empty() {
+            missing.push("bot_id");
+        }
+        if !secret_set {
+            missing.push("bot_secret");
+        }
+        if missing.is_empty() {
+            report.push(
+                "channel.wecom",
+                "WeCom credentials",
+                CheckStatus::Pass,
+                "WeCom AI Bot long connection configured (no public callback)",
+                None,
+            );
+        } else {
+            report.push(
+                "channel.wecom",
+                "WeCom credentials",
+                CheckStatus::Fail,
+                format!(
+                    "WeCom AI Bot is partially configured; missing: {}",
+                    missing.join(", ")
+                ),
+                Some(
+                    "Set Bot ID and long-connection Secret in Settings → Integrations, then restart."
+                        .to_string(),
+                ),
+            );
+        }
+        return;
+    }
+    let (corp_id, secret_set, agent_id, callback_set, aes_set, port) = if let Some(row) = inst {
+        (
+            row.wecom_corp_id.trim().to_string(),
+            !row.token.trim().is_empty(),
+            row.wecom_agent_id,
+            !row.wecom_callback_token.trim().is_empty(),
+            !row.wecom_encoding_aes_key.trim().is_empty(),
+            row.wecom_webhook_port,
+        )
+    } else {
+        (
+            config.wecom_corp_id.clone().unwrap_or_default(),
+            config
+                .wecom_corp_secret
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false),
+            config.wecom_agent_id,
+            config
+                .wecom_callback_token
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false),
+            config
+                .wecom_encoding_aes_key
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false),
+            config.wecom_webhook_port,
+        )
+    };
+    let missing: Vec<&str> = [
+        (corp_id.is_empty(), "corp_id"),
+        (!secret_set, "corp_secret"),
+        (agent_id <= 0, "agent_id"),
+        (!callback_set, "callback_token"),
+        (!aes_set, "encoding_aes_key"),
+        (port == 0, "webhook_port"),
+    ]
+    .into_iter()
+    .filter_map(|(missing, name)| if missing { Some(name) } else { None })
+    .collect();
+    if missing.is_empty() {
+        report.push(
+            "channel.wecom",
+            "WeCom credentials",
+            CheckStatus::Pass,
+            format!("WeCom app configured (callback port {port})"),
+            None,
+        );
+    } else {
+        report.push(
+            "channel.wecom",
+            "WeCom credentials",
+            CheckStatus::Fail,
+            format!("WeCom is partially configured; missing: {}", missing.join(", ")),
+            Some(
+                "Complete Corp ID, Agent ID, corp secret, callback token, and EncodingAESKey in Settings → Integrations, then restart.".to_string(),
+            ),
+        );
+    }
 }
 
 fn check_config(report: &mut DoctorReport) {

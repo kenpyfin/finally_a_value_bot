@@ -558,17 +558,11 @@ async fn api_health(
 }
 
 /// Single universal chat; no multi-chat concept. Web always uses this chat.
-const DEFAULT_UNIVERSAL_CHAT_ID: i64 = 997894126;
-
-/// Resolve chat_id for web requests. Always returns the single universal chat.
-/// chat_id in request is ignored; there is only one conversation across all channels.
 fn resolve_chat_id_for_web(
     _chat_id: Option<i64>,
     config: &Config,
 ) -> Result<i64, (StatusCode, String)> {
-    Ok(config
-        .universal_chat_id
-        .unwrap_or(DEFAULT_UNIVERSAL_CHAT_ID))
+    Ok(config.operator_inbox_chat_id())
 }
 
 /// Ensure web/default always points to the configured universal chat.
@@ -2117,12 +2111,13 @@ async fn send_and_store_response_with_events(
             state.app_state.db.clone(),
             state.app_state.telegram_bots.as_ref(),
             state.app_state.discord_http.as_ref(),
+            state.app_state.wecom.as_deref(),
             &state.app_state.config.bot_username,
             chat_id,
             persona_id,
             &resp,
             Some(state.app_state.config.workspace_root_absolute()),
-            DeliveryScope::ContactWide,
+            DeliveryScope::StoreOnly,
             None,
         )
         .await
@@ -2226,12 +2221,13 @@ async fn send_and_store_response_with_events(
             state.app_state.db.clone(),
             state.app_state.telegram_bots.as_ref(),
             state.app_state.discord_http.as_ref(),
+            state.app_state.wecom.as_deref(),
             &state.app_state.config.bot_username,
             chat_id,
             persona_id,
             &response,
             Some(state.app_state.config.workspace_root_absolute()),
-            DeliveryScope::ContactWide,
+            DeliveryScope::StoreOnly,
             body.session_id.clone(),
         )
         .await
@@ -2941,6 +2937,7 @@ fn normalize_persona_scope_ids(ids: &[i64]) -> Vec<i64> {
 struct ChatSessionsListQuery {
     chat_id: Option<i64>,
     persona_id: Option<i64>,
+    /// Deprecated: session archive is gone; the list always includes every session.
     #[serde(default)]
     include_archived: Option<bool>,
 }
@@ -2978,9 +2975,9 @@ async fn api_chat_sessions_list(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
-    let include_archived = query.include_archived.unwrap_or(false);
+    let _ = query.include_archived;
     let sessions = call_blocking(state.app_state.db.clone(), move |db| {
-        db.list_chat_sessions(chat_id, persona_id, include_archived)
+        db.list_chat_sessions(chat_id, persona_id)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -3109,7 +3106,8 @@ async fn api_chat_sessions_create(
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let title = intent.chars().take(60).collect::<String>();
-    let ttl_hours = body.ttl_hours.unwrap_or(72).max(0);
+    // ttl_hours is accepted for compatibility; session TTL auto-archive is deprecated.
+    let ttl_hours = body.ttl_hours.unwrap_or(0).max(0);
     let mirror_main_chat = body.mirror_main_chat.unwrap_or(false);
 
     let sid = session_id.clone();
@@ -3205,6 +3203,23 @@ async fn api_chat_sessions_patch(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
 
+    if let Some(ref status) = body.status {
+        match status.as_str() {
+            "archived" => {
+                return Err((
+                    StatusCode::GONE,
+                    "session archive is deprecated; delete the session instead".into(),
+                ));
+            }
+            "active" => {
+                // no-op: archive/TTL restore is deprecated; sessions stay active
+            }
+            _ => {
+                return Err((StatusCode::BAD_REQUEST, "status must be 'active'".into()));
+            }
+        }
+    }
+
     if let Some(ref title) = body.title {
         let sid = session_id.clone();
         let t = title.clone();
@@ -3213,33 +3228,6 @@ async fn api_chat_sessions_patch(
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-
-    if let Some(ref status) = body.status {
-        match status.as_str() {
-            "archived" => {
-                let sid = session_id.clone();
-                call_blocking(state.app_state.db.clone(), move |db| {
-                    db.archive_chat_session(&sid)
-                })
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-            "active" => {
-                let sid = session_id.clone();
-                call_blocking(state.app_state.db.clone(), move |db| {
-                    db.reopen_chat_session(&sid)
-                })
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-            _ => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "status must be 'active' or 'archived'".into(),
-                ));
-            }
-        }
     }
 
     if let Some(ttl) = body.ttl_hours {
@@ -6367,6 +6355,24 @@ fn json_channel_bot_instance_redacted(inst: &ChannelBotInstance) -> serde_json::
             mask_setting_value(&inst.whatsapp_verify_token)
         },
         "whatsapp_webhook_port": inst.whatsapp_webhook_port,
+        "wecom_corp_id": inst.wecom_corp_id,
+        "wecom_agent_id": inst.wecom_agent_id,
+        "wecom_callback_token_set": !inst.wecom_callback_token.trim().is_empty(),
+        "wecom_callback_token_redacted": if inst.wecom_callback_token.trim().is_empty() {
+            String::new()
+        } else {
+            mask_setting_value(&inst.wecom_callback_token)
+        },
+        "wecom_encoding_aes_key_set": !inst.wecom_encoding_aes_key.trim().is_empty(),
+        "wecom_encoding_aes_key_redacted": if inst.wecom_encoding_aes_key.trim().is_empty() {
+            String::new()
+        } else {
+            mask_setting_value(&inst.wecom_encoding_aes_key)
+        },
+        "wecom_webhook_port": inst.wecom_webhook_port,
+        "wecom_allowed_chats": inst.wecom_allowed_chats,
+        "wecom_aibot_id": inst.wecom_aibot_id,
+        "wecom_mode": inst.wecom_mode,
         "created_at": inst.created_at,
         "env_primary": false,
         "is_primary": matches!(
@@ -6374,6 +6380,7 @@ fn json_channel_bot_instance_redacted(inst: &ChannelBotInstance) -> serde_json::
             crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY
                 | crate::db::BOT_INSTANCE_DISCORD_PRIMARY
                 | crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY
+                | crate::db::BOT_INSTANCE_WECOM_PRIMARY
         ),
     })
 }
@@ -6395,6 +6402,22 @@ struct ChannelBotInstanceCreateRequest {
     whatsapp_verify_token: Option<String>,
     #[serde(default)]
     whatsapp_webhook_port: Option<u16>,
+    #[serde(default)]
+    wecom_corp_id: Option<String>,
+    #[serde(default)]
+    wecom_agent_id: Option<i64>,
+    #[serde(default)]
+    wecom_callback_token: Option<String>,
+    #[serde(default)]
+    wecom_encoding_aes_key: Option<String>,
+    #[serde(default)]
+    wecom_webhook_port: Option<u16>,
+    #[serde(default)]
+    wecom_allowed_chats: Option<String>,
+    #[serde(default)]
+    wecom_aibot_id: Option<String>,
+    #[serde(default)]
+    wecom_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6414,18 +6437,71 @@ struct ChannelBotInstanceUpdateRequest {
     whatsapp_verify_token: Option<String>,
     #[serde(default)]
     whatsapp_webhook_port: Option<u16>,
+    #[serde(default)]
+    wecom_corp_id: Option<String>,
+    #[serde(default)]
+    wecom_agent_id: Option<i64>,
+    #[serde(default)]
+    wecom_callback_token: Option<String>,
+    #[serde(default)]
+    wecom_encoding_aes_key: Option<String>,
+    #[serde(default)]
+    wecom_webhook_port: Option<u16>,
+    #[serde(default)]
+    wecom_allowed_chats: Option<String>,
+    #[serde(default)]
+    wecom_aibot_id: Option<String>,
+    #[serde(default)]
+    wecom_mode: Option<String>,
 }
 
-fn parse_csv_i64_lossy(raw: &str) -> Vec<i64> {
-    raw.split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect()
+fn parse_id_list_i64(raw: &str) -> Result<Vec<i64>, String> {
+    let mut ids = Vec::new();
+    let mut invalid = Vec::new();
+    for part in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let token = token
+            .strip_prefix("chat:")
+            .or_else(|| token.strip_prefix("user:"))
+            .unwrap_or(token)
+            .trim_start_matches('+');
+        match token.parse::<i64>() {
+            Ok(id) => ids.push(id),
+            Err(_) => invalid.push(token.to_string()),
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(format!(
+            "Invalid chat IDs (numeric Telegram IDs, comma-separated): {}",
+            invalid.join(", ")
+        ));
+    }
+    Ok(ids)
 }
 
-fn parse_csv_u64_lossy(raw: &str) -> Vec<u64> {
-    raw.split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect()
+fn parse_id_list_u64(raw: &str) -> Result<Vec<u64>, String> {
+    let mut ids = Vec::new();
+    let mut invalid = Vec::new();
+    for part in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.parse::<u64>() {
+            Ok(id) => ids.push(id),
+            Err(_) => invalid.push(token.to_string()),
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(format!(
+            "Invalid channel IDs (numeric Discord IDs, comma-separated): {}",
+            invalid.join(", ")
+        ));
+    }
+    Ok(ids)
 }
 
 fn looks_like_masked_secret(value: &str) -> bool {
@@ -6464,16 +6540,28 @@ async fn api_channel_bot_instances_post(
     let allowed_groups = body
         .allowed_groups
         .as_deref()
-        .map(parse_csv_i64_lossy)
+        .map(parse_id_list_i64)
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?
         .unwrap_or_default();
     let discord_allowed_channels = body
         .discord_allowed_channels
         .as_deref()
-        .map(parse_csv_u64_lossy)
+        .map(parse_id_list_u64)
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?
         .unwrap_or_default();
     let whatsapp_phone_number_id = body.whatsapp_phone_number_id.map(|v| v.trim().to_string());
     let whatsapp_verify_token = body.whatsapp_verify_token.map(|v| v.trim().to_string());
     let whatsapp_webhook_port = body.whatsapp_webhook_port;
+    let wecom_corp_id = body.wecom_corp_id.map(|v| v.trim().to_string());
+    let wecom_agent_id = body.wecom_agent_id;
+    let wecom_callback_token = body.wecom_callback_token.map(|v| v.trim().to_string());
+    let wecom_encoding_aes_key = body.wecom_encoding_aes_key.map(|v| v.trim().to_string());
+    let wecom_webhook_port = body.wecom_webhook_port;
+    let wecom_allowed_chats = body.wecom_allowed_chats.map(|v| v.trim().to_string());
+    let wecom_aibot_id = body.wecom_aibot_id.map(|v| v.trim().to_string());
+    let wecom_mode = body.wecom_mode.map(|v| v.trim().to_string());
     let db = state.app_state.db.clone();
     let id = call_blocking(db.clone(), move |db| {
         let id = db.create_channel_bot_instance(&platform, &label, &token)?;
@@ -6485,6 +6573,17 @@ async fn api_channel_bot_instances_post(
             whatsapp_phone_number_id.as_deref(),
             whatsapp_verify_token.as_deref(),
             whatsapp_webhook_port,
+        )?;
+        db.update_channel_bot_instance_wecom_options(
+            id,
+            wecom_corp_id.as_deref(),
+            wecom_agent_id,
+            wecom_callback_token.as_deref(),
+            wecom_encoding_aes_key.as_deref(),
+            wecom_webhook_port,
+            wecom_allowed_chats.as_deref(),
+            wecom_aibot_id.as_deref(),
+            wecom_mode.as_deref(),
         )?;
         Ok(id)
     })
@@ -6513,11 +6612,18 @@ async fn api_channel_bot_instances_patch(
     let label = body.label;
     let token = body.token;
     let bot_username = body.bot_username.map(|v| v.trim().to_string());
-    let allowed_groups = body.allowed_groups.as_deref().map(parse_csv_i64_lossy);
+    let allowed_groups = body
+        .allowed_groups
+        .as_deref()
+        .map(parse_id_list_i64)
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let discord_allowed_channels = body
         .discord_allowed_channels
         .as_deref()
-        .map(parse_csv_u64_lossy);
+        .map(parse_id_list_u64)
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let whatsapp_phone_number_id = body.whatsapp_phone_number_id.map(|v| v.trim().to_string());
     let whatsapp_verify_token = body.whatsapp_verify_token.and_then(|v| {
         if looks_like_masked_secret(&v) {
@@ -6527,6 +6633,26 @@ async fn api_channel_bot_instances_patch(
         }
     });
     let whatsapp_webhook_port = body.whatsapp_webhook_port;
+    let wecom_corp_id = body.wecom_corp_id.map(|v| v.trim().to_string());
+    let wecom_agent_id = body.wecom_agent_id;
+    let wecom_callback_token = body.wecom_callback_token.and_then(|v| {
+        if looks_like_masked_secret(&v) {
+            None
+        } else {
+            Some(v.trim().to_string())
+        }
+    });
+    let wecom_encoding_aes_key = body.wecom_encoding_aes_key.and_then(|v| {
+        if looks_like_masked_secret(&v) {
+            None
+        } else {
+            Some(v.trim().to_string())
+        }
+    });
+    let wecom_webhook_port = body.wecom_webhook_port;
+    let wecom_allowed_chats = body.wecom_allowed_chats.map(|v| v.trim().to_string());
+    let wecom_aibot_id = body.wecom_aibot_id.map(|v| v.trim().to_string());
+    let wecom_mode = body.wecom_mode.map(|v| v.trim().to_string());
     let updated = call_blocking(state.app_state.db.clone(), move |db| {
         let Some(current) = db.get_channel_bot_instance(id)? else {
             return Ok(false);
@@ -6546,6 +6672,17 @@ async fn api_channel_bot_instances_patch(
             whatsapp_phone_number_id.as_deref(),
             whatsapp_verify_token.as_deref(),
             whatsapp_webhook_port,
+        )?;
+        db.update_channel_bot_instance_wecom_options(
+            id,
+            wecom_corp_id.as_deref(),
+            wecom_agent_id,
+            wecom_callback_token.as_deref(),
+            wecom_encoding_aes_key.as_deref(),
+            wecom_webhook_port,
+            wecom_allowed_chats.as_deref(),
+            wecom_aibot_id.as_deref(),
+            wecom_mode.as_deref(),
         )?;
         Ok(true)
     })
@@ -7624,6 +7761,7 @@ mod tests {
             tools: ToolRegistry::new(&cfg, bot, db, runtime_toggles, env_redactor),
             cursor_mcp: Arc::new(crate::cursor_mcp_bridge::CursorMcpRegistry::new()),
             discord_http: Arc::new(std::collections::HashMap::new()),
+            wecom: None,
             chat_queue: crate::chat_queue::ChatRunQueue::default(),
             background_job_control: crate::background_jobs::BackgroundJobControl::default(),
         };

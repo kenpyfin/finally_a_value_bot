@@ -14,6 +14,7 @@ flowchart TB
         Telegram
         Discord
         WhatsApp
+        WeCom
         Web
     end
 
@@ -45,6 +46,7 @@ The central entry point is `process_with_agent` (and `process_with_agent_with_ev
 - **Telegram** — message handler
 - **Discord** — message handler
 - **WhatsApp** — webhook handler
+- **WeCom** — 智能机器人 WebSocket long connection (preferred) or encrypted self-built app callback
 - **Web** — HTTP API handlers
 - **Scheduler** — background task executor (every 60s for due cron tasks)
 
@@ -109,7 +111,7 @@ The main agent no longer exposes a `send_message` tool; user-visible output is t
 - **Agent background jobs** (`background_jobs` table, `job_kind=agent`): enqueued via web/scheduler handoff (`##BACKGROUND_JOB_HANDOFF##`); worker runs `process_with_agent_with_events` in a Tokio task; final reply via `deliver_agent_final_to_contact`.
 - **Shell background jobs** (`job_kind=shell`): core tool `spawn_background_command` runs the command in tmux (`background_shell_tmux_session_prefix`), logs under `runtime/background_jobs/{job_id}/`, and a monitor loop finalizes when the session ends and delivers results to the user. On success (default), an agent background job summarizes outputs; on failure, an agent job may diagnose and retry. Not available in Docker when tmux is disabled.
 - **Tracked external jobs** (`job_kind=tracked`): core tool `register_tracked_job` inserts the external system's id (e.g. ComfyUI `prompt_id`) into `background_jobs` so the cockpit queue matches user-visible job ids; does not count toward the one active shell/handoff slot per chat.
-- **Foreground agent queue** (`ChatRunQueue`): one FIFO worker per `(canonical chat_id, persona_id)` so different personas in the same contact can run agent turns in parallel; the same persona stays strictly serialized. Telegram, Discord, WhatsApp, web send, and scheduler due tasks all enqueue into this queue.
+- **Foreground agent queue** (`ChatRunQueue`): one FIFO worker per `(canonical chat_id, persona_id)` so different personas in the same contact can run agent turns in parallel; the same persona stays strictly serialized. Telegram, Discord, WhatsApp, WeCom, web send, and scheduler due tasks all enqueue into this queue.
 - **Ops visibility**: `GET /api/queue_diagnostics` returns one lane row per `(chat_id, persona_id)` plus `background_by_chat`; `GET /api/background_jobs` lists job rows with heartbeats.
 
 ### Main vs Sub-Agent Tools
@@ -202,14 +204,15 @@ The `cursor_agent` tool runs the Cursor CLI (`cursor-agent`) as a subprocess. It
 
 ## 6. Unified Contact (Linked Identity) and Channel Bindings
 
-Chat is **one conversation per contact**, synced across channels. A **contact** is identified by a **canonical `chat_id`**. Channel handles (Telegram chat id, Discord channel id, web session key) are bound to that contact via the **`channel_bindings`** table.
+Chat is **one conversation per contact** in the web UI. A **contact** is identified by a **canonical `chat_id`**. Channel handles (Telegram chat id, Discord channel id, WeCom `user:`/`chat:` handle, web session key) are bound to that contact via the **`channel_bindings`** table. Outbound replies are **directional**: each external channel only receives responses to messages it sent; the web UI loads the merged history from SQLite.
 
 ### Resolve flow
 
-Every entry path (Telegram, Discord, Web, Scheduler) **resolves** `(channel_type, channel_handle)` to a canonical `chat_id` **before** building `AgentRequestContext` and calling `process_with_agent`:
+Every entry path (Telegram, Discord, WeCom, Web, Scheduler) **resolves** `(channel_type, channel_handle)` to a canonical `chat_id` **before** building `AgentRequestContext` and calling `process_with_agent`:
 
 - **Telegram**: `(telegram, chat_id)` → lookup or create binding; canonical is that chat_id (or existing linked contact).
 - **Discord**: `(discord, channel_id)` → same pattern.
+- **WeCom**: `(wecom, user:{userid}` or `chat:{chatid})` → string handles, all bound to the operator inbox for persona policy and web history. Inbound is either `wss://openws.work.weixin.qq.com` (`aibot_msg_callback`) or the self-built app HTTPS `/callback`. Replies are directional per handle (`DeliveryScope::platform_reply`).
 - **Web**: `(web, session_key)` → resolve via bindings; if missing, create new contact (e.g. hash-based id) and insert binding.
 - **Scheduler**: uses canonical `chat_id` already stored on the task.
 
@@ -220,14 +223,17 @@ Per-channel persona scope is stored in `channel_persona_policy`:
 - `mode=all` (default): channel can use all personas (current behavior).
 - `mode=single`: channel is locked to one persona id; inbound routing forces that persona, and cross-channel delivery skips that channel for other personas.
 
-### Delivery (sync across channels)
+### Delivery (directional reply; web aggregates history)
 
-After the agent produces a reply, the handler does **not** store and send only to the requesting channel. It calls **`deliver_to_contact(state, canonical_chat_id, persona_id, text)`** (in `src/channel.rs`), which:
+After the agent produces a reply, handlers call **`deliver_to_contact`** (in `src/channel.rs`), which:
 
-1. **Stores the message once** in the DB under the canonical `chat_id`.
-2. **Delivers to every bound channel**: Telegram (via `Bot`), Discord (via optional `discord_http` on `AppState`), web (history is loaded by clients; no extra push unless SSE is added).
+1. **Stores the message once** in the DB under the canonical `chat_id` (visible in the web UI).
+2. **Delivers externally only per scope:**
+   - **Inbound channel reply** (`DeliveryScope::platform_reply`): Telegram, Discord, WhatsApp, and WeCom replies go back only to the binding handle that received the message (WeCom groups each get their own handle).
+   - **Web UI** (`DeliveryScope::StoreOnly`): main chat and focused sessions persist to history without fan-out to external channels.
+   - **Scheduler / background jobs** (`StoreOnly`): results appear in the web UI; they do not broadcast to every bound channel.
 
-So the same thread is visible on all linked channels; new bot replies are sent to all bindings so the conversation stays in sync.
+So the web UI shows the unified timeline; external channels only receive replies for messages they sent.
 
 ### Web identity and linking
 
@@ -242,14 +248,15 @@ Web has no native identity. To sync with Telegram/Discord, the user **binds** th
 - `config`, `db`, `llm`, `tools`, `memory`, `skills`, `mcp` (via tools), `chat_queue`
 - `telegram_bots`: `HashMap<i64, Bot>` — one Telegram `Bot` per `channel_bot_instances` row (platform `telegram`)
 - `discord_http`: `HashMap<i64, Arc<Http>>` — one Discord HTTP client per `channel_bot_instances` row (platform `discord`)
+- `wecom`: optional `WecomGateway` for the primary WeCom instance (id 4) — AI Bot WebSocket or self-built app callback
 
-It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which picks the correct `Bot` / Discord client per binding’s `bot_instance_id`.
+It is passed into `process_with_agent` and used throughout the loop. Delivery to all channels uses `deliver_to_contact`, which picks the correct `Bot` / Discord client / WeCom client per binding’s `bot_instance_id`.
 
 ## 8. Configuration and settings
 
 - **Bootstrap** (`WEB_*`, `WORKSPACE_DIR`, LLM API keys, vault, social OAuth) comes from repo-root `.env` (or `FINALLY_A_VALUE_BOT_CONFIG`) plus process environment — see `Config::load` / `load_from_env` in `src/config.rs`.
-- **Chat integrations** (Telegram / Discord / WhatsApp tokens and platform access settings) are configured in **Web UI → Settings → Integrations** and persisted in SQLite. `channel_bot_instances` is the source of truth for per-bot settings such as Telegram `BOT_USERNAME` / group allowlist, Discord channel allowlist, and WhatsApp phone/verify/webhook fields; `CONTROL_CHAT_IDS` remains a global `app_settings` value. First boot may one-time-import legacy channel env vars; afterward the DB is authoritative. **Restart** after token changes so dispatchers reload.
-- **Channel persona routing** is configured separately in **Settings → Channels** via `channel_persona_policy`. Telegram and Discord instances can use all personas or a single persona for a contact. WhatsApp is intentionally single-persona because this gateway supports one WhatsApp Business number/webhook.
+- **Chat integrations** (Telegram / Discord / WhatsApp / WeCom tokens and platform access settings) are configured in **Web UI → Settings → Integrations** and persisted in SQLite. `channel_bot_instances` is the source of truth for per-bot settings such as Telegram `BOT_USERNAME` / group allowlist, Discord channel allowlist, WhatsApp phone/verify/webhook fields, and WeCom AI Bot Bot ID + secret (or self-built app corp/agent/callback/EncodingAESKey/port); `CONTROL_CHAT_IDS` remains a global `app_settings` value. First boot may one-time-import legacy channel env vars; afterward the DB is authoritative. **Restart** after token changes so dispatchers reload.
+- **Channel persona routing** is configured separately in **Settings → Channels** via `channel_persona_policy`. Telegram, Discord, and WeCom instances can use all personas or a single persona for a contact. WhatsApp is intentionally single-persona because this gateway supports one WhatsApp Business number/webhook. Preferred WeCom path is 智能机器人 **长连接** (Bot ID + Secret; no public callback). Self-built app HTTPS `/callback` (port 8081 by default) remains available. Groups: AI Bot already requires @mention; callback mode only runs the agent when the app is @mentioned.
 - LLM provider/model selection, runtime toggles, Cursor engine, and local-delegate settings also live in `app_settings` and are merged at startup / hot-reloaded where supported. `PATCH /api/settings` remains disabled (501); use dedicated Settings APIs.
 - **Restart hook:** set `FINALLY_A_VALUE_BOT_RESTART_COMMAND` to a fixed supervisor command; authenticated `POST /api/restart` runs it (optional one-click from Web UI).
 

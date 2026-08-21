@@ -30,6 +30,7 @@ use crate::agent_history::{
     EvaluatorStepRecord, IterationRecord, ToolCallRecord,
 };
 use crate::background_jobs::BackgroundJobControl;
+use crate::channel::{DeliveryScope, CHANNEL_PROCESSING_ACK};
 use crate::chat_queue::{ChatRunQueue, QueueEnqueueMeta, QueueSource};
 use crate::claude::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
 use crate::config::Config;
@@ -293,6 +294,8 @@ pub struct AppState {
     pub cursor_mcp: Arc<crate::cursor_mcp_bridge::CursorMcpRegistry>,
     /// Discord HTTP clients keyed by `channel_bot_instances.id`.
     pub discord_http: Arc<HashMap<i64, Arc<SerenityHttp>>>,
+    /// WeCom gateway: AI Bot long connection or self-built app callback (single primary instance).
+    pub wecom: Option<Arc<crate::channels::wecom::WecomGateway>>,
     pub chat_queue: ChatRunQueue,
     pub background_job_control: BackgroundJobControl,
 }
@@ -607,6 +610,7 @@ pub async fn run_bot(
         }
     }
 
+    let wecom = crate::channels::wecom::WecomGateway::from_config(&config);
     let state = Arc::new(AppState {
         config,
         env_redactor,
@@ -623,6 +627,7 @@ pub async fn run_bot(
         tools,
         cursor_mcp: Arc::new(crate::cursor_mcp_bridge::CursorMcpRegistry::new()),
         discord_http: Arc::new(discord_http_map),
+        wecom,
         chat_queue: ChatRunQueue::default(),
         background_job_control: BackgroundJobControl::default(),
     });
@@ -647,6 +652,24 @@ pub async fn run_bot(
         tokio::spawn(async move {
             crate::whatsapp::start_whatsapp_server(wa_state, token, phone_id, verify, port).await;
         });
+    }
+
+    if let Some(wecom) = state.wecom.clone() {
+        let wecom_state = state.clone();
+        if wecom.is_aibot() {
+            if let Some(aibot) = wecom.aibot_client() {
+                info!("Starting WeCom AI Bot long connection");
+                tokio::spawn(async move {
+                    crate::channels::wecom_aibot::start_wecom_aibot(wecom_state, aibot).await;
+                });
+            }
+        } else if let Some(callback) = wecom.callback_client() {
+            let port = state.config.wecom_webhook_port;
+            info!("Starting WeCom callback server on port {port}");
+            tokio::spawn(async move {
+                crate::wecom::start_wecom_server(wecom_state, callback, port).await;
+            });
+        }
     }
 
     // Start one Discord client per configured Discord bot instance
@@ -1425,6 +1448,11 @@ async fn handle_message(
         && !allowed_groups.is_empty()
         && !allowed_groups.contains(&chat_id)
     {
+        tracing::info!(
+            target: "telegram",
+            chat_id,
+            "dropped inbound: chat not in Integrations allowed groups"
+        );
         // Store message but don't process
         let chat_title_owned = chat_title.clone();
         let chat_type_owned = db_chat_type.to_string();
@@ -1576,6 +1604,22 @@ async fn handle_message(
             std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let status_msg_id_ev = status_msg_id.clone();
 
+        // Immediate processing ack (edited into tool status, deleted on finish).
+        {
+            let mut req = bot_spawn.send_message(chat_id_spawn, CHANNEL_PROCESSING_ACK);
+            if let Some(tid) = thread_id_spawn {
+                req = req.message_thread_id(tid);
+            }
+            if let Ok(Ok(sent)) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                req,
+            )
+            .await
+            {
+                *status_msg_id.lock().await = Some(sent.id);
+            }
+        }
+
         let event_bot = bot_spawn.clone();
         let event_chat_id = chat_id_spawn;
         let event_thread_id = thread_id_spawn;
@@ -1668,14 +1712,16 @@ async fn handle_message(
                     to_send.len()
                 );
                 let ws_root = state_spawn.config.workspace_root_absolute();
-                let delivery_scope = crate::channel::DeliveryScope::PlatformInstance {
-                    channel_type: "telegram",
-                    bot_instance_id: telegram_bot_instance_id_spawn,
-                };
+                let delivery_scope = DeliveryScope::platform_reply(
+                    "telegram",
+                    telegram_bot_instance_id_spawn,
+                    chat_id_spawn.0.to_string(),
+                );
                 if let Err(e) = crate::channel::deliver_agent_final_to_contact(
                     state_spawn.db.clone(),
                     state_spawn.telegram_bots.as_ref(),
                     state_spawn.discord_http.as_ref(),
+                    state_spawn.wecom.as_deref(),
                     &state_spawn.config.bot_username,
                     canonical_chat_id_spawn,
                     persona_id,

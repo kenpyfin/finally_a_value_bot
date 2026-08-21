@@ -7,12 +7,16 @@ use teloxide::prelude::*;
 use crate::channels::telegram::{
     send_response_result, strip_embedded_bulletin_focus, WorkspaceAutoImageContext,
 };
+use crate::channels::wecom::WecomGateway;
 use crate::db::{call_blocking, message_origin_interactive, Database, StoredMessage};
 use crate::final_delivery_dedupe::{plan_agent_final_delivery, AgentFinalDeliveryPlan};
 use crate::final_delivery_media::{
     materialize_web_delivery_file_links, normalize_assistant_artifact_references,
 };
 use crate::tools::auth_context_from_input;
+
+/// Re-export for call sites that already import from `crate::channel`.
+pub use crate::channels::CHANNEL_PROCESSING_ACK;
 
 /// How a stored outbound message should be classified in `messages.origin`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -173,18 +177,34 @@ pub async fn deliver_and_store_bot_message(
 }
 
 /// Controls which external bindings receive an outbound message (web history always stored).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum DeliveryScope {
-    /// Deliver to every bound channel for this contact (scheduler, web-initiated, background jobs).
-    #[default]
+    /// Deliver to every bound channel for this contact (legacy; avoid for interactive replies).
     ContactWide,
-    /// Reply only on the platform + bot instance that received the inbound message.
+    /// Reply only on the platform + bot instance (+ optional handle) that received the inbound message.
     PlatformInstance {
         channel_type: &'static str,
         bot_instance_id: i64,
+        /// When set, deliver only to this binding handle (required when one contact has multiple handles, e.g. WeCom groups).
+        channel_handle: Option<String>,
     },
-    /// Persist for web/history only; no Telegram/Discord/WhatsApp send.
+    /// Persist for web/history only; no Telegram/Discord/WhatsApp/WeCom send.
+    #[default]
     StoreOnly,
+}
+
+impl DeliveryScope {
+    pub fn platform_reply(
+        channel_type: &'static str,
+        bot_instance_id: i64,
+        channel_handle: impl Into<String>,
+    ) -> Self {
+        Self::PlatformInstance {
+            channel_type,
+            bot_instance_id,
+            channel_handle: Some(channel_handle.into()),
+        }
+    }
 }
 
 /// Store the bot message once under canonical_chat_id and deliver per [`DeliveryScope`].
@@ -192,6 +212,7 @@ pub async fn deliver_to_contact(
     db: Arc<Database>,
     telegram_bots: &HashMap<i64, Bot>,
     discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
+    wecom: Option<&WecomGateway>,
     bot_username: &str,
     canonical_chat_id: i64,
     persona_id: i64,
@@ -204,6 +225,7 @@ pub async fn deliver_to_contact(
         db,
         telegram_bots,
         discord_http,
+        wecom,
         bot_username,
         canonical_chat_id,
         persona_id,
@@ -220,6 +242,7 @@ pub async fn deliver_to_contact_with_origin(
     db: Arc<Database>,
     telegram_bots: &HashMap<i64, Bot>,
     discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
+    wecom: Option<&WecomGateway>,
     bot_username: &str,
     canonical_chat_id: i64,
     persona_id: i64,
@@ -232,6 +255,7 @@ pub async fn deliver_to_contact_with_origin(
     let text = strip_embedded_bulletin_focus(text);
     let text = crate::agent_turn_context::strip_stored_dialogue_markup(&text);
     let text = &with_persona_indicator(db.clone(), persona_id, &text).await;
+    let scope = effective_delivery_scope(scope, session_id.as_deref());
     let msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
         chat_id: canonical_chat_id,
@@ -275,14 +299,13 @@ pub async fn deliver_to_contact_with_origin(
         return Ok(());
     }
     for b in &bindings {
-        if let DeliveryScope::PlatformInstance {
-            channel_type,
-            bot_instance_id,
-        } = scope
-        {
-            if b.channel_type != channel_type || b.bot_instance_id != bot_instance_id {
-                continue;
-            }
+        if !binding_matches_delivery_scope(
+            &b.channel_type,
+            b.bot_instance_id,
+            &b.channel_handle,
+            &scope,
+        ) {
+            continue;
         }
         if let Some((mode, policy_persona_id)) = policy_by_instance.get(&b.bot_instance_id) {
             if *mode == crate::db::ChannelPersonaMode::Single
@@ -300,8 +323,10 @@ pub async fn deliver_to_contact_with_origin(
         }
         match b.channel_type.as_str() {
             "telegram" => {
-                let tg_bot = match scope {
-                    DeliveryScope::PlatformInstance { .. } => telegram_bots.get(&b.bot_instance_id),
+                let tg_bot = match &scope {
+                    DeliveryScope::PlatformInstance {
+                        bot_instance_id, ..
+                    } => telegram_bots.get(bot_instance_id),
                     _ => telegram_bots
                         .get(&b.bot_instance_id)
                         .or_else(|| telegram_bots.get(&crate::db::BOT_INSTANCE_TELEGRAM_PRIMARY)),
@@ -332,8 +357,10 @@ pub async fn deliver_to_contact_with_origin(
                 }
             }
             "discord" => {
-                let http = match scope {
-                    DeliveryScope::PlatformInstance { .. } => discord_http.get(&b.bot_instance_id),
+                let http = match &scope {
+                    DeliveryScope::PlatformInstance {
+                        bot_instance_id, ..
+                    } => discord_http.get(bot_instance_id),
                     _ => discord_http
                         .get(&b.bot_instance_id)
                         .or_else(|| discord_http.get(&crate::db::BOT_INSTANCE_DISCORD_PRIMARY)),
@@ -360,11 +387,59 @@ pub async fn deliver_to_contact_with_origin(
             "web" => {
                 // Already stored above; web clients load from history or SSE
             }
+            "wecom" => {
+                if let Some(client) = wecom {
+                    if let Err(e) = client.send_text(&b.channel_handle, text).await {
+                        tracing::warn!(
+                            target: "channel",
+                            handle = %b.channel_handle,
+                            error = %e,
+                            "WeCom delivery to bound channel failed"
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     Ok(())
+}
+
+/// Web focused sessions must not fan out to external channels.
+pub(crate) fn effective_delivery_scope(
+    scope: DeliveryScope,
+    session_id: Option<&str>,
+) -> DeliveryScope {
+    if session_id.is_some() && matches!(scope, DeliveryScope::ContactWide) {
+        DeliveryScope::StoreOnly
+    } else {
+        scope
+    }
+}
+
+/// Whether a binding should receive an outbound message for the given scope.
+pub(crate) fn binding_matches_delivery_scope(
+    binding_channel_type: &str,
+    binding_bot_instance_id: i64,
+    binding_handle: &str,
+    scope: &DeliveryScope,
+) -> bool {
+    match scope {
+        DeliveryScope::ContactWide => true,
+        DeliveryScope::PlatformInstance {
+            channel_type,
+            bot_instance_id,
+            channel_handle,
+        } => {
+            binding_channel_type == *channel_type
+                && binding_bot_instance_id == *bot_instance_id
+                && channel_handle
+                    .as_ref()
+                    .is_none_or(|want| want == binding_handle)
+        }
+        DeliveryScope::StoreOnly => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,6 +470,7 @@ pub async fn deliver_agent_final_to_contact(
     db: Arc<Database>,
     telegram_bots: &HashMap<i64, Bot>,
     discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
+    wecom: Option<&WecomGateway>,
     bot_username: &str,
     canonical_chat_id: i64,
     persona_id: i64,
@@ -407,6 +483,7 @@ pub async fn deliver_agent_final_to_contact(
         db,
         telegram_bots,
         discord_http,
+        wecom,
         bot_username,
         canonical_chat_id,
         persona_id,
@@ -423,6 +500,7 @@ pub async fn deliver_agent_final_to_contact_with_origin(
     db: Arc<Database>,
     telegram_bots: &HashMap<i64, Bot>,
     discord_http: &HashMap<i64, Arc<serenity::http::Http>>,
+    wecom: Option<&WecomGateway>,
     bot_username: &str,
     canonical_chat_id: i64,
     persona_id: i64,
@@ -457,6 +535,7 @@ pub async fn deliver_agent_final_to_contact_with_origin(
                 db.clone(),
                 telegram_bots,
                 discord_http,
+                wecom,
                 bot_username,
                 canonical_chat_id,
                 persona_id,
@@ -492,6 +571,7 @@ pub async fn deliver_agent_final_to_contact_with_origin(
                 db.clone(),
                 telegram_bots,
                 discord_http,
+                wecom,
                 bot_username,
                 canonical_chat_id,
                 persona_id,
@@ -521,7 +601,73 @@ pub async fn deliver_agent_final_to_contact_with_origin(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_persona_prefixed_text;
+    use super::{
+        binding_matches_delivery_scope, effective_delivery_scope, normalize_persona_prefixed_text,
+        DeliveryScope,
+    };
+    use crate::db::BOT_INSTANCE_WECOM_PRIMARY;
+
+    #[test]
+    fn platform_reply_delivers_only_to_matching_wecom_handle() {
+        let scope =
+            DeliveryScope::platform_reply("wecom", BOT_INSTANCE_WECOM_PRIMARY, "chat:groupA");
+        assert!(binding_matches_delivery_scope(
+            "wecom",
+            BOT_INSTANCE_WECOM_PRIMARY,
+            "chat:groupA",
+            &scope,
+        ));
+        assert!(!binding_matches_delivery_scope(
+            "wecom",
+            BOT_INSTANCE_WECOM_PRIMARY,
+            "chat:groupB",
+            &scope,
+        ));
+        assert!(!binding_matches_delivery_scope(
+            "telegram",
+            BOT_INSTANCE_WECOM_PRIMARY,
+            "chat:groupA",
+            &scope,
+        ));
+    }
+
+    #[test]
+    fn contact_wide_delivers_to_all_bindings() {
+        let scope = DeliveryScope::ContactWide;
+        assert!(binding_matches_delivery_scope(
+            "wecom",
+            BOT_INSTANCE_WECOM_PRIMARY,
+            "chat:any",
+            &scope,
+        ));
+        assert!(binding_matches_delivery_scope("telegram", 1, "123", &scope,));
+    }
+
+    #[test]
+    fn store_only_skips_external_bindings() {
+        let scope = DeliveryScope::StoreOnly;
+        assert!(!binding_matches_delivery_scope(
+            "wecom",
+            BOT_INSTANCE_WECOM_PRIMARY,
+            "chat:groupA",
+            &scope,
+        ));
+    }
+
+    #[test]
+    fn focused_session_contact_wide_becomes_store_only() {
+        let scope = effective_delivery_scope(DeliveryScope::ContactWide, Some("session-1"));
+        assert!(matches!(scope, DeliveryScope::StoreOnly));
+    }
+
+    #[test]
+    fn main_chat_platform_reply_is_unchanged() {
+        let scope = effective_delivery_scope(
+            DeliveryScope::platform_reply("wecom", BOT_INSTANCE_WECOM_PRIMARY, "chat:g1"),
+            None,
+        );
+        assert!(matches!(scope, DeliveryScope::PlatformInstance { .. }));
+    }
 
     #[test]
     fn persona_prefix_is_added_once() {

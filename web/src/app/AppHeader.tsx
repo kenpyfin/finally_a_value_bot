@@ -22,8 +22,6 @@ export type AppHeaderSessionProps = {
   historyLoading: boolean
   onSelectSession: (sessionId: string | null) => void
   onCreateSession: (intent: string, mirrorMainChat: boolean) => Promise<void>
-  onArchiveSession: (sessionId: string) => Promise<void>
-  onReopenSession: (sessionId: string) => Promise<void>
   onDeleteSession: (sessionId: string) => Promise<void>
 }
 
@@ -79,8 +77,6 @@ export const AppHeader = React.memo(function AppHeader({
     historyLoading,
     onSelectSession,
     onCreateSession,
-    onArchiveSession,
-    onReopenSession,
     onDeleteSession,
   } = session
   const {
@@ -183,8 +179,6 @@ export const AppHeader = React.memo(function AppHeader({
                 activeSessionId={activeSessionId}
                 onSelectSession={onSelectSession}
                 onCreateSession={onCreateSession}
-                onArchiveSession={onArchiveSession}
-                onReopenSession={onReopenSession}
                 onDeleteSession={onDeleteSession}
                 loading={historyLoading}
               />

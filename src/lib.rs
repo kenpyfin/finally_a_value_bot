@@ -57,4 +57,5 @@ pub mod web;
 pub mod web_terminal;
 pub use channels::discord;
 pub use channels::telegram;
+pub use channels::wecom;
 pub use channels::whatsapp;

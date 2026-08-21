@@ -1,6 +1,6 @@
 //! Chat channel integration settings persisted in SQLite (`app_settings` + `channel_bot_instances`).
 //!
-//! Bootstrap (`WEB_*`, `WORKSPACE_DIR`) stays in `.env`. Telegram / Discord / WhatsApp tokens and
+//! Bootstrap (`WEB_*`, `WORKSPACE_DIR`) stays in `.env`. Telegram / Discord / WhatsApp / WeCom tokens and
 //! platform options are configured in Web UI → Settings → Integrations.
 
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::db::{
     Database, BOT_INSTANCE_DISCORD_PRIMARY, BOT_INSTANCE_TELEGRAM_PRIMARY,
-    BOT_INSTANCE_WHATSAPP_PRIMARY,
+    BOT_INSTANCE_WECOM_PRIMARY, BOT_INSTANCE_WHATSAPP_PRIMARY,
 };
 use crate::error::FinallyAValueBotError;
 
@@ -349,6 +349,37 @@ pub fn migrate_from_env_if_empty(
             }
         }
 
+        if db
+            .get_channel_bot_instance(BOT_INSTANCE_WECOM_PRIMARY)?
+            .is_none()
+        {
+            let secret = config.wecom_corp_secret.as_deref().unwrap_or("").trim();
+            if !secret.is_empty() {
+                db.upsert_primary_channel_bot_instance(
+                    BOT_INSTANCE_WECOM_PRIMARY,
+                    "wecom",
+                    "Primary WeCom",
+                    secret,
+                )?;
+                let allowed = config.wecom_allowed_chats.join(",");
+                db.update_channel_bot_instance_wecom_options(
+                    BOT_INSTANCE_WECOM_PRIMARY,
+                    config.wecom_corp_id.as_deref(),
+                    Some(config.wecom_agent_id),
+                    config.wecom_callback_token.as_deref(),
+                    config.wecom_encoding_aes_key.as_deref(),
+                    Some(if config.wecom_webhook_port == 0 {
+                        8081
+                    } else {
+                        config.wecom_webhook_port
+                    }),
+                    Some(allowed.as_str()),
+                    config.wecom_aibot_id.as_deref(),
+                    Some(config.wecom_mode.as_str()),
+                )?;
+            }
+        }
+
         save_to_db(db, &from_env)?;
         db.set_app_setting(APP_SETTING_CHANNEL_INTEGRATION_SEEDED, "1")?;
     }
@@ -377,6 +408,14 @@ fn warn_if_stale_env_channel_vars(config: &Config) {
         .unwrap_or(false)
     {
         present.push("WHATSAPP_ACCESS_TOKEN");
+    }
+    if config
+        .wecom_corp_secret
+        .as_deref()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false)
+    {
+        present.push("WECOM_SECRET");
     }
     if !config.bot_username.trim().is_empty() {
         present.push("BOT_USERNAME");
@@ -453,14 +492,64 @@ pub fn merge_into_config(config: &mut Config, db: &Database) -> Result<(), Final
         config.whatsapp_access_token = None;
     }
 
+    if let Some(inst) = db.get_channel_bot_instance(BOT_INSTANCE_WECOM_PRIMARY)? {
+        let tok = inst.token.trim().to_string();
+        config.wecom_corp_secret = if tok.is_empty() { None } else { Some(tok) };
+        config.wecom_corp_id = if inst.wecom_corp_id.trim().is_empty() {
+            None
+        } else {
+            Some(inst.wecom_corp_id.trim().to_string())
+        };
+        config.wecom_agent_id = inst.wecom_agent_id;
+        config.wecom_callback_token = if inst.wecom_callback_token.trim().is_empty() {
+            None
+        } else {
+            Some(inst.wecom_callback_token.trim().to_string())
+        };
+        config.wecom_encoding_aes_key = if inst.wecom_encoding_aes_key.trim().is_empty() {
+            None
+        } else {
+            Some(inst.wecom_encoding_aes_key.trim().to_string())
+        };
+        config.wecom_webhook_port = if inst.wecom_webhook_port == 0 {
+            8081
+        } else {
+            inst.wecom_webhook_port
+        };
+        config.wecom_allowed_chats = inst
+            .wecom_allowed_chats
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        config.wecom_aibot_id = if inst.wecom_aibot_id.trim().is_empty() {
+            None
+        } else {
+            Some(inst.wecom_aibot_id.trim().to_string())
+        };
+        config.wecom_mode = inst.wecom_mode.trim().to_string();
+    } else {
+        config.wecom_corp_secret = None;
+        config.wecom_corp_id = None;
+        config.wecom_agent_id = 0;
+        config.wecom_callback_token = None;
+        config.wecom_encoding_aes_key = None;
+        config.wecom_webhook_port = 8081;
+        config.wecom_allowed_chats = Vec::new();
+        config.wecom_aibot_id = None;
+        config.wecom_mode = String::new();
+    }
+
     Ok(())
 }
 
 /// True when any Telegram / Discord / WhatsApp bot instance has a non-empty token.
 pub fn has_any_messaging_bot_token(db: &Database) -> Result<bool, FinallyAValueBotError> {
     for inst in db.list_all_channel_bot_instances()? {
-        if matches!(inst.platform.as_str(), "telegram" | "discord" | "whatsapp")
-            && !inst.token.trim().is_empty()
+        if matches!(
+            inst.platform.as_str(),
+            "telegram" | "discord" | "whatsapp" | "wecom"
+        ) && !inst.token.trim().is_empty()
         {
             return Ok(true);
         }
@@ -480,7 +569,7 @@ pub fn validate_runtime_channel_or_web(
         return Ok(());
     }
     Err(FinallyAValueBotError::Config(
-        "No messaging channel configured. Enable WEB_ENABLED=true or add a Telegram/Discord/WhatsApp bot in Web UI → Settings → Integrations (or migrate from .env on first boot).".into(),
+        "No messaging channel configured. Enable WEB_ENABLED=true or add a Telegram/Discord/WhatsApp/WeCom bot in Web UI → Settings → Integrations (or migrate from .env on first boot).".into(),
     ))
 }
 

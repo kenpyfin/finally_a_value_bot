@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -227,6 +228,26 @@ pub const BOT_INSTANCE_WEB: i64 = 0;
 pub const BOT_INSTANCE_TELEGRAM_PRIMARY: i64 = 1;
 pub const BOT_INSTANCE_DISCORD_PRIMARY: i64 = 2;
 pub const BOT_INSTANCE_WHATSAPP_PRIMARY: i64 = 3;
+pub const BOT_INSTANCE_WECOM_PRIMARY: i64 = 4;
+
+/// Stable positive i64 for string platform handles (WeCom userid/chatid).
+pub fn stable_canonical_chat_id_for_handle(platform: &str, handle: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(platform.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(handle.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let mut id = i64::from_be_bytes(bytes) & i64::MAX;
+    if id <= BOT_INSTANCE_WECOM_PRIMARY || id == 997894126 {
+        id = 1_000_000 + (id % 900_000_000);
+    }
+    if id <= BOT_INSTANCE_WECOM_PRIMARY || id == 997894126 {
+        id = 1_000_010;
+    }
+    id
+}
 
 #[derive(Debug, Clone)]
 pub struct ChannelBotInstance {
@@ -240,6 +261,14 @@ pub struct ChannelBotInstance {
     pub whatsapp_phone_number_id: String,
     pub whatsapp_verify_token: String,
     pub whatsapp_webhook_port: u16,
+    pub wecom_corp_id: String,
+    pub wecom_agent_id: i64,
+    pub wecom_callback_token: String,
+    pub wecom_encoding_aes_key: String,
+    pub wecom_webhook_port: u16,
+    pub wecom_allowed_chats: String,
+    pub wecom_aibot_id: String,
+    pub wecom_mode: String,
     pub created_at: String,
 }
 
@@ -875,7 +904,9 @@ impl Database {
 
     fn channel_bot_instance_select() -> &'static str {
         "SELECT id, platform, label, token, bot_username, allowed_groups, discord_allowed_channels,
-                whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port, created_at
+                whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port,
+                wecom_corp_id, wecom_agent_id, wecom_callback_token, wecom_encoding_aes_key,
+                wecom_webhook_port, wecom_allowed_chats, wecom_aibot_id, wecom_mode, created_at
          FROM channel_bot_instances"
     }
 
@@ -887,6 +918,11 @@ impl Database {
             .ok()
             .filter(|p| *p > 0)
             .unwrap_or(8080);
+        let wecom_port_raw: i64 = row.get(14)?;
+        let wecom_webhook_port = u16::try_from(wecom_port_raw)
+            .ok()
+            .filter(|p| *p > 0)
+            .unwrap_or(8081);
         let allowed_groups_raw: String = row.get(5)?;
         let discord_allowed_raw: String = row.get(6)?;
         Ok(ChannelBotInstance {
@@ -900,7 +936,15 @@ impl Database {
             whatsapp_phone_number_id: row.get(7)?,
             whatsapp_verify_token: row.get(8)?,
             whatsapp_webhook_port,
-            created_at: row.get(10)?,
+            wecom_corp_id: row.get(10)?,
+            wecom_agent_id: row.get(11)?,
+            wecom_callback_token: row.get(12)?,
+            wecom_encoding_aes_key: row.get(13)?,
+            wecom_webhook_port,
+            wecom_allowed_chats: row.get(15)?,
+            wecom_aibot_id: row.get(16)?,
+            wecom_mode: row.get(17)?,
+            created_at: row.get(18)?,
         })
     }
 
@@ -931,6 +975,14 @@ impl Database {
             ("whatsapp_phone_number_id", "TEXT NOT NULL DEFAULT ''"),
             ("whatsapp_verify_token", "TEXT NOT NULL DEFAULT ''"),
             ("whatsapp_webhook_port", "INTEGER NOT NULL DEFAULT 8080"),
+            ("wecom_corp_id", "TEXT NOT NULL DEFAULT ''"),
+            ("wecom_agent_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("wecom_callback_token", "TEXT NOT NULL DEFAULT ''"),
+            ("wecom_encoding_aes_key", "TEXT NOT NULL DEFAULT ''"),
+            ("wecom_webhook_port", "INTEGER NOT NULL DEFAULT 8081"),
+            ("wecom_allowed_chats", "TEXT NOT NULL DEFAULT ''"),
+            ("wecom_aibot_id", "TEXT NOT NULL DEFAULT ''"),
+            ("wecom_mode", "TEXT NOT NULL DEFAULT ''"),
         ] {
             if !Self::column_exists(conn, "channel_bot_instances", column)? {
                 conn.execute(
@@ -1087,13 +1139,14 @@ impl Database {
         Ok(())
     }
 
-    /// Reassign extra bot rows that occupy reserved primary ids 2 (Discord) or 3 (WhatsApp).
+    /// Reassign extra bot rows that occupy reserved primary ids 2–4.
     fn migrate_misplaced_channel_bot_instance_ids(
         conn: &Connection,
     ) -> Result<(), FinallyAValueBotError> {
-        let expected: [(i64, &str); 2] = [
+        let expected: [(i64, &str); 3] = [
             (BOT_INSTANCE_DISCORD_PRIMARY, "discord"),
             (BOT_INSTANCE_WHATSAPP_PRIMARY, "whatsapp"),
+            (BOT_INSTANCE_WECOM_PRIMARY, "wecom"),
         ];
         for (reserved_id, expected_platform) in expected {
             let platform: Option<String> = conn
@@ -1128,7 +1181,7 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
-        Ok(max_id.max(BOT_INSTANCE_WHATSAPP_PRIMARY) + 1)
+        Ok(max_id.max(BOT_INSTANCE_WECOM_PRIMARY) + 1)
     }
 
     fn reassign_channel_bot_instance_id_conn(
@@ -1136,33 +1189,40 @@ impl Database {
         old_id: i64,
         new_id: i64,
     ) -> Result<(), FinallyAValueBotError> {
-        let row: (String, String, String, String, String, String, String, String, i64, String) = conn.query_row(
-            "SELECT platform, label, token, bot_username, allowed_groups, discord_allowed_channels,
-                    whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port, created_at
-             FROM channel_bot_instances WHERE id = ?1",
+        let inst = conn.query_row(
+            &format!("{} WHERE id = ?1", Self::channel_bot_instance_select()),
             params![old_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                ))
-            },
+            Self::map_channel_bot_instance_row,
         )?;
         conn.execute(
             "INSERT INTO channel_bot_instances (
                 id, platform, label, token, bot_username, allowed_groups, discord_allowed_channels,
-                whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port, created_at
+                whatsapp_phone_number_id, whatsapp_verify_token, whatsapp_webhook_port,
+                wecom_corp_id, wecom_agent_id, wecom_callback_token, wecom_encoding_aes_key,
+                wecom_webhook_port, wecom_allowed_chats, wecom_aibot_id, wecom_mode, created_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![new_id, row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            params![
+                new_id,
+                inst.platform,
+                inst.label,
+                inst.token,
+                inst.bot_username,
+                Self::format_csv_i64(&inst.allowed_groups),
+                Self::format_csv_u64(&inst.discord_allowed_channels),
+                inst.whatsapp_phone_number_id,
+                inst.whatsapp_verify_token,
+                inst.whatsapp_webhook_port as i64,
+                inst.wecom_corp_id,
+                inst.wecom_agent_id,
+                inst.wecom_callback_token,
+                inst.wecom_encoding_aes_key,
+                inst.wecom_webhook_port as i64,
+                inst.wecom_allowed_chats,
+                inst.wecom_aibot_id,
+                inst.wecom_mode,
+                inst.created_at
+            ],
         )?;
         conn.execute(
             "UPDATE channel_bindings SET bot_instance_id = ?1 WHERE bot_instance_id = ?2",
@@ -1575,7 +1635,7 @@ impl Database {
                 created_at TEXT NOT NULL,
                 last_active_at TEXT NOT NULL,
                 archived_at TEXT,
-                ttl_hours INTEGER NOT NULL DEFAULT 72,
+                ttl_hours INTEGER NOT NULL DEFAULT 0,
                 bootstrap_context_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_chat_sessions_persona
@@ -1596,6 +1656,11 @@ impl Database {
                 [],
             )?;
         }
+        // Session archive/TTL is deprecated: restore any previously archived sessions.
+        conn.execute(
+            "UPDATE chat_sessions SET status = 'active', archived_at = NULL WHERE status = 'archived'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -2099,6 +2164,25 @@ impl Database {
 
     // --- Channel bindings (unified contact) ---
 
+    /// Lookup an existing binding without creating one.
+    pub fn lookup_canonical_chat_id(
+        &self,
+        bot_instance_id: i64,
+        channel_type: &str,
+        channel_handle: &str,
+    ) -> Result<Option<i64>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT canonical_chat_id FROM channel_bindings WHERE bot_instance_id = ?1 AND channel_type = ?2 AND channel_handle = ?3",
+            params![bot_instance_id, channel_type, channel_handle],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Resolve (`bot_instance_id`, `channel_type`, `channel_handle`) to canonical_chat_id. If no binding exists, creates one:
     /// - telegram/discord: use handle (as i64) as canonical_chat_id, ensure chat exists, insert binding.
     /// - web: use create_with_canonical_id as the new canonical (caller provides e.g. hash-based id), ensure chat exists, insert binding.
@@ -2132,6 +2216,8 @@ impl Database {
                     "web resolve requires create_with_canonical_id".into(),
                 )
             })?,
+            "wecom" => create_with_canonical_id
+                .unwrap_or_else(|| stable_canonical_chat_id_for_handle("wecom", channel_handle)),
             _ => {
                 return Err(FinallyAValueBotError::ToolExecution(format!(
                     "unknown channel_type: {}",
@@ -2259,7 +2345,7 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Upsert a primary bot row (ids 1–3) or any fixed id used as the platform primary.
+    /// Upsert a primary bot row (ids 1–4) or any fixed id used as the platform primary.
     pub fn upsert_primary_channel_bot_instance(
         &self,
         id: i64,
@@ -2268,9 +2354,9 @@ impl Database {
         token: &str,
     ) -> Result<(), FinallyAValueBotError> {
         let p = platform.trim().to_ascii_lowercase();
-        if !matches!(p.as_str(), "telegram" | "discord" | "whatsapp") {
+        if !matches!(p.as_str(), "telegram" | "discord" | "whatsapp" | "wecom") {
             return Err(FinallyAValueBotError::ToolExecution(
-                "platform must be telegram, discord, or whatsapp".into(),
+                "platform must be telegram, discord, whatsapp, or wecom".into(),
             ));
         }
         if token.trim().is_empty() {
@@ -2282,6 +2368,7 @@ impl Database {
             "telegram" => BOT_INSTANCE_TELEGRAM_PRIMARY,
             "discord" => BOT_INSTANCE_DISCORD_PRIMARY,
             "whatsapp" => BOT_INSTANCE_WHATSAPP_PRIMARY,
+            "wecom" => BOT_INSTANCE_WECOM_PRIMARY,
             _ => id,
         };
         if id != expected_id {
@@ -2374,7 +2461,87 @@ impl Database {
         Ok(true)
     }
 
-    /// Insert a non-primary bot instance. Ids 1–3 are reserved for primaries; extras use id >= 4.
+    pub fn update_channel_bot_instance_wecom_options(
+        &self,
+        id: i64,
+        wecom_corp_id: Option<&str>,
+        wecom_agent_id: Option<i64>,
+        wecom_callback_token: Option<&str>,
+        wecom_encoding_aes_key: Option<&str>,
+        wecom_webhook_port: Option<u16>,
+        wecom_allowed_chats: Option<&str>,
+        wecom_aibot_id: Option<&str>,
+        wecom_mode: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        if matches!(wecom_webhook_port, Some(0)) {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "wecom_webhook_port must be between 1 and 65535".into(),
+            ));
+        }
+        if matches!(wecom_agent_id, Some(v) if v < 0) {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "wecom_agent_id must be >= 0".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let current = conn.query_row(
+            "SELECT wecom_corp_id, wecom_agent_id, wecom_callback_token, wecom_encoding_aes_key,
+                    wecom_webhook_port, wecom_allowed_chats, wecom_aibot_id, wecom_mode
+             FROM channel_bot_instances WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        );
+        let Ok(current) = current else {
+            return Ok(false);
+        };
+        let port = wecom_webhook_port
+            .map(i64::from)
+            .unwrap_or(current.4)
+            .max(1);
+        conn.execute(
+            "UPDATE channel_bot_instances
+             SET wecom_corp_id = ?1,
+                 wecom_agent_id = ?2,
+                 wecom_callback_token = ?3,
+                 wecom_encoding_aes_key = ?4,
+                 wecom_webhook_port = ?5,
+                 wecom_allowed_chats = ?6,
+                 wecom_aibot_id = ?7,
+                 wecom_mode = ?8
+             WHERE id = ?9",
+            params![
+                wecom_corp_id.map(str::trim).unwrap_or(current.0.as_str()),
+                wecom_agent_id.unwrap_or(current.1),
+                wecom_callback_token
+                    .map(str::trim)
+                    .unwrap_or(current.2.as_str()),
+                wecom_encoding_aes_key
+                    .map(str::trim)
+                    .unwrap_or(current.3.as_str()),
+                port,
+                wecom_allowed_chats
+                    .map(str::trim)
+                    .unwrap_or(current.5.as_str()),
+                wecom_aibot_id.map(str::trim).unwrap_or(current.6.as_str()),
+                wecom_mode.map(str::trim).unwrap_or(current.7.as_str()),
+                id
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Insert a non-primary bot instance. Ids 1–4 are reserved for primaries; extras use id >= 5.
     pub fn create_channel_bot_instance(
         &self,
         platform: &str,
@@ -2382,9 +2549,9 @@ impl Database {
         token: &str,
     ) -> Result<i64, FinallyAValueBotError> {
         let p = platform.trim().to_ascii_lowercase();
-        if !matches!(p.as_str(), "telegram" | "discord" | "whatsapp") {
+        if !matches!(p.as_str(), "telegram" | "discord" | "whatsapp" | "wecom") {
             return Err(FinallyAValueBotError::ToolExecution(
-                "platform must be telegram, discord, or whatsapp".into(),
+                "platform must be telegram, discord, whatsapp, or wecom".into(),
             ));
         }
         if token.trim().is_empty() {
@@ -2408,6 +2575,24 @@ impl Database {
                 token,
             )?;
             return Ok(BOT_INSTANCE_WHATSAPP_PRIMARY);
+        }
+        if p == "wecom" {
+            if !self
+                .list_channel_bot_instances_by_platform("wecom")?
+                .is_empty()
+            {
+                return Err(FinallyAValueBotError::ToolExecution(
+                    "Only one WeCom app is supported. Edit or delete the existing WeCom instance."
+                        .into(),
+                ));
+            }
+            self.upsert_primary_channel_bot_instance(
+                BOT_INSTANCE_WECOM_PRIMARY,
+                "wecom",
+                label,
+                token,
+            )?;
+            return Ok(BOT_INSTANCE_WECOM_PRIMARY);
         }
         let conn = self.conn.lock().unwrap();
         let new_id = Self::next_extra_bot_instance_id_conn(&conn)?;
@@ -2483,7 +2668,10 @@ impl Database {
         let instances = self.list_all_channel_bot_instances()?;
         let mut total = 0u32;
         for inst in instances {
-            if !matches!(inst.platform.as_str(), "telegram" | "discord" | "whatsapp") {
+            if !matches!(
+                inst.platform.as_str(),
+                "telegram" | "discord" | "whatsapp" | "wecom"
+            ) {
                 continue;
             }
             total += self.provision_bindings_for_instance(&inst.platform, inst.id)?;
@@ -2510,7 +2698,7 @@ impl Database {
             binding_by_instance.insert(b.bot_instance_id, b);
         }
         let mut rows = Vec::new();
-        for platform in ["telegram", "discord", "whatsapp"] {
+        for platform in ["telegram", "discord", "whatsapp", "wecom"] {
             for inst in self.list_channel_bot_instances_by_platform(platform)? {
                 let binding = binding_by_instance.get(&inst.id);
                 let (persona_mode, persona_id) = policy_by_instance
@@ -2598,7 +2786,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Deletes a bot instance. Primary ids 1–3 may be deleted to disable that platform.
+    /// Deletes a bot instance. Primary ids 1–4 may be deleted to disable that platform.
     pub fn delete_channel_bot_instance(&self, id: i64) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         // Drop related persona policy rows for this instance (bindings stay for contact history).
@@ -6155,22 +6343,13 @@ impl Database {
         &self,
         chat_id: i64,
         persona_id: i64,
-        include_archived: bool,
     ) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let query = if include_archived {
-            format!(
-                "SELECT {CHAT_SESSION_SELECT_COLS}
+        let query = format!(
+            "SELECT {CHAT_SESSION_SELECT_COLS}
              FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2
              ORDER BY last_active_at DESC"
-            )
-        } else {
-            format!(
-                "SELECT {CHAT_SESSION_SELECT_COLS}
-             FROM chat_sessions WHERE chat_id = ?1 AND persona_id = ?2 AND status = 'active'
-             ORDER BY last_active_at DESC"
-            )
-        };
+        );
         let mut stmt = conn.prepare(&query)?;
         let sessions = stmt
             .query_map(params![chat_id, persona_id], chat_session_from_row)?
@@ -6243,26 +6422,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn archive_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        let rows = conn.execute(
-            "UPDATE chat_sessions SET status = 'archived', archived_at = ?1 WHERE id = ?2 AND status = 'active'",
-            params![now, session_id],
-        )?;
-        Ok(rows > 0)
-    }
-
-    pub fn reopen_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        let rows = conn.execute(
-            "UPDATE chat_sessions SET status = 'active', archived_at = NULL, last_active_at = ?1 WHERE id = ?2 AND status = 'archived'",
-            params![now, session_id],
-        )?;
-        Ok(rows > 0)
-    }
-
     pub fn delete_chat_session(&self, session_id: &str) -> Result<bool, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -6291,21 +6450,6 @@ impl Database {
             .query_map(params![session_id], stored_message_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
-    }
-
-    pub fn get_expired_chat_sessions(&self) -> Result<Vec<ChatSession>, FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {CHAT_SESSION_SELECT_COLS}
-             FROM chat_sessions
-             WHERE status = 'active'
-               AND ttl_hours > 0
-               AND datetime(last_active_at, '+' || ttl_hours || ' hours') < datetime('now')",
-        ))?;
-        let sessions = stmt
-            .query_map([], chat_session_from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(sessions)
     }
 }
 

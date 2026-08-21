@@ -395,12 +395,13 @@ Run the bot on a host with tmux, or use inline bash for short commands."
         state.db.clone(),
         state.telegram_bots.as_ref(),
         state.discord_http.as_ref(),
+        state.wecom.as_deref(),
         &state.config.bot_username,
         chat_id,
         persona_id,
         &ack,
         Some(state.config.workspace_root_absolute()),
-        DeliveryScope::ContactWide,
+        DeliveryScope::StoreOnly,
         None,
     )
     .await
@@ -656,12 +657,13 @@ async fn deliver_shell_notification(
         state.db.clone(),
         state.telegram_bots.as_ref(),
         state.discord_http.as_ref(),
+        state.wecom.as_deref(),
         &state.config.bot_username,
         chat_id,
         persona_id,
         text,
         Some(state.config.workspace_root_absolute()),
-        DeliveryScope::ContactWide,
+        DeliveryScope::StoreOnly,
         None,
     )
     .await
@@ -772,12 +774,13 @@ pub async fn finalize_shell_job(
         state.db.clone(),
         state.telegram_bots.as_ref(),
         state.discord_http.as_ref(),
+        state.wecom.as_deref(),
         &state.config.bot_username,
         chat_id,
         persona_id,
         &delivery_text,
         Some(state.config.workspace_root_absolute()),
-        DeliveryScope::ContactWide,
+        DeliveryScope::StoreOnly,
         None,
     )
     .await
@@ -941,6 +944,7 @@ async fn caller_channel_for_chat(state: &AppState, chat_id: i64) -> &'static str
         Ok(Some(t)) if t == "web" => "web",
         Ok(Some(t)) if t == "discord" => "discord",
         Ok(Some(t)) if t == "whatsapp" => "whatsapp",
+        Ok(Some(t)) if t == "wecom" => "wecom",
         _ => "telegram",
     }
 }

@@ -56,6 +56,7 @@ enum ActiveAttachmentTarget {
     Telegram(i64),
     Discord(i64),
     Whatsapp(i64),
+    Wecom(String),
     Web(i64),
 }
 
@@ -344,6 +345,7 @@ impl SendMessageTool {
             "telegram" => Some("telegram"),
             "discord" => Some("discord"),
             "whatsapp" => Some("whatsapp"),
+            "wecom" => Some("wecom"),
             "web" => Some("web"),
             _ => None,
         }
@@ -356,7 +358,7 @@ impl SendMessageTool {
     ) -> Result<ActiveAttachmentTarget, String> {
         let normalized = Self::normalize_caller_channel(caller_channel).ok_or_else(|| {
             format!(
-                "Attachment sending is only available from active channels: telegram, web, discord, whatsapp (got: {})",
+                "Attachment sending is only available from active channels: telegram, web, discord, whatsapp, wecom (got: {})",
                 caller_channel
             )
         })?;
@@ -371,6 +373,11 @@ impl SendMessageTool {
             .map_err(|e| format!("Failed to resolve channel bindings: {e}"))?;
 
         if let Some(binding) = bindings.iter().find(|b| b.channel_type == normalized) {
+            if normalized == "wecom" {
+                return Ok(ActiveAttachmentTarget::Wecom(
+                    binding.channel_handle.clone(),
+                ));
+            }
             let handle = binding.channel_handle.parse::<i64>().map_err(|_| {
                 format!(
                     "Invalid {} channel handle for contact {}: {}",
@@ -385,6 +392,12 @@ impl SendMessageTool {
             });
         }
 
+        if normalized == "wecom" {
+            return Err(format!(
+                "No WeCom channel binding for contact {canonical_chat_id}"
+            ));
+        }
+
         // Back-compat: in single-channel setups, canonical chat id may itself be the handle.
         Ok(match normalized {
             "telegram" => ActiveAttachmentTarget::Telegram(canonical_chat_id),
@@ -392,6 +405,35 @@ impl SendMessageTool {
             "whatsapp" => ActiveAttachmentTarget::Whatsapp(canonical_chat_id),
             _ => unreachable!(),
         })
+    }
+
+    async fn send_wecom_attachment_note(
+        &self,
+        handle: &str,
+        file_path: PathBuf,
+        caption: Option<String>,
+    ) -> Result<String, String> {
+        let cfg = self
+            .config
+            .as_ref()
+            .ok_or_else(|| "send_message config unavailable".to_string())?;
+        if cfg.wecom_uses_aibot() {
+            return Err(
+                "WeCom AI Bot long connection is owned by the running gateway; send_message cannot open a second websocket"
+                    .into(),
+            );
+        }
+        let client = crate::channels::wecom::WecomClient::from_config(cfg)
+            .ok_or_else(|| "WeCom is not configured".to_string())?;
+        let note = match caption {
+            Some(c) => format!("[attachment:{}] {c}", file_path.display()),
+            None => format!("[attachment:{}]", file_path.display()),
+        };
+        client
+            .send_text(handle, &note)
+            .await
+            .map_err(|e| format!("Failed to send WeCom attachment note: {e}"))?;
+        Ok(note)
     }
 }
 
@@ -576,6 +618,14 @@ impl Tool for SendMessageTool {
                 ActiveAttachmentTarget::Whatsapp(handle) => {
                     self.send_whatsapp_attachment(handle, file_path.clone(), used_caption.clone())
                         .await
+                }
+                ActiveAttachmentTarget::Wecom(handle) => {
+                    self.send_wecom_attachment_note(
+                        &handle,
+                        file_path.clone(),
+                        used_caption.clone(),
+                    )
+                    .await
                 }
                 ActiveAttachmentTarget::Web(canonical) => {
                     self.send_web_attachment(canonical, file_path.clone(), used_caption.clone())

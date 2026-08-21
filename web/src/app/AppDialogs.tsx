@@ -796,7 +796,7 @@ export function AppDialogs({
     >
       <Text size="2" weight="bold">External channel persona mode</Text>
       <Text size="1" color="gray" className="mb-2 block">
-        Bot integrations appear here for this contact. Telegram and Discord can use all personas or a single persona. WhatsApp is single-persona by design; Web chat uses the persona selector in the main UI.
+        Bot integrations appear here for this contact’s main chat. Replies are directional: each channel only receives responses to messages it sent. All traffic still appears in the web UI. Telegram, Discord, and WeCom can use all personas or a single persona. WhatsApp is single-persona by design. Focused sessions stay in the web UI.
       </Text>
       <div className="space-y-2">
         {bindings.length === 0 ? (

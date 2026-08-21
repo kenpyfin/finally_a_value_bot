@@ -81,6 +81,42 @@ struct SidecarRunOutcome {
     cleared_stale_resume: bool,
 }
 
+const CURSOR_EMPTY_OUTPUT_PLACEHOLDER: &str = "(Cursor agent completed with no text output.)";
+
+fn is_cursor_empty_user_facing_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty() || trimmed == CURSOR_EMPTY_OUTPUT_PLACEHOLDER
+}
+
+fn empty_output_nudge_prompt() -> String {
+    concat!(
+        "[system_runtime_context]\n",
+        "Your previous turn produced no user-visible text. ",
+        "Reply now with a concise final answer the user can read in chat. ",
+        "Do not end with only tool calls; include a short message."
+    )
+    .to_string()
+}
+
+/// Prefer a short non-JSON tool result when Cursor returns no assistant text.
+fn recover_user_text_from_tool_records(records: &[ToolCallRecord]) -> Option<String> {
+    for record in records.iter().rev() {
+        if record.is_error {
+            continue;
+        }
+        let preview = record.result_preview.trim();
+        if preview.is_empty() || preview.len() > 4_000 {
+            continue;
+        }
+        let first = preview.chars().next().unwrap_or('\0');
+        if first == '{' || first == '[' {
+            continue;
+        }
+        return Some(preview.to_string());
+    }
+    None
+}
+
 fn is_stale_cursor_agent_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("not found") && lower.contains("agent")
@@ -611,7 +647,30 @@ pub async fn run_cursor_engine(
         }
 
         if final_text.trim().is_empty() {
-            final_text = "(Cursor agent completed with no text output.)".into();
+            let can_nudge_empty =
+                nudge_count < DEFERRED_COMMITMENT_MAX_NUDGES && returned_agent_id.is_some();
+            if can_nudge_empty {
+                warn!(
+                    chat_id,
+                    persona_id,
+                    nudge_count,
+                    "Cursor agent returned empty text; nudging for user-facing reply"
+                );
+                nudge_count += 1;
+                prompt = empty_output_nudge_prompt();
+                continue;
+            }
+            if let Some(recovered) = recover_user_text_from_tool_records(&stream_tool_records) {
+                info!(
+                    chat_id,
+                    persona_id,
+                    recovered_len = recovered.len(),
+                    "Recovered user-facing text from Cursor tool results after empty assistant output"
+                );
+                final_text = recovered;
+            } else {
+                final_text = CURSOR_EMPTY_OUTPUT_PLACEHOLDER.into();
+            }
         }
 
         let can_continue = nudge_count < DEFERRED_COMMITMENT_MAX_NUDGES;
@@ -670,6 +729,20 @@ pub async fn run_cursor_engine(
             run_tool_names = names;
             history_tool_records = records;
             history_hook_events = hook_events;
+        }
+    }
+
+    if is_cursor_empty_user_facing_text(&final_text) {
+        if let Some(recovered) = recover_user_text_from_tool_records(&history_tool_records)
+            .or_else(|| recover_user_text_from_tool_records(&stream_tool_records))
+        {
+            info!(
+                chat_id,
+                persona_id,
+                recovered_len = recovered.len(),
+                "Replaced empty Cursor placeholder with tool-result summary"
+            );
+            final_text = recovered;
         }
     }
 
@@ -852,6 +925,40 @@ mod tests {
             "Cursor SDK startup failed: Agent agent-cea12fe8-fdd5-4fa4-880b-d8f7f6225a54 not found"
         ));
         assert!(!is_stale_cursor_agent_error("prompt required"));
+    }
+
+    #[test]
+    fn empty_output_helpers_detect_placeholder_and_recover_tool_text() {
+        assert!(is_cursor_empty_user_facing_text(""));
+        assert!(is_cursor_empty_user_facing_text(
+            CURSOR_EMPTY_OUTPUT_PLACEHOLDER
+        ));
+        assert!(!is_cursor_empty_user_facing_text("hello"));
+
+        let nudge = empty_output_nudge_prompt();
+        assert!(nudge.contains("no user-visible text"));
+
+        let records = vec![
+            ToolCallRecord {
+                name: "bash".into(),
+                input_preview: "{}".into(),
+                result_preview: r#"{"ok":true}"#.into(),
+                duration_ms: 1,
+                is_error: false,
+            },
+            ToolCallRecord {
+                name: "read_file".into(),
+                input_preview: "{}".into(),
+                result_preview: "Album links should sit above the group notice.".into(),
+                duration_ms: 1,
+                is_error: false,
+            },
+        ];
+        assert_eq!(
+            recover_user_text_from_tool_records(&records).as_deref(),
+            Some("Album links should sit above the group notice.")
+        );
+        assert!(recover_user_text_from_tool_records(&[]).is_none());
     }
 
     #[test]

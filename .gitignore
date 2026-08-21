@@ -27,3 +27,4 @@ workspace/**/.env
 workspace/**/node_modules/
 
 docs/development-journal.md
+builtin_skills/steel-browser/__pycache__/*

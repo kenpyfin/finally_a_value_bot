@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::background_jobs::{
     await_handoff_startup_ack, is_background_handoff_response, try_enqueue_background_handoff,
@@ -27,6 +27,7 @@ fn channel_from_chat_type(chat_type: &str) -> &'static str {
     match chat_type {
         "discord" => "discord",
         "whatsapp" => "whatsapp",
+        "wecom" => "wecom",
         "web" => "web",
         _ => "telegram",
     }
@@ -49,27 +50,6 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
     let task_timeout_secs = state.config.scheduler_task_timeout_secs;
     let stale_reclaim_secs = state.config.scheduler_stale_running_reclaim_secs as i64;
     let poll_interval_secs = state.config.scheduler_poll_interval_secs.max(1);
-
-    // Session TTL sweep (every 15 minutes)
-    let db_for_ttl = state.db.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(900)).await;
-            match call_blocking(db_for_ttl.clone(), |db| db.get_expired_chat_sessions()).await {
-                Ok(expired) => {
-                    for session in expired {
-                        let id = session.id.clone();
-                        let _ = call_blocking(db_for_ttl.clone(), move |db| {
-                            db.archive_chat_session(&id)
-                        })
-                        .await;
-                        info!("Session TTL: auto-archived session {}", session.id);
-                    }
-                }
-                Err(e) => warn!("Session TTL sweep error: {e}"),
-            }
-        }
-    });
 
     tokio::spawn(async move {
         info!(
@@ -507,12 +487,13 @@ async fn run_scheduled_agent_and_finalize(
                 state.db.clone(),
                 state.telegram_bots.as_ref(),
                 state.discord_http.as_ref(),
+                state.wecom.as_deref(),
                 &state.config.bot_username,
                 chat_id,
                 persona_id,
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
-                DeliveryScope::ContactWide,
+                DeliveryScope::StoreOnly,
                 None,
             )
             .await
@@ -567,12 +548,13 @@ async fn run_scheduled_agent_and_finalize(
                 state.db.clone(),
                 state.telegram_bots.as_ref(),
                 state.discord_http.as_ref(),
+                state.wecom.as_deref(),
                 &state.config.bot_username,
                 chat_id,
                 persona_id,
                 &response_text,
                 Some(state.config.workspace_root_absolute()),
-                DeliveryScope::ContactWide,
+                DeliveryScope::StoreOnly,
                 None,
                 MessageStoreOrigin::Scheduled,
             )
@@ -650,12 +632,13 @@ async fn run_scheduled_agent_and_finalize(
                 state.db.clone(),
                 state.telegram_bots.as_ref(),
                 state.discord_http.as_ref(),
+                state.wecom.as_deref(),
                 &state.config.bot_username,
                 chat_id,
                 persona_id,
                 &err_text,
                 Some(state.config.workspace_root_absolute()),
-                DeliveryScope::ContactWide,
+                DeliveryScope::StoreOnly,
                 None,
             )
             .await

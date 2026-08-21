@@ -3,7 +3,7 @@ import { Button, Callout, Flex, IconButton, Select, Text, TextField, Tooltip } f
 import { SettingsPanelSkeleton } from './skeleton'
 import type { BotInstanceRow, ChannelIntegrationSettings } from '../types'
 
-type Platform = 'telegram' | 'discord' | 'whatsapp'
+type Platform = 'telegram' | 'discord' | 'whatsapp' | 'wecom'
 
 type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
@@ -23,6 +23,14 @@ type InstanceDraft = {
   whatsappPhoneNumberId: string
   whatsappVerifyToken: string
   whatsappWebhookPort: string
+  wecomCorpId: string
+  wecomAgentId: string
+  wecomCallbackToken: string
+  wecomEncodingAesKey: string
+  wecomWebhookPort: string
+  wecomAllowedChats: string
+  wecomAibotId: string
+  wecomMode: string
 }
 
 function draftFromRow(row: BotInstanceRow): InstanceDraft {
@@ -35,7 +43,26 @@ function draftFromRow(row: BotInstanceRow): InstanceDraft {
     whatsappPhoneNumberId: row.whatsapp_phone_number_id ?? '',
     whatsappVerifyToken: '',
     whatsappWebhookPort: String(row.whatsapp_webhook_port ?? 8080),
+    wecomCorpId: row.wecom_corp_id ?? '',
+    wecomAgentId: row.wecom_agent_id != null ? String(row.wecom_agent_id) : '',
+    wecomCallbackToken: '',
+    wecomEncodingAesKey: '',
+    wecomWebhookPort: String(row.wecom_webhook_port ?? 8081),
+    wecomAllowedChats: row.wecom_allowed_chats ?? '',
+    wecomAibotId: row.wecom_aibot_id ?? '',
+    wecomMode: wecomModeFromRow(row),
   }
+}
+
+function wecomModeFromRow(row: BotInstanceRow): 'aibot' | 'callback' {
+  const mode = (row.wecom_mode ?? '').trim().toLowerCase()
+  if (mode === 'callback') return 'callback'
+  if (mode === 'aibot' || mode === 'websocket' || mode === 'long_connection' || mode === 'long-connection') {
+    return 'aibot'
+  }
+  if ((row.wecom_aibot_id ?? '').trim()) return 'aibot'
+  if ((row.wecom_corp_id ?? '').trim()) return 'callback'
+  return 'aibot'
 }
 
 function platformLabel(platform: string): string {
@@ -46,6 +73,8 @@ function platformLabel(platform: string): string {
       return 'Discord'
     case 'whatsapp':
       return 'WhatsApp Cloud API'
+    case 'wecom':
+      return 'WeCom (企业微信)'
     default:
       return platform
   }
@@ -59,6 +88,135 @@ function defaultLabel(platform: Platform): string {
       return 'Discord bot'
     case 'whatsapp':
       return 'WhatsApp number'
+    case 'wecom':
+      return 'WeCom bot'
+  }
+}
+
+function FieldLabel({ children }: { children: string }) {
+  return (
+    <Text size="1" color="gray" className="mb-1 block">
+      {children}
+    </Text>
+  )
+}
+
+type WecomExtraValues = {
+  mode: 'aibot' | 'callback'
+  aibotId: string
+  corpId: string
+  agentId: string
+  callbackToken: string
+  encodingAesKey: string
+  webhookPort: string
+  allowedChats: string
+}
+
+function WecomExtraFields({
+  values,
+  callbackTokenPlaceholder,
+  encodingAesKeyPlaceholder,
+  onChange,
+}: {
+  values: WecomExtraValues
+  callbackTokenPlaceholder: string
+  encodingAesKeyPlaceholder: string
+  onChange: (patch: Partial<WecomExtraValues>) => void
+}) {
+  return (
+    <>
+      <div>
+        <FieldLabel>Connection</FieldLabel>
+        <Select.Root
+          value={values.mode}
+          onValueChange={(value) => onChange({ mode: value === 'callback' ? 'callback' : 'aibot' })}
+        >
+          <Select.Trigger className="w-full" />
+          <Select.Content>
+            <Select.Item value="aibot">AI Bot long connection (no callback URL)</Select.Item>
+            <Select.Item value="callback">Self-built app callback</Select.Item>
+          </Select.Content>
+        </Select.Root>
+      </div>
+      {values.mode === 'aibot' ? (
+        <div>
+          <FieldLabel>Bot ID</FieldLabel>
+          <TextField.Root
+            placeholder="AI Bot ID from WeCom admin"
+            value={values.aibotId}
+            onChange={(e) => onChange({ aibotId: e.target.value })}
+          />
+        </div>
+      ) : (
+        <>
+          <div>
+            <FieldLabel>Corp ID</FieldLabel>
+            <TextField.Root
+              placeholder="wwxxxxxxxx"
+              value={values.corpId}
+              onChange={(e) => onChange({ corpId: e.target.value })}
+            />
+          </div>
+          <div>
+            <FieldLabel>Agent ID</FieldLabel>
+            <TextField.Root
+              placeholder="1000002"
+              value={values.agentId}
+              onChange={(e) => onChange({ agentId: e.target.value })}
+            />
+          </div>
+          <div>
+            <FieldLabel>Callback token</FieldLabel>
+            <TextField.Root
+              type="password"
+              placeholder={callbackTokenPlaceholder}
+              value={values.callbackToken}
+              onChange={(e) => onChange({ callbackToken: e.target.value })}
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <FieldLabel>EncodingAESKey</FieldLabel>
+            <TextField.Root
+              type="password"
+              placeholder={encodingAesKeyPlaceholder}
+              value={values.encodingAesKey}
+              onChange={(e) => onChange({ encodingAesKey: e.target.value })}
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <FieldLabel>Callback port</FieldLabel>
+            <TextField.Root
+              placeholder="8081"
+              value={values.webhookPort}
+              onChange={(e) => onChange({ webhookPort: e.target.value })}
+            />
+          </div>
+        </>
+      )}
+      <div>
+        <FieldLabel>Allowed chat IDs (WeCom chatid or userid, not the group name)</FieldLabel>
+        <TextField.Root
+          placeholder="Comma-separated; empty = all; applies on save"
+          value={values.allowedChats}
+          onChange={(e) => onChange({ allowedChats: e.target.value })}
+        />
+      </div>
+    </>
+  )
+}
+
+function emptyWecomExtra(port = '8081'): WecomExtraValues {
+  return {
+    mode: 'aibot',
+    aibotId: '',
+    corpId: '',
+    agentId: '',
+    callbackToken: '',
+    encodingAesKey: '',
+    webhookPort: port,
+    allowedChats: '',
   }
 }
 
@@ -71,6 +229,9 @@ function integrationDescription(row: BotInstanceRow): string {
   }
   if (row.platform === 'whatsapp') {
     return 'Single supported WhatsApp Business number. Persona routing lives on the Channels tab.'
+  }
+  if (row.platform === 'wecom') {
+    return 'Single WeCom 智能机器人 (long connection) or self-built app. Long connection needs Bot ID + Secret only — no public callback. Restart after save.'
   }
   return 'External chat bot integration.'
 }
@@ -93,6 +254,7 @@ export function SettingsIntegrationsPanel({
   const [newPlatform, setNewPlatform] = useState<Platform>('telegram')
   const [newLabel, setNewLabel] = useState('')
   const [newToken, setNewToken] = useState('')
+  const [newWecom, setNewWecom] = useState<WecomExtraValues>(() => emptyWecomExtra())
 
   const panelStyle =
     appearance === 'dark'
@@ -106,6 +268,9 @@ export function SettingsIntegrationsPanel({
     setControlChatIds(data.control_chat_ids ?? '')
     setDrafts(Object.fromEntries(rows.map((row) => [row.id, draftFromRow(row)])))
     if (rows.some((row) => row.platform === 'whatsapp') && newPlatform === 'whatsapp') {
+      setNewPlatform('telegram')
+    }
+    if (rows.some((row) => row.platform === 'wecom') && newPlatform === 'wecom') {
       setNewPlatform('telegram')
     }
   }, [newPlatform])
@@ -129,6 +294,10 @@ export function SettingsIntegrationsPanel({
 
   const whatsappExists = useMemo(
     () => instances.some((row) => row.platform === 'whatsapp'),
+    [instances],
+  )
+  const wecomExists = useMemo(
+    () => instances.some((row) => row.platform === 'wecom'),
     [instances],
   )
 
@@ -187,12 +356,28 @@ export function SettingsIntegrationsPanel({
           body.whatsapp_verify_token = draft.whatsappVerifyToken.trim()
         }
       }
+      if (row.platform === 'wecom') {
+        body.wecom_mode = draft.wecomMode === 'callback' ? 'callback' : 'aibot'
+        body.wecom_aibot_id = draft.wecomAibotId.trim()
+        body.wecom_corp_id = draft.wecomCorpId.trim()
+        body.wecom_agent_id = Number.parseInt(draft.wecomAgentId, 10) || 0
+        body.wecom_webhook_port = Number.parseInt(draft.wecomWebhookPort, 10) || 8081
+        body.wecom_allowed_chats = draft.wecomAllowedChats.trim()
+        if (draft.wecomCallbackToken.trim()) {
+          body.wecom_callback_token = draft.wecomCallbackToken.trim()
+        }
+        if (draft.wecomEncodingAesKey.trim()) {
+          body.wecom_encoding_aes_key = draft.wecomEncodingAesKey.trim()
+        }
+      }
       await api(`/api/channel_bot_instances/${row.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      setNotice('Integration saved. Restart the gateway to apply dispatcher changes.')
+      setNotice(
+        'Integration saved. Group/chat allowlists apply immediately. Restart the gateway only for token or connection changes.',
+      )
       await load()
       onSaved?.()
     } catch (e) {
@@ -206,20 +391,63 @@ export function SettingsIntegrationsPanel({
     const label = newLabel.trim() || defaultLabel(newPlatform)
     const token = newToken.trim()
     if (!token) {
-      onError('Token is required.')
+      onError(
+        newPlatform === 'wecom'
+          ? newWecom.mode === 'aibot'
+            ? 'AI Bot secret is required.'
+            : 'Corp secret is required.'
+          : 'Token is required.',
+      )
       return
+    }
+    if (newPlatform === 'wecom') {
+      if (newWecom.mode === 'aibot') {
+        if (!newWecom.aibotId.trim()) {
+          onError('Bot ID is required.')
+          return
+        }
+      } else {
+        if (!newWecom.corpId.trim()) {
+          onError('Corp ID is required.')
+          return
+        }
+        if ((Number.parseInt(newWecom.agentId, 10) || 0) <= 0) {
+          onError('Agent ID is required.')
+          return
+        }
+        if (!newWecom.callbackToken.trim()) {
+          onError('Callback token is required.')
+          return
+        }
+        if (!newWecom.encodingAesKey.trim()) {
+          onError('EncodingAESKey is required.')
+          return
+        }
+      }
     }
     setBusyId('new')
     setNotice(null)
     onError('')
     try {
+      const body: Record<string, unknown> = { platform: newPlatform, label, token }
+      if (newPlatform === 'wecom') {
+        body.wecom_mode = newWecom.mode
+        body.wecom_aibot_id = newWecom.aibotId.trim()
+        body.wecom_corp_id = newWecom.corpId.trim()
+        body.wecom_agent_id = Number.parseInt(newWecom.agentId, 10) || 0
+        body.wecom_callback_token = newWecom.callbackToken.trim()
+        body.wecom_encoding_aes_key = newWecom.encodingAesKey.trim()
+        body.wecom_webhook_port = Number.parseInt(newWecom.webhookPort, 10) || 8081
+        body.wecom_allowed_chats = newWecom.allowedChats.trim()
+      }
       const data = await api<{ message?: string }>('/api/channel_bot_instances', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platform: newPlatform, label, token }),
+        body: JSON.stringify(body),
       })
       setNewLabel('')
       setNewToken('')
+      setNewWecom(emptyWecomExtra())
       setNotice(data.message ?? 'Bot instance created. Restart the gateway to activate it.')
       await load()
       onSaved?.()
@@ -300,25 +528,50 @@ export function SettingsIntegrationsPanel({
                 value={draft.label}
                 onChange={(e) => updateDraft(row.id, { label: e.target.value })}
               />
-              <TextField.Root
-                type="password"
-                placeholder={row.token_set ? 'New token (optional)' : 'Bot token'}
-                value={draft.token}
-                onChange={(e) => updateDraft(row.id, { token: e.target.value })}
-                autoComplete="off"
-              />
+              <div>
+                <FieldLabel>
+                  {row.platform === 'wecom'
+                    ? draft.wecomMode === 'callback'
+                      ? 'Corp secret'
+                      : 'AI Bot secret'
+                    : 'Token'}
+                </FieldLabel>
+                <TextField.Root
+                  type="password"
+                  placeholder={
+                    row.platform === 'wecom'
+                      ? row.token_set
+                        ? 'New secret (optional)'
+                        : draft.wecomMode === 'callback'
+                          ? 'Corp secret'
+                          : 'AI Bot secret'
+                      : row.token_set
+                        ? 'New token (optional)'
+                        : 'Bot token'
+                  }
+                  value={draft.token}
+                  onChange={(e) => updateDraft(row.id, { token: e.target.value })}
+                  autoComplete="off"
+                />
+              </div>
               {row.platform === 'telegram' ? (
                 <>
-                  <TextField.Root
-                    placeholder="Bot username for @mentions (without @)"
-                    value={draft.botUsername}
-                    onChange={(e) => updateDraft(row.id, { botUsername: e.target.value })}
-                  />
-                  <TextField.Root
-                    placeholder="Allowed group chat IDs (comma-separated; empty = all)"
-                    value={draft.allowedGroups}
-                    onChange={(e) => updateDraft(row.id, { allowedGroups: e.target.value })}
-                  />
+                  <div>
+                    <FieldLabel>Bot username for @mentions (without @)</FieldLabel>
+                    <TextField.Root
+                      placeholder="example_bot"
+                      value={draft.botUsername}
+                      onChange={(e) => updateDraft(row.id, { botUsername: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <FieldLabel>Allowed Telegram group IDs (numeric; empty = all)</FieldLabel>
+                    <TextField.Root
+                      placeholder="-1001234567890, -1009876543210"
+                      value={draft.allowedGroups}
+                      onChange={(e) => updateDraft(row.id, { allowedGroups: e.target.value })}
+                    />
+                  </div>
                 </>
               ) : null}
               {row.platform === 'discord' ? (
@@ -353,6 +606,42 @@ export function SettingsIntegrationsPanel({
                   />
                 </>
               ) : null}
+              {row.platform === 'wecom' ? (
+                <WecomExtraFields
+                  values={{
+                    mode: draft.wecomMode === 'callback' ? 'callback' : 'aibot',
+                    aibotId: draft.wecomAibotId,
+                    corpId: draft.wecomCorpId,
+                    agentId: draft.wecomAgentId,
+                    callbackToken: draft.wecomCallbackToken,
+                    encodingAesKey: draft.wecomEncodingAesKey,
+                    webhookPort: draft.wecomWebhookPort,
+                    allowedChats: draft.wecomAllowedChats,
+                  }}
+                  callbackTokenPlaceholder={
+                    row.wecom_callback_token_set
+                      ? `New callback token (optional; current ${row.wecom_callback_token_redacted})`
+                      : 'Receive-server Token'
+                  }
+                  encodingAesKeyPlaceholder={
+                    row.wecom_encoding_aes_key_set
+                      ? `New EncodingAESKey (optional; current ${row.wecom_encoding_aes_key_redacted})`
+                      : '43-character EncodingAESKey'
+                  }
+                  onChange={(patch) =>
+                    updateDraft(row.id, {
+                      ...(patch.mode != null ? { wecomMode: patch.mode } : {}),
+                      ...(patch.aibotId != null ? { wecomAibotId: patch.aibotId } : {}),
+                      ...(patch.corpId != null ? { wecomCorpId: patch.corpId } : {}),
+                      ...(patch.agentId != null ? { wecomAgentId: patch.agentId } : {}),
+                      ...(patch.callbackToken != null ? { wecomCallbackToken: patch.callbackToken } : {}),
+                      ...(patch.encodingAesKey != null ? { wecomEncodingAesKey: patch.encodingAesKey } : {}),
+                      ...(patch.webhookPort != null ? { wecomWebhookPort: patch.webhookPort } : {}),
+                      ...(patch.allowedChats != null ? { wecomAllowedChats: patch.allowedChats } : {}),
+                    })
+                  }
+                />
+              ) : null}
             </Flex>
             <Flex gap="2" mt="3" wrap="wrap">
               <Button size="1" disabled={busyId === row.id} onClick={() => void saveInstance(row)}>
@@ -377,49 +666,100 @@ export function SettingsIntegrationsPanel({
           Add Bot Instance
         </Text>
         <Text size="1" color="gray" className="mb-2 block">
-          Telegram and Discord can have multiple bot instances. WhatsApp supports one Business
-          number in this gateway.
+          Telegram and Discord can have multiple bot instances. WhatsApp and WeCom support one
+          app/number in this gateway.
         </Text>
-        <Flex gap="2" wrap="wrap" align="end">
-          <div>
-            <Text size="1" color="gray" className="mb-1 block">
-              Platform
-            </Text>
-            <Select.Root
-              value={newPlatform}
-              onValueChange={(value) =>
-                setNewPlatform(
-                  value === 'discord' ? 'discord' : value === 'whatsapp' ? 'whatsapp' : 'telegram',
-                )
-              }
-            >
-              <Select.Trigger className="w-[150px]" />
-              <Select.Content>
-                <Select.Item value="telegram">telegram</Select.Item>
-                <Select.Item value="discord">discord</Select.Item>
-                <Select.Item value="whatsapp" disabled={whatsappExists}>
-                  whatsapp
-                </Select.Item>
-              </Select.Content>
-            </Select.Root>
-          </div>
-          <TextField.Root
-            className="min-w-[160px] flex-1"
-            placeholder={defaultLabel(newPlatform)}
-            value={newLabel}
-            onChange={(e) => setNewLabel(e.target.value)}
-          />
-          <TextField.Root
-            className="min-w-[220px] flex-1"
-            type="password"
-            placeholder="Bot token"
-            value={newToken}
-            onChange={(e) => setNewToken(e.target.value)}
-            autoComplete="off"
-          />
-          <Button size="1" disabled={busyId === 'new'} onClick={() => void addBotInstance()}>
-            {busyId === 'new' ? 'Adding…' : 'Add'}
-          </Button>
+        <Flex direction="column" gap="2">
+          <Flex gap="2" wrap="wrap" align="end">
+            <div>
+              <FieldLabel>Platform</FieldLabel>
+              <Select.Root
+                value={newPlatform}
+                onValueChange={(value) =>
+                  setNewPlatform(
+                    value === 'discord'
+                      ? 'discord'
+                      : value === 'whatsapp'
+                        ? 'whatsapp'
+                        : value === 'wecom'
+                          ? 'wecom'
+                          : 'telegram',
+                  )
+                }
+              >
+                <Select.Trigger className="w-[150px]" />
+                <Select.Content>
+                  <Select.Item value="telegram">telegram</Select.Item>
+                  <Select.Item value="discord">discord</Select.Item>
+                  <Select.Item value="whatsapp" disabled={whatsappExists}>
+                    whatsapp
+                  </Select.Item>
+                  <Select.Item value="wecom" disabled={wecomExists}>
+                    wecom
+                  </Select.Item>
+                </Select.Content>
+              </Select.Root>
+            </div>
+            <div className="min-w-[160px] flex-1">
+              <FieldLabel>Label</FieldLabel>
+              <TextField.Root
+                placeholder={defaultLabel(newPlatform)}
+                value={newLabel}
+                onChange={(e) => setNewLabel(e.target.value)}
+              />
+            </div>
+            <div className="min-w-[220px] flex-1">
+              <FieldLabel>
+                {newPlatform === 'wecom'
+                  ? newWecom.mode === 'callback'
+                    ? 'Corp secret'
+                    : 'AI Bot secret'
+                  : newPlatform === 'whatsapp'
+                    ? 'Access token'
+                    : 'Bot token'}
+              </FieldLabel>
+              <TextField.Root
+                type="password"
+                placeholder={
+                  newPlatform === 'wecom'
+                    ? newWecom.mode === 'callback'
+                      ? 'Corp secret'
+                      : 'Long-connection Secret'
+                    : newPlatform === 'whatsapp'
+                      ? 'Access token'
+                      : 'Bot token'
+                }
+                value={newToken}
+                onChange={(e) => setNewToken(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+            {newPlatform !== 'wecom' ? (
+              <Button size="1" disabled={busyId === 'new'} onClick={() => void addBotInstance()}>
+                {busyId === 'new' ? 'Adding…' : 'Add'}
+              </Button>
+            ) : null}
+          </Flex>
+          {newPlatform === 'wecom' ? (
+            <>
+              <Text size="1" color="gray">
+                {newWecom.mode === 'aibot'
+                  ? 'Create a 智能机器人 in WeCom, enable API mode → 长连接, then paste Bot ID and Secret. No HTTPS callback is required.'
+                  : 'Receive-server URL after restart: https://your-host/callback (HTTPS). Token and EncodingAESKey must match WeCom admin.'}
+              </Text>
+              <WecomExtraFields
+                values={newWecom}
+                callbackTokenPlaceholder="Receive-server Token"
+                encodingAesKeyPlaceholder="43-character EncodingAESKey"
+                onChange={(patch) => setNewWecom((current) => ({ ...current, ...patch }))}
+              />
+              <div>
+                <Button size="1" disabled={busyId === 'new'} onClick={() => void addBotInstance()}>
+                  {busyId === 'new' ? 'Adding…' : 'Add'}
+                </Button>
+              </div>
+            </>
+          ) : null}
         </Flex>
       </div>
 

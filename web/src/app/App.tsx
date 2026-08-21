@@ -382,8 +382,6 @@ export function App({
     switchPersona,
     handleSelectSession,
     handleCreateSession,
-    handleArchiveSession,
-    handleReopenSession,
     handleDeleteSession,
     onCreatePersona,
     onDeletePersona,
@@ -1766,8 +1764,6 @@ export function App({
       historyLoading,
       onSelectSession: handleSelectSessionStable,
       onCreateSession: handleCreateSession,
-      onArchiveSession: handleArchiveSession,
-      onReopenSession: handleReopenSession,
       onDeleteSession: handleDeleteSession,
     }),
     [
@@ -1778,8 +1774,6 @@ export function App({
       historyLoading,
       handleSelectSessionStable,
       handleCreateSession,
-      handleArchiveSession,
-      handleReopenSession,
       handleDeleteSession,
     ],
   )

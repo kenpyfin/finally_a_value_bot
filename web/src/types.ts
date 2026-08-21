@@ -389,6 +389,16 @@ export type BotInstanceRow = {
   whatsapp_verify_token_set?: boolean
   whatsapp_verify_token_redacted?: string
   whatsapp_webhook_port?: number
+  wecom_corp_id?: string
+  wecom_agent_id?: number
+  wecom_callback_token_set?: boolean
+  wecom_callback_token_redacted?: string
+  wecom_encoding_aes_key_set?: boolean
+  wecom_encoding_aes_key_redacted?: string
+  wecom_webhook_port?: number
+  wecom_allowed_chats?: string
+  wecom_aibot_id?: string
+  wecom_mode?: string
   created_at: string
   env_primary?: boolean
   is_primary?: boolean
@@ -573,7 +583,9 @@ export type ChatSession = {
   status: 'active' | 'archived'
   created_at: string
   last_active_at: string
+  /** Deprecated: session archive is no longer used. */
   archived_at?: string | null
+  /** Deprecated: TTL auto-archive is no longer used. */
   ttl_hours: number
   /** When true, session messages also appear on the main chat timeline. */
   mirror_main_chat?: boolean

@@ -9,6 +9,7 @@ use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 use tracing::{error, info};
 
+use crate::channel::{DeliveryScope, CHANNEL_PROCESSING_ACK};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::claude::Message as ClaudeMessage;
 use crate::db::call_blocking;
@@ -380,6 +381,12 @@ impl EventHandler for Handler {
                 // Start typing indicator while this queued item is running.
                 let typing = channel_id_for_send.start_typing(&http);
 
+                // Immediate processing ack (deleted before the final reply).
+                let processing_msg = channel_id_for_send
+                    .say(&http, CHANNEL_PROCESSING_ACK)
+                    .await
+                    .ok();
+
                 match process_with_agent_with_events(
                     &app_state,
                     AgentRequestContext {
@@ -402,20 +409,25 @@ impl EventHandler for Handler {
                 {
                     Ok(agent_out) => {
                         drop(typing);
+                        if let Some(msg) = processing_msg {
+                            let _ = msg.delete(&http).await;
+                        }
                         let to_send = if agent_out.response.trim().is_empty() {
                             "Done.".to_string()
                         } else {
                             agent_out.response.clone()
                         };
                         if !to_send.is_empty() {
-                            let delivery_scope = crate::channel::DeliveryScope::PlatformInstance {
-                                channel_type: "discord",
-                                bot_instance_id: discord_bot_instance_id,
-                            };
+                            let delivery_scope = DeliveryScope::platform_reply(
+                                "discord",
+                                discord_bot_instance_id,
+                                channel_id_for_send.get().to_string(),
+                            );
                             if let Err(e) = crate::channel::deliver_agent_final_to_contact(
                                 app_state.db.clone(),
                                 app_state.telegram_bots.as_ref(),
                                 app_state.discord_http.as_ref(),
+                                app_state.wecom.as_deref(),
                                 &app_state.config.bot_username,
                                 canonical_chat_id,
                                 persona_id,
@@ -434,6 +446,9 @@ impl EventHandler for Handler {
                     }
                     Err(e) => {
                         drop(typing);
+                        if let Some(msg) = processing_msg {
+                            let _ = msg.delete(&http).await;
+                        }
                         error!("Error processing Discord message: {e}");
                         let _ = channel_id_for_send.say(&http, format!("Error: {e}")).await;
                     }

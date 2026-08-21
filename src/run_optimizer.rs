@@ -613,12 +613,13 @@ pub fn spawn_run_optimize_job(
                     state.db.clone(),
                     state.telegram_bots.as_ref(),
                     state.discord_http.as_ref(),
+                    state.wecom.as_deref(),
                     &state.config.bot_username,
                     chat_id,
                     persona_id,
                     &delivery,
                     Some(state.config.workspace_root_absolute()),
-                    DeliveryScope::ContactWide,
+                    DeliveryScope::StoreOnly,
                     None,
                 )
                 .await
@@ -649,12 +650,13 @@ pub fn spawn_run_optimize_job(
                     state.db.clone(),
                     state.telegram_bots.as_ref(),
                     state.discord_http.as_ref(),
+                    state.wecom.as_deref(),
                     &state.config.bot_username,
                     chat_id,
                     persona_id,
                     &msg,
                     Some(state.config.workspace_root_absolute()),
-                    DeliveryScope::ContactWide,
+                    DeliveryScope::StoreOnly,
                     None,
                 )
                 .await;

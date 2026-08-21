@@ -365,3 +365,74 @@ mod resolve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod wecom_channel_policy_tests {
+    use super::resolve_incoming_run_persona_for_channel;
+    use crate::config::DEFAULT_UNIVERSAL_CHAT_ID;
+    use crate::db::{ChannelPersonaMode, Database, BOT_INSTANCE_WECOM_PRIMARY};
+
+    #[test]
+    fn wecom_inbox_honors_single_persona_policy() {
+        let dir = std::env::temp_dir().join(format!("persona_wecom_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = Database::new(dir.to_str().unwrap()).unwrap();
+        let inbox = DEFAULT_UNIVERSAL_CHAT_ID;
+        db.upsert_chat(inbox, None, "web").unwrap();
+        let _ = db.create_persona(inbox, "default", None).unwrap();
+        let selling_id = db.create_persona(inbox, "selling_oversea", None).unwrap();
+        db.set_channel_persona_policy(
+            inbox,
+            BOT_INSTANCE_WECOM_PRIMARY,
+            ChannelPersonaMode::Single,
+            Some(selling_id),
+        )
+        .unwrap();
+
+        let (pid, body) = resolve_incoming_run_persona_for_channel(
+            &db,
+            inbox,
+            "wecom",
+            BOT_INSTANCE_WECOM_PRIMARY,
+            "@bot hello",
+        )
+        .unwrap();
+        assert_eq!(pid, selling_id);
+        assert_eq!(body, "@bot hello");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wecom_hashed_contact_does_not_inherit_inbox_single_policy() {
+        let dir = std::env::temp_dir().join(format!("persona_wecom_hash_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = Database::new(dir.to_str().unwrap()).unwrap();
+        let inbox = DEFAULT_UNIVERSAL_CHAT_ID;
+        let hashed = 8735507888382702007_i64;
+        db.upsert_chat(inbox, None, "web").unwrap();
+        db.upsert_chat(hashed, None, "wecom").unwrap();
+        let selling_id = db.create_persona(inbox, "selling_oversea", None).unwrap();
+        let default_hashed = db.get_or_create_default_persona(hashed).unwrap();
+        db.set_channel_persona_policy(
+            inbox,
+            BOT_INSTANCE_WECOM_PRIMARY,
+            ChannelPersonaMode::Single,
+            Some(selling_id),
+        )
+        .unwrap();
+
+        let (pid, _) = resolve_incoming_run_persona_for_channel(
+            &db,
+            hashed,
+            "wecom",
+            BOT_INSTANCE_WECOM_PRIMARY,
+            "hello",
+        )
+        .unwrap();
+        assert_eq!(pid, default_hashed);
+        assert_ne!(pid, selling_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -639,12 +639,26 @@ def _stream_agent_turn(
     run = agent.send(prompt, send_options) if send_options else agent.send(prompt)
     for message in run.messages():
         msg_type = getattr(message, "type", None)
-        if msg_type != "assistant":
-            continue
+        # Some SDK builds use "assistant"; also accept common aliases.
+        if msg_type not in (None, "assistant", "assistant_message", "message"):
+            # Still try if role looks assistant-like.
+            role = getattr(message, "role", None)
+            if role != "assistant":
+                continue
         payload = getattr(message, "message", None)
         if payload is None:
+            payload = message
+        content = getattr(payload, "content", None)
+        if isinstance(content, str) and content.strip():
+            final_text_parts.append(content)
+            yield json.dumps({"type": "text", "text": content}) + "\n"
             continue
-        for block in getattr(payload, "content", []) or []:
+        for block in content or []:
+            if isinstance(block, str):
+                if block.strip():
+                    final_text_parts.append(block)
+                    yield json.dumps({"type": "text", "text": block}) + "\n"
+                continue
             block_type = getattr(block, "type", None)
             if block_type == "text":
                 text = getattr(block, "text", "") or ""
@@ -665,11 +679,14 @@ def _stream_agent_turn(
                     }
                 ) + "\n"
             elif block_type == "tool_result":
+                output = getattr(block, "content", "") or ""
+                if not isinstance(output, str):
+                    output = str(output)
                 yield json.dumps(
                     {
                         "type": "tool_result",
                         "name": getattr(block, "name", "") or "",
-                        "output": getattr(block, "content", "") or "",
+                        "output": output,
                         "is_error": bool(getattr(block, "is_error", False)),
                     }
                 ) + "\n"
@@ -682,16 +699,18 @@ def _stream_agent_turn(
     status = getattr(result, "status", None) or "finished"
     result_text = getattr(result, "result", None)
     if isinstance(result_text, str) and result_text.strip():
-        if not final_text_parts:
-            final_text_parts.append(result_text)
+        # Prefer wait().result when stream collected no assistant text.
+        if not any(p.strip() for p in final_text_parts):
+            final_text_parts = [result_text]
     returned_agent_id = getattr(agent, "agent_id", None) or returned_agent_id
 
+    joined = "".join(final_text_parts)
     yield json.dumps(
         {
             "type": "done",
             "status": status,
             "agent_id": returned_agent_id,
-            "result": "".join(final_text_parts),
+            "result": joined,
         }
     ) + "\n"
 

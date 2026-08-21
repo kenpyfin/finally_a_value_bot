@@ -4,6 +4,104 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-20 — Shared processing ack on all external channels
+
+- **Area:** channels / Telegram / Discord / WhatsApp / WeCom
+- **Summary:** All external channels now show `Processing…` when a queued inbound run starts. Telegram seeds the editable status message (then tool updates / delete); Discord sends then deletes; WhatsApp sends a short interim; WeCom AI Bot stream placeholder uses the same string; WeCom callback sends a proactive interim.
+- **Key files / symbols:** `CHANNEL_PROCESSING_ACK` in `src/channels/mod.rs`; wired in `telegram.rs`, `discord.rs`, `whatsapp.rs`, `wecom.rs`, `wecom_aibot.rs`.
+- **Note:** Restart gateway. Web UI keeps its own loading state (no chat spam).
+
+### 2026-08-20 — WeCom long-connection: immediate stream ack + delayed send_msg
+
+- **Area:** channels / WeCom AI Bot
+- **Summary:** After a long Cursor turn (incl. empty-output placeholder), WeCom stopped delivering group callbacks. Root cause: replies used late `aibot_respond_msg` without opening a stream within WeCom’s callback window. Now: `begin_stream_reply` sends stream `finish=false` (“处理中…”) before the agent run; final reply finishes the stream within 9 minutes or falls back to `aibot_send_msg`. Heartbeat pong watchdog reconnects half-open sockets.
+- **Key files / symbols:** `begin_stream_reply`, `respond_stream_frame`, `PendingReply` in `src/channels/wecom_aibot.rs`.
+- **Note:** Restart the gateway. After restart, @ the bot in the group; you should see “处理中…” then the final answer.
+
+### 2026-08-20 — Cursor empty-output nudge for WeCom/channels
+
+- **Area:** cursor engine / WeCom
+- **Summary:** Resume turns sometimes finished with no assistant text; the gateway delivered `(Cursor agent completed with no text output.)` to WeCom. Now: nudge up to `DEFERRED_COMMITMENT_MAX_NUDGES` for a user-facing reply when empty and resume id exists; else recover short prose from tool results; placeholder only as last resort. Sidecar also accepts broader assistant message shapes and prefers `wait().result` when stream text is empty.
+- **Key files / symbols:** `empty_output_nudge_prompt`, `recover_user_text_from_tool_records` in `src/cursor_engine.rs`; `_stream_agent_turn` in `scripts/cursor-sdk-runner.py`.
+- **Note:** Restart gateway + recycle `cursor-sdk-runner.py` so both pick up the change.
+
+### 2026-08-19 — WeCom group chat: re-bind all handles to operator inbox
+
+- **Area:** channels / WeCom
+- **Summary:** Extra WeCom groups were routed to hashed canonical contacts (`resolve_wecom_canonical_chat_id` refused a second handle on the inbox). Those groups missed Settings → Channels Single persona (`selling_oversea`) and showed inbound messages with zero bot replies. All handles now re-link to the operator inbox on each inbound; directional `platform_reply` still replies only to the sender’s handle. Direct `send_text` fallback if unified delivery fails.
+- **Key files / symbols:** `resolve_wecom_canonical_chat_id`, WeCom agent delivery in `src/channels/wecom.rs`.
+- **Note:** Restart gateway. @ the bot in the group; stale hashed bindings migrate on the next inbound message.
+
+### 2026-08-19 — Directional channel replies (WeCom included)
+
+- **Area:** channels / delivery
+- **Summary:** External integrations (Telegram, Discord, WhatsApp, WeCom) now reply only on the inbound binding handle via `DeliveryScope::platform_reply`. Web main chat and focused sessions use `StoreOnly` (history in UI, no fan-out). Scheduler/background delivery is web-only. WeCom multi-group on one inbox no longer broadcasts replies to every linked handle.
+- **Key files / symbols:** `DeliveryScope` / `platform_reply` in `src/channel.rs`; inbound handlers in `src/channels/{telegram,discord,whatsapp,wecom}.rs`; web send in `src/web.rs`.
+- **Note:** Restart the gateway. Rebuild `web/dist` if using embedded UI.
+
+### 2026-08-18 — Only main chat syncs with Channels
+
+- **Area:** channels / WeCom / web sessions
+- **Summary:** Channels persona routing and outbound fan-out belong to the operator inbox main chat. Focused sessions store web-only (`DeliveryScope::StoreOnly`). WeCom links at most one handle to that inbox (first inbound, or `UNIVERSAL_CHAT_ID`); extra WeCom groups/DMs keep hashed contacts so they do not inherit the inbox policy.
+- **Key files / symbols:** `deliver_to_contact_with_origin` in `src/channel.rs`; `resolve_wecom_canonical_chat_id` in `src/channels/wecom.rs`; `lookup_canonical_chat_id` in `src/db.rs`.
+- **Note:** Restart the gateway. Existing extra WeCom handles already linked to `997894126` stay until unlinked.
+
+### 2026-08-18 — Deprecate focused-session archive
+
+- **Area:** web UI / chat sessions / scheduler
+- **Summary:** Removed focused-session archive and the 15-minute TTL auto-archive sweep. Sessions stay until the operator deletes them. Startup reopens any previously archived rows. PATCH `status=archived` returns 410; list no longer hides rows; create default `ttl_hours` is 0. Session picker drops archive/restore and can delete the current focused session. `/archive` (markdown dump of the conversation) is unchanged.
+- **Key files / symbols:** `migrate_chat_sessions_schema` / `list_chat_sessions` in `src/db.rs`; `api_chat_sessions_list` / `api_chat_sessions_patch` in `src/web.rs`; TTL loop removed from `spawn_scheduler` in `src/scheduler.rs`; `SessionPicker` in `web/src/components/session-picker.tsx`; `handleDeleteSession` in `web/src/hooks/use-persona-session.ts`.
+- **Note:** Rebuild `web/dist` and restart the gateway. Previously archived sessions reappear in the picker after restart.
+
+### 2026-08-18 — WeCom honors Settings → Channels persona policy
+
+- **Area:** channels / WeCom / personas
+- **Summary:** Settings → Channels is saved on the web inbox (`997894126`), but WeCom inbound hashed its own canonical chat and `get_or_create_default_persona` always ran there. Single-persona locks never matched (`persona_exists` is per chat). WeCom now links into `Config::operator_inbox_chat_id()` so All/Single policy and the selected persona apply without restart.
+- **Key files / symbols:** `ingest_wecom_incoming` in `src/channels/wecom.rs`; `operator_inbox_chat_id` / `DEFAULT_UNIVERSAL_CHAT_ID` in `src/config.rs`.
+- **Note:** Restart once to pick up the bind. Then change Channels in the web UI; WeCom uses that contact’s policy on the next message.
+
+### 2026-08-18 — WeCom inbound frames were dropped silently
+
+- **Area:** channels / WeCom
+- **Summary:** AI Bot websocket subscribed but inbound traffic produced no logs or replies. Parser required string `from.userid` + `chattype=="group"` and returned without logging; Integrations allowlist `selling_oversea` (group name, not chatid) would also drop group messages. Now log every `aibot_*` frame, accept numeric chattype/userid, keep the connection on a bad JSON frame, and warn on allowlist/persona/mention drops.
+- **Key files / symbols:** `handle_msg_callback`, `parse_chattype`, `json_text` in `src/channels/wecom_aibot.rs`; ingest warnings in `src/channels/wecom.rs`.
+- **Note:** Restart gateway. In a group the user must @ the bot. If allowlist is set, copy `chatid=` from `WeCom inbound message` logs into Integrations (empty = all).
+
+### 2026-08-18 — Integrations allowlists apply without restart
+
+- **Area:** channels / WeCom / Telegram / integrations
+- **Summary:** Settings → Integrations allowlists now apply on save. WeCom was still using the list copied into the dispatcher at boot, so changing allowed chats did nothing until restart (and a group *name* never matched WeCom’s `chatid`). Inbound WeCom now reloads `wecom_allowed_chats` from the bot instance row, matches `chat:`/`user:` prefixes case-insensitively, and logs the real id when a message is dropped. Telegram/Discord already read from DB; invalid numeric IDs now return 400 instead of being silently dropped.
+- **Key files / symbols:** `load_wecom_allowed_chats` / `chat_allowed` in `src/channels/wecom.rs`; `handle_msg_callback` in `src/channels/wecom_aibot.rs`; `parse_id_list_i64` in `src/web.rs`; Integrations labels in `web/src/components/settings-integrations.tsx`.
+- **Note:** Rebuild `web/dist` and restart once so the binary picks up the live-reload code. After that, allowlist edits apply immediately. WeCom allowlist must be the callback `chatid`/`userid` (check logs `dropped inbound: not in Integrations allowed chats` for the real id), not the group display name.
+
+### 2026-08-18 — WeCom inbound frames were dropped silently
+
+- **Area:** channels / WeCom
+- **Summary:** AI Bot websocket subscribed but inbound traffic produced no logs or replies. Parser required string `from.userid` + `chattype=="group"` and returned without logging; Integrations allowlist `selling_oversea` (group name, not chatid) would also drop group messages. Now log every `aibot_*` frame, accept numeric chattype/userid, keep the connection on a bad JSON frame, and warn on allowlist/persona/mention drops.
+- **Key files / symbols:** `handle_msg_callback`, `parse_chattype`, `json_text` in `src/channels/wecom_aibot.rs`; ingest warnings in `src/channels/wecom.rs`.
+- **Note:** Restart gateway. In a group the user must @ the bot. If allowlist is set, copy `chatid=` from `WeCom inbound message` logs into Integrations (empty = all).
+
+### 2026-08-18 — WeCom AI Bot long-connection adapter
+
+- **Area:** channels / WeCom / integrations
+- **Summary:** Added the 智能机器人 WebSocket adapter (`wss://openws.work.weixin.qq.com`) as the preferred WeCom path. Platform remains `wecom` / instance id 4. When Bot ID + Secret are set (mode `aibot`, or Bot ID present), the gateway subscribes with `aibot_subscribe`, heartbeats `ping` every 30s, ingests `aibot_msg_callback` (groups already @-filtered), replies with `aibot_respond_msg` / fanout `aibot_send_msg`, and decrypts media via per-file `aeskey`. Self-built app HTTPS `/callback` stays as fallback. One live connection per bot (new subscribe kicks the old one). Settings → Integrations: Connection = AI Bot long connection vs callback; token field is the long-connection Secret.
+- **Key files / symbols:** `src/channels/wecom_aibot.rs` (`WecomAiBotClient`, `start_wecom_aibot`); `WecomGateway` in `src/channels/wecom.rs`; `Config::wecom_uses_aibot`; DB `wecom_aibot_id` / `wecom_mode`; `WecomExtraFields` in `web/src/components/settings-integrations.tsx`.
+- **Note:** Restart after saving. No SWAG `/callback` needed for AI Bot. Rebuild `web/dist` so embedded UI includes the Connection selector. Official Account (公众号) and 客户联系 remain out of scope.
+
+### 2026-08-18 — WeCom Integrations add form fields
+
+- **Area:** web UI / WeCom
+- **Summary:** Settings → Integrations “Add Bot Instance” only showed label + corp secret for WeCom. Corp ID, Agent ID, callback token, EncodingAESKey, port, and allowed chats now appear on create (and with labels on the saved instance card). POST `/api/channel_bot_instances` already accepted those fields.
+- **Key files / symbols:** `WecomExtraFields` in `web/src/components/settings-integrations.tsx`.
+- **Note:** Rebuild `web/dist` and restart the gateway so embedded assets pick this up.
+
+### 2026-08-17 — WeCom (企业微信) channel
+
+- **Area:** channels / WeCom / integrations
+- **Summary:** Added a WeCom self-built app channel (`wecom`) with encrypted callback verification (WXBizMsgCrypt), async agent turns, and outbound `message/send` / `appchat/send` through `deliver_to_contact` so the unified inbox fans out. Single primary instance id `4`; string handles `user:{userid}` / `chat:{chatid}` with hashed canonical ids when `UNIVERSAL_CHAT_ID` is unset. Settings → Integrations form plus Channels All/Single (not WhatsApp-locked). Dedicated callback port default 8081 (`GET|POST /callback`); HTTPS reverse proxy required by WeCom.
+- **Key files / symbols:** `src/channels/wecom.rs`, `src/channels/wecom_crypt.rs`, `WecomClient` on `AppState`; `BOT_INSTANCE_WECOM_PRIMARY` + `wecom_*` columns in `src/db.rs`; `deliver_to_contact` wecom arm in `src/channel.rs`; Integrations UI in `web/src/components/settings-integrations.tsx`.
+- **Note:** Restart after saving WeCom credentials. Official Account (公众号) and 客户联系 are out of scope.
+
 ### 2026-08-12 — Cursor sidecar: close ephemeral bridges (EMFILE fix)
 
 - **Area:** cursor engine / sidecar

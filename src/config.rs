@@ -47,6 +47,12 @@ fn default_timezone() -> String {
 fn default_whatsapp_webhook_port() -> u16 {
     8080
 }
+fn default_wecom_webhook_port() -> u16 {
+    8081
+}
+
+/// Web UI and channel inbox when `UNIVERSAL_CHAT_ID` is unset.
+pub const DEFAULT_UNIVERSAL_CHAT_ID: i64 = 997894126;
 fn default_control_chat_ids() -> Vec<i64> {
     Vec::new()
 }
@@ -477,6 +483,24 @@ pub struct Config {
     pub whatsapp_verify_token: Option<String>,
     #[serde(default = "default_whatsapp_webhook_port")]
     pub whatsapp_webhook_port: u16,
+    #[serde(default)]
+    pub wecom_corp_id: Option<String>,
+    #[serde(default)]
+    pub wecom_corp_secret: Option<String>,
+    #[serde(default)]
+    pub wecom_agent_id: i64,
+    #[serde(default)]
+    pub wecom_callback_token: Option<String>,
+    #[serde(default)]
+    pub wecom_encoding_aes_key: Option<String>,
+    #[serde(default = "default_wecom_webhook_port")]
+    pub wecom_webhook_port: u16,
+    #[serde(default)]
+    pub wecom_allowed_chats: Vec<String>,
+    #[serde(default)]
+    pub wecom_aibot_id: Option<String>,
+    #[serde(default)]
+    pub wecom_mode: String,
     #[serde(default)]
     pub discord_bot_token: Option<String>,
     #[serde(default)]
@@ -999,6 +1023,24 @@ impl Config {
                 "WHATSAPP_WEBHOOK_PORT",
                 default_whatsapp_webhook_port(),
             ),
+            wecom_corp_id: Self::env("WECOM_CORP_ID"),
+            wecom_corp_secret: Self::env("WECOM_BOT_SECRET").or_else(|| Self::env("WECOM_SECRET")),
+            wecom_agent_id: Self::env("WECOM_AGENT_ID")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            wecom_callback_token: Self::env("WECOM_CALLBACK_TOKEN"),
+            wecom_encoding_aes_key: Self::env("WECOM_ENCODING_AES_KEY"),
+            wecom_webhook_port: Self::env_u16("WECOM_WEBHOOK_PORT", default_wecom_webhook_port()),
+            wecom_allowed_chats: Self::env("WECOM_ALLOWED_CHATS")
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            wecom_aibot_id: Self::env("WECOM_BOT_ID"),
+            wecom_mode: Self::env("WECOM_MODE").unwrap_or_default(),
             discord_bot_token: Self::env("DISCORD_BOT_TOKEN"),
             discord_allowed_channels: Self::env_vec_u64("DISCORD_ALLOWED_CHANNELS"),
             show_thinking: Self::env_bool("SHOW_THINKING", false),
@@ -1220,6 +1262,28 @@ impl Config {
             project_auto_association_strictness: Self::env("PROJECT_AUTO_ASSOCIATION_STRICTNESS")
                 .unwrap_or_else(default_project_auto_association_strictness),
         }
+    }
+
+    /// True when WeCom should use 智能机器人 long connection instead of the self-built app callback.
+    pub fn wecom_uses_aibot(&self) -> bool {
+        let mode = self.wecom_mode.trim().to_ascii_lowercase();
+        if matches!(
+            mode.as_str(),
+            "aibot" | "websocket" | "long_connection" | "long-connection"
+        ) {
+            return true;
+        }
+        if mode == "callback" {
+            return false;
+        }
+        self.wecom_aibot_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Canonical contact used by the Web UI and by channels that share that inbox.
+    pub fn operator_inbox_chat_id(&self) -> i64 {
+        self.universal_chat_id.unwrap_or(DEFAULT_UNIVERSAL_CHAT_ID)
     }
 
     /// Apply Web UI channel integration settings from SQLite onto this config.
@@ -1845,6 +1909,15 @@ pub fn test_config() -> Config {
         whatsapp_phone_number_id: None,
         whatsapp_verify_token: None,
         whatsapp_webhook_port: 8080,
+        wecom_corp_id: None,
+        wecom_corp_secret: None,
+        wecom_agent_id: 0,
+        wecom_callback_token: None,
+        wecom_encoding_aes_key: None,
+        wecom_webhook_port: 8081,
+        wecom_allowed_chats: vec![],
+        wecom_aibot_id: None,
+        wecom_mode: String::new(),
         discord_bot_token: None,
         discord_allowed_channels: vec![],
         show_thinking: false,

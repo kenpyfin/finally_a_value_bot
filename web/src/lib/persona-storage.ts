@@ -70,7 +70,7 @@ export function writeStoredSessionForPersona(personaId: number, sessionId: strin
 export function resolveStoredSessionId(sessions: ChatSession[], personaId: number): string | null {
   const stored = readStoredSessionForPersona(personaId)
   if (!stored) return null
-  const match = sessions.find((s) => s.id === stored && s.status === 'active')
+  const match = sessions.find((s) => s.id === stored)
   return match ? match.id : null
 }
 

@@ -148,7 +148,7 @@ export function usePersonaSession({
       }
       try {
         const data = await api<{ sessions?: ChatSession[] }>(
-          `/api/chat_sessions?chat_id=${c}&persona_id=${p}&include_archived=true`,
+          `/api/chat_sessions?chat_id=${c}&persona_id=${p}`,
         )
         const sessions = Array.isArray(data.sessions) ? data.sessions : []
         setChatSessions(sessions)
@@ -183,7 +183,7 @@ export function usePersonaSession({
           if (want == null) {
             targetSessionId = null
           } else {
-            const match = sessions.find((s) => s.id === want && s.status === 'active')
+            const match = sessions.find((s) => s.id === want)
             targetSessionId = match ? match.id : null
           }
         } else {
@@ -267,7 +267,7 @@ export function usePersonaSession({
                 status: 'active' as const,
                 created_at: new Date().toISOString(),
                 last_active_at: new Date().toISOString(),
-                ttl_hours: 72,
+                ttl_hours: 0,
                 mirror_main_chat: mirrorMainChat,
               }
             : null)
@@ -286,68 +286,6 @@ export function usePersonaSession({
           sessionId: session.id,
         })
         void loadSessions()
-      } finally {
-        setHistoryLoading(false)
-      }
-    },
-    [activePersonaId, chatId, loadHistory, loadSessions, resetHistoryPagination, setHistoryLoading],
-  )
-
-  const handleArchiveSession = useCallback(
-    async (sessionId: string) => {
-      await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'archived' }),
-      })
-      if (activeSessionId === sessionId) {
-        setHistoryLoading(true)
-        try {
-          setActiveSessionId(null)
-          if (activePersonaId != null) {
-            writeStoredSessionForPersona(activePersonaId, null)
-          }
-          resetHistoryPagination()
-          await loadHistory(chatId, activePersonaId ?? undefined, null, {
-            force: true,
-            limitOverride: HISTORY_PAGE_SIZE,
-            sessionId: null,
-          })
-        } finally {
-          setHistoryLoading(false)
-        }
-      }
-      await loadSessions()
-    },
-    [
-      activePersonaId,
-      activeSessionId,
-      chatId,
-      loadHistory,
-      loadSessions,
-      resetHistoryPagination,
-      setHistoryLoading,
-    ],
-  )
-
-  const handleReopenSession = useCallback(
-    async (sessionId: string) => {
-      setHistoryLoading(true)
-      try {
-        await api(`/api/chat_sessions/${encodeURIComponent(sessionId)}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ status: 'active' }),
-        })
-        setActiveSessionId(sessionId)
-        if (activePersonaId != null) {
-          writeStoredSessionForPersona(activePersonaId, sessionId)
-        }
-        await loadSessions()
-        resetHistoryPagination()
-        await loadHistory(chatId, activePersonaId ?? undefined, null, {
-          force: true,
-          limitOverride: HISTORY_PAGE_SIZE,
-          sessionId,
-        })
       } finally {
         setHistoryLoading(false)
       }
@@ -468,8 +406,6 @@ export function usePersonaSession({
     switchPersona,
     handleSelectSession,
     handleCreateSession,
-    handleArchiveSession,
-    handleReopenSession,
     handleDeleteSession,
     onCreatePersona,
     onDeletePersona,

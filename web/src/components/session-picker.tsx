@@ -11,7 +11,7 @@ import {
   TextArea,
 } from '@radix-ui/themes'
 import { ConfirmDialog } from './confirm-dialog'
-import { IconChevronDown, IconChevronUp, IconMoreVertical } from './icons'
+import { IconMoreVertical } from './icons'
 import type { ChatSession } from '../types'
 
 type SessionPickerProps = {
@@ -19,8 +19,6 @@ type SessionPickerProps = {
   activeSessionId: string | null
   onSelectSession: (sessionId: string | null) => void
   onCreateSession: (intent: string, mirrorMainChat: boolean) => Promise<void>
-  onArchiveSession: (sessionId: string) => Promise<void>
-  onReopenSession: (sessionId: string) => Promise<void>
   onDeleteSession: (sessionId: string) => Promise<void>
   loading?: boolean
   /** Tighter layout for header row */
@@ -43,8 +41,6 @@ export function SessionPicker({
   activeSessionId,
   onSelectSession,
   onCreateSession,
-  onArchiveSession,
-  onReopenSession,
   onDeleteSession,
   loading,
   compact = false,
@@ -55,10 +51,6 @@ export function SessionPicker({
   const [creating, setCreating] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
-
-  const activeSessions = sessions.filter((s) => s.status === 'active')
-  const archivedSessions = sessions.filter((s) => s.status === 'archived')
-  const [showArchived, setShowArchived] = useState(false)
 
   const handleCreate = useCallback(async () => {
     if (!intentDraft.trim()) return
@@ -110,47 +102,13 @@ export function SessionPicker({
         </Select.Trigger>
         <Select.Content position="popper" sideOffset={4}>
           <Select.Item value="__main__">Main chat</Select.Item>
-          {activeSessions.length > 0 && <Select.Separator />}
-          {activeSessions.map((s) => (
+          {sessions.length > 0 && <Select.Separator />}
+          {sessions.map((s) => (
             <Select.Item key={s.id} value={s.id}>
               {s.title}
               {s.mirror_main_chat ? ' · main' : ''} ({formatRelativeTime(s.last_active_at)})
             </Select.Item>
           ))}
-          {archivedSessions.length > 0 ? (
-            <>
-              <Select.Separator />
-              <Select.Group>
-                <Select.Label>
-                  <button
-                    type="button"
-                    className="mc-archived-toggle cursor-pointer"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      setShowArchived(!showArchived)
-                    }}
-                  >
-                    Archived ({archivedSessions.length}){' '}
-                    {showArchived ? <IconChevronUp /> : <IconChevronDown />}
-                  </button>
-                </Select.Label>
-                {showArchived
-                  ? archivedSessions.map((s) => (
-                      <Select.Item key={s.id} value={s.id}>
-                        {s.title} (archived)
-                      </Select.Item>
-                    ))
-                  : null}
-              </Select.Group>
-            </>
-          ) : (
-            <>
-              <Select.Separator />
-              <Select.Item value="__no_archived__" disabled>
-                No archived sessions
-              </Select.Item>
-            </>
-          )}
         </Select.Content>
       </Select.Root>
 
@@ -183,24 +141,12 @@ export function SessionPicker({
             </IconButton>
           </DropdownMenu.Trigger>
           <DropdownMenu.Content>
-            {activeSession.status === 'active' ? (
-              <DropdownMenu.Item onSelect={() => void onArchiveSession(activeSessionId)}>
-                Archive session
-              </DropdownMenu.Item>
-            ) : null}
-            {activeSession.status === 'archived' ? (
-              <>
-                <DropdownMenu.Item onSelect={() => void onReopenSession(activeSessionId)}>
-                  Restore session
-                </DropdownMenu.Item>
-                <DropdownMenu.Item
-                  color="red"
-                  onSelect={() => setDeleteConfirmOpen(true)}
-                >
-                  Delete session
-                </DropdownMenu.Item>
-              </>
-            ) : null}
+            <DropdownMenu.Item
+              color="red"
+              onSelect={() => setDeleteConfirmOpen(true)}
+            >
+              Delete session
+            </DropdownMenu.Item>
           </DropdownMenu.Content>
         </DropdownMenu.Root>
       ) : null}

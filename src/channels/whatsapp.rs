@@ -10,7 +10,7 @@ use base64::Engine;
 use serde::Deserialize;
 use tracing::{error, info};
 
-use crate::channel::{deliver_agent_final_to_contact, DeliveryScope};
+use crate::channel::{deliver_agent_final_to_contact, DeliveryScope, CHANNEL_PROCESSING_ACK};
 use crate::chat_queue::{QueueEnqueueMeta, QueueSource};
 use crate::db::call_blocking;
 use crate::db::StoredMessage;
@@ -549,6 +549,14 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 };
                 let (queue_position, _) = chat_queue
                     .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {
+                        send_whatsapp_message(
+                            &http_client,
+                            &access_token,
+                            &phone_number_id,
+                            &to_phone,
+                            CHANNEL_PROCESSING_ACK,
+                        )
+                        .await;
                         match process_with_agent_with_events(
                             &app_state,
                             AgentRequestContext {
@@ -580,15 +588,17 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                     app_state.db.clone(),
                                     app_state.telegram_bots.as_ref(),
                                     app_state.discord_http.as_ref(),
+                                    app_state.wecom.as_deref(),
                                     &app_state.config.bot_username,
                                     chat_id,
                                     persona_id,
                                     &agent_out.response,
                                     Some(app_state.config.workspace_root_absolute()),
-                                    DeliveryScope::PlatformInstance {
-                                        channel_type: "whatsapp",
-                                        bot_instance_id: crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
-                                    },
+                                    DeliveryScope::platform_reply(
+                                        "whatsapp",
+                                        crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
+                                        to_phone.clone(),
+                                    ),
                                     None,
                                 )
                                 .await;

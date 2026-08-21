@@ -38,6 +38,7 @@ pub enum QueueSource {
     Telegram,
     Discord,
     Whatsapp,
+    Wecom,
     Scheduler,
 }
 
@@ -48,6 +49,7 @@ impl QueueSource {
             QueueSource::Telegram => "telegram",
             QueueSource::Discord => "discord",
             QueueSource::Whatsapp => "whatsapp",
+            QueueSource::Wecom => "wecom",
             QueueSource::Scheduler => "scheduler",
         }
     }

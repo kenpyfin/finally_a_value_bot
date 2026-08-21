@@ -12,13 +12,13 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
     println!(
-        r#"FinallyAValueBot v{VERSION} — Agentic AI assistant for Telegram, WhatsApp & Discord
+        r#"FinallyAValueBot v{VERSION} — Agentic AI assistant for Telegram, WhatsApp, Discord & WeCom
 
 USAGE:
     finally_a_value_bot <COMMAND>
 
 COMMANDS:
-    start       Start the bot (Telegram + optional WhatsApp/Discord)
+    start       Start the bot (Telegram + optional WhatsApp/Discord/WeCom)
     gateway     Manage gateway service (install/uninstall/start/stop/status/logs)
     config      (retired) Use Web UI Settings instead
     doctor      Run preflight diagnostics (cross-platform)
@@ -42,6 +42,7 @@ FEATURES:
     - MCP (Model Context Protocol) server integration
     - WhatsApp Cloud API support
     - Discord bot support
+    - WeCom (企业微信) AI Bot long connection or self-built app callback
     - Sensitive path blacklisting for file tools
 
 SETUP:
@@ -71,8 +72,8 @@ CONFIG FILE (.env):
       timezone               IANA timezone for scheduling (default: UTC)
 
     Channels (Web UI → Settings → Integrations; stored in SQLite):
-      Telegram / Discord / WhatsApp tokens and platform options
-      (bot username, allowed groups/channels, WhatsApp webhook fields).
+      Telegram / Discord / WhatsApp / WeCom tokens and platform options
+      (bot username, allowed groups/channels, WhatsApp/WeCom webhook fields).
       Legacy channel env vars are one-time-imported on first boot after upgrade.
 
 MCP (optional):

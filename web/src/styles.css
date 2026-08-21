@@ -664,8 +664,7 @@ html:not(.dark) .aui-composer-send:hover {
 .mc-bookmark-btn:focus-visible,
 .mc-msg-action-btn:focus-visible,
 .mc-reply-quote-dismiss:focus-visible,
-.mc-cockpit-status-chip:focus-visible,
-.mc-archived-toggle:focus-visible {
+.mc-cockpit-status-chip:focus-visible {
   outline: 2px solid var(--mc-accent);
   outline-offset: 2px;
 }
@@ -1643,17 +1642,6 @@ html.dark *::-webkit-scrollbar-thumb:hover {
     min-height: 2.5rem;
     min-width: 2.5rem;
   }
-}
-
-.mc-archived-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.25rem;
-  background: none;
-  border: none;
-  color: var(--mc-text-muted);
-  font-size: var(--font-size-1);
-  padding: 0;
 }
 
 .mc-shortcuts-list {
