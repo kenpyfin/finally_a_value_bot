@@ -1608,6 +1608,11 @@ impl Database {
             "DELETE FROM hook_definitions WHERE name LIKE 'template-%'",
             [],
         )?;
+        // Legacy unfinished PreDelivery PDF guard (module never shipped); drop any seeded row.
+        conn.execute(
+            "DELETE FROM hook_definitions WHERE name = 'predelivery-char-limit-pdf-guard'",
+            [],
+        )?;
         let dir = crate::builtin_hooks::resolve_builtin_hooks_dir_fallback().ok_or_else(|| {
             FinallyAValueBotError::ToolExecution(
                 "builtin_hooks catalog not found: expected repository builtin_hooks/ with *.hook.json manifests".into(),
@@ -2999,11 +3004,10 @@ impl Database {
                 | "builtin_turn_skill_gate"
                 | "builtin_deferred_commitment_guard"
                 | "builtin_loop_guard"
-                | "builtin_char_limit_pdf_guard"
         );
         if !valid_action_type {
             return Err(FinallyAValueBotError::ToolExecution(format!(
-                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard, builtin_char_limit_pdf_guard",
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard",
                 action_type
             )));
         }
@@ -7230,7 +7234,6 @@ mod tests {
             "pretool-turn-skill-gate",
             "prestop-deferred-commitment-guard",
             "postbatch-loop-guard",
-            "predelivery-char-limit-pdf-guard",
         ];
         for name in builtin_names {
             let hook = hooks

@@ -154,6 +154,18 @@ pub struct SidecarHealth {
     pub reachable: bool,
     pub api_key_configured: bool,
     pub cursor_sdk_installed: bool,
+    #[serde(default)]
+    pub runs_in_flight: u64,
+    #[serde(default)]
+    pub persona_bridges_active: u64,
+    #[serde(default)]
+    pub os_bridge_pids: u64,
+    #[serde(default)]
+    pub uptime_secs: u64,
+    #[serde(default)]
+    pub started_at_unix: u64,
+    #[serde(default)]
+    pub recycle_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -318,6 +330,10 @@ pub fn validate_runner_url(url: &str) -> Result<(), String> {
 }
 
 pub async fn probe_sidecar_health(base_url: &str) -> SidecarHealth {
+    probe_sidecar_health_with_timeout(base_url, Duration::from_secs(10)).await
+}
+
+pub async fn probe_sidecar_health_with_timeout(base_url: &str, timeout: Duration) -> SidecarHealth {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return SidecarHealth {
@@ -325,14 +341,12 @@ pub async fn probe_sidecar_health(base_url: &str) -> SidecarHealth {
             api_key_configured: false,
             cursor_sdk_installed: false,
             error: Some("Runner URL is not configured".into()),
+            ..Default::default()
         };
     }
 
     let url = format!("{trimmed}/health");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(c) => c,
         Err(e) => {
             return SidecarHealth {
@@ -340,6 +354,7 @@ pub async fn probe_sidecar_health(base_url: &str) -> SidecarHealth {
                 api_key_configured: false,
                 cursor_sdk_installed: false,
                 error: Some(format!("HTTP client error: {e}")),
+                ..Default::default()
             };
         }
     };
@@ -356,6 +371,30 @@ pub async fn probe_sidecar_health(base_url: &str) -> SidecarHealth {
                     .get("cursor_sdk_installed")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                runs_in_flight: body
+                    .get("runs_in_flight")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                persona_bridges_active: body
+                    .get("persona_bridges_active")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                os_bridge_pids: body
+                    .get("os_bridge_pids")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                uptime_secs: body
+                    .get("uptime_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                started_at_unix: body
+                    .get("started_at_unix")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                recycle_requested: body
+                    .get("recycle_requested")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 error: None,
             },
             Err(e) => SidecarHealth {
@@ -363,6 +402,7 @@ pub async fn probe_sidecar_health(base_url: &str) -> SidecarHealth {
                 api_key_configured: false,
                 cursor_sdk_installed: false,
                 error: Some(format!("Invalid health JSON: {e}")),
+                ..Default::default()
             },
         },
         Ok(resp) => SidecarHealth {
@@ -370,12 +410,14 @@ pub async fn probe_sidecar_health(base_url: &str) -> SidecarHealth {
             api_key_configured: false,
             cursor_sdk_installed: false,
             error: Some(format!("Sidecar health returned HTTP {}", resp.status())),
+            ..Default::default()
         },
         Err(e) => SidecarHealth {
             reachable: false,
             api_key_configured: false,
             cursor_sdk_installed: false,
             error: Some(format!("Sidecar unreachable: {e}")),
+            ..Default::default()
         },
     }
 }
@@ -498,6 +540,7 @@ mod tests {
             api_key_configured: true,
             cursor_sdk_installed: true,
             error: None,
+            ..Default::default()
         };
         assert!(cfg.engine_ready(&health));
     }

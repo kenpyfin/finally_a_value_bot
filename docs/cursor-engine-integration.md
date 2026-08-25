@@ -12,7 +12,7 @@ This is **not** a sync to Cursor IDE artifacts (`.cursor/rules`, `.cursor/hooks.
 | **Skills** | Guidance + execution | Catalog in flattened prompt; `activate_skill` / `run_skill_script` as MCP tools |
 | **Hooks** | Policy at turn/tool boundaries | Same `hook_runtime` as Classic; tool hooks run inside MCP `tools/call` |
 
-**MCP connects tools, not hooks.** Hooks are Rust policy that runs at fixed points. Tool-related hooks (`PreToolUse`, `PostToolUse`) fire when Cursor invokes an MCP tool. Turn hooks (`BeforeTurn`, `PreStop`, `PreDelivery`, `PostDelivery`) and `PostToolBatch` run in `cursor_engine.rs` without going through MCP.
+**MCP connects tools, not hooks.** Hooks are Rust policy that runs at fixed points. Tool-related hooks (`PreToolUse`, `PostToolUse`) fire when Cursor invokes an MCP tool. Turn hooks (`BeforeTurn`, `PreStop`, `PostDelivery`) and `PostToolBatch` run in `cursor_engine.rs` without going through MCP.
 
 See also: [`hooks-architecture.md`](hooks-architecture.md) (hook catalog and storage), [`agent-harness-research.md`](agent-harness-research.md) (engine comparison and SDK layers).
 
@@ -190,10 +190,9 @@ Bot hooks are defined in SQLite (`hook_definitions`) and evaluated by `hook_runt
 | `PostToolUse` | Yes | Inside MCP `tools/call` after tool result |
 | `PostToolBatch` | Yes | `cursor_mcp.finish_run` after sidecar completes (one batch per sidecar invocation) |
 | `PreStop` | Yes | `hook_turn_bridge` after sidecar text; deferred-commitment nudge loop (max 2 resumes) |
-| `PreDelivery` | Yes | `pipeline_finish_turn` — char-limit PDF spill replaces over-long replies before PDQE |
 | `PostDelivery` | Yes | `pipeline_finish_turn` — focus sync, PDQE, history |
 
-Shipped builtins that matter for tool-heavy personas: `pretool-turn-skill-gate`, `postbatch-loop-guard`, `postdelivery-persona-focus-sync`, `prestop-deferred-commitment-guard`, `predelivery-char-limit-pdf-guard`, `beforeturn-scheduler-policy-context`. See [`hooks-architecture.md`](hooks-architecture.md).
+Shipped builtins that matter for tool-heavy personas: `pretool-turn-skill-gate`, `postbatch-loop-guard`, `postdelivery-persona-focus-sync`, `prestop-deferred-commitment-guard`, `beforeturn-scheduler-policy-context`. See [`hooks-architecture.md`](hooks-architecture.md).
 
 ### Finish-path note
 

@@ -4383,41 +4383,17 @@ async fn finish_turn_with_quality_gate(
     multimodel_summary: &crate::local_delegate::LocalDelegateRunSummary,
     pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
 ) -> anyhow::Result<FinishTurnOutcome> {
-    let (pre_delivery_summary, post_delivery_out) = {
-        let pre = run_pre_delivery_hooks(
-            state,
-            context,
-            event_tx,
-            run_key,
-            chat_id,
-            persona_id,
-            stop_reason,
-            final_text,
-        )
-        .await;
-        let post = run_post_delivery_hooks_before_gate(
-            state,
-            context,
-            event_tx,
-            run_key,
-            chat_id,
-            persona_id,
-            stop_reason,
-            final_text,
-        )
-        .await;
-        (pre, post)
-    };
-    let (hook_summary, should_run_focus_sync) = {
-        let (post_summary, focus_sync) = post_delivery_out;
-        let summary = match (pre_delivery_summary, post_summary) {
-            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        (summary, focus_sync)
-    };
+    let (hook_summary, should_run_focus_sync) = run_post_delivery_hooks_before_gate(
+        state,
+        context,
+        event_tx,
+        run_key,
+        chat_id,
+        persona_id,
+        stop_reason,
+        final_text,
+    )
+    .await;
     if let Some(summary) = hook_summary {
         if let Some(last) = history_iterations.last_mut() {
             last.hook_events.push(summary);
@@ -4741,52 +4717,6 @@ async fn finish_turn_with_quality_gate(
     Ok(FinishTurnOutcome::Complete(agent_process_result(
         final_text.clone(),
     )))
-}
-
-async fn run_pre_delivery_hooks(
-    state: &AppState,
-    context: &AgentRequestContext<'_>,
-    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
-    run_key: &str,
-    chat_id: i64,
-    persona_id: i64,
-    stop_reason: &str,
-    final_text: &mut String,
-) -> Option<String> {
-    if let Ok(pre_delivery_hook) = run_hooks_for_event_async(
-        state.db.clone(),
-        &state.config,
-        state.env_redactor.as_ref(),
-        HookEventName::PreDelivery,
-        &HookRunInput {
-            chat_id,
-            persona_id,
-            caller_channel: context.caller_channel.to_string(),
-            is_scheduled_task: context.is_scheduled_task,
-            stop_reason: Some(stop_reason.to_string()),
-            assistant_text: Some(final_text.clone()),
-            ..HookRunInput::default()
-        },
-    )
-    .await
-    {
-        publish_hook_event(
-            state,
-            event_tx,
-            run_key,
-            chat_id,
-            persona_id,
-            HookEventName::PreDelivery,
-            None,
-            &pre_delivery_hook,
-        )
-        .await;
-        if let Some(ref updated) = pre_delivery_hook.updated_assistant_text {
-            *final_text = updated.clone();
-        }
-        return hook_event_summary(HookEventName::PreDelivery, None, &pre_delivery_hook);
-    }
-    None
 }
 
 async fn run_post_delivery_hooks_before_gate(

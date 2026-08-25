@@ -6,9 +6,13 @@ Requires on the host:
 
 Environment:
   CURSOR_API_KEY   User API key from Cursor Dashboard → Integrations
+  CURSOR_RUN_CONCURRENCY  Max concurrent /run turns (default 4)
+  CURSOR_BRIDGE_*  Idle TTL, pool max, orphan grace, launch timeout
+  CURSOR_SIDECAR_MAX_UPTIME_SECS  Soft self-recycle when idle (default 86400)
 
 API:
   GET  /health
+  POST /admin/request_recycle  Idle-only drain/exit (does not cancel in-flight /run)
   POST /run
     Body: {"prompt": "...", "cwd": "...", "model": "composer-2.5", "agent_id": "..."}
     Response: NDJSON stream
@@ -28,6 +32,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
@@ -53,6 +58,8 @@ DEFAULT_BRIDGE_POOL_MAX = 16
 DEFAULT_BRIDGE_REAPER_INTERVAL_SECS = 60
 # Orphan OS processes not tracked in _POOL (e.g. after client disconnect).
 DEFAULT_BRIDGE_ORPHAN_GRACE_SECS = 120
+DEFAULT_RUN_CONCURRENCY = 4
+DEFAULT_SIDECAR_MAX_UPTIME_SECS = 86400
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -99,6 +106,26 @@ def _bridge_orphan_grace_secs() -> int:
         return DEFAULT_BRIDGE_ORPHAN_GRACE_SECS
 
 
+def _run_concurrency() -> int:
+    raw = os.environ.get("CURSOR_RUN_CONCURRENCY", "").strip()
+    if not raw:
+        return DEFAULT_RUN_CONCURRENCY
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_RUN_CONCURRENCY
+
+
+def _sidecar_max_uptime_secs() -> int:
+    raw = os.environ.get("CURSOR_SIDECAR_MAX_UPTIME_SECS", "").strip()
+    if not raw:
+        return DEFAULT_SIDECAR_MAX_UPTIME_SECS
+    try:
+        return max(300, int(raw))
+    except ValueError:
+        return DEFAULT_SIDECAR_MAX_UPTIME_SECS
+
+
 def _is_ephemeral_session_scope(session_scope: str) -> bool:
     """One-shot scopes that must never keep a warm bridge after /run.
 
@@ -134,6 +161,112 @@ _REAPER_TASK: asyncio.Task[None] | None = None
 # PIDs of bridges currently being launched (not yet in _POOL).
 _LAUNCHING_PIDS: set[int] = set()
 _ORPHANS_KILLED_TOTAL = 0
+_RUNS_IN_FLIGHT = 0
+_RUNS_IN_FLIGHT_LOCK = asyncio.Lock()
+_STARTED_AT_MONOTONIC = time.monotonic()
+_STARTED_AT_UNIX = time.time()
+_RECYCLE_REQUESTED = False
+_RECYCLE_LOCK = asyncio.Lock()
+_SHUTDOWN_TRIGGERED = False
+
+
+@dataclass
+class _ActiveTurn:
+    """Tracks the in-flight sync SDK run so disconnect can call run.cancel()."""
+
+    cancel_requested: bool = False
+    run: Any | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _cancel_sdk_run(run: Any) -> None:
+    if run is None:
+        return
+    try:
+        supports = getattr(run, "supports", None)
+        if callable(supports) and not supports("cancel"):
+            return
+        cancel = getattr(run, "cancel", None)
+        if callable(cancel):
+            cancel()
+    except Exception:
+        pass
+
+
+def _request_turn_cancel(active: _ActiveTurn) -> None:
+    with active.lock:
+        active.cancel_requested = True
+        run = active.run
+    _cancel_sdk_run(run)
+
+
+async def _try_begin_run() -> bool:
+    global _RUNS_IN_FLIGHT
+    limit = _run_concurrency()
+    async with _RUNS_IN_FLIGHT_LOCK:
+        if _RUNS_IN_FLIGHT >= limit:
+            return False
+        _RUNS_IN_FLIGHT += 1
+        return True
+
+
+async def _end_run() -> None:
+    global _RUNS_IN_FLIGHT
+    async with _RUNS_IN_FLIGHT_LOCK:
+        _RUNS_IN_FLIGHT = max(0, _RUNS_IN_FLIGHT - 1)
+
+
+def _uptime_secs() -> int:
+    return max(0, int(time.monotonic() - _STARTED_AT_MONOTONIC))
+
+
+async def _mark_recycle_requested(reason: str) -> bool:
+    """Request idle exit. Returns True if accepted (idle). Never cancels runs."""
+    global _RECYCLE_REQUESTED
+    async with _RECYCLE_LOCK:
+        async with _RUNS_IN_FLIGHT_LOCK:
+            in_flight = _RUNS_IN_FLIGHT
+        if in_flight > 0:
+            return False
+        if not _RECYCLE_REQUESTED:
+            _RECYCLE_REQUESTED = True
+            print(
+                f"[cursor-sdk-runner] recycle requested ({reason}); "
+                "will exit when idle",
+                file=sys.stderr,
+            )
+        return True
+
+
+async def _trigger_clean_shutdown(reason: str) -> None:
+    """Close pools and stop the process. Safe only when idle."""
+    global _SHUTDOWN_TRIGGERED
+    async with _RECYCLE_LOCK:
+        if _SHUTDOWN_TRIGGERED:
+            return
+        async with _RUNS_IN_FLIGHT_LOCK:
+            if _RUNS_IN_FLIGHT > 0:
+                return
+        _SHUTDOWN_TRIGGERED = True
+    print(
+        f"[cursor-sdk-runner] shutting down for recycle ({reason})",
+        file=sys.stderr,
+    )
+    try:
+        await _close_all_pooled_bridges()
+    except Exception as err:  # pragma: no cover
+        print(f"[cursor-sdk-runner] pool close during recycle: {err}", file=sys.stderr)
+    # SIGTERM lets web.run_app unwind; hard exit as a backstop.
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+    except Exception:
+        pass
+    asyncio.get_running_loop().call_later(3.0, os._exit, 0)
+
+
+def _client_is_loopback(request: web.Request) -> bool:
+    peer = request.remote or ""
+    return peer in ("127.0.0.1", "::1", "localhost")
 
 
 def _api_key() -> str:
@@ -331,9 +464,7 @@ def _bridge_subprocess_exited(client: Any) -> bool:
     return proc is not None and proc.poll() is not None
 
 
-def _bridge_is_alive(client: Any) -> bool:
-    if _bridge_subprocess_exited(client):
-        return False
+def _bridge_ping_ok(client: Any) -> bool:
     try:
         client.ping()
         return True
@@ -415,6 +546,17 @@ async def _bridge_idle_reaper() -> None:
                     f"orphans_killed={orphans}; pool_size={len(_POOL)}",
                     file=sys.stderr,
                 )
+
+            # Soft self-recycle after max uptime when idle (no run cancel).
+            if _uptime_secs() >= _sidecar_max_uptime_secs():
+                await _mark_recycle_requested("max_uptime")
+
+            if _RECYCLE_REQUESTED:
+                async with _RUNS_IN_FLIGHT_LOCK:
+                    in_flight = _RUNS_IN_FLIGHT
+                if in_flight == 0:
+                    await _trigger_clean_shutdown("idle_recycle")
+                    return
         except asyncio.CancelledError:
             raise
         except Exception as err:  # pragma: no cover
@@ -426,22 +568,42 @@ async def _get_pooled_bridge(cwd: str, session_scope: str = "") -> _PooledBridge
     state_root = _bridge_state_root(cwd, session_scope)
     os.makedirs(state_root, exist_ok=True)
 
+    candidate: _PooledBridge | None = None
+    stale_dead: _PooledBridge | None = None
     async with _POOL_GUARD:
         entry = _POOL.get(pool_key)
-        if entry is not None and _bridge_is_alive(entry.client):
-            entry.last_used_monotonic = time.monotonic()
-            return entry
+        if entry is not None and not _bridge_subprocess_exited(entry.client):
+            candidate = entry
+        elif entry is not None:
+            _POOL.pop(pool_key, None)
+            stale_dead = entry
+
+    if stale_dead is not None:
+        await asyncio.to_thread(_close_pooled_bridge, stale_dead)
+
+    if candidate is not None:
+        # Ping outside the global pool lock so a slow/dead bridge cannot stall
+        # every other /run and the idle reaper.
+        if await asyncio.to_thread(_bridge_ping_ok, candidate.client):
+            candidate.last_used_monotonic = time.monotonic()
+            return candidate
+        await _evict_pooled_bridge(pool_key)
 
     async with _BRIDGE_LAUNCH_SEM:
+        candidate = None
+        stale: _PooledBridge | None = None
         async with _POOL_GUARD:
             entry = _POOL.get(pool_key)
-            if entry is not None and _bridge_is_alive(entry.client):
-                entry.last_used_monotonic = time.monotonic()
-                return entry
-            if entry is not None:
+            if entry is not None and not _bridge_subprocess_exited(entry.client):
+                candidate = entry
+            elif entry is not None:
                 stale = _POOL.pop(pool_key, None)
-            else:
-                stale = None
+
+        if candidate is not None:
+            if await asyncio.to_thread(_bridge_ping_ok, candidate.client):
+                candidate.last_used_monotonic = time.monotonic()
+                return candidate
+            await _evict_pooled_bridge(pool_key)
 
         if stale is not None:
             await asyncio.to_thread(_close_pooled_bridge, stale)
@@ -636,6 +798,7 @@ def _open_agent(
 async def _stream_run(
     body: dict[str, Any],
     active_pool_key: list[str | None] | None = None,
+    active_turn_slot: list[_ActiveTurn | None] | None = None,
 ) -> AsyncIterator[str]:
     prompt = (body.get("prompt") or "").strip()
     cwd = (body.get("cwd") or ".").strip() or "."
@@ -678,11 +841,13 @@ async def _stream_run(
     for attempt in range(BRIDGE_RETRY_MAX_ATTEMPTS):
         agent = None
         pooled: _PooledBridge | None = None
+        active_turn: _ActiveTurn | None = None
         try:
             pooled = await _get_pooled_bridge(cwd, session_scope)
             async with pooled.lock:
                 pooled.last_used_monotonic = time.monotonic()
-                agent = _open_agent(
+                agent = await asyncio.to_thread(
+                    _open_agent,
                     pooled.client,
                     agent_id=resume_id,
                     model=model,
@@ -692,7 +857,12 @@ async def _stream_run(
                     opts=opts,
                     mcp_servers=mcp_servers,
                 )
-                for line in _stream_agent_turn(agent, prompt, resume_id, mcp_servers):
+                active_turn = _ActiveTurn()
+                if active_turn_slot is not None:
+                    active_turn_slot[0] = active_turn
+                async for line in _stream_agent_turn_async(
+                    agent, prompt, resume_id, mcp_servers, active_turn
+                ):
                     yield line
                 return
         except CursorAgentError as err:
@@ -737,6 +907,12 @@ async def _stream_run(
             yield json.dumps({"type": "error", "message": str(err)}) + "\n"
             return
         finally:
+            if (
+                active_turn_slot is not None
+                and active_turn is not None
+                and active_turn_slot[0] is active_turn
+            ):
+                active_turn_slot[0] = None
             _close_agent_only(agent)
             # One-shot scheduled/background scopes must not keep bridges warm.
             if pooled is not None and _is_ephemeral_session_scope(session_scope):
@@ -745,11 +921,54 @@ async def _stream_run(
                 pooled.last_used_monotonic = time.monotonic()
 
 
+async def _stream_agent_turn_async(
+    agent: Any,
+    prompt: str,
+    resume_id: str | None,
+    mcp_servers: dict[str, Any] | None,
+    active: _ActiveTurn,
+) -> AsyncIterator[str]:
+    """Run sync `_stream_agent_turn` in a worker thread; yield NDJSON on the loop."""
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def producer() -> None:
+        try:
+            for line in _stream_agent_turn(
+                agent, prompt, resume_id, mcp_servers, active
+            ):
+                asyncio.run_coroutine_threadsafe(queue.put(("line", line)), loop).result()
+            asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result()
+        except Exception as err:  # pragma: no cover
+            asyncio.run_coroutine_threadsafe(queue.put(("error", err)), loop).result()
+
+    producer_task = asyncio.create_task(asyncio.to_thread(producer))
+    completed = False
+    try:
+        while True:
+            kind, payload = await queue.get()
+            if kind == "line":
+                yield payload
+            elif kind == "end":
+                completed = True
+                break
+            elif kind == "error":
+                raise payload
+    finally:
+        if not completed:
+            await asyncio.to_thread(_request_turn_cancel, active)
+        try:
+            await producer_task
+        except Exception:
+            pass
+
+
 def _stream_agent_turn(
     agent: Any,
     prompt: str,
     resume_id: str | None,
     mcp_servers: dict[str, Any] | None,
+    active: _ActiveTurn | None = None,
 ):
     final_text_parts: list[str] = []
     status = "error"
@@ -759,7 +978,26 @@ def _stream_agent_turn(
 
     returned_agent_id: str | None = getattr(agent, "agent_id", None) or resume_id
     run = agent.send(prompt, send_options) if send_options else agent.send(prompt)
+    if active is not None:
+        with active.lock:
+            active.run = run
+            cancel_now = active.cancel_requested
+        if cancel_now:
+            _cancel_sdk_run(run)
+            yield json.dumps(
+                {"type": "error", "message": "Run cancelled"}
+            ) + "\n"
+            return
+
     for message in run.messages():
+        if active is not None:
+            with active.lock:
+                if active.cancel_requested:
+                    _cancel_sdk_run(run)
+                    yield json.dumps(
+                        {"type": "error", "message": "Run cancelled"}
+                    ) + "\n"
+                    return
         msg_type = getattr(message, "type", None)
         # Some SDK builds use "assistant"; also accept common aliases.
         if msg_type not in (None, "assistant", "assistant_message", "message"):
@@ -817,6 +1055,15 @@ def _stream_agent_turn(
                 if thinking:
                     yield json.dumps({"type": "thinking", "thinking": thinking}) + "\n"
 
+    if active is not None:
+        with active.lock:
+            if active.cancel_requested:
+                _cancel_sdk_run(run)
+                yield json.dumps(
+                    {"type": "error", "message": "Run cancelled"}
+                ) + "\n"
+                return
+
     result = run.wait()
     status = getattr(result, "status", None) or "finished"
     result_text = getattr(result, "result", None)
@@ -857,8 +1104,44 @@ async def handle_health(_request: web.Request) -> web.Response:
             "bridge_idle_ttl_secs": _bridge_idle_ttl_secs(),
             "bridge_pool_max": _bridge_pool_max(),
             "bridge_orphan_grace_secs": _bridge_orphan_grace_secs(),
+            "run_concurrency": _run_concurrency(),
+            "runs_in_flight": _RUNS_IN_FLIGHT,
             "orphans_killed_total": _ORPHANS_KILLED_TOTAL,
             "os_bridge_pids": len(_list_sdk_bridge_pids()),
+            "started_at_unix": int(_STARTED_AT_UNIX),
+            "uptime_secs": _uptime_secs(),
+            "max_uptime_secs": _sidecar_max_uptime_secs(),
+            "recycle_requested": _RECYCLE_REQUESTED,
+        }
+    )
+
+
+async def handle_request_recycle(request: web.Request) -> web.Response:
+    if not _client_is_loopback(request):
+        return web.json_response(
+            {"accepted": False, "reason": "loopback_only"},
+            status=403,
+        )
+    async with _RUNS_IN_FLIGHT_LOCK:
+        in_flight = _RUNS_IN_FLIGHT
+    if in_flight > 0:
+        return web.json_response(
+            {
+                "accepted": False,
+                "runs_in_flight": in_flight,
+                "reason": "busy",
+            },
+            status=202,
+        )
+    accepted = await _mark_recycle_requested("admin")
+    if accepted:
+        # Kick exit promptly; reaper also polls.
+        asyncio.create_task(_trigger_clean_shutdown("admin_recycle"))
+    return web.json_response(
+        {
+            "accepted": accepted,
+            "runs_in_flight": 0,
+            "reason": "accepted" if accepted else "busy",
         }
     )
 
@@ -872,6 +1155,18 @@ async def handle_run(request: web.Request) -> web.StreamResponse:
             status=400,
         )
 
+    if not await _try_begin_run():
+        return web.json_response(
+            {
+                "type": "error",
+                "message": (
+                    f"Cursor sidecar at capacity "
+                    f"(CURSOR_RUN_CONCURRENCY={_run_concurrency()})"
+                ),
+            },
+            status=503,
+        )
+
     response = web.StreamResponse(
         status=200,
         reason="OK",
@@ -880,33 +1175,42 @@ async def handle_run(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
 
     active_pool_key: list[str | None] = [None]
+    active_turn_slot: list[_ActiveTurn | None] = [None]
     try:
         async for line in _stream_run(
             body if isinstance(body, dict) else {},
             active_pool_key=active_pool_key,
+            active_turn_slot=active_turn_slot,
         ):
             try:
                 await response.write(line.encode("utf-8"))
             except (ConnectionResetError, BrokenPipeError, OSError) as err:
                 print(
                     "[cursor-sdk-runner] client disconnected during /run "
-                    f"({err}); evicting bridge pool_key={active_pool_key[0]}",
+                    f"({err}); requesting turn cancel "
+                    f"pool_key={active_pool_key[0]}",
                     file=sys.stderr,
                 )
-                if active_pool_key[0]:
-                    await _evict_pooled_bridge(active_pool_key[0])
+                # Never evict while the turn may still hold pooled.lock —
+                # cancel the SDK run and let _stream_run finally clean up.
+                if active_turn_slot[0] is not None:
+                    await asyncio.to_thread(
+                        _request_turn_cancel, active_turn_slot[0]
+                    )
                 return response
         await response.write_eof()
     except Exception as err:
         # Includes aiohttp ClientConnectionResetError on chunked write.
         print(
             f"[cursor-sdk-runner] /run stream failed ({err}); "
-            f"evicting bridge pool_key={active_pool_key[0]}",
+            f"requesting turn cancel pool_key={active_pool_key[0]}",
             file=sys.stderr,
         )
-        if active_pool_key[0]:
-            await _evict_pooled_bridge(active_pool_key[0])
+        if active_turn_slot[0] is not None:
+            await asyncio.to_thread(_request_turn_cancel, active_turn_slot[0])
         raise
+    finally:
+        await _end_run()
     return response
 
 
@@ -974,6 +1278,7 @@ def _run_self_tests() -> None:
     assert _bridge_idle_ttl_secs() >= 60
     assert _bridge_pool_max() >= 4
     assert _bridge_orphan_grace_secs() >= 30
+    assert _sidecar_max_uptime_secs() >= 300
     assert _is_retryable_bridge_error(
         RuntimeError("Cannot write to closing transport")
     )
@@ -990,6 +1295,7 @@ def main() -> None:
     app.router.add_get("/health", handle_health)
     app.router.add_get("/models", handle_models)
     app.router.add_post("/run", handle_run)
+    app.router.add_post("/admin/request_recycle", handle_request_recycle)
     print(f"Cursor SDK runner listening on 0.0.0.0:{port}", file=sys.stderr)
     web.run_app(app, host="0.0.0.0", port=port, print=None)
 

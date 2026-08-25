@@ -4,6 +4,27 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-25 — Cursor sidecar idle-safe auto-recycle
+
+- **Area:** Cursor SDK sidecar / deploy
+- **Summary:** Sidecar exposes idle-only `POST /admin/request_recycle` plus uptime fields on `/health`. Rust supervisor soft-recycles on max uptime / script mtime / orphan bridge pressure when `runs_in_flight==0`, and force-recycles after two wedged health probes. Bootstrap no longer attaches forever to a stale runner. `reload.sh` soft-drains then force-kills sidecar + bridges before gateway restart (`scripts/recycle-cursor-sidecar.sh`).
+- **Key files / symbols:** `handle_request_recycle` in `scripts/cursor-sdk-runner.py`; `supervise_sidecar` / `SidecarHandle` in `src/cursor_sdk_sidecar.rs`; `reload.sh`.
+- **Note:** Recycle/rebuild gateway to pick up. Optional: `CURSOR_SIDECAR_MAX_UPTIME_SECS` (default 86400).
+
+### 2026-08-25 — Remove unfinished PreDelivery char-limit PDF guard
+
+- **Area:** hooks / delivery
+- **Summary:** Stripped the incomplete global PreDelivery PDF-spill attempt (module was never committed; wiring left the tree broken). Removed `PreDelivery` event, `updated_assistant_text`, `builtin_char_limit_pdf_guard`, `DELIVERY_CHAR_LIMIT_*` config, and docs/UI catalog entries. Migrate deletes any seeded `predelivery-char-limit-pdf-guard` row. Finish path goes straight to PostDelivery again. Prep for a future persona-gated dense-delivery rebuild.
+- **Key files / symbols:** `hook_runtime.rs`, `pipeline_finish_turn` in `telegram.rs`, `ensure_builtin_hook_definitions` in `db.rs`.
+- **Note:** Restart gateway so migrate clears the orphaned hook row if still present.
+
+### 2026-08-24 — Cursor sidecar: offload sync turns + cancel-safe disconnect
+
+- **Area:** Cursor SDK sidecar / cursor engine
+- **Summary:** Long sync `agent.send`/`messages`/`wait` no longer blocks the aiohttp loop (queue-from-thread). Disconnect requests `run.cancel()` instead of evicting the bridge under `pooled.lock`. Ping runs outside `_POOL_GUARD`. `/run` concurrency capped (`CURSOR_RUN_CONCURRENCY`, default 4). Rust stream cancel polls every 250ms; MCP tokens revoke on Drop if `finish_run` did not take them.
+- **Key files / symbols:** `scripts/cursor-sdk-runner.py` (`_stream_agent_turn_async`, `_ActiveTurn`, `_try_begin_run`); `McpTokenGuard` / `consume_sidecar_stream` in `src/cursor_engine.rs`.
+- **Note:** Recycle `cursor-sdk-runner.py` after deploy. Optional: `CURSOR_RUN_CONCURRENCY`.
+
 ### 2026-08-21 — Always-finish turns + Cursor bridge orphan sweeper
 
 - **Area:** chat queue / PDQE / Cursor SDK sidecar

@@ -9,7 +9,6 @@ const HOOK_LIFECYCLE_EVENTS = [
   'PostToolUse',
   'PostToolBatch',
   'PreStop',
-  'PreDelivery',
   'PostDelivery',
 ] as const
 
@@ -21,7 +20,6 @@ const HOOK_EVENT_HINTS: Record<HookLifecycleEvent, string> = {
   PostToolUse: 'After each tool call',
   PostToolBatch: 'After a batch of tool calls',
   PreStop: 'Before the agent stops',
-  PreDelivery: 'Before the reply is delivered (transform or guard)',
   PostDelivery: 'After the reply is delivered',
 }
 

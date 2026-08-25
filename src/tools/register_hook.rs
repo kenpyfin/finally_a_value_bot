@@ -53,7 +53,7 @@ impl Tool for RegisterHookTool {
                     },
                     "event_name": {
                         "type": "string",
-                        "description": "Lifecycle event: BeforeTurn, PreToolUse, PostToolUse, PostToolBatch, PreStop, PreDelivery, or PostDelivery"
+                        "description": "Lifecycle event: BeforeTurn, PreToolUse, PostToolUse, PostToolBatch, PreStop, or PostDelivery"
                     },
                     "matcher": {
                         "type": "string",

@@ -18,6 +18,10 @@ use crate::error::FinallyAValueBotError;
 
 const HEALTH_POLL_INTERVAL_MS: u64 = 250;
 const HEALTH_WAIT_MAX_SECS: u64 = 45;
+const SUPERVISOR_INTERVAL_SECS: u64 = 30;
+const SUPERVISOR_HEALTH_TIMEOUT_MS: u64 = 2_500;
+const SOFT_RECYCLE_WAIT_SECS: u64 = 120;
+const ORPHAN_BRIDGE_SLACK: u64 = 4;
 const SIDECAR_VENV_DIR_NAME: &str = "cursor-sdk-venv";
 const SIDECAR_PID_FILE: &str = "cursor-sdk-sidecar.pid";
 const SIDECAR_STDERR_LOG: &str = "cursor-sdk-sidecar.stderr.log";
@@ -25,9 +29,21 @@ const SIDECAR_PYTHON_PACKAGES: &[&str] = &["cursor-sdk", "aiohttp"];
 const VENV_CREATE_TIMEOUT_SECS: u64 = 120;
 const PIP_INSTALL_TIMEOUT_SECS: u64 = 180;
 
-/// Keeps the sidecar child process alive for the bot lifetime (`kill_on_drop` on the child).
+#[derive(Clone)]
+struct SupervisorCtx {
+    port: u16,
+    runtime_data_dir: String,
+    workspace_root: PathBuf,
+    max_uptime_secs: u64,
+    auto_install: bool,
+    python_override: String,
+}
+
+/// Keeps the sidecar child process alive and auto-recycles when idle / wedged.
 pub struct SidecarHandle {
-    _child: Mutex<Option<Child>>,
+    child: Mutex<Option<Child>>,
+    recycle_lock: Mutex<()>,
+    ctx: SupervisorCtx,
     pub managed_locally: bool,
     pub runner_url: String,
 }
@@ -282,13 +298,303 @@ fn in_docker() -> bool {
         || Path::new("/.dockerenv").exists()
 }
 
+fn script_mtime_unix(script: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(script).ok()?;
+    let modified = meta.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn health_suggests_stale_attach(
+    health: &SidecarHealth,
+    ctx: &SupervisorCtx,
+    script: &Path,
+) -> bool {
+    if !health.reachable || !health.cursor_sdk_installed {
+        return false;
+    }
+    if health.uptime_secs >= ctx.max_uptime_secs {
+        return true;
+    }
+    if let (Some(mtime), true) = (script_mtime_unix(script), health.started_at_unix > 0) {
+        if mtime > health.started_at_unix {
+            return true;
+        }
+    }
+    health.os_bridge_pids
+        > health
+            .persona_bridges_active
+            .saturating_add(ORPHAN_BRIDGE_SLACK)
+}
+
+#[cfg(unix)]
+async fn kill_sdk_bridge_processes(runtime_data_dir: &str) {
+    let runtime = runtime_data_dir.trim();
+    let script = if runtime.is_empty() {
+        "pkill -f 'cursor-sdk-bridge.js' 2>/dev/null || true".to_string()
+    } else {
+        format!(
+            "pgrep -af 'cursor-sdk-bridge.js' 2>/dev/null | while read -r line; do \
+               case \"$line\" in *\"{runtime}\"*) \
+                 pid=$(echo \"$line\" | awk '{{print $1}}'); \
+                 kill -TERM \"$pid\" 2>/dev/null || true ;; \
+               esac; \
+             done"
+        )
+    };
+    let _ = run_command_with_timeout("sh", &["-c", &script], 15).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[cfg(not(unix))]
+async fn kill_sdk_bridge_processes(_runtime_data_dir: &str) {}
+
+async fn request_soft_recycle(runner_url: &str) -> Result<bool, String> {
+    let trimmed = runner_url.trim().trim_end_matches('/');
+    let url = format!("{trimmed}/admin/request_recycle");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("recycle request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let accepted = body
+        .get("accepted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if status.as_u16() == 202 || !accepted {
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+
+async fn wait_for_sidecar_gone(runner_url: &str, wait_secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+    while tokio::time::Instant::now() < deadline {
+        let health = cursor_engine_config::probe_sidecar_health_with_timeout(
+            runner_url,
+            Duration::from_millis(SUPERVISOR_HEALTH_TIMEOUT_MS),
+        )
+        .await;
+        if !health.reachable {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
 impl SidecarHandle {
     pub fn inactive() -> Arc<Self> {
         Arc::new(Self {
-            _child: Mutex::new(None),
+            child: Mutex::new(None),
+            recycle_lock: Mutex::new(()),
+            ctx: SupervisorCtx {
+                port: 3848,
+                runtime_data_dir: String::new(),
+                workspace_root: PathBuf::from("."),
+                max_uptime_secs: 86_400,
+                auto_install: true,
+                python_override: "python3".into(),
+            },
             managed_locally: false,
             runner_url: default_local_runner_url(3848),
         })
+    }
+
+    async fn force_recycle_and_respawn(self: &Arc<Self>, reason: &str) {
+        let _guard = self.recycle_lock.lock().await;
+        info!("Cursor SDK sidecar force recycle ({reason})");
+        {
+            let mut slot = self.child.lock().await;
+            if let Some(mut child) = slot.take() {
+                let _ = child.start_kill();
+            }
+        }
+        // Config-less stop via ctx paths
+        let pid_path = PathBuf::from(&self.ctx.runtime_data_dir).join(SIDECAR_PID_FILE);
+        if let Ok(raw) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = raw.trim().parse::<u32>() {
+                terminate_pid(pid).await;
+            }
+            let _ = std::fs::remove_file(&pid_path);
+        }
+        terminate_listener_on_port(self.ctx.port).await;
+        kill_sdk_bridge_processes(&self.ctx.runtime_data_dir).await;
+
+        match self.spawn_fresh().await {
+            Ok(()) => info!(
+                "Cursor SDK sidecar respawned at {} after force recycle",
+                self.runner_url
+            ),
+            Err(e) => warn!("Cursor SDK sidecar respawn failed after force recycle: {e}"),
+        }
+    }
+
+    async fn soft_recycle_then_respawn(self: &Arc<Self>, reason: &str) {
+        let _guard = self.recycle_lock.lock().await;
+        info!("Cursor SDK sidecar soft recycle requested ({reason})");
+        match request_soft_recycle(&self.runner_url).await {
+            Ok(true) => {
+                info!("Cursor SDK sidecar accepted soft recycle");
+            }
+            Ok(false) => {
+                info!("Cursor SDK sidecar busy; deferring soft recycle ({reason})");
+                return;
+            }
+            Err(e) => {
+                warn!("Cursor SDK soft recycle request failed ({e}); will force if still up");
+            }
+        }
+        let gone = wait_for_sidecar_gone(&self.runner_url, SOFT_RECYCLE_WAIT_SECS).await;
+        if !gone {
+            // Drop lock before nested force? We're holding recycle_lock — force also takes it.
+            // Avoid deadlock: do force body inline without re-locking.
+            warn!("Cursor SDK sidecar still up after soft wait; forcing ({reason})");
+            {
+                let mut slot = self.child.lock().await;
+                if let Some(mut child) = slot.take() {
+                    let _ = child.start_kill();
+                }
+            }
+            let pid_path = PathBuf::from(&self.ctx.runtime_data_dir).join(SIDECAR_PID_FILE);
+            if let Ok(raw) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    terminate_pid(pid).await;
+                }
+                let _ = std::fs::remove_file(&pid_path);
+            }
+            terminate_listener_on_port(self.ctx.port).await;
+            kill_sdk_bridge_processes(&self.ctx.runtime_data_dir).await;
+        } else {
+            let mut slot = self.child.lock().await;
+            *slot = None;
+        }
+        match self.spawn_fresh().await {
+            Ok(()) => info!(
+                "Cursor SDK sidecar respawned at {} after soft recycle",
+                self.runner_url
+            ),
+            Err(e) => warn!("Cursor SDK sidecar respawn failed after soft recycle: {e}"),
+        }
+    }
+
+    async fn spawn_fresh(self: &Arc<Self>) -> Result<(), String> {
+        let script = resolve_sidecar_script().ok_or_else(|| {
+            "cursor-sdk-runner.py not found (set CURSOR_SDK_RUNNER_SCRIPT or run from repo root)"
+                .to_string()
+        })?;
+        // Build a minimal Config-like spawn using stored ctx.
+        let python = if self.ctx.auto_install {
+            // Reuse venv under runtime dir without full Config.
+            let venv_dir = PathBuf::from(&self.ctx.runtime_data_dir).join(SIDECAR_VENV_DIR_NAME);
+            let venv_py = venv_python_executable(&venv_dir);
+            if venv_py.is_file() {
+                venv_py
+            } else {
+                PathBuf::from(if self.ctx.python_override.trim().is_empty() {
+                    "python3"
+                } else {
+                    self.ctx.python_override.trim()
+                })
+            }
+        } else {
+            PathBuf::from(if self.ctx.python_override.trim().is_empty() {
+                "python3"
+            } else {
+                self.ctx.python_override.trim()
+            })
+        };
+        let stderr_log = PathBuf::from(&self.ctx.runtime_data_dir).join(SIDECAR_STDERR_LOG);
+        let proc = spawn_sidecar_process(
+            &script,
+            self.ctx.port,
+            &python,
+            &stderr_log,
+            &self.ctx.runtime_data_dir,
+            &self.ctx.workspace_root,
+            self.ctx.max_uptime_secs,
+        )
+        .await?;
+        if let Some(pid) = proc.id() {
+            let path = PathBuf::from(&self.ctx.runtime_data_dir).join(SIDECAR_PID_FILE);
+            if let Err(e) = std::fs::write(&path, pid.to_string()) {
+                warn!(
+                    "Failed to write Cursor SDK sidecar pid file {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        {
+            let mut slot = self.child.lock().await;
+            *slot = Some(proc);
+        }
+        let health = wait_for_sidecar_health(&self.runner_url).await;
+        if !health.reachable {
+            return Err(format!(
+                "sidecar did not become healthy at {}",
+                self.runner_url
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn supervise_sidecar(handle: Arc<SidecarHandle>) {
+    let mut wedged_streak: u8 = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(SUPERVISOR_INTERVAL_SECS)).await;
+        let health = cursor_engine_config::probe_sidecar_health_with_timeout(
+            &handle.runner_url,
+            Duration::from_millis(SUPERVISOR_HEALTH_TIMEOUT_MS),
+        )
+        .await;
+
+        if !health.reachable {
+            wedged_streak = wedged_streak.saturating_add(1);
+            if wedged_streak >= 2 {
+                wedged_streak = 0;
+                handle.force_recycle_and_respawn("wedged_health").await;
+            }
+            continue;
+        }
+        wedged_streak = 0;
+
+        let mut soft_reason: Option<&'static str> = None;
+        if health.uptime_secs >= handle.ctx.max_uptime_secs && health.runs_in_flight == 0 {
+            soft_reason = Some("max_uptime");
+        } else if health.os_bridge_pids
+            > health
+                .persona_bridges_active
+                .saturating_add(ORPHAN_BRIDGE_SLACK)
+            && health.runs_in_flight == 0
+        {
+            soft_reason = Some("orphan_bridges");
+        } else if let Some(script) = resolve_sidecar_script() {
+            if let Some(mtime) = script_mtime_unix(&script) {
+                if health.started_at_unix > 0
+                    && mtime > health.started_at_unix
+                    && health.runs_in_flight == 0
+                {
+                    soft_reason = Some("script_updated");
+                }
+            }
+        }
+
+        if let Some(reason) = soft_reason {
+            handle.soft_recycle_then_respawn(reason).await;
+        }
     }
 }
 
@@ -299,6 +605,7 @@ async fn spawn_sidecar_process(
     stderr_log: &Path,
     runtime_data_dir: &str,
     workspace_root: &Path,
+    max_uptime_secs: u64,
 ) -> Result<Child, String> {
     let stderr_file = std::fs::OpenOptions::new()
         .create(true)
@@ -329,6 +636,10 @@ async fn spawn_sidecar_process(
             cmd.env("CURSOR_API_KEY", key);
         }
     }
+    cmd.env(
+        "CURSOR_SIDECAR_MAX_UPTIME_SECS",
+        max_uptime_secs.max(300).to_string(),
+    );
 
     // Inherited by cursor-sdk-bridge shell tools so git does not bind the bot checkout
     // when cwd is under WORKSPACE_DIR. Tier-1 target repos remain usable via explicit cd.
@@ -376,10 +687,20 @@ pub async fn bootstrap(
     }
 
     let runner_url = settings.sdk_runner_url.clone();
+    let ctx = SupervisorCtx {
+        port,
+        runtime_data_dir: config.runtime_data_dir(),
+        workspace_root: config.workspace_root_absolute(),
+        max_uptime_secs: config.cursor_sidecar_max_uptime_secs.max(300),
+        auto_install: config.cursor_sdk_auto_install,
+        python_override: config.cursor_sdk_python.clone(),
+    };
     let mut managed_locally = false;
     let mut child: Option<Child> = None;
+    let supervise =
+        config.cursor_sdk_auto_start && !in_docker() && is_local_runner_url(&runner_url, port);
 
-    if config.cursor_sdk_auto_start && !in_docker() && is_local_runner_url(&runner_url, port) {
+    if supervise {
         let sidecar_python = match resolve_sidecar_python(config).await {
             Ok(python) => python,
             Err(e) => {
@@ -389,6 +710,21 @@ pub async fn bootstrap(
         };
 
         let mut health = cursor_engine_config::probe_sidecar_health(&runner_url).await;
+        if let Some(script) = resolve_sidecar_script() {
+            if health_suggests_stale_attach(&health, &ctx, &script) {
+                info!(
+                    "Cursor SDK sidecar at {runner_url} is stale (uptime={}s, orphans={}/{}); recycling before attach",
+                    health.uptime_secs, health.os_bridge_pids, health.persona_bridges_active
+                );
+                let _ = request_soft_recycle(&runner_url).await;
+                let _ = wait_for_sidecar_gone(&runner_url, 30).await;
+                stop_recorded_sidecar(config).await;
+                terminate_listener_on_port(port).await;
+                kill_sdk_bridge_processes(&ctx.runtime_data_dir).await;
+                health = cursor_engine_config::probe_sidecar_health(&runner_url).await;
+            }
+        }
+
         if sidecar_needs_restart(&health) {
             if health.reachable && !health.cursor_sdk_installed {
                 info!(
@@ -409,6 +745,7 @@ pub async fn bootstrap(
                         &stderr_log,
                         &config.runtime_data_dir(),
                         &config.workspace_root_absolute(),
+                        ctx.max_uptime_secs,
                     )
                     .await
                     {
@@ -475,11 +812,17 @@ pub async fn bootstrap(
         );
     }
 
-    Arc::new(SidecarHandle {
-        _child: Mutex::new(child),
+    let handle = Arc::new(SidecarHandle {
+        child: Mutex::new(child),
+        recycle_lock: Mutex::new(()),
+        ctx,
         managed_locally,
         runner_url,
-    })
+    });
+    if supervise {
+        tokio::spawn(supervise_sidecar(handle.clone()));
+    }
+    handle
 }
 
 #[cfg(test)]
@@ -517,6 +860,7 @@ mod tests {
             api_key_configured: true,
             cursor_sdk_installed: false,
             error: None,
+            ..Default::default()
         };
         assert!(sidecar_needs_restart(&health));
     }

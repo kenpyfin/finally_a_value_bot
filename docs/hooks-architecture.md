@@ -11,7 +11,6 @@ Hooks are evaluated at these boundaries:
 - `PostToolUse`
 - `PostToolBatch`
 - `PreStop`
-- `PreDelivery`
 - `PostDelivery`
 
 Runtime entry point:
@@ -29,7 +28,6 @@ On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests 
 | `pretool-turn-skill-gate.hook.json` | PreToolUse | `builtin_turn_skill_gate` |
 | `prestop-deferred-commitment-guard.hook.json` | PreStop | `builtin_deferred_commitment_guard` |
 | `postbatch-loop-guard.hook.json` | PostToolBatch | `builtin_loop_guard` |
-| `predelivery-char-limit-pdf-guard.hook.json` | PreDelivery | `builtin_char_limit_pdf_guard` |
 
 Handlers run in Rust (`hook_runtime.rs`). Manifests are the install-time catalog, not subprocess scripts.
 
@@ -62,7 +60,6 @@ Supported `action_type` values:
 - `builtin_turn_skill_gate` (PreToolUse schedule/modify activation gate)
 - `builtin_deferred_commitment_guard` (PreStop deferred-work guard; no-op when `stop_reason` is `ask_clarification`)
 - `builtin_loop_guard` (PostToolBatch discovery/edit loop guard)
-- `builtin_char_limit_pdf_guard` (PreDelivery: spill over-limit replies to PDF + summary)
 
 `pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.
 
@@ -91,7 +88,6 @@ Hooks may return:
 - `reason`, `user_message`
 - `agent_message`, `additional_context`
 - `updated_tool_input`
-- `updated_assistant_text` (PreDelivery: replace the outgoing assistant reply)
 - `effects.memory_tier3_prune.terminal_pz_post_ids`
 
 Notes:
@@ -158,7 +154,6 @@ When **Settings → Runtime → Agent engine** is **Cursor**, bot hooks still ru
 | `PostToolUse` | Yes — loopback MCP `tools/call` | Yes |
 | `PostToolBatch` | Yes — end of Cursor sidecar turn | Yes |
 | `PreStop` | Yes — `end_turn` + deferred-commitment nudge loop (max 2 sidecar resumes) | Yes |
-| `PreDelivery` | Yes — via `pipeline_finish_turn` (transform reply before PDQE/delivery) | Yes |
 | `PostDelivery` | Yes — via `pipeline_finish_turn` (assistant message appended first) | Yes |
 
 Shared turn-boundary helpers live in `src/channels/hook_turn_bridge.rs`. Tool hooks: `src/tool_hook_dispatch.rs`, `src/cursor_mcp_bridge.rs` (`POST /internal/cursor-mcp`). Cursor dispatch: `src/cursor_engine.rs` (`run_cursor_engine`).

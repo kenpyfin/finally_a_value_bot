@@ -20,7 +20,6 @@ pub enum HookEventName {
     PostToolUse,
     PostToolBatch,
     PreStop,
-    PreDelivery,
     PostDelivery,
 }
 
@@ -32,7 +31,6 @@ impl HookEventName {
             Self::PostToolUse => "PostToolUse",
             Self::PostToolBatch => "PostToolBatch",
             Self::PreStop => "PreStop",
-            Self::PreDelivery => "PreDelivery",
             Self::PostDelivery => "PostDelivery",
         }
     }
@@ -66,7 +64,6 @@ pub struct HookRunResult {
     pub updated_tool_input: Option<Value>,
     pub memory_effects: HookMemoryEffects,
     pub run_persona_focus_sync: bool,
-    pub updated_assistant_text: Option<String>,
 }
 
 fn event_matches(record: &HookDefinitionRecord, event: HookEventName) -> bool {
@@ -97,7 +94,7 @@ fn matcher_target(input: &HookRunInput, event: HookEventName) -> String {
             }
             parts.join("\n")
         }
-        HookEventName::PreStop | HookEventName::PreDelivery | HookEventName::PostDelivery => input
+        HookEventName::PreStop | HookEventName::PostDelivery => input
             .stop_reason
             .clone()
             .or_else(|| input.assistant_text.clone())
@@ -245,12 +242,6 @@ pub async fn run_hooks_for_event_async(
         if output.updated_tool_input.is_some() {
             out.updated_tool_input = output.updated_tool_input;
         }
-        if let Some(text) = output
-            .updated_assistant_text
-            .filter(|s| !s.trim().is_empty())
-        {
-            out.updated_assistant_text = Some(text);
-        }
         if let Some(effects) = output.effects.and_then(|e| e.memory_tier3_prune) {
             for id in effects.terminal_pz_post_ids {
                 out.memory_effects.terminal_pz_post_ids.push(id);
@@ -327,21 +318,6 @@ pub async fn run_hooks_for_event_async(
                         crate::skill_activation_gate::modify_skill_required_error_message()
                     ));
                     break;
-                }
-            }
-            "builtin_char_limit_pdf_guard" => {
-                if let Some(text) = input.assistant_text.as_deref() {
-                    if let Some(replacement) =
-                        crate::delivery_char_limit_pdf_guard::maybe_spill_to_pdf(
-                            config,
-                            input.chat_id,
-                            input.persona_id,
-                            &input.caller_channel,
-                            text,
-                        )
-                    {
-                        out.updated_assistant_text = Some(replacement);
-                    }
                 }
             }
             "builtin_deferred_commitment_guard" => {

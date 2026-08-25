@@ -19,7 +19,6 @@ pub mod cursor_engine_config;
 pub mod cursor_mcp_bridge;
 pub mod cursor_sdk_sidecar;
 pub mod db;
-pub mod delivery_char_limit_pdf_guard;
 pub mod doctor;
 pub mod error;
 pub mod final_delivery_dedupe;

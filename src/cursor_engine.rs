@@ -27,7 +27,7 @@ use crate::cursor_delegation_prompt::{
     DelegationPromptMode, DelegationRuntimeHeader,
 };
 use crate::cursor_mcp_bridge::{
-    build_mcp_servers_config, mcp_endpoint_url, CursorMcpRegisterParams,
+    build_mcp_servers_config, mcp_endpoint_url, CursorMcpRegisterParams, CursorMcpRegistry,
 };
 use crate::db::call_blocking;
 use crate::tools;
@@ -140,7 +140,34 @@ fn is_cursor_sidecar_recoverable_error(message: &str) -> bool {
     {
         return true;
     }
+    if lower.contains("at capacity") || lower.contains("cursor_run_concurrency") {
+        return true;
+    }
     lower.contains("connection refused") || lower.contains("errno 111")
+}
+
+/// Revokes the MCP run token on drop unless `take_for_finish` was used.
+struct McpTokenGuard {
+    registry: Arc<CursorMcpRegistry>,
+    token: Option<String>,
+}
+
+impl McpTokenGuard {
+    fn new(registry: Arc<CursorMcpRegistry>, token: Option<String>) -> Self {
+        Self { registry, token }
+    }
+
+    fn take_for_finish(&mut self) -> Option<String> {
+        self.token.take()
+    }
+}
+
+impl Drop for McpTokenGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.registry.revoke_run(&token);
+        }
+    }
 }
 
 fn cursor_session_scope(context: &AgentRequestContext<'_>) -> String {
@@ -202,115 +229,131 @@ async fn consume_sidecar_stream(
     let mut buffer = String::new();
 
     let mut byte_stream = response.bytes_stream();
-    while let Some(chunk) = byte_stream.next().await {
-        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-            return Err(anyhow::anyhow!("Run cancelled"));
-        }
-        let chunk = chunk.map_err(|e| anyhow::anyhow!("Cursor sidecar stream error: {e}"))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim().to_string();
-            buffer.drain(..=pos);
-            if line.is_empty() {
-                continue;
+    let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    cancel_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel_tick.tick(), if cancel.is_some() => {
+                if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return Err(anyhow::anyhow!("Run cancelled"));
+                }
             }
-            let event: SidecarStreamEvent = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Cursor sidecar NDJSON parse error: {e} line={line}");
-                    continue;
+            chunk = byte_stream.next() => {
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return Err(anyhow::anyhow!("Run cancelled"));
                 }
-            };
-            match event.event_type.as_str() {
-                "text" | "text_delta" => {
-                    let delta = if event.text.is_empty() {
-                        event.message
-                    } else {
-                        event.text
-                    };
-                    if !delta.is_empty() {
-                        final_text.push_str(&delta);
-                        if let Some(tx) = event_tx {
-                            let _ = tx.send(AgentEvent::TextDelta { delta });
+                let chunk = chunk.map_err(|e| anyhow::anyhow!("Cursor sidecar stream error: {e}"))?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer.drain(..=pos);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event: SidecarStreamEvent = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Cursor sidecar NDJSON parse error: {e} line={line}");
+                            continue;
                         }
-                    }
-                }
-                "done" => {
-                    run_status = if event.status.is_empty() {
-                        "finished".into()
-                    } else {
-                        event.status
                     };
-                    returned_agent_id = event.agent_id;
-                    if let Some(result) = event.result.filter(|s| !s.is_empty()) {
-                        if final_text.is_empty() {
-                            final_text = result;
-                        }
-                    }
-                }
-                "error" => {
-                    sidecar_error = Some(if event.message.is_empty() {
-                        "Cursor sidecar run failed".into()
-                    } else {
-                        event.message
-                    });
-                }
-                "tool_use" => {
-                    let name = event.name.unwrap_or_default();
-                    let tool_use_id = uuid::Uuid::new_v4().to_string();
-                    let input = event.input.unwrap_or(serde_json::json!({}));
-                    if let Some(tx) = event_tx {
-                        let _ = tx.send(AgentEvent::ToolStart {
-                            tool_use_id: tool_use_id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        });
-                    }
-                    tool_call_records.push(ToolCallRecord {
-                        name,
-                        input_preview: serde_json::to_string(&input).unwrap_or_default(),
-                        result_preview: String::new(),
-                        duration_ms: 0,
-                        is_error: false,
-                    });
-                }
-                "tool_result" => {
-                    let name = event.name.unwrap_or_default();
-                    let is_error = event.is_error.unwrap_or(false);
-                    let output = event.output.unwrap_or_default();
-                    if let Some(tx) = event_tx {
-                        let _ = tx.send(AgentEvent::ToolResult {
-                            tool_use_id: uuid::Uuid::new_v4().to_string(),
-                            name: name.clone(),
-                            is_error,
-                            output: output.clone(),
-                            duration_ms: 0,
-                            status_code: Some(if is_error { 1 } else { 0 }),
-                            bytes: output.len(),
-                            error_type: None,
-                        });
-                    }
-                    if let Some(record) = tool_call_records
-                        .iter_mut()
-                        .rev()
-                        .find(|r| r.name == name && r.result_preview.is_empty())
-                    {
-                        record.result_preview = output;
-                        record.is_error = is_error;
-                    }
-                    *mcp_tool_count = mcp_tool_count.saturating_add(1);
-                }
-                "thinking" => {
-                    if state_show_thinking(event_tx) {
-                        if let Some(text) = event.thinking.filter(|s| !s.is_empty()) {
-                            if let Some(tx) = event_tx {
-                                let _ = tx.send(AgentEvent::TextDelta { delta: text });
+                    match event.event_type.as_str() {
+                        "text" | "text_delta" => {
+                            let delta = if event.text.is_empty() {
+                                event.message
+                            } else {
+                                event.text
+                            };
+                            if !delta.is_empty() {
+                                final_text.push_str(&delta);
+                                if let Some(tx) = event_tx {
+                                    let _ = tx.send(AgentEvent::TextDelta { delta });
+                                }
                             }
                         }
+                        "done" => {
+                            run_status = if event.status.is_empty() {
+                                "finished".into()
+                            } else {
+                                event.status
+                            };
+                            returned_agent_id = event.agent_id;
+                            if let Some(result) = event.result.filter(|s| !s.is_empty()) {
+                                if final_text.is_empty() {
+                                    final_text = result;
+                                }
+                            }
+                        }
+                        "error" => {
+                            sidecar_error = Some(if event.message.is_empty() {
+                                "Cursor sidecar run failed".into()
+                            } else {
+                                event.message
+                            });
+                        }
+                        "tool_use" => {
+                            let name = event.name.unwrap_or_default();
+                            let tool_use_id = uuid::Uuid::new_v4().to_string();
+                            let input = event.input.unwrap_or(serde_json::json!({}));
+                            if let Some(tx) = event_tx {
+                                let _ = tx.send(AgentEvent::ToolStart {
+                                    tool_use_id: tool_use_id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                });
+                            }
+                            tool_call_records.push(ToolCallRecord {
+                                name,
+                                input_preview: serde_json::to_string(&input).unwrap_or_default(),
+                                result_preview: String::new(),
+                                duration_ms: 0,
+                                is_error: false,
+                            });
+                        }
+                        "tool_result" => {
+                            let name = event.name.unwrap_or_default();
+                            let is_error = event.is_error.unwrap_or(false);
+                            let output = event.output.unwrap_or_default();
+                            if let Some(tx) = event_tx {
+                                let _ = tx.send(AgentEvent::ToolResult {
+                                    tool_use_id: uuid::Uuid::new_v4().to_string(),
+                                    name: name.clone(),
+                                    is_error,
+                                    output: output.clone(),
+                                    duration_ms: 0,
+                                    status_code: Some(if is_error { 1 } else { 0 }),
+                                    bytes: output.len(),
+                                    error_type: None,
+                                });
+                            }
+                            if let Some(record) = tool_call_records
+                                .iter_mut()
+                                .rev()
+                                .find(|r| r.name == name && r.result_preview.is_empty())
+                            {
+                                record.result_preview = output;
+                                record.is_error = is_error;
+                            }
+                            *mcp_tool_count = mcp_tool_count.saturating_add(1);
+                        }
+                        "thinking" => {
+                            if state_show_thinking(event_tx) {
+                                if let Some(text) = event.thinking.filter(|s| !s.is_empty()) {
+                                    if let Some(tx) = event_tx {
+                                        let _ = tx.send(AgentEvent::TextDelta { delta: text });
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            warn!("Cursor sidecar unknown event type: {other}");
+                        }
                     }
-                }
-                other => {
-                    warn!("Cursor sidecar unknown event type: {other}");
                 }
             }
         }
@@ -530,7 +573,7 @@ pub async fn run_cursor_engine(
     };
 
     let mcp_enabled = settings.mcp_tools_enabled && state.config.web_enabled;
-    let (mcp_token, mcp_servers) = if mcp_enabled {
+    let (mcp_servers, mut mcp_guard) = if mcp_enabled {
         let url = mcp_endpoint_url(state.config.web_port);
         let token = state.cursor_mcp.register_run(
             CursorMcpRegisterParams {
@@ -545,9 +588,12 @@ pub async fn run_cursor_engine(
             event_tx.cloned(),
         );
         let servers = build_mcp_servers_config(&url, &token);
-        (Some(token), Some(servers))
+        (
+            Some(servers),
+            McpTokenGuard::new(state.cursor_mcp.clone(), Some(token)),
+        )
     } else {
-        (None, None)
+        (None, McpTokenGuard::new(state.cursor_mcp.clone(), None))
     };
 
     let started_at = chrono::Utc::now().to_rfc3339();
@@ -608,9 +654,7 @@ pub async fn run_cursor_engine(
         {
             Ok(o) => o,
             Err(e) => {
-                if let Some(token) = mcp_token.as_deref() {
-                    state.cursor_mcp.revoke_run(token);
-                }
+                // McpTokenGuard Drop revokes on abort/cancel/error.
                 let msg = e.to_string();
                 if is_cursor_sidecar_recoverable_error(&msg) {
                     return cursor_engine_classic_fallback(
@@ -716,10 +760,10 @@ pub async fn run_cursor_engine(
     let mut history_tool_records: Vec<ToolCallRecord> = Vec::new();
     let mut history_hook_events: Vec<String> = Vec::new();
 
-    if let Some(token) = mcp_token.as_deref() {
+    if let Some(token) = mcp_guard.take_for_finish() {
         if let Some((stall, names, records, hook_events)) = state
             .cursor_mcp
-            .finish_run(state, &context, &prep.run_key, token, event_tx)
+            .finish_run(state, &context, &prep.run_key, &token, event_tx)
             .await
         {
             if let Some(stall_text) = stall {
@@ -974,6 +1018,9 @@ mod tests {
         ));
         assert!(is_cursor_sidecar_recoverable_error(
             "Cursor SDK startup failed: Timed out waiting for bridge discovery"
+        ));
+        assert!(is_cursor_sidecar_recoverable_error(
+            "Cursor sidecar at capacity (CURSOR_RUN_CONCURRENCY=4)"
         ));
         assert!(!is_cursor_sidecar_recoverable_error("prompt required"));
     }

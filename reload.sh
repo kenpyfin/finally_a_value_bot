@@ -94,6 +94,15 @@ main() {
   install_binary_atomic "$bin_path" "$install_dir"
   log_success "Binary installed to ${install_dir}/${BIN_NAME}"
 
+  # Soft-drain then force-recycle sidecar so deploys never keep a stale runner.
+  if [ -f "$REPO_ROOT/scripts/recycle-cursor-sidecar.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$REPO_ROOT/scripts/recycle-cursor-sidecar.sh"
+    recycle_cursor_sidecar "$REPO_ROOT"
+  else
+    log_warn "scripts/recycle-cursor-sidecar.sh missing; skipping sidecar recycle"
+  fi
+
   local bot_cmd="${install_dir}/${BIN_NAME}"
   if "$bot_cmd" gateway status >/dev/null 2>&1; then
     log_info "Restarting gateway service..."

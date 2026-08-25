@@ -13,7 +13,29 @@ Template:
 - **Files/refs:** key paths, symbols, log signatures
 ```
 
+### 2026-08-25 — PreDelivery PDF guard shipped without module
+- **Symptom:** Tree failed to build / hook stubbed; `pub mod delivery_char_limit_pdf_guard` referenced a file that was never committed.
+- **Root cause:** Incomplete PreDelivery char-limit PDF spill was mixed into a larger hang-fix commit; only wiring landed, not the implementation module.
+- **Fix:** Removed PreDelivery event, config knobs, builtin action, finish-path hooks, and docs/UI entries; migrate deletes `predelivery-char-limit-pdf-guard` rows.
+- **Prevention:** Do not declare `pub mod` or ship builtin hook manifests until the handler module and tests land in the same change. Prefer persona-gated dense delivery as a clean rebuild.
+- **Files/refs:** `src/hook_runtime.rs`; `ensure_builtin_hook_definitions` DELETE in `src/db.rs`; plan `dense_delivery_guard_d62ee57e`.
+
+### 2026-08-25 — Stale Cursor sidecar survived gateway reloads
+- **Symptom:** Cursor turns stayed slow / `/health` timed out after days of uptime; `reload.sh` restarted the gateway but left a multi-day `cursor-sdk-runner.py` attached.
+- **Root cause:** Bootstrap attached to any reachable local runner and never recycled process-level state; sync SDK I/O could starve the sidecar loop.
+- **Fix:** Idle-only `/admin/request_recycle`; Rust supervisor (soft on uptime/mtime/orphans, force after two wedged probes); `reload.sh` soft-then-force recycle via `scripts/recycle-cursor-sidecar.sh`.
+- **Prevention:** Never attach forever to a reachable sidecar without age/script checks; deploy paths must recycle the runner, not only the Rust binary.
+- **Files/refs:** `src/cursor_sdk_sidecar.rs` (`supervise_sidecar`); `scripts/cursor-sdk-runner.py`; `reload.sh`; log `shutting down for recycle`.
+
 ---
+
+### 2026-08-24 — Cursor timeouts climbed after many runs (event-loop starvation)
+
+- **Symptom:** After long uptime with many Cursor turns, bridge discovery / request timeouts rose; `/health` lagged; disconnect left `Cannot write to closing transport` and orphan bridges.
+- **Root cause:** Sync SDK streaming ran on the aiohttp event loop, starving the idle/orphan reaper and other `/run`s. Client disconnect evicted the bridge while the turn still held `pooled.lock`. Cancel only checked after the next NDJSON chunk; hard abort skipped MCP revoke.
+- **Fix:** Offload `_stream_agent_turn` via a worker thread + queue; cancel with `run.cancel()` on disconnect without lock-held eviction; ping outside `_POOL_GUARD`; cap concurrent `/run`s; Rust `select!` cancel poll + MCP token Drop guard.
+- **Prevention:** Never run long sync Cursor SDK I/O on the sidecar event loop; never `_evict_pooled_bridge` from the write-error path while a turn holds the pool lock. Alert when `/health` `os_bridge_pids` ≫ `persona_bridges_active`.
+- **Files/refs:** `scripts/cursor-sdk-runner.py`; `src/cursor_engine.rs` (`McpTokenGuard`); log `client disconnected during /run … requesting turn cancel`.
 
 ### 2026-08-21 — Interactive runs hung with no reply / orphan Cursor bridges
 
