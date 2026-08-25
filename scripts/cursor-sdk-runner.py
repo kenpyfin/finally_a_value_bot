@@ -24,6 +24,8 @@ import hashlib
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -46,9 +48,11 @@ BRIDGE_RETRY_BACKOFF_SECS = (0.5, 1.5, 3.0)
 DEFAULT_BRIDGE_LAUNCH_TIMEOUT_SECS = 60
 # Warm interactive bridges (main / focus sessions). Scheduled + background
 # scopes are one-shot and must not stay pooled.
-DEFAULT_BRIDGE_IDLE_TTL_SECS = 900
-DEFAULT_BRIDGE_POOL_MAX = 32
+DEFAULT_BRIDGE_IDLE_TTL_SECS = 600
+DEFAULT_BRIDGE_POOL_MAX = 16
 DEFAULT_BRIDGE_REAPER_INTERVAL_SECS = 60
+# Orphan OS processes not tracked in _POOL (e.g. after client disconnect).
+DEFAULT_BRIDGE_ORPHAN_GRACE_SECS = 120
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -85,6 +89,16 @@ def _bridge_pool_max() -> int:
         return DEFAULT_BRIDGE_POOL_MAX
 
 
+def _bridge_orphan_grace_secs() -> int:
+    raw = os.environ.get("CURSOR_BRIDGE_ORPHAN_GRACE_SECS", "").strip()
+    if not raw:
+        return DEFAULT_BRIDGE_ORPHAN_GRACE_SECS
+    try:
+        return max(30, int(raw))
+    except ValueError:
+        return DEFAULT_BRIDGE_ORPHAN_GRACE_SECS
+
+
 def _is_ephemeral_session_scope(session_scope: str) -> bool:
     """One-shot scopes that must never keep a warm bridge after /run.
 
@@ -117,6 +131,9 @@ _POOL_GUARD = asyncio.Lock()
 # Serialize cold `Client.launch_bridge` across all pools/personas/sessions.
 _BRIDGE_LAUNCH_SEM = asyncio.Semaphore(1)
 _REAPER_TASK: asyncio.Task[None] | None = None
+# PIDs of bridges currently being launched (not yet in _POOL).
+_LAUNCHING_PIDS: set[int] = set()
+_ORPHANS_KILLED_TOTAL = 0
 
 
 def _api_key() -> str:
@@ -141,6 +158,9 @@ def _is_retryable_bridge_error(err: Exception) -> bool:
         "errno 111",
         "broken pipe",
         "connection reset",
+        "cannot write to closing transport",
+        "incomplete chunked read",
+        "peer closed connection",
     )
     return any(needle in msg for needle in needles)
 
@@ -202,6 +222,95 @@ def _force_kill_bridge_process(client: Any) -> None:
                 pass
     except Exception:
         pass
+
+
+def _bridge_pid(client: Any) -> int | None:
+    proc = _bridge_process(client)
+    if proc is None:
+        return None
+    try:
+        return int(proc.pid)
+    except Exception:
+        return None
+
+
+def _list_sdk_bridge_pids() -> set[int]:
+    """PIDs of live cursor-sdk-bridge.js processes (Linux/host)."""
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "cursor-sdk-bridge.js"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return set()
+    pids: set[int] = set()
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.add(int(line))
+    return pids
+
+
+def _proc_elapsed_secs(pid: int) -> float | None:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "etimes=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if not out:
+            return None
+        return float(out.split()[0])
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def _kill_orphan_bridge_processes_sync() -> int:
+    """Terminate bridge OS processes not owned by the in-memory pool."""
+    global _ORPHANS_KILLED_TOTAL
+    owned: set[int] = set(_LAUNCHING_PIDS)
+    for entry in list(_POOL.values()):
+        pid = _bridge_pid(entry.client)
+        if pid is not None:
+            owned.add(pid)
+    live = _list_sdk_bridge_pids()
+    grace = float(_bridge_orphan_grace_secs())
+    killed = 0
+    for pid in live - owned:
+        age = _proc_elapsed_secs(pid)
+        if age is not None and age < grace:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed += 1
+            print(
+                f"[cursor-sdk-runner] killed orphan bridge pid={pid} "
+                f"age_secs={age if age is not None else '?'}",
+                file=sys.stderr,
+            )
+        except ProcessLookupError:
+            continue
+        except OSError as err:
+            print(
+                f"[cursor-sdk-runner] failed to kill orphan pid={pid}: {err}",
+                file=sys.stderr,
+            )
+    if killed:
+        _ORPHANS_KILLED_TOTAL += killed
+        # Give processes a moment, then SIGKILL stragglers.
+        time.sleep(0.5)
+        still = _list_sdk_bridge_pids() - owned
+        for pid in still:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    return killed
+
+
+async def _kill_orphan_bridge_processes() -> int:
+    return await asyncio.to_thread(_kill_orphan_bridge_processes_sync)
 
 
 def _close_pooled_bridge(entry: _PooledBridge) -> None:
@@ -299,10 +408,11 @@ async def _bridge_idle_reaper() -> None:
         try:
             await asyncio.sleep(DEFAULT_BRIDGE_REAPER_INTERVAL_SECS)
             closed = await _evict_idle_and_over_cap_bridges()
-            if closed:
+            orphans = await _kill_orphan_bridge_processes()
+            if closed or orphans:
                 print(
                     f"[cursor-sdk-runner] reaper closed {closed} bridge(s); "
-                    f"pool_size={len(_POOL)}",
+                    f"orphans_killed={orphans}; pool_size={len(_POOL)}",
                     file=sys.stderr,
                 )
         except asyncio.CancelledError:
@@ -348,15 +458,22 @@ async def _get_pooled_bridge(cwd: str, session_scope: str = "") -> _PooledBridge
             state_root,
             timeout_secs,
         )
-        entry = _PooledBridge(
-            client=client,
-            cwd=cwd,
-            session_scope=session_scope,
-            pool_key=pool_key,
-            state_root=state_root,
-        )
-        async with _POOL_GUARD:
-            _POOL[pool_key] = entry
+        launch_pid = _bridge_pid(client)
+        if launch_pid is not None:
+            _LAUNCHING_PIDS.add(launch_pid)
+        try:
+            entry = _PooledBridge(
+                client=client,
+                cwd=cwd,
+                session_scope=session_scope,
+                pool_key=pool_key,
+                state_root=state_root,
+            )
+            async with _POOL_GUARD:
+                _POOL[pool_key] = entry
+        finally:
+            if launch_pid is not None:
+                _LAUNCHING_PIDS.discard(launch_pid)
         scope_label = session_scope.strip() or "main"
         print(
             "[cursor-sdk-runner] launched bridge for "
@@ -516,7 +633,10 @@ def _open_agent(
         raise
 
 
-async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
+async def _stream_run(
+    body: dict[str, Any],
+    active_pool_key: list[str | None] | None = None,
+) -> AsyncIterator[str]:
     prompt = (body.get("prompt") or "").strip()
     cwd = (body.get("cwd") or ".").strip() or "."
     model = (body.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
@@ -552,6 +672,8 @@ async def _stream_run(body: dict[str, Any]) -> AsyncIterator[str]:
     opts = AgentOptions(api_key=api_key)
     resume_id = agent_id
     pool_key = _bridge_pool_key(cwd, session_scope)
+    if active_pool_key is not None:
+        active_pool_key[0] = pool_key
 
     for attempt in range(BRIDGE_RETRY_MAX_ATTEMPTS):
         agent = None
@@ -734,6 +856,9 @@ async def handle_health(_request: web.Request) -> web.Response:
             "session_scoped_bridges": True,
             "bridge_idle_ttl_secs": _bridge_idle_ttl_secs(),
             "bridge_pool_max": _bridge_pool_max(),
+            "bridge_orphan_grace_secs": _bridge_orphan_grace_secs(),
+            "orphans_killed_total": _ORPHANS_KILLED_TOTAL,
+            "os_bridge_pids": len(_list_sdk_bridge_pids()),
         }
     )
 
@@ -754,10 +879,34 @@ async def handle_run(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
 
-    async for line in _stream_run(body if isinstance(body, dict) else {}):
-        await response.write(line.encode("utf-8"))
-
-    await response.write_eof()
+    active_pool_key: list[str | None] = [None]
+    try:
+        async for line in _stream_run(
+            body if isinstance(body, dict) else {},
+            active_pool_key=active_pool_key,
+        ):
+            try:
+                await response.write(line.encode("utf-8"))
+            except (ConnectionResetError, BrokenPipeError, OSError) as err:
+                print(
+                    "[cursor-sdk-runner] client disconnected during /run "
+                    f"({err}); evicting bridge pool_key={active_pool_key[0]}",
+                    file=sys.stderr,
+                )
+                if active_pool_key[0]:
+                    await _evict_pooled_bridge(active_pool_key[0])
+                return response
+        await response.write_eof()
+    except Exception as err:
+        # Includes aiohttp ClientConnectionResetError on chunked write.
+        print(
+            f"[cursor-sdk-runner] /run stream failed ({err}); "
+            f"evicting bridge pool_key={active_pool_key[0]}",
+            file=sys.stderr,
+        )
+        if active_pool_key[0]:
+            await _evict_pooled_bridge(active_pool_key[0])
+        raise
     return response
 
 
@@ -824,6 +973,13 @@ def _run_self_tests() -> None:
     assert not _is_ephemeral_session_scope("focus:project-x")
     assert _bridge_idle_ttl_secs() >= 60
     assert _bridge_pool_max() >= 4
+    assert _bridge_orphan_grace_secs() >= 30
+    assert _is_retryable_bridge_error(
+        RuntimeError("Cannot write to closing transport")
+    )
+    assert _is_retryable_bridge_error(
+        RuntimeError("peer closed connection without sending complete message body")
+    )
 
 
 def main() -> None:

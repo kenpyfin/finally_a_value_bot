@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-21 — Always-finish turns + Cursor bridge orphan sweeper
+
+- **Area:** chat queue / PDQE / Cursor SDK sidecar
+- **Summary:** Stuck interactive turns (PZ / selling_oversea / Videographer) started tools then never wrote `run_finished` or a bot reply. Hardened: (1) queue hard-timeout/panic now invokes `on_hard_abort` to store a user-visible notice + `run_finished` (web also publishes run_hub `error`); (2) PDQE has an outer wall timeout (evaluator timeout + 30s) fail-open; focus sync is wall-timed at 120s; `run_finished` is awaited before return; (3) sidecar idle TTL default 600s / pool max 16, reaper kills untracked `cursor-sdk-bridge.js` PIDs, and client disconnect during `/run` evicts the active pool key.
+- **Key files / symbols:** `src/queue_abort.rs`; `QueueHardAbortHook` in `src/chat_queue.rs`; finish path in `src/channels/telegram.rs`; `scripts/cursor-sdk-runner.py` (`_kill_orphan_bridge_processes`, handle_run eviction).
+- **Note:** Restart gateway + recycle `cursor-sdk-runner.py`. Optionally set `CURSOR_BRIDGE_IDLE_TTL_SECS` / `CURSOR_BRIDGE_POOL_MAX` / `CURSOR_BRIDGE_ORPHAN_GRACE_SECS`. Kill any pre-existing orphan bridge PIDs once after deploy.
+
 ### 2026-08-20 — Shared processing ack on all external channels
 
 - **Area:** channels / Telegram / Discord / WhatsApp / WeCom

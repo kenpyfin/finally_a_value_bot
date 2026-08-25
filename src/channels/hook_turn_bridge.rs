@@ -35,18 +35,25 @@ pub fn hook_event_summary(
     if result.matched_hook_ids.is_empty()
         && result.blocked_reason.is_none()
         && result.additional_contexts.is_empty()
+        && result.updated_assistant_text.is_none()
     {
         return None;
     }
     let tool = tool_name.unwrap_or("-");
     let blocked = result.blocked_reason.as_deref().unwrap_or("-");
+    let replaced = if result.updated_assistant_text.is_some() {
+        "yes"
+    } else {
+        "no"
+    };
     Some(format!(
-        "{} tool={} matched={:?} blocked={} add_ctx={}",
+        "{} tool={} matched={:?} blocked={} add_ctx={} replaced_text={}",
         event_name.as_str(),
         tool,
         result.matched_hook_ids,
         blocked,
-        result.additional_contexts.len()
+        result.additional_contexts.len(),
+        replaced
     ))
 }
 

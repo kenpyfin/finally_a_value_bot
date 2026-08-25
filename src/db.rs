@@ -2999,10 +2999,11 @@ impl Database {
                 | "builtin_turn_skill_gate"
                 | "builtin_deferred_commitment_guard"
                 | "builtin_loop_guard"
+                | "builtin_char_limit_pdf_guard"
         );
         if !valid_action_type {
             return Err(FinallyAValueBotError::ToolExecution(format!(
-                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard",
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard, builtin_char_limit_pdf_guard",
                 action_type
             )));
         }
@@ -7229,6 +7230,7 @@ mod tests {
             "pretool-turn-skill-gate",
             "prestop-deferred-commitment-guard",
             "postbatch-loop-guard",
+            "predelivery-char-limit-pdf-guard",
         ];
         for name in builtin_names {
             let hook = hooks
@@ -7250,7 +7252,7 @@ mod tests {
         assert_eq!(
             hooks.len(),
             builtin_names.len(),
-            "fresh DB should contain only the five shipped catalog hooks: {:?}",
+            "fresh DB should contain only the six shipped catalog hooks: {:?}",
             hooks.iter().map(|h| &h.name).collect::<Vec<_>>()
         );
         cleanup(&dir);

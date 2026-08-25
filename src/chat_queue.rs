@@ -13,7 +13,15 @@ type BoxTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type RunCancel = Arc<AtomicBool>;
 type RunRegistryValue = (QueueLaneKey, RunCancel);
 type RunRegistry = HashMap<String, RunRegistryValue>;
+/// Called when a running queue task is aborted (hard timeout or panic) so callers
+/// can deliver a user-visible notice and mark `run_finished`.
+pub type QueueHardAbortHook =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 const QUEUED_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+pub fn queued_task_hard_timeout_secs() -> u64 {
+    QUEUED_TASK_HARD_TIMEOUT.as_secs()
+}
 
 /// FIFO lane identity: one worker per `(chat_id, persona_id)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -61,6 +69,7 @@ struct QueuedTask {
     run_id: String,
     project_id: Option<i64>,
     workflow_id: Option<i64>,
+    on_hard_abort: Option<QueueHardAbortHook>,
 }
 
 struct QueueItemEntry {
@@ -94,7 +103,7 @@ pub struct QueueTaskMeta {
 }
 
 /// Metadata for one enqueue; `run_id` must be unique per enqueue (e.g. UUID).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct QueueEnqueueMeta {
     pub run_id: String,
     pub persona_id: i64,
@@ -102,6 +111,22 @@ pub struct QueueEnqueueMeta {
     pub label: String,
     pub project_id: Option<i64>,
     pub workflow_id: Option<i64>,
+    /// Invoked after the lane aborts a running task (timeout / panic).
+    pub on_hard_abort: Option<QueueHardAbortHook>,
+}
+
+impl std::fmt::Debug for QueueEnqueueMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueEnqueueMeta")
+            .field("run_id", &self.run_id)
+            .field("persona_id", &self.persona_id)
+            .field("source", &self.source)
+            .field("label", &self.label)
+            .field("project_id", &self.project_id)
+            .field("workflow_id", &self.workflow_id)
+            .field("on_hard_abort", &self.on_hard_abort.as_ref().map(|_| "set"))
+            .finish()
+    }
 }
 
 impl QueueEnqueueMeta {
@@ -120,6 +145,7 @@ impl QueueEnqueueMeta {
             label,
             project_id: m.project_id,
             workflow_id: m.workflow_id,
+            on_hard_abort: None,
         }
     }
 }
@@ -222,102 +248,122 @@ impl ChatRunQueue {
         let fut = make_fut(cancel.clone());
 
         let mut lanes = self.lanes.lock().await;
-        let lane = if let Some(existing) = lanes.get_mut(&lane_key) {
-            existing
-        } else {
-            let queue = self.clone();
-            let (tx, mut rx) = mpsc::unbounded_channel::<QueuedTask>();
-            let lane_key_worker = lane_key;
-            tokio::spawn(async move {
-                while let Some(task) = rx.recv().await {
-                    let started_wait = task.enqueued_at.elapsed();
-                    if started_wait.as_secs() >= 300 {
-                        warn!(
-                            chat_id = lane_key_worker.chat_id,
-                            persona_id = lane_key_worker.persona_id,
-                            wait_ms = started_wait.as_millis(),
-                            project_id = task.project_id,
-                            workflow_id = task.workflow_id,
-                            "queued task waited a long time before starting"
-                        );
-                    }
-                    let run_id = task.run_id.clone();
-                    let skip = {
-                        let guard = queue.runs.lock().await;
-                        guard
-                            .get(&run_id)
-                            .map(|(_, c)| c.load(Ordering::SeqCst))
-                            .unwrap_or(false)
-                    };
-                    if skip {
-                        queue.finish_one(lane_key_worker, &run_id).await;
-                        continue;
-                    }
-                    {
-                        let mut lanes = queue.lanes.lock().await;
-                        if let Some(lane) = lanes.get_mut(&lane_key_worker) {
-                            lane.current_run_id = Some(run_id.clone());
+        let lane =
+            if let Some(existing) = lanes.get_mut(&lane_key) {
+                existing
+            } else {
+                let queue = self.clone();
+                let (tx, mut rx) = mpsc::unbounded_channel::<QueuedTask>();
+                let lane_key_worker = lane_key;
+                tokio::spawn(async move {
+                    while let Some(task) = rx.recv().await {
+                        let started_wait = task.enqueued_at.elapsed();
+                        if started_wait.as_secs() >= 300 {
+                            warn!(
+                                chat_id = lane_key_worker.chat_id,
+                                persona_id = lane_key_worker.persona_id,
+                                wait_ms = started_wait.as_millis(),
+                                project_id = task.project_id,
+                                workflow_id = task.workflow_id,
+                                "queued task waited a long time before starting"
+                            );
                         }
-                    }
+                        let run_id = task.run_id.clone();
+                        let skip = {
+                            let guard = queue.runs.lock().await;
+                            guard
+                                .get(&run_id)
+                                .map(|(_, c)| c.load(Ordering::SeqCst))
+                                .unwrap_or(false)
+                        };
+                        if skip {
+                            queue.finish_one(lane_key_worker, &run_id).await;
+                            continue;
+                        }
+                        {
+                            let mut lanes = queue.lanes.lock().await;
+                            if let Some(lane) = lanes.get_mut(&lane_key_worker) {
+                                lane.current_run_id = Some(run_id.clone());
+                            }
+                        }
 
-                    // Isolate each queue task so a panic cannot kill the lane worker.
-                    let mut task_handle = tokio::spawn(task.fut);
-                    match tokio::time::timeout(QUEUED_TASK_HARD_TIMEOUT, &mut task_handle).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            let msg = if e.is_panic() {
-                                "queued task panicked; lane recovered".to_string()
-                            } else {
-                                "queued task join failed; lane recovered".to_string()
+                        // Isolate each queue task so a panic cannot kill the lane worker.
+                        let mut task_handle = tokio::spawn(task.fut);
+                        let abort_hook = task.on_hard_abort.clone();
+                        let abort_reason =
+                            match tokio::time::timeout(QUEUED_TASK_HARD_TIMEOUT, &mut task_handle)
+                                .await
+                            {
+                                Ok(Ok(())) => None,
+                                Ok(Err(e)) => {
+                                    let msg = if e.is_panic() {
+                                        "queued task panicked; lane recovered".to_string()
+                                    } else {
+                                        "queued task join failed; lane recovered".to_string()
+                                    };
+                                    warn!(
+                                        chat_id = lane_key_worker.chat_id,
+                                        persona_id = lane_key_worker.persona_id,
+                                        run_id = %run_id,
+                                        error = %e,
+                                        "{msg}"
+                                    );
+                                    queue.note_lane_error(lane_key_worker, msg.clone()).await;
+                                    Some(msg)
+                                }
+                                Err(_) => {
+                                    // Prefer cooperative cancel so the agent can notice, then abort.
+                                    {
+                                        let guard = queue.runs.lock().await;
+                                        if let Some((_, c)) = guard.get(&run_id) {
+                                            c.store(true, Ordering::SeqCst);
+                                        }
+                                    }
+                                    task_handle.abort();
+                                    let _ = task_handle.await;
+                                    let msg = format!(
+                                        "queued task exceeded hard timeout ({}s) and was cancelled",
+                                        QUEUED_TASK_HARD_TIMEOUT.as_secs()
+                                    );
+                                    warn!(
+                                        chat_id = lane_key_worker.chat_id,
+                                        persona_id = lane_key_worker.persona_id,
+                                        run_id = %run_id,
+                                        timeout_secs = QUEUED_TASK_HARD_TIMEOUT.as_secs(),
+                                        "{msg}"
+                                    );
+                                    queue.note_lane_error(lane_key_worker, msg.clone()).await;
+                                    Some(crate::queue_abort::hard_timeout_user_message(
+                                        QUEUED_TASK_HARD_TIMEOUT.as_secs(),
+                                    ))
+                                }
                             };
-                            warn!(
-                                chat_id = lane_key_worker.chat_id,
-                                persona_id = lane_key_worker.persona_id,
-                                run_id = %run_id,
-                                error = %e,
-                                "{msg}"
-                            );
-                            queue.note_lane_error(lane_key_worker, msg).await;
-                        }
-                        Err(_) => {
-                            task_handle.abort();
-                            let _ = task_handle.await;
-                            let msg = format!(
-                                "queued task exceeded hard timeout ({}s) and was cancelled",
-                                QUEUED_TASK_HARD_TIMEOUT.as_secs()
-                            );
-                            warn!(
-                                chat_id = lane_key_worker.chat_id,
-                                persona_id = lane_key_worker.persona_id,
-                                run_id = %run_id,
-                                timeout_secs = QUEUED_TASK_HARD_TIMEOUT.as_secs(),
-                                "{msg}"
-                            );
-                            queue.note_lane_error(lane_key_worker, msg).await;
-                        }
-                    }
 
-                    queue.finish_one(lane_key_worker, &run_id).await;
-                }
-            });
-            lanes.insert(
-                lane_key,
-                PersonaLane {
-                    tx,
-                    pending: 0,
-                    started_at: Instant::now(),
-                    last_error: None,
-                    current_project_id: None,
-                    current_workflow_id: None,
-                    oldest_enqueued_at: None,
-                    items: VecDeque::new(),
-                    current_run_id: None,
-                },
-            );
-            lanes
-                .get_mut(&lane_key)
-                .expect("lane inserted for persona queue")
-        };
+                        if let (Some(reason), Some(hook)) = (abort_reason, abort_hook) {
+                            hook(reason).await;
+                        }
+
+                        queue.finish_one(lane_key_worker, &run_id).await;
+                    }
+                });
+                lanes.insert(
+                    lane_key,
+                    PersonaLane {
+                        tx,
+                        pending: 0,
+                        started_at: Instant::now(),
+                        last_error: None,
+                        current_project_id: None,
+                        current_workflow_id: None,
+                        oldest_enqueued_at: None,
+                        items: VecDeque::new(),
+                        current_run_id: None,
+                    },
+                );
+                lanes
+                    .get_mut(&lane_key)
+                    .expect("lane inserted for persona queue")
+            };
 
         lane.pending = lane.pending.saturating_add(1);
         lane.current_project_id = meta.project_id.or(lane.current_project_id);
@@ -337,6 +383,7 @@ impl ChatRunQueue {
                 run_id: run_id.clone(),
                 project_id: meta.project_id,
                 workflow_id: meta.workflow_id,
+                on_hard_abort: meta.on_hard_abort.clone(),
             })
             .is_err()
         {
@@ -547,6 +594,7 @@ mod tests {
             label: format!("chat {chat_id} persona {persona_id}"),
             project_id: None,
             workflow_id: None,
+            on_hard_abort: None,
         }
     }
 

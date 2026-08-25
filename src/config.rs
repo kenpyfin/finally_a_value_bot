@@ -293,6 +293,14 @@ fn default_hook_prompt_model() -> String {
     String::new()
 }
 
+fn default_delivery_char_limit_max_chars() -> usize {
+    0
+}
+
+fn default_delivery_char_limit_summary_chars() -> usize {
+    0
+}
+
 fn default_allow_fuzzy_search_replace() -> bool {
     false
 }
@@ -644,6 +652,12 @@ pub struct Config {
     /// Optional model override for prompt hooks.
     #[serde(default = "default_hook_prompt_model")]
     pub hook_prompt_model: String,
+    /// Max assistant reply characters before PreDelivery PDF spill (0 = channel defaults).
+    #[serde(default = "default_delivery_char_limit_max_chars")]
+    pub delivery_char_limit_max_chars: usize,
+    /// Summary excerpt length for PDF spill delivery (0 = built-in default).
+    #[serde(default = "default_delivery_char_limit_summary_chars")]
+    pub delivery_char_limit_summary_chars: usize,
     /// Allow fuzzy fallback in apply_search_replace when input requests allow_fuzzy.
     #[serde(default = "default_allow_fuzzy_search_replace")]
     pub allow_fuzzy_search_replace: bool,
@@ -1164,6 +1178,14 @@ impl Config {
                 default_hook_prompt_timeout_secs(),
             ),
             hook_prompt_model: Self::env("HOOK_PROMPT_MODEL").unwrap_or_default(),
+            delivery_char_limit_max_chars: Self::env_usize(
+                "DELIVERY_CHAR_LIMIT_MAX_CHARS",
+                default_delivery_char_limit_max_chars(),
+            ),
+            delivery_char_limit_summary_chars: Self::env_usize(
+                "DELIVERY_CHAR_LIMIT_SUMMARY_CHARS",
+                default_delivery_char_limit_summary_chars(),
+            ),
             allow_fuzzy_search_replace: Self::env_bool(
                 "ALLOW_FUZZY_SEARCH_REPLACE",
                 default_allow_fuzzy_search_replace(),
@@ -1977,6 +1999,8 @@ pub fn test_config() -> Config {
         hook_command_timeout_secs: default_hook_command_timeout_secs(),
         hook_prompt_timeout_secs: default_hook_prompt_timeout_secs(),
         hook_prompt_model: String::new(),
+        delivery_char_limit_max_chars: 0,
+        delivery_char_limit_summary_chars: 0,
         allow_fuzzy_search_replace: false,
         symbol_edit_enabled: false,
         post_edit_validation_enabled: true,

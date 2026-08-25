@@ -955,6 +955,39 @@ async fn api_send(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     let queue_label = body.message.chars().take(120).collect::<String>();
+    let abort_hook = {
+        let db = state.app_state.db.clone();
+        let bot_username = state.app_state.config.bot_username.clone();
+        let run_hub = state.run_hub.clone();
+        let run_id_abort = run_id.clone();
+        let limits = state.limits.clone();
+        let base = crate::queue_abort::make_store_only_hard_abort_hook(
+            db,
+            bot_username,
+            chat_id,
+            persona_id_queue,
+            run_id.clone(),
+        );
+        std::sync::Arc::new(move |reason: String| {
+            let run_hub = run_hub.clone();
+            let run_id_abort = run_id_abort.clone();
+            let limits = limits.clone();
+            let base = base.clone();
+            let reason_for_hub = reason.clone();
+            Box::pin(async move {
+                base(reason).await;
+                run_hub
+                    .publish(
+                        &run_id_abort,
+                        "error",
+                        serde_json::json!({ "error": reason_for_hub }).to_string(),
+                        limits.run_history_limit,
+                    )
+                    .await;
+                run_hub.remove_later(run_id_abort, 300).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        })
+    };
     let queue_meta = QueueEnqueueMeta {
         run_id: run_id.clone(),
         persona_id: persona_id_queue,
@@ -962,6 +995,7 @@ async fn api_send(
         label: queue_label,
         project_id: None,
         workflow_id: None,
+        on_hard_abort: Some(abort_hook),
     };
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();
@@ -1121,6 +1155,39 @@ async fn api_send_stream(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     let queue_label = text.chars().take(120).collect::<String>();
+    let abort_hook = {
+        let db = state.app_state.db.clone();
+        let bot_username = state.app_state.config.bot_username.clone();
+        let run_hub = state.run_hub.clone();
+        let run_id_abort = run_id.clone();
+        let limits = state.limits.clone();
+        let base = crate::queue_abort::make_store_only_hard_abort_hook(
+            db,
+            bot_username,
+            chat_id,
+            persona_id_queue,
+            run_id.clone(),
+        );
+        std::sync::Arc::new(move |reason: String| {
+            let run_hub = run_hub.clone();
+            let run_id_abort = run_id_abort.clone();
+            let limits = limits.clone();
+            let base = base.clone();
+            let reason_for_hub = reason.clone();
+            Box::pin(async move {
+                base(reason).await;
+                run_hub
+                    .publish(
+                        &run_id_abort,
+                        "error",
+                        serde_json::json!({ "error": reason_for_hub }).to_string(),
+                        limits.run_history_limit,
+                    )
+                    .await;
+                run_hub.remove_later(run_id_abort, 300).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        })
+    };
     let queue_meta = QueueEnqueueMeta {
         run_id: run_id.clone(),
         persona_id: persona_id_queue,
@@ -1128,6 +1195,7 @@ async fn api_send_stream(
         label: queue_label,
         project_id: None,
         workflow_id: None,
+        on_hard_abort: Some(abort_hook),
     };
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();

@@ -38,6 +38,8 @@ pub struct HookOutput {
     #[serde(default)]
     pub updated_tool_input: Option<Value>,
     #[serde(default)]
+    pub updated_assistant_text: Option<String>,
+    #[serde(default)]
     pub effects: Option<HookOutputEffects>,
 }
 
@@ -246,6 +248,7 @@ pub async fn execute_command_hook(
                     agent_message: None,
                     additional_context: None,
                     updated_tool_input: None,
+                    updated_assistant_text: None,
                     effects: None,
                 });
             }
@@ -260,6 +263,7 @@ pub async fn execute_command_hook(
                     agent_message: None,
                     additional_context: None,
                     updated_tool_input: None,
+                    updated_assistant_text: None,
                     effects: None,
                 });
             }
@@ -279,6 +283,7 @@ pub async fn execute_command_hook(
                 agent_message: None,
                 additional_context: None,
                 updated_tool_input: None,
+                updated_assistant_text: None,
                 effects: None,
             });
         }
@@ -296,6 +301,7 @@ pub async fn execute_command_hook(
             agent_message: None,
             additional_context: None,
             updated_tool_input: None,
+            updated_assistant_text: None,
             effects: None,
         }),
         _ => {
@@ -309,6 +315,7 @@ pub async fn execute_command_hook(
                     agent_message: None,
                     additional_context: None,
                     updated_tool_input: None,
+                    updated_assistant_text: None,
                     effects: None,
                 })
             } else {

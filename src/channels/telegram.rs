@@ -1570,6 +1570,22 @@ async fn handle_message(
     let canonical_chat_id_spawn = canonical_chat_id;
     let queue_label = text.chars().take(120).collect::<String>();
     let queue_run_id = uuid::Uuid::new_v4().to_string();
+    let on_hard_abort = Some(crate::queue_abort::make_deliver_hard_abort_hook(
+        state.db.clone(),
+        state.telegram_bots.clone(),
+        state.discord_http.clone(),
+        state.wecom.clone(),
+        state.config.bot_username.clone(),
+        canonical_chat_id_spawn,
+        persona_id,
+        queue_run_id.clone(),
+        crate::channel::DeliveryScope::PlatformInstance {
+            channel_type: "telegram",
+            bot_instance_id: telegram_bot_instance_id,
+            channel_handle: None,
+        },
+        Some(state.config.workspace_root_absolute()),
+    ));
     let queue_meta = QueueEnqueueMeta {
         run_id: queue_run_id,
         persona_id,
@@ -1577,6 +1593,7 @@ async fn handle_message(
         label: queue_label,
         project_id: None,
         workflow_id: None,
+        on_hard_abort,
     };
     let (queue_position, _) = state
         .chat_queue
@@ -4366,17 +4383,41 @@ async fn finish_turn_with_quality_gate(
     multimodel_summary: &crate::local_delegate::LocalDelegateRunSummary,
     pipeline_extras: Option<&crate::agent_history::PipelineFinishExtras>,
 ) -> anyhow::Result<FinishTurnOutcome> {
-    let (hook_summary, should_run_focus_sync) = run_post_delivery_hooks_before_gate(
-        state,
-        context,
-        event_tx,
-        run_key,
-        chat_id,
-        persona_id,
-        stop_reason,
-        final_text,
-    )
-    .await;
+    let (pre_delivery_summary, post_delivery_out) = {
+        let pre = run_pre_delivery_hooks(
+            state,
+            context,
+            event_tx,
+            run_key,
+            chat_id,
+            persona_id,
+            stop_reason,
+            final_text,
+        )
+        .await;
+        let post = run_post_delivery_hooks_before_gate(
+            state,
+            context,
+            event_tx,
+            run_key,
+            chat_id,
+            persona_id,
+            stop_reason,
+            final_text,
+        )
+        .await;
+        (pre, post)
+    };
+    let (hook_summary, should_run_focus_sync) = {
+        let (post_summary, focus_sync) = post_delivery_out;
+        let summary = match (pre_delivery_summary, post_summary) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        (summary, focus_sync)
+    };
     if let Some(summary) = hook_summary {
         if let Some(last) = history_iterations.last_mut() {
             last.hook_events.push(summary);
@@ -4440,15 +4481,47 @@ async fn finish_turn_with_quality_gate(
         )
         .await;
 
-        match crate::response_quality_evaluator::evaluate_delivery_quality(
-            state.runtime_toggles.response_quality_evaluator_enabled(),
-            &state.config,
-            Some(&state.llm.local_delegate_config()),
-            state.env_redactor.as_ref(),
-            &pdqe_ctx,
+        // Outer wall clock so provider construction / unexpected hangs cannot block delivery.
+        const PDQE_WALL_TIMEOUT_SECS: u64 = crate::llm::EVALUATOR_TIMEOUT_SECS + 30;
+        let pdqe_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(PDQE_WALL_TIMEOUT_SECS),
+            crate::response_quality_evaluator::evaluate_delivery_quality(
+                state.runtime_toggles.response_quality_evaluator_enabled(),
+                &state.config,
+                Some(&state.llm.local_delegate_config()),
+                state.env_redactor.as_ref(),
+                &pdqe_ctx,
+            ),
         )
         .await
         {
+            Ok(inner) => inner,
+            Err(_) => {
+                tracing::warn!(
+                    run_key,
+                    chat_id,
+                    persona_id,
+                    timeout_secs = PDQE_WALL_TIMEOUT_SECS,
+                    "PDQE wall timeout; fail-open and deliver"
+                );
+                push_pdqe_step(
+                    pdqe_steps,
+                    "quality_eval_error",
+                    &serde_json::json!({
+                        "error": format!(
+                            "PDQE wall timeout after {PDQE_WALL_TIMEOUT_SECS}s"
+                        )
+                    })
+                    .to_string(),
+                    &provider_label,
+                );
+                Err(crate::error::FinallyAValueBotError::Config(format!(
+                    "PDQE wall timeout after {PDQE_WALL_TIMEOUT_SECS}s"
+                )))
+            }
+        };
+
+        match pdqe_result {
             Ok(outcome) => {
                 let verdict = outcome.verdict;
                 let eval_provider_label = if outcome.provider_label.is_empty() {
@@ -4570,18 +4643,34 @@ async fn finish_turn_with_quality_gate(
     }
 
     if should_run_focus_sync {
-        run_persona_focus_sync_after_delivery(
-            state,
-            chat_id,
-            persona_id,
-            context.caller_channel,
-            messages,
-            final_text.len(),
-            had_tool_calls,
-            context.is_background_job,
-            is_conversational,
+        // Bound so bulletin focus sync cannot leave the turn without run_finished.
+        const FOCUS_SYNC_WALL_TIMEOUT_SECS: u64 = 120;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(FOCUS_SYNC_WALL_TIMEOUT_SECS),
+            run_persona_focus_sync_after_delivery(
+                state,
+                chat_id,
+                persona_id,
+                context.caller_channel,
+                messages,
+                final_text.len(),
+                had_tool_calls,
+                context.is_background_job,
+                is_conversational,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => {
+                tracing::warn!(
+                    chat_id,
+                    persona_id,
+                    timeout_secs = FOCUS_SYNC_WALL_TIMEOUT_SECS,
+                    "focus_sync wall timeout; continuing to deliver"
+                );
+            }
+        }
     }
 
     if let Some(tx) = event_tx {
@@ -4627,26 +4716,77 @@ async fn finish_turn_with_quality_gate(
         &record,
     );
     let run_key_for_db = run_key.to_string();
-    tokio::spawn({
-        let db = state.db.clone();
-        async move {
-            let _ = call_blocking(db.clone(), move |db| {
-                db.append_run_timeline_event(
-                    &run_key_for_db,
-                    chat_id,
-                    persona_id,
-                    "run_finished",
-                    Some(&format!(r#"{{"stop_reason":"{}"}}"#, stop_reason_owned)),
-                )?;
-                Ok(())
-            })
-            .await;
-        }
-    });
+    let stop_reason_for_db = stop_reason_owned.clone();
+    if let Err(e) = call_blocking(state.db.clone(), move |db| {
+        db.append_run_timeline_event(
+            &run_key_for_db,
+            chat_id,
+            persona_id,
+            "run_finished",
+            Some(&format!(r#"{{"stop_reason":"{}"}}"#, stop_reason_for_db)),
+        )?;
+        Ok(())
+    })
+    .await
+    {
+        tracing::warn!(
+            run_key,
+            chat_id,
+            persona_id,
+            error = %e,
+            "failed to append run_finished timeline event"
+        );
+    }
 
     Ok(FinishTurnOutcome::Complete(agent_process_result(
         final_text.clone(),
     )))
+}
+
+async fn run_pre_delivery_hooks(
+    state: &AppState,
+    context: &AgentRequestContext<'_>,
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    run_key: &str,
+    chat_id: i64,
+    persona_id: i64,
+    stop_reason: &str,
+    final_text: &mut String,
+) -> Option<String> {
+    if let Ok(pre_delivery_hook) = run_hooks_for_event_async(
+        state.db.clone(),
+        &state.config,
+        state.env_redactor.as_ref(),
+        HookEventName::PreDelivery,
+        &HookRunInput {
+            chat_id,
+            persona_id,
+            caller_channel: context.caller_channel.to_string(),
+            is_scheduled_task: context.is_scheduled_task,
+            stop_reason: Some(stop_reason.to_string()),
+            assistant_text: Some(final_text.clone()),
+            ..HookRunInput::default()
+        },
+    )
+    .await
+    {
+        publish_hook_event(
+            state,
+            event_tx,
+            run_key,
+            chat_id,
+            persona_id,
+            HookEventName::PreDelivery,
+            None,
+            &pre_delivery_hook,
+        )
+        .await;
+        if let Some(ref updated) = pre_delivery_hook.updated_assistant_text {
+            *final_text = updated.clone();
+        }
+        return hook_event_summary(HookEventName::PreDelivery, None, &pre_delivery_hook);
+    }
+    None
 }
 
 async fn run_post_delivery_hooks_before_gate(

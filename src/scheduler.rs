@@ -233,6 +233,13 @@ async fn run_due_tasks(
             let chat_id_for_queue = prepared.chat_id;
             let prompt_label = prepared.prompt.chars().take(120).collect::<String>();
             let queue_run_id = uuid::Uuid::new_v4().to_string();
+            let on_hard_abort = Some(crate::queue_abort::make_store_only_hard_abort_hook(
+                state.db.clone(),
+                state.config.bot_username.clone(),
+                chat_id_for_queue,
+                prepared.persona_id,
+                queue_run_id.clone(),
+            ));
             let queue_meta = QueueEnqueueMeta {
                 run_id: queue_run_id,
                 persona_id: prepared.persona_id,
@@ -240,6 +247,7 @@ async fn run_due_tasks(
                 label: prompt_label,
                 project_id: None,
                 workflow_id: None,
+                on_hard_abort,
             };
             let chat_queue = state.chat_queue.clone();
             let (queue_position, _) = chat_queue

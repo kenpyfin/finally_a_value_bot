@@ -598,13 +598,31 @@ pub(crate) async fn ingest_wecom_incoming(
     let chat_queue = app_state.chat_queue.clone();
     let chat_type = if is_group { "group" } else { "private" };
     let queue_label = text.chars().take(120).collect::<String>();
+    let queue_run_id = uuid::Uuid::new_v4().to_string();
+    let on_hard_abort = Some(crate::queue_abort::make_deliver_hard_abort_hook(
+        app_state.db.clone(),
+        app_state.telegram_bots.clone(),
+        app_state.discord_http.clone(),
+        app_state.wecom.clone(),
+        app_state.config.bot_username.clone(),
+        chat_id,
+        persona_id,
+        queue_run_id.clone(),
+        crate::channel::DeliveryScope::platform_reply(
+            "wecom",
+            crate::db::BOT_INSTANCE_WECOM_PRIMARY,
+            handle.clone(),
+        ),
+        Some(app_state.config.workspace_root_absolute()),
+    ));
     let queue_meta = QueueEnqueueMeta {
-        run_id: uuid::Uuid::new_v4().to_string(),
+        run_id: queue_run_id,
         persona_id,
         source: QueueSource::Wecom,
         label: queue_label,
         project_id: None,
         workflow_id: None,
+        on_hard_abort,
     };
     let app_state_run = app_state.clone();
     let (queue_position, _) = chat_queue

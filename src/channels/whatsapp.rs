@@ -539,6 +539,18 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                 let to_phone = message.from.clone();
                 let queue_run_id = uuid::Uuid::new_v4().to_string();
                 let queue_label = text.chars().take(120).collect::<String>();
+                let on_hard_abort = Some(crate::queue_abort::make_deliver_hard_abort_hook(
+                    app_state.db.clone(),
+                    app_state.telegram_bots.clone(),
+                    app_state.discord_http.clone(),
+                    app_state.wecom.clone(),
+                    app_state.config.bot_username.clone(),
+                    chat_id,
+                    persona_id,
+                    queue_run_id.clone(),
+                    crate::channel::DeliveryScope::StoreOnly,
+                    Some(app_state.config.workspace_root_absolute()),
+                ));
                 let queue_meta = QueueEnqueueMeta {
                     run_id: queue_run_id,
                     persona_id,
@@ -546,6 +558,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                     label: queue_label,
                     project_id: None,
                     workflow_id: None,
+                    on_hard_abort,
                 };
                 let (queue_position, _) = chat_queue
                     .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {

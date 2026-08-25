@@ -517,6 +517,8 @@ fn default_config() -> Config {
         hook_command_timeout_secs: 10,
         hook_prompt_timeout_secs: 15,
         hook_prompt_model: String::new(),
+        delivery_char_limit_max_chars: 0,
+        delivery_char_limit_summary_chars: 0,
         allow_fuzzy_search_replace: false,
         symbol_edit_enabled: false,
         post_edit_validation_enabled: true,

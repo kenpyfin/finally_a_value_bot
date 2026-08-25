@@ -15,6 +15,14 @@ Template:
 
 ---
 
+### 2026-08-21 — Interactive runs hung with no reply / orphan Cursor bridges
+
+- **Symptom:** User messages on PZ, selling_oversea, Videographer stayed unanswered for 40+ minutes to hours; timeline showed `run_started` / tools / sometimes `quality_eval_started` but never `run_finished`. Many hours-old `cursor-sdk-bridge.js` processes; sidecar logged `Cannot write to closing transport` and bridge discovery timeouts.
+- **Root cause:** (1) Finish path could hang in PDQE setup or focus sync with no wall clock, so delivery + `run_finished` never ran; (2) queue hard timeout aborted the task without a user-visible notice; (3) warm bridges for `main` stayed pooled, but client disconnect / retries left OS bridge processes outside `_POOL` that the idle reaper never saw.
+- **Fix:** Hard-abort hooks deliver a notice + `run_finished`; PDQE/focus-sync wall timeouts; await `run_finished` before completing the turn; sidecar orphan PID sweeper + disconnect eviction; tighter default idle TTL (600s) and pool max (16).
+- **Prevention:** Never return from finish without `run_finished`; never leave `/run` client disconnect without pool eviction; alert when `/health` `os_bridge_pids` ≫ `persona_bridges_active`.
+- **Files/refs:** `src/queue_abort.rs`; `src/chat_queue.rs` (`QUEUED_TASK_HARD_TIMEOUT`); `finish_turn_with_quality_gate` in `src/channels/telegram.rs`; `scripts/cursor-sdk-runner.py` (`_kill_orphan_bridge_processes`, `handle_run`).
+
 ### 2026-08-20 — WeCom stopped receiving after late Cursor replies
 
 - **Symptom:** After `(Cursor agent completed with no text output.)` (or other long Cursor turns), group @-mentions no longer produced `aibot_msg_callback` frames; DM sometimes still worked briefly, then silence for hours with no reconnect log.

@@ -3,7 +3,7 @@ name: create-hook
 description: Author and register lifecycle hooks (block/add_context/command/prompt) in hook_definitions.
 when_to_use: |
   Use when the user wants deterministic automation around agent lifecycle events
-  (BeforeTurn, PreToolUse, PostToolUse, PostToolBatch, PreStop, PostDelivery),
+  (BeforeTurn, PreToolUse, PostToolUse, PostToolBatch, PreStop, PreDelivery, PostDelivery),
   including command-hook scripts and prompt-hook policy checks.
 license: MIT
 compatibility:
@@ -69,6 +69,7 @@ Use this skill to create or update bot-native hooks stored in SQLite `hook_defin
   - `permission`: `allow` | `deny` | `ask`
   - `reason`, `user_message`, `agent_message`, `additional_context`
   - `updated_tool_input`
+  - `updated_assistant_text` (PreDelivery: replace the outgoing reply)
   - `effects.memory_tier3_prune.terminal_pz_post_ids`
 
 Non-zero exit behavior:
