@@ -745,8 +745,8 @@ export function AppDialogs({
         <SettingsAgentEnginePanel
           api={api}
           onError={setSettingsError}
-          chatId={chatId}
           activePersonaId={activePersonaId}
+          personas={personas}
         />
       </Tabs.Content>
       <Tabs.Content value="hooks-skills">

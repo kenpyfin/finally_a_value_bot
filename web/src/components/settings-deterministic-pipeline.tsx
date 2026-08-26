@@ -314,8 +314,8 @@ export function SettingsDeterministicPipelinePanel({ api, onError }: Props) {
       {agentEngine !== 'deterministic' ? (
         <Callout.Root color="orange" size="1" variant="soft">
           <Callout.Text>
-            Agent engine is <strong>{agentEngine}</strong> (global inherit default). This profile
-            applies when a persona&apos;s engine is <strong>Deterministic</strong>.
+            This profile applies when the current persona&apos;s engine is{' '}
+            <strong>Deterministic</strong>.
           </Callout.Text>
         </Callout.Root>
       ) : null}
