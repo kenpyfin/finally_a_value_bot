@@ -21,6 +21,7 @@ pub enum HookEventName {
     PostToolBatch,
     PreStop,
     PostDelivery,
+    PreDelivery,
 }
 
 impl HookEventName {
@@ -32,6 +33,7 @@ impl HookEventName {
             Self::PostToolBatch => "PostToolBatch",
             Self::PreStop => "PreStop",
             Self::PostDelivery => "PostDelivery",
+            Self::PreDelivery => "PreDelivery",
         }
     }
 }
@@ -64,6 +66,7 @@ pub struct HookRunResult {
     pub updated_tool_input: Option<Value>,
     pub memory_effects: HookMemoryEffects,
     pub run_persona_focus_sync: bool,
+    pub updated_assistant_text: Option<String>,
 }
 
 fn event_matches(record: &HookDefinitionRecord, event: HookEventName) -> bool {
@@ -94,7 +97,7 @@ fn matcher_target(input: &HookRunInput, event: HookEventName) -> String {
             }
             parts.join("\n")
         }
-        HookEventName::PreStop | HookEventName::PostDelivery => input
+        HookEventName::PreStop | HookEventName::PostDelivery | HookEventName::PreDelivery => input
             .stop_reason
             .clone()
             .or_else(|| input.assistant_text.clone())
@@ -197,7 +200,7 @@ pub async fn run_hooks_for_event_async(
     let chat_id = input.chat_id;
     let persona_id = input.persona_id;
     let input_cloned = input.clone();
-    let hooks = call_blocking(db, move |db| {
+    let hooks = call_blocking(db.clone(), move |db| {
         let hooks = db.list_hook_definitions()?;
         let mut matched = Vec::new();
         for hook in hooks {
@@ -241,6 +244,12 @@ pub async fn run_hooks_for_event_async(
         }
         if output.updated_tool_input.is_some() {
             out.updated_tool_input = output.updated_tool_input;
+        }
+        if let Some(text) = output
+            .updated_assistant_text
+            .filter(|s| !s.trim().is_empty())
+        {
+            out.updated_assistant_text = Some(text);
         }
         if let Some(effects) = output.effects.and_then(|e| e.memory_tier3_prune) {
             for id in effects.terminal_pz_post_ids {
@@ -361,6 +370,22 @@ pub async fn run_hooks_for_event_async(
                             .to_string(),
                     );
                     break;
+                }
+            }
+            "builtin_dense_delivery_guard" => {
+                if let Some(text) = input.assistant_text.as_deref() {
+                    if let Some(updated) = crate::dense_delivery_guard::maybe_apply_dense_delivery(
+                        config,
+                        db.as_ref(),
+                        input.chat_id,
+                        input.persona_id,
+                        &input.caller_channel,
+                        text,
+                    )
+                    .await
+                    {
+                        out.updated_assistant_text = Some(updated);
+                    }
                 }
             }
             _ => {}

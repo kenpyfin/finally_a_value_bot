@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { EmptyState } from './empty-state'
-import { Button, Dialog, Flex, Select, Text, TextArea } from '@radix-ui/themes'
+import { Button, Dialog, Flex, Select, Switch, Text, TextArea } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api/client'
@@ -10,6 +10,7 @@ import {
   type InstallationStatus,
   type PersonaBulletinFocus,
   type PersonaBulletinHistorySuffix,
+  type PersonaDenseDeliveryInfo,
   type PersonaMessageBookmark,
   type QueueLane,
 } from '../types'
@@ -71,6 +72,7 @@ export type CockpitBarProps = {
   historySuffix: PersonaBulletinHistorySuffix | null
   /** Server-stored operator memo (may be null). */
   operatorMemoServer: string | null
+  denseDelivery: PersonaDenseDeliveryInfo | null
   /** Reload bulletin after PATCH (same persona). */
   reloadBulletin: () => Promise<void>
   /** Short status line updates after successful saves. */
@@ -99,6 +101,7 @@ export const CockpitBar = React.memo(function CockpitBar({
   onRemoveBookmark,
   historySuffix,
   operatorMemoServer,
+  denseDelivery,
   reloadBulletin,
   onBulletinStatus,
   floating = false,
@@ -125,6 +128,8 @@ export const CockpitBar = React.memo(function CockpitBar({
   const [memoDraft, setMemoDraft] = useState('')
   const [memoBusy, setMemoBusy] = useState(false)
   const [memoError, setMemoError] = useState('')
+  const [deliveryBusy, setDeliveryBusy] = useState(false)
+  const [deliveryError, setDeliveryError] = useState('')
   const [bulletinFullOpen, setBulletinFullOpen] = useState(false)
   const expandedRootRef = useRef<HTMLDivElement | null>(null)
   const panelId = useId()
@@ -199,6 +204,27 @@ export const CockpitBar = React.memo(function CockpitBar({
     reloadBulletin,
     onBulletinStatus,
   ])
+
+  const applyDenseDelivery = useCallback(
+    async (enabled: boolean) => {
+      if (activePersonaId == null) return
+      setDeliveryBusy(true)
+      setDeliveryError('')
+      try {
+        await api(`/api/personas/${activePersonaId}/bulletin`, {
+          method: 'PATCH',
+          body: JSON.stringify({ dense_delivery_enabled: enabled }),
+        })
+        await reloadBulletin()
+        onBulletinStatus?.(enabled ? 'Dense delivery on' : 'Dense delivery off')
+      } catch (e) {
+        setDeliveryError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setDeliveryBusy(false)
+      }
+    },
+    [activePersonaId, reloadBulletin, onBulletinStatus],
+  )
 
   const onMemoBlur = useCallback(() => {
     if (!memoDirty || memoBusy || memoTooLong) return
@@ -572,6 +598,37 @@ export const CockpitBar = React.memo(function CockpitBar({
                     {memoError}
                   </Text>
                 ) : null}
+              </div>
+
+              <div className="border-t border-[color:var(--mc-border-soft)] pt-3">
+                <Flex align="center" justify="between" gap="3" wrap="wrap">
+                  <Flex direction="column" gap="1" style={{ flex: 1, minWidth: 200 }}>
+                    <Text size="1" weight="medium">
+                      Dense delivery (short message + PDF link)
+                    </Text>
+                    <Text size="1" color="gray" className="leading-snug">
+                      Spill over the channel cap to PDF, upload to catbox, then send a summary with a
+                      public HTTPS URL. Needed for WeCom/Telegram long reports.
+                    </Text>
+                    {denseDelivery?.enabled ? (
+                      <Text size="1" color="gray">
+                        Caps: messaging {denseDelivery.messaging_max_chars} chars, web{' '}
+                        {denseDelivery.web_max_chars} chars
+                      </Text>
+                    ) : null}
+                    {deliveryError ? (
+                      <Text size="1" color="red">
+                        {deliveryError}
+                      </Text>
+                    ) : null}
+                  </Flex>
+                  <Switch
+                    size="2"
+                    checked={denseDelivery?.enabled ?? false}
+                    disabled={activePersonaId == null || deliveryBusy}
+                    onCheckedChange={(checked) => void applyDenseDelivery(checked)}
+                  />
+                </Flex>
               </div>
             </div>
 

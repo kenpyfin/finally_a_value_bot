@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Callout, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
-import type { LlmConfigResponse, LlmProviderOption } from '../types'
+import type { LlmCatalogModel, LlmConfigResponse, LlmLiveCatalogResponse, LlmProviderOption } from '../types'
 
 type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
@@ -21,6 +21,13 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
   const [showThinking, setShowThinking] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
+  const [liveModels, setLiveModels] = useState<LlmCatalogModel[] | null>(null)
+  const [catalogSource, setCatalogSource] = useState<'live' | 'static_fallback' | 'static_curated'>(
+    'static_curated',
+  )
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [modelsNotice, setModelsNotice] = useState<string | null>(null)
+  const lastLoadedKeyRef = useRef('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -62,6 +69,10 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
       }
       setThinkingEnabled(data.thinking_enabled === true)
       setShowThinking(data.show_thinking === true)
+      setLiveModels(null)
+      setCatalogSource('static_curated')
+      setModelsNotice(null)
+      lastLoadedKeyRef.current = ''
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       setLlm(null)
@@ -79,7 +90,8 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
     [llm?.providers, selectedProvider],
   )
 
-  const catalogForProvider = activeProviderEntry?.models ?? llm?.catalog ?? []
+  const staticCatalog = activeProviderEntry?.models ?? llm?.catalog ?? []
+  const catalogForProvider = liveModels ?? staticCatalog
 
   const isLocalProvider =
     selectedProvider === 'ollama' ||
@@ -91,9 +103,98 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
     selectedProvider === 'gemini' ||
     llm?.thinking_supported === true
 
+  const applyCatalogSelection = useCallback(
+    (models: LlmCatalogModel[]) => {
+      const current = (useCustom ? customModel : selectedModel).trim() || (llm?.model ?? '').trim()
+      if (current && models.some((m) => m.id === current)) {
+        setUseCustom(false)
+        setSelectedModel(current)
+        setCustomModel('')
+        return
+      }
+      if (!current && models[0]) {
+        setUseCustom(false)
+        setSelectedModel(models[0].id)
+      }
+    },
+    [customModel, llm?.model, selectedModel, useCustom],
+  )
+
+  const loadLiveModels = useCallback(
+    async (opts?: { silent?: boolean; provider?: string; baseUrl?: string }) => {
+      const provider = (opts?.provider ?? selectedProvider).trim()
+      if (!provider) return
+      const local =
+        provider === 'ollama' || provider === 'llama' || provider === 'llamacpp'
+      const baseUrl = (opts?.baseUrl ?? serverUrl).trim()
+      if (local && !baseUrl) {
+        if (!opts?.silent) {
+          onError('Enter the local server URL before loading models.')
+        }
+        return
+      }
+
+      const loadKey = `${provider}|${local ? baseUrl : ''}`
+      setLoadingModels(true)
+      setModelsNotice(null)
+      try {
+        const qs = new URLSearchParams({ provider })
+        if (local) qs.set('base_url', baseUrl)
+        const res = await api<LlmLiveCatalogResponse>(`/api/llm/models?${qs.toString()}`)
+        const models = res.models ?? []
+        lastLoadedKeyRef.current = loadKey
+        setLiveModels(models)
+        setCatalogSource(res.source === 'live' ? 'live' : 'static_fallback')
+        applyCatalogSelection(models)
+        if (res.source === 'live') {
+          const n = res.live_count ?? models.filter((m) => m.from_live).length
+          const truncated = res.truncated ? ' (truncated; use custom id for others)' : ''
+          setModelsNotice(`${n} model${n === 1 ? '' : 's'} loaded from provider API${truncated}.`)
+        } else {
+          const msg = res.message?.trim() || 'Provider API unavailable; showing curated list.'
+          setModelsNotice(msg)
+          if (!opts?.silent) onError(msg)
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        setLiveModels(null)
+        setCatalogSource('static_fallback')
+        setModelsNotice(null)
+        if (!opts?.silent) onError(msg)
+      } finally {
+        setLoadingModels(false)
+      }
+    },
+    [api, applyCatalogSelection, onError, selectedProvider, serverUrl],
+  )
+
+  useEffect(() => {
+    if (!selectedProvider || loading) return
+    const local =
+      selectedProvider === 'ollama' ||
+      selectedProvider === 'llama' ||
+      selectedProvider === 'llamacpp'
+    if (local && !serverUrl.trim()) {
+      lastLoadedKeyRef.current = ''
+      return
+    }
+    const loadKey = `${selectedProvider}|${local ? serverUrl.trim() : ''}`
+    if (loadKey === lastLoadedKeyRef.current) return
+
+    const timer = window.setTimeout(() => {
+      void loadLiveModels({ silent: true, provider: selectedProvider, baseUrl: serverUrl })
+    }, local ? 500 : 0)
+
+    return () => window.clearTimeout(timer)
+  }, [loadLiveModels, loading, selectedProvider, serverUrl])
+
   function onProviderChange(nextProvider: string) {
     setSelectedProvider(nextProvider)
     setSaveNotice(null)
+    setLiveModels(null)
+    setCatalogSource('static_curated')
+    setModelsNotice(null)
+    lastLoadedKeyRef.current = ''
     const entry = llm?.providers?.find((p) => p.id === nextProvider)
     const firstModel = entry?.models?.[0]?.id ?? ''
     if (!useCustom) {
@@ -161,14 +262,18 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
   }
 
   const selectedCatalog = catalogForProvider.find((m) => m.id === selectedModel)
+  const catalogLabel = (m: LlmCatalogModel) => {
+    if (m.from_active_config) return `${m.id} (active, from config)`
+    return m.id
+  }
 
   return (
     <Flex direction="column" gap="3">
       <Text size="1" color="gray">
         Put API keys in repo-root <code className="text-xs">.env</code> only (never in this UI).
         Provider and model are configured here and saved in the app database - not in{' '}
-        <code className="text-xs">.env</code>. Lists are curated in code, not live from provider
-        APIs; use custom model id for newer releases.
+        <code className="text-xs">.env</code>. Model lists load live from the provider API; curated
+        cost hints are shown when the id matches.
       </Text>
 
       <Flex direction="column" gap="2">
@@ -233,16 +338,27 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
       ) : null}
 
       <Flex direction="column" gap="2">
-        <Text size="2" weight="medium">
-          Model
-        </Text>
+        <Flex align="center" justify="between" gap="3">
+          <Text size="2" weight="medium">
+            Model
+          </Text>
+          <Button
+            size="1"
+            variant="soft"
+            type="button"
+            disabled={loadingModels || (llm.providers ?? []).length === 0}
+            onClick={() => void loadLiveModels()}
+          >
+            {loadingModels ? 'Loading…' : 'Refresh models'}
+          </Button>
+        </Flex>
         {!useCustom ? (
           <Select.Root value={selectedModel} onValueChange={setSelectedModel}>
             <Select.Trigger placeholder="Select model" />
             <Select.Content>
               {catalogForProvider.map((m) => (
                 <Select.Item key={m.id} value={m.id}>
-                  {m.from_active_config ? `${m.id} (active, from config)` : m.id}
+                  {catalogLabel(m)}
                 </Select.Item>
               ))}
             </Select.Content>
@@ -253,6 +369,17 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
             value={customModel}
             onChange={(e) => setCustomModel(e.target.value)}
           />
+        )}
+        {modelsNotice ? (
+          <Text size="1" color={catalogSource === 'live' ? 'green' : 'gray'}>
+            {modelsNotice}
+          </Text>
+        ) : (
+          <Text size="1" color="gray">
+            {catalogSource === 'live'
+              ? 'Showing live models from the provider API.'
+              : 'Showing curated fallback until the provider API responds.'}
+          </Text>
         )}
         {llm.custom_model_allowed ? (
           <Button

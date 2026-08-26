@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Callout, Flex, Switch, Text } from '@radix-ui/themes'
+import { Flex, Switch, Text } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
-import type { CursorEngineConfigResponse, RuntimeConfigResponse } from '../types'
+import type { RuntimeConfigResponse } from '../types'
 
 type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
@@ -14,7 +14,6 @@ function sourceLabel(source?: 'env' | 'app_settings'): string {
 
 export function SettingsRuntimePanel({ api, onError }: Props) {
   const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null)
-  const [cursorStatus, setCursorStatus] = useState<CursorEngineConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
 
@@ -23,20 +22,9 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
     try {
       const data = await api<RuntimeConfigResponse>('/api/runtime')
       setRuntime(data)
-      if (data.agent_engine === 'cursor') {
-        try {
-          const cursor = await api<CursorEngineConfigResponse>('/api/cursor-engine')
-          setCursorStatus(cursor)
-        } catch {
-          setCursorStatus(null)
-        }
-      } else {
-        setCursorStatus(null)
-      }
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       setRuntime(null)
-      setCursorStatus(null)
     } finally {
       setLoading(false)
     }
@@ -71,10 +59,6 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
   }
 
   const sources = runtime?.sources ?? {}
-  const costRoutingSelected = runtime?.agent_engine === 'classic_cost_routing'
-  const localReady = runtime?.local_delegate_ready === true
-  const localConfigured = runtime?.local_delegate_configured === true
-  const toolsOk = runtime?.local_delegate_tools_ok === true
 
   return (
     <Flex direction="column" gap="4">
@@ -143,70 +127,6 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
             )
           }
         />
-      </Flex>
-
-      <Flex direction="column" gap="2">
-        <Text size="2" weight="medium">
-          Agent engine
-        </Text>
-        <Text size="1" color="gray">
-          Single turn uses one cloud model for the full Classic loop. Cost routing keeps the same
-          loop but routes read-only tool chains to a verified local model. Deterministic runs a
-          structured pipeline. Cursor delegates the turn to a local SDK sidecar. Applies immediately
-          ({sourceLabel(sources.agent_engine)}).
-        </Text>
-        <Flex gap="2" wrap="wrap">
-          {(
-            [
-              ['classic', 'Single turn', 'One cloud model — best reasoning continuity'],
-              [
-                'classic_cost_routing',
-                'Classic · Cost routing',
-                'Local read-only discovery + delegate sub-jobs',
-              ],
-              ['deterministic', 'Deterministic pipeline', 'Intent → plan → execute → consolidate'],
-              ['cursor', 'Cursor (SDK)', 'Full turn via Cursor sidecar'],
-            ] as const
-          ).map(([engine, label, subtitle]) => (
-            <button
-              key={engine}
-              type="button"
-              disabled={savingKey != null}
-              className={
-                runtime?.agent_engine === engine
-                  ? 'mc-engine-option mc-engine-option--active'
-                  : 'mc-engine-option'
-              }
-              title={subtitle}
-              onClick={() => void patchRuntime({ agent_engine: engine }, 'agent_engine')}
-            >
-              {label}
-            </button>
-          ))}
-        </Flex>
-
-        {costRoutingSelected && !localReady ? (
-          <Callout.Root color="orange" size="1" variant="soft" role="alert">
-            <Callout.Text>
-              {!localConfigured
-                ? 'Cost routing is selected but no local URL/model is configured. Runs use the cloud model only until you configure Local delegate settings.'
-                : !toolsOk
-                  ? 'Cost routing is selected but local tool calling is not verified. Runs use the cloud model only until you run Test in Local delegate.'
-                  : 'Cost routing is selected but the local delegate is not ready. Runs use the cloud model only.'}
-            </Callout.Text>
-          </Callout.Root>
-        ) : null}
-
-        {runtime?.agent_engine === 'cursor' && cursorStatus && !cursorStatus.engine_ready ? (
-          <Callout.Root color="orange" size="1" variant="soft">
-            <Callout.Text>
-              Cursor engine is active but not ready ({cursorStatus.sidecar_reachable ? 'sidecar up' : 'sidecar down'}
-              , API key {cursorStatus.api_key_configured ? 'ok' : 'missing'}, health{' '}
-              {cursorStatus.sdk_runner_ok ? 'verified' : 'not verified'}). Open Settings → Cursor to
-              finish setup.
-            </Callout.Text>
-          </Callout.Root>
-        ) : null}
       </Flex>
     </Flex>
   )

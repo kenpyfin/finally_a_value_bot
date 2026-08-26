@@ -365,7 +365,13 @@ pub async fn prepare_agent_run(
     .await;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
-    let agent_engine = state.runtime_toggles.agent_engine();
+    let global_engine = state.runtime_toggles.agent_engine();
+    let agent_engine = crate::runtime_toggles::resolve_run_agent_engine_from_persona(
+        state.db.as_ref(),
+        chat_id,
+        persona_id,
+        global_engine,
+    );
     let mm_cfg = state.llm.local_delegate_config();
     let cost_routing = crate::local_delegate::cost_routing_active(agent_engine, &mm_cfg);
     let local_delegate_run_summary = state.llm.local_delegate_run_summary(cost_routing);

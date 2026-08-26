@@ -1862,7 +1862,23 @@ pub async fn process_with_agent_with_events(
     event_tx: Option<&UnboundedSender<AgentEvent>>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<AgentProcessResult> {
-    if state.runtime_toggles.agent_engine() == crate::runtime_toggles::AgentEngine::Deterministic {
+    let chat_id = context.chat_id;
+    let persona_id = context.persona_id;
+    let global_engine = state.runtime_toggles.agent_engine();
+    let run_engine = call_blocking(state.db.clone(), move |db| {
+        Ok(
+            crate::runtime_toggles::resolve_run_agent_engine_from_persona(
+                db,
+                chat_id,
+                persona_id,
+                global_engine,
+            ),
+        )
+    })
+    .await
+    .unwrap_or(global_engine);
+
+    if run_engine == crate::runtime_toggles::AgentEngine::Deterministic {
         let prep = prepare_agent_run(state, &context, override_prompt, image_data.clone()).await?;
         return crate::agent_pipeline::run_deterministic_pipeline(
             state, context, prep, event_tx, cancel,
@@ -1870,7 +1886,7 @@ pub async fn process_with_agent_with_events(
         .await;
     }
 
-    if state.runtime_toggles.agent_engine() == crate::runtime_toggles::AgentEngine::Cursor {
+    if run_engine == crate::runtime_toggles::AgentEngine::Cursor {
         let prep = prepare_agent_run(state, &context, override_prompt, image_data.clone()).await?;
         return crate::cursor_engine::run_cursor_engine(state, context, prep, event_tx, cancel)
             .await;
@@ -2339,7 +2355,13 @@ pub(crate) async fn process_classic_agent_with_events(
     let mut run_tool_names: Vec<String> = Vec::new();
     let mut last_iteration_tools: Vec<String> = Vec::new();
     let mut local_tier_error_streak: u32 = 0;
-    let agent_engine = state.runtime_toggles.agent_engine();
+    let global_engine = state.runtime_toggles.agent_engine();
+    let agent_engine = crate::runtime_toggles::resolve_run_agent_engine_from_persona(
+        state.db.as_ref(),
+        chat_id,
+        persona_id,
+        global_engine,
+    );
     let mm_cfg_for_routing = state.llm.local_delegate_config();
     let cost_routing =
         crate::local_delegate::cost_routing_active(agent_engine, &mm_cfg_for_routing);
@@ -4649,6 +4671,23 @@ async fn finish_turn_with_quality_gate(
         }
     }
 
+    let (pre_delivery_summary, _spilled) = run_pre_delivery_hooks_after_gate(
+        state,
+        context,
+        event_tx,
+        run_key,
+        chat_id,
+        persona_id,
+        stop_reason,
+        final_text,
+    )
+    .await;
+    if let Some(summary) = pre_delivery_summary {
+        if let Some(last) = history_iterations.last_mut() {
+            last.hook_events.push(summary);
+        }
+    }
+
     if let Some(tx) = event_tx {
         let _ = tx.send(AgentEvent::FinalResponse {
             text: final_text.clone(),
@@ -4657,7 +4696,15 @@ async fn finish_turn_with_quality_gate(
 
     let stop_reason_owned = stop_reason.to_string();
     let (pipeline_stages, cloud_calls, agent_engine) = pipeline_extras.map_or_else(
-        || (Vec::new(), 0u32, "classic".to_string()),
+        || {
+            let engine = crate::runtime_toggles::resolve_run_agent_engine_from_persona(
+                state.db.as_ref(),
+                chat_id,
+                persona_id,
+                state.runtime_toggles.agent_engine(),
+            );
+            (Vec::new(), 0u32, engine.as_str().to_string())
+        },
         |ex| {
             (
                 ex.pipeline_stages.clone(),
@@ -4763,6 +4810,56 @@ async fn run_post_delivery_hooks_before_gate(
         }
         let summary = hook_event_summary(HookEventName::PostDelivery, None, &post_delivery_hook);
         return (summary, post_delivery_hook.run_persona_focus_sync);
+    }
+    (None, false)
+}
+
+async fn run_pre_delivery_hooks_after_gate(
+    state: &AppState,
+    context: &AgentRequestContext<'_>,
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    run_key: &str,
+    chat_id: i64,
+    persona_id: i64,
+    stop_reason: &str,
+    final_text: &mut String,
+) -> (Option<String>, bool) {
+    if let Ok(pre_delivery_hook) = run_hooks_for_event_async(
+        state.db.clone(),
+        &state.config,
+        state.env_redactor.as_ref(),
+        HookEventName::PreDelivery,
+        &HookRunInput {
+            chat_id,
+            persona_id,
+            caller_channel: context.caller_channel.to_string(),
+            is_scheduled_task: context.is_scheduled_task,
+            stop_reason: Some(stop_reason.to_string()),
+            assistant_text: Some(final_text.clone()),
+            ..HookRunInput::default()
+        },
+    )
+    .await
+    {
+        publish_hook_event(
+            state,
+            event_tx,
+            run_key,
+            chat_id,
+            persona_id,
+            HookEventName::PreDelivery,
+            None,
+            &pre_delivery_hook,
+        )
+        .await;
+        let spilled = if let Some(updated) = pre_delivery_hook.updated_assistant_text.clone() {
+            *final_text = updated;
+            true
+        } else {
+            false
+        };
+        let summary = hook_event_summary(HookEventName::PreDelivery, None, &pre_delivery_hook);
+        return (summary, spilled);
     }
     (None, false)
 }

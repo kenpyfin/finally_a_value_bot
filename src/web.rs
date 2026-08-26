@@ -2818,10 +2818,15 @@ async fn api_personas(
         .map(|row| (row.persona_id, row))
         .collect();
 
+    let global_engine = state.app_state.runtime_toggles.agent_engine();
     let items: Vec<serde_json::Value> = personas
         .iter()
         .map(|p| {
             let last = last_bot_by_persona.get(&p.id);
+            let effective = crate::runtime_toggles::resolve_run_agent_engine(
+                p.agent_engine_override.as_deref(),
+                global_engine,
+            );
             json!({
                 "id": p.id,
                 "name": p.name,
@@ -2830,6 +2835,8 @@ async fn api_personas(
                 "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
                 "last_bot_message_session_id": last.and_then(|r| r.session_id.clone()),
                 "last_bot_message_session_title": last.and_then(|r| r.session_title.clone()),
+                "agent_engine_override": p.agent_engine_override,
+                "agent_engine_effective": effective.as_str(),
             })
         })
         .collect();
@@ -2991,6 +2998,21 @@ struct PersonaBulletinPatchBody {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_patch_field")]
     operator_memo: Option<Option<String>>,
+    #[serde(default)]
+    dense_delivery_enabled: Option<bool>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    dense_delivery_messaging_max_chars: Option<Option<i64>>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    dense_delivery_web_max_chars: Option<Option<i64>>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    dense_delivery_summary_chars: Option<Option<i64>>,
+    /// `null`/empty clears override (inherit global). Omitted = leave unchanged.
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    agent_engine_override: Option<Option<String>>,
 }
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
@@ -3793,12 +3815,13 @@ async fn api_persona_bulletin_get(
     let cfg = &state.app_state.config;
     let def_u = cfg.recent_history_min_user_messages.clamp(1, 25) as i64;
     let def_a = cfg.recent_history_min_assistant_messages.clamp(1, 25) as i64;
-    let hs_json = if let Some(ref p) = persona {
+    let global_engine = state.app_state.runtime_toggles.agent_engine();
+    let (hs_json, delivery_json, engine_json) = if let Some(ref p) = persona {
         let o_u = p.recent_history_min_user;
         let o_a = p.recent_history_min_assistant;
         let e_u = o_u.unwrap_or(def_u).clamp(1, 25);
         let e_a = o_a.unwrap_or(def_a).clamp(1, 25);
-        json!({
+        let hs = json!({
             "min_user": {
                 "effective": e_u,
                 "persona_override": o_u,
@@ -3810,9 +3833,33 @@ async fn api_persona_bulletin_get(
                 "uses_default": o_a.is_none(),
             },
             "defaults": { "min_user": def_u, "min_assistant": def_a },
-        })
+        });
+        let msg_max = crate::dense_delivery_guard::effective_max_chars(p, "wecom");
+        let web_max = crate::dense_delivery_guard::effective_max_chars(p, "web");
+        let delivery = json!({
+            "enabled": p.dense_delivery_enabled,
+            "messaging_max_chars": msg_max,
+            "web_max_chars": web_max,
+            "summary_chars": crate::dense_delivery_guard::effective_summary_chars(p),
+            "defaults": {
+                "messaging_max_chars": crate::dense_delivery_guard::DEFAULT_MESSAGING_MAX_CHARS,
+                "web_max_chars": crate::dense_delivery_guard::DEFAULT_WEB_MAX_CHARS,
+                "summary_chars": crate::dense_delivery_guard::DEFAULT_SUMMARY_CHARS,
+            },
+        });
+        let effective = crate::runtime_toggles::resolve_run_agent_engine(
+            p.agent_engine_override.as_deref(),
+            global_engine,
+        );
+        let engine = json!({
+            "override": p.agent_engine_override,
+            "global": global_engine.as_str(),
+            "effective": effective.as_str(),
+            "uses_default": p.agent_engine_override.as_deref().map(str::trim).unwrap_or("").is_empty(),
+        });
+        (hs, delivery, engine)
     } else {
-        json!({})
+        (json!({}), json!({}), json!({}))
     };
 
     Ok(Json(json!({
@@ -3822,6 +3869,15 @@ async fn api_persona_bulletin_get(
         "bookmarks": bookmarks_json,
         "history_suffix": hs_json,
         "operator_memo": persona.as_ref().and_then(|p| p.operator_memo.clone()),
+        "dense_delivery_enabled": persona.as_ref().map(|p| p.dense_delivery_enabled).unwrap_or(false),
+        "dense_delivery": delivery_json,
+        "agent_engine_override": persona.as_ref().and_then(|p| p.agent_engine_override.clone()),
+        "agent_engine_global": global_engine.as_str(),
+        "agent_engine_effective": crate::runtime_toggles::resolve_run_agent_engine(
+            persona.as_ref().and_then(|p| p.agent_engine_override.as_deref()),
+            global_engine,
+        ).as_str(),
+        "agent_engine": engine_json,
     })))
 }
 
@@ -3839,10 +3895,15 @@ async fn api_persona_bulletin_patch(
     if body.recent_history_min_user.is_none()
         && body.recent_history_min_assistant.is_none()
         && body.operator_memo.is_none()
+        && body.dense_delivery_enabled.is_none()
+        && body.dense_delivery_messaging_max_chars.is_none()
+        && body.dense_delivery_web_max_chars.is_none()
+        && body.dense_delivery_summary_chars.is_none()
+        && body.agent_engine_override.is_none()
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            "no fields to update (send recent_history_min_user, recent_history_min_assistant, and/or operator_memo)"
+            "no fields to update (send recent_history_min_user, recent_history_min_assistant, operator_memo, dense_delivery_enabled, and/or agent_engine_override)"
                 .into(),
         ));
     }
@@ -3865,6 +3926,9 @@ async fn api_persona_bulletin_patch(
         return Err((StatusCode::NOT_FOUND, "persona not found".into()));
     }
 
+    let patch_prompt = body.recent_history_min_user.is_some()
+        || body.recent_history_min_assistant.is_some()
+        || body.operator_memo.is_some();
     let mut nu = current.recent_history_min_user;
     let mut na = current.recent_history_min_assistant;
     let mut memo = current.operator_memo.clone();
@@ -3917,8 +3981,68 @@ async fn api_persona_bulletin_patch(
         };
     }
 
+    let mut dense_enabled = current.dense_delivery_enabled;
+    let mut msg_max = current.dense_delivery_messaging_max_chars;
+    let mut web_max = current.dense_delivery_web_max_chars;
+    let mut summary_chars = current.dense_delivery_summary_chars;
+    let mut engine_ov = current.agent_engine_override.clone();
+    let mut patch_delivery = false;
+    let mut patch_engine = false;
+
+    if let Some(v) = body.dense_delivery_enabled {
+        dense_enabled = v;
+        patch_delivery = true;
+    }
+    if let Some(v) = body.dense_delivery_messaging_max_chars {
+        msg_max = v.filter(|n| *n > 0);
+        patch_delivery = true;
+    }
+    if let Some(v) = body.dense_delivery_web_max_chars {
+        web_max = v.filter(|n| *n > 0);
+        patch_delivery = true;
+    }
+    if let Some(v) = body.dense_delivery_summary_chars {
+        summary_chars = v.filter(|n| *n > 0);
+        patch_delivery = true;
+    }
+    if let Some(v) = body.agent_engine_override {
+        patch_engine = true;
+        engine_ov = match v {
+            None => None,
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else if crate::runtime_toggles::AgentEngine::parse_override(t).is_none() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "agent_engine_override must be classic, classic_cost_routing, cursor, deterministic, or null".into(),
+                    ));
+                } else {
+                    Some(t.to_string())
+                }
+            }
+        };
+    }
+
     let ok = call_blocking(state.app_state.db.clone(), move |db| {
-        db.set_persona_prompt_overrides(chat_id, pid, nu, na, memo.as_deref())
+        if patch_prompt {
+            db.set_persona_prompt_overrides(chat_id, pid, nu, na, memo.as_deref())?;
+        }
+        if patch_delivery {
+            db.set_persona_delivery_policy(
+                chat_id,
+                pid,
+                dense_enabled,
+                msg_max,
+                web_max,
+                summary_chars,
+            )?;
+        }
+        if patch_engine {
+            db.set_persona_engine_override(chat_id, pid, engine_ov.as_deref())?;
+        }
+        Ok(true)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -5256,6 +5380,14 @@ struct LlmModelPatchRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct LlmModelsQuery {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RuntimePatchRequest {
     #[serde(default)]
     tool_output_debug: Option<bool>,
@@ -5634,7 +5766,7 @@ async fn api_llm_get(
         "catalog": catalog,
         "providers": providers,
         "catalog_source": "static_curated",
-        "cost_reference_note": "Curated catalog (not live from provider APIs). Put API keys in repo-root .env only (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or LLM_API_KEY). Approximate USD per 1M tokens — verify on your provider billing page.",
+        "cost_reference_note": "Approximate USD per 1M tokens for curated ids — verify on your provider billing page. Model lists are loaded live from the provider (GET /api/llm/models); this payload is the curated fallback. Put API keys in repo-root .env only.",
         "custom_model_allowed": true,
         "thinking_enabled": state.app_state.llm.thinking_enabled(),
         "thinking_source": if thinking_source {
@@ -5654,6 +5786,97 @@ async fn api_llm_get(
     })))
 }
 
+async fn api_llm_models_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<LlmModelsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let provider_id = query
+        .provider
+        .as_deref()
+        .map(crate::llm_catalog::resolve_catalog_provider_id)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| state.app_state.llm.current_provider());
+    if crate::llm_catalog::find_provider(&provider_id).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unknown provider {provider_id:?}"),
+        ));
+    }
+    let current_provider = state.app_state.llm.current_provider();
+    let current_model = if provider_id.eq_ignore_ascii_case(&current_provider) {
+        state.app_state.llm.current_model()
+    } else {
+        String::new()
+    };
+    let is_local = crate::llm_catalog::is_local_provider(&provider_id);
+    let base_url = if is_local {
+        let raw = query
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                if provider_id.eq_ignore_ascii_case(&current_provider) {
+                    state.app_state.llm.current_base_url()
+                } else {
+                    None
+                }
+            });
+        raw.map(|u| crate::llm_catalog::normalize_local_base_url(&u, &provider_id))
+    } else {
+        None
+    };
+    if is_local && base_url.as_deref().unwrap_or("").is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_url is required for Ollama and llama.cpp providers".into(),
+        ));
+    }
+
+    let api_key = crate::llm_catalog::resolve_api_key_for_provider_with_config(
+        &provider_id,
+        Some(&state.app_state.config),
+    );
+    let static_models = crate::llm_catalog::catalog_models_json(&provider_id, &current_model);
+
+    let live_result =
+        crate::llm::fetch_live_provider_models(&provider_id, &api_key, base_url.as_deref()).await;
+
+    let (source, models, truncated, live_count, message) = match live_result {
+        Ok(ids) => {
+            let merged =
+                crate::llm_catalog::merge_live_model_ids(&provider_id, &current_model, &ids);
+            (
+                "live",
+                merged.models,
+                merged.truncated,
+                Some(merged.live_count),
+                None,
+            )
+        }
+        Err(err) => ("static_fallback", static_models, false, None, Some(err)),
+    };
+
+    let models_json: Vec<serde_json::Value> = models
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "provider": provider_id,
+        "source": source,
+        "truncated": truncated,
+        "live_count": live_count,
+        "models": models_json,
+        "base_url": base_url,
+        "message": message,
+    })))
+}
+
 async fn api_llm_patch(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -5664,22 +5887,17 @@ async fn api_llm_patch(
     if model.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "model is required".into()));
     }
+    if model.len() > 256 {
+        return Err((StatusCode::BAD_REQUEST, "model id is too long".into()));
+    }
+    let _ = body.custom;
     let provider_id = body
         .provider
         .as_deref()
         .map(crate::llm_catalog::resolve_catalog_provider_id)
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| state.app_state.llm.current_provider());
-    if !body.custom && !crate::llm_catalog::model_allowed_for_provider(&provider_id, &model, false)
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Model {:?} is not in the catalog for provider {:?}. Pick a listed model or set custom=true.",
-                model, provider_id
-            ),
-        ));
-    }
+    // Live catalog ids are not in the static curated list; custom=true is not required.
 
     let (provider_saved, model_saved) = state
         .app_state
@@ -7319,6 +7537,7 @@ fn build_router(web_state: WebState) -> Router {
             get(api_settings_get).patch(api_settings_patch),
         )
         .route("/api/llm", get(api_llm_get).patch(api_llm_patch))
+        .route("/api/llm/models", get(api_llm_models_get))
         .route(
             "/api/multimodel",
             get(api_multimodel_get).patch(api_multimodel_patch),

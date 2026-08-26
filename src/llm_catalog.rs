@@ -1,9 +1,10 @@
 //! Provider/model catalog for Web UI model selection and cost reference.
 //!
-//! **How models are chosen:** This is a **curated static list** in code (`PROVIDER_CATALOG`), keyed
-//! Provider and model are chosen in Web UI (`app_settings`); API keys stay in `.env`. Catalog is **not** fetched
-//! live from provider APIs. When your active `LLM_MODEL` is not in the list, the API still
-//! prepends it so you can keep using it (custom id or newer releases before we update the catalog).
+//! Provider and model are chosen in Web UI (`app_settings`); API keys stay in `.env`.
+//! `PROVIDER_CATALOG` is a **curated static list** used for cost hints and as a fallback when a
+//! live `/models` fetch fails. Settings loads live ids via `GET /api/llm/models` (OpenAI-compatible
+//! `/models`, Anthropic `/v1/models`, Gemini model list). When the active model is not in either
+//! list, the API still prepends it so you can keep using a custom id.
 //!
 //! Pricing values are approximate list-price hints (USD per 1M tokens), not live quotes.
 
@@ -473,6 +474,9 @@ pub struct CatalogModelJson {
     /// True when this row was added because it is the active model but not in the curated list.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub from_active_config: bool,
+    /// True when the provider API listed this id (cost fields may still come from the curated list).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_live: bool,
 }
 
 impl CatalogModelJson {
@@ -484,6 +488,7 @@ impl CatalogModelJson {
             cost_tier: m.cost_tier.to_string(),
             cost_summary: format_cost_summary(m),
             from_active_config: false,
+            from_live: false,
         }
     }
 
@@ -497,7 +502,122 @@ impl CatalogModelJson {
                 "Active model from your config — not in curated catalog; check provider pricing."
                     .to_string(),
             from_active_config: true,
+            from_live: false,
         }
+    }
+
+    pub fn from_live(model_id: &str) -> Self {
+        CatalogModelJson {
+            id: model_id.to_string(),
+            input_usd_per_mtok: None,
+            output_usd_per_mtok: None,
+            cost_tier: "standard".to_string(),
+            cost_summary:
+                "Listed by the provider API. Pricing is not included — check your billing page."
+                    .to_string(),
+            from_active_config: false,
+            from_live: true,
+        }
+    }
+}
+
+/// Max extra live ids appended after curated/active rows (OpenRouter-scale lists).
+pub const LIVE_MODEL_LIST_CAP: usize = 200;
+
+/// Skip embeddings, TTS, image, and other non-chat ids from live `/models` lists.
+pub fn looks_like_chat_completion_model(id: &str) -> bool {
+    let l = id.trim().to_ascii_lowercase();
+    if l.is_empty() {
+        return false;
+    }
+    const SKIP: &[&str] = &[
+        "embedding",
+        "embed-",
+        "-embed",
+        "whisper",
+        "tts-",
+        "-tts",
+        "dall-e",
+        "dall_e",
+        "imagen",
+        "moderation",
+        "transcribe",
+        "realtime",
+        "gpt-image",
+        "sora-",
+        "computer-use",
+        "omni-moderation",
+        "text-moderation",
+        "text-embedding",
+        "aqa",
+    ];
+    !SKIP.iter().any(|needle| l.contains(needle))
+}
+
+/// Normalize a live model id for `provider` (strip Gemini `models/` prefix, drop non-chat ids).
+pub fn normalize_live_model_id(provider: &str, raw: &str) -> Option<String> {
+    let mut id = raw.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    if resolve_catalog_provider_id(provider) == "google" {
+        if let Some(rest) = id.strip_prefix("models/") {
+            id = rest.to_string();
+        }
+    }
+    if !looks_like_chat_completion_model(&id) {
+        return None;
+    }
+    Some(id)
+}
+
+#[derive(Debug)]
+pub struct LiveCatalogMerge {
+    pub models: Vec<CatalogModelJson>,
+    pub truncated: bool,
+    pub live_count: usize,
+}
+
+/// Overlay live provider ids onto the curated catalog, keeping cost hints when ids match.
+pub fn merge_live_model_ids(
+    provider: &str,
+    active_model: &str,
+    live_ids: &[String],
+) -> LiveCatalogMerge {
+    let mut normalized: Vec<String> = live_ids
+        .iter()
+        .filter_map(|id| normalize_live_model_id(provider, id))
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    let live_count = normalized.len();
+    let live_set: HashSet<&str> = normalized.iter().map(String::as_str).collect();
+
+    let mut models = catalog_models_json(provider, active_model);
+    for row in &mut models {
+        if live_set.contains(row.id.as_str()) {
+            row.from_live = true;
+            if row.from_active_config {
+                let id = row.id.clone();
+                *row = CatalogModelJson::from_live(&id);
+            }
+        }
+    }
+    let mut seen: HashSet<String> = models.iter().map(|m| m.id.clone()).collect();
+    let mut extra: Vec<CatalogModelJson> = Vec::new();
+    for id in &normalized {
+        if seen.insert(id.clone()) {
+            extra.push(CatalogModelJson::from_live(id));
+        }
+    }
+    let cap_extra = LIVE_MODEL_LIST_CAP.saturating_sub(models.len());
+    let truncated = extra.len() > cap_extra;
+    extra.truncate(cap_extra);
+    models.extend(extra);
+    LiveCatalogMerge {
+        models,
+        truncated,
+        live_count,
     }
 }
 
@@ -625,5 +745,60 @@ mod tests {
             effective_local_base_url("ollama", Some("http://10.0.0.5:11434")),
             "http://10.0.0.5:11434/v1"
         );
+    }
+
+    #[test]
+    fn live_catalog_skips_embeddings_and_strips_gemini_prefix() {
+        assert!(!looks_like_chat_completion_model("text-embedding-3-large"));
+        assert!(looks_like_chat_completion_model("gpt-5.4"));
+        assert_eq!(
+            normalize_live_model_id("google", "models/gemini-2.5-flash").as_deref(),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(
+            normalize_live_model_id("openai", "text-embedding-3-small"),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_live_keeps_curated_cost_and_appends_new_ids() {
+        let merged = merge_live_model_ids(
+            "openai",
+            "gpt-5.4",
+            &[
+                "gpt-5.4".into(),
+                "gpt-4o".into(),
+                "text-embedding-3-large".into(),
+            ],
+        );
+        let gpt54 = merged
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-5.4")
+            .expect("gpt-5.4");
+        assert!(gpt54.from_live);
+        assert!(gpt54.input_usd_per_mtok.is_some());
+        assert!(merged
+            .models
+            .iter()
+            .any(|m| m.id == "gpt-4o" && m.from_live));
+        assert!(merged
+            .models
+            .iter()
+            .all(|m| m.id != "text-embedding-3-large"));
+        assert_eq!(merged.live_count, 2);
+        assert!(!merged.truncated);
+    }
+
+    #[test]
+    fn merge_live_truncates_oversized_provider_lists() {
+        let ids: Vec<String> = (0..(LIVE_MODEL_LIST_CAP + 50))
+            .map(|i| format!("live-model-{i}"))
+            .collect();
+        let merged = merge_live_model_ids("openai", "", &ids);
+        assert!(merged.truncated);
+        assert_eq!(merged.live_count, LIVE_MODEL_LIST_CAP + 50);
+        assert!(merged.models.len() <= LIVE_MODEL_LIST_CAP + 8);
     }
 }

@@ -1,6 +1,6 @@
 # Cursor engine integration (tools, skills, hooks)
 
-How the bot's **ToolRegistry**, **skills**, and **bot-native hooks** are linked when **Settings → Runtime → Agent engine** is **Cursor**.
+How the bot's **ToolRegistry**, **skills**, and **bot-native hooks** are linked when **Settings → Agent engine** is **Cursor**.
 
 This is **not** a sync to Cursor IDE artifacts (`.cursor/rules`, `.cursor/hooks.json`, `~/.cursor/skills`). The bot keeps a single source of truth in Rust/SQLite/workspace and bridges Cursor through **prompt text** plus a **loopback MCP server**.
 
@@ -12,7 +12,7 @@ This is **not** a sync to Cursor IDE artifacts (`.cursor/rules`, `.cursor/hooks.
 | **Skills** | Guidance + execution | Catalog in flattened prompt; `activate_skill` / `run_skill_script` as MCP tools |
 | **Hooks** | Policy at turn/tool boundaries | Same `hook_runtime` as Classic; tool hooks run inside MCP `tools/call` |
 
-**MCP connects tools, not hooks.** Hooks are Rust policy that runs at fixed points. Tool-related hooks (`PreToolUse`, `PostToolUse`) fire when Cursor invokes an MCP tool. Turn hooks (`BeforeTurn`, `PreStop`, `PostDelivery`) and `PostToolBatch` run in `cursor_engine.rs` without going through MCP.
+**MCP connects tools, not hooks.** Hooks are Rust policy that runs at fixed points. Tool-related hooks (`PreToolUse`, `PostToolUse`) fire when Cursor invokes an MCP tool. Turn hooks (`BeforeTurn`, `PreStop`, `PostDelivery`, `PreDelivery`) and `PostToolBatch` run in `cursor_engine.rs` / `pipeline_finish_turn` without going through MCP.
 
 See also: [`hooks-architecture.md`](hooks-architecture.md) (hook catalog and storage), [`agent-harness-research.md`](agent-harness-research.md) (engine comparison and SDK layers).
 
@@ -20,10 +20,10 @@ See also: [`hooks-architecture.md`](hooks-architecture.md) (hook catalog and sto
 
 | Requirement | Why |
 | --- | --- |
-| `AGENT_ENGINE=cursor` (Settings → Runtime) | Selects `run_cursor_engine` instead of Classic loop |
+| `AGENT_ENGINE=cursor` (Settings → Agent engine, per persona or inherit) | Selects `run_cursor_engine` instead of Classic loop |
 | `WEB_ENABLED=true` | MCP endpoint is mounted on the web server |
 | `CURSOR_API_KEY` in repo-root `.env` | Sidecar (`cursor-sdk-runner.py`) authenticates to Cursor API |
-| Settings → Cursor: **Expose bot tools (MCP)** on (default) | Registers MCP config on each sidecar `agent.send` |
+| Settings → Agent engine: Cursor panel **Expose bot tools (MCP)** on (default) | Registers MCP config on each sidecar `agent.send` |
 | Sidecar reachable (`CURSOR_SDK_RUNNER_URL`) | Rust POSTs `/run` and receives NDJSON stream |
 
 If MCP is disabled or Web UI is off, the Cursor turn still gets **prompt-injected** principles/skills catalog, but **bot tools do not execute** during the turn (no bulletin updates, no skill scripts, no tool hooks).
@@ -63,7 +63,7 @@ NDJSON text (+ optional tool_use / tool_result events) back to Rust
        ├─ PreStop hooks  (hook_turn_bridge)
        ├─ PostToolBatch  (cursor_mcp.finish_run)
        ├─ Append assistant message to messages
-       └─ pipeline_finish_turn  → PostDelivery hooks, history, PDQE
+       └─ pipeline_finish_turn  → PostDelivery hooks, PDQE, PreDelivery dense spill, history
 ```
 
 ```mermaid
@@ -77,6 +77,7 @@ flowchart TB
     PS[PreStop]
     PB[PostToolBatch]
     PD[PostDelivery]
+    PreD[PreDelivery]
     Prep --> BT
     BT --> Sidecar
   end
@@ -93,6 +94,7 @@ flowchart TB
   Send -->|text| PS
   PS --> PB
   PB --> PD
+  PD --> PreD
 ```
 
 ## Core tools and capabilities (MCP)
@@ -190,9 +192,10 @@ Bot hooks are defined in SQLite (`hook_definitions`) and evaluated by `hook_runt
 | `PostToolUse` | Yes | Inside MCP `tools/call` after tool result |
 | `PostToolBatch` | Yes | `cursor_mcp.finish_run` after sidecar completes (one batch per sidecar invocation) |
 | `PreStop` | Yes | `hook_turn_bridge` after sidecar text; deferred-commitment nudge loop (max 2 resumes) |
-| `PostDelivery` | Yes | `pipeline_finish_turn` — focus sync, PDQE, history |
+| `PostDelivery` | Yes | `pipeline_finish_turn` — focus sync flag, then PDQE |
+| `PreDelivery` | Yes | `pipeline_finish_turn` after PDQE accept/fail-open — persona dense-delivery spill |
 
-Shipped builtins that matter for tool-heavy personas: `pretool-turn-skill-gate`, `postbatch-loop-guard`, `postdelivery-persona-focus-sync`, `prestop-deferred-commitment-guard`, `beforeturn-scheduler-policy-context`. See [`hooks-architecture.md`](hooks-architecture.md).
+Shipped builtins that matter for tool-heavy personas: `pretool-turn-skill-gate`, `postbatch-loop-guard`, `postdelivery-persona-focus-sync`, `prestop-deferred-commitment-guard`, `beforeturn-scheduler-policy-context`, `predelivery-dense-delivery-guard`. See [`hooks-architecture.md`](hooks-architecture.md).
 
 ### Finish-path note
 
@@ -208,7 +211,8 @@ Before `pipeline_finish_turn`, Cursor engine **appends the delivered assistant m
 6. **PreStop** — end-turn guard; optional nudge + resume with same `agent_id`.
 7. **PostToolBatch** — loop/discovery stall hints from batch stats.
 8. **Append assistant** to `messages`.
-9. **PostDelivery** — `pipeline_finish_turn` (bulletin focus sync, quality gate, history).
+9. **PostDelivery** — `pipeline_finish_turn` (bulletin focus sync flag, quality gate).
+10. **PreDelivery** — after PDQE accept/fail-open; persona dense-delivery may replace the delivered text with a summary + public PDF URL.
 
 Agent history records a synthetic iteration with tool rows when MCP tools ran (`had_tool_calls` set for focus-sync heuristics).
 
@@ -237,8 +241,8 @@ Pipeline stage telemetry includes `delegation=full_slim|resume_delta|full_slim_s
 
 | Surface | Keys / behavior |
 | --- | --- |
-| Settings → Runtime | `agent_engine=cursor` |
-| Settings → Cursor | Model, sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt**, **resume delta prompts** |
+| Settings → Agent engine | Per-persona engine (`personas.agent_engine_override`); global default used when a persona inherits. Set a persona to Cursor here. |
+| Settings → Agent engine (Cursor panel) | Model, sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt**, **resume delta prompts** |
 | DB app_settings | `CURSOR_MCP_TOOLS_ENABLED`, `CURSOR_MCP_EXPOSE_SEND_MESSAGE`, `CURSOR_DELEGATION_SLIM_PROMPT`, `CURSOR_DELEGATION_RESUME_DELTA` |
 | Doctor | `cursor_engine.mcp_bridge` when engine is Cursor |
 | API | `GET/PATCH /api/cursor-engine` includes `mcp_endpoint_url`, `mcp_bridge_ready` |

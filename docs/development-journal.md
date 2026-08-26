@@ -4,6 +4,27 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-25 — Per-persona agent engine in Settings
+
+- **Area:** Settings / personas / cockpit
+- **Summary:** Agent engine is no longer chosen in the cockpit. Settings → Agent engine lists every persona with its own engine (or inherit). The previous global picker is the inherit default only. Runtime still resolves `personas.agent_engine_override` at `process_with_agent_with_events`. `GET /api/personas` now includes `agent_engine_override` / `agent_engine_effective`.
+- **Key files / symbols:** `settings-agent-engine.tsx`; `api_personas` in `src/web.rs`; cockpit engine UI removed from `cockpit-bar.tsx`.
+- **Note:** Rebuild `web/dist`. Existing persona overrides keep working.
+
+### 2026-08-25 — Live model catalog for Agent engine (Classic LLM)
+
+- **Area:** Settings / LLM catalog
+- **Summary:** Agent engine → Single turn (Classic) now loads live model ids from the provider API (`GET /api/llm/models`) instead of only the curated in-code list. OpenAI-compatible `/models` (with Bearer), Anthropic `/v1/models`, and Gemini model list; local Ollama/llama.cpp uses the existing `/v1/models` probe. Curated rows stay for cost hints and as a fail-open fallback. PATCH `/api/llm` accepts live ids (no longer requires `custom=true`). Azure/Bedrock/custom stay curated-only. Refresh models in `settings-llm.tsx`.
+- **Key files / symbols:** `fetch_live_provider_models` in `src/llm.rs`; `merge_live_model_ids` in `src/llm_catalog.rs`; `api_llm_models_get` in `src/web.rs`; `SettingsLlmPanel`.
+- **Note:** Restart gateway. Rebuild `web/dist` for Settings. Keys remain in `.env` only.
+
+### 2026-08-25 — Dense Delivery Guard + per-persona agent engine
+
+- **Area:** hooks / delivery / personas / Settings
+- **Summary:** Persona-gated dense delivery spills over-limit replies (2k messaging / 1k web) to markdown+PDF, uploads to catbox, and replaces the delivered text with a summary + public HTTPS URL. Runs as PreDelivery **after PDQE** so quality eval still sees the full report. Cockpit toggle (seeded on for persona 28). Per-persona `agent_engine_override` is resolved at `process_with_agent_with_events` (NULL/invalid inherit global). Settings folds LLM / Local delegate / Cursor / Deterministic into one **Agent engine** tab.
+- **Key files / symbols:** `dense_delivery_guard.rs`; `builtin_dense_delivery_guard`; `run_pre_delivery_hooks_after_gate` in `telegram.rs`; `resolve_run_agent_engine`; `personas.dense_delivery_*` / `agent_engine_override`; cockpit bulletin PATCH; `settings-agent-engine.tsx`.
+- **Note:** Restart gateway so migrate adds columns and seeds persona 28. Rebuild `web/dist` for Settings/cockpit. Optional: `DELIVERY_UPLOAD_PROVIDER=catbox|none`.
+
 ### 2026-08-25 — Fix ops_poll UTF-8 panic (cockpit queue blank)
 
 - **Area:** web / cockpit ops poll

@@ -78,6 +78,25 @@ const MAIN_CHAT_MESSAGE_VISIBILITY: &str = "(
     )
 )";
 
+const PERSONA_SELECT_COLS: &str = "id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo, dense_delivery_enabled, dense_delivery_messaging_max_chars, dense_delivery_web_max_chars, dense_delivery_summary_chars, agent_engine_override";
+
+fn persona_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Persona> {
+    Ok(Persona {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        name: row.get(2)?,
+        model_override: row.get(3)?,
+        recent_history_min_user: row.get(4)?,
+        recent_history_min_assistant: row.get(5)?,
+        operator_memo: row.get(6)?,
+        dense_delivery_enabled: row.get::<_, i64>(7)? != 0,
+        dense_delivery_messaging_max_chars: row.get(8)?,
+        dense_delivery_web_max_chars: row.get(9)?,
+        dense_delivery_summary_chars: row.get(10)?,
+        agent_engine_override: row.get(11)?,
+    })
+}
+
 const CHAT_SESSION_SELECT_COLS: &str =
     "id, chat_id, persona_id, title, intent, status, created_at, last_active_at, archived_at, ttl_hours, bootstrap_context_json, mirror_main_chat";
 
@@ -127,6 +146,17 @@ pub struct Persona {
     pub recent_history_min_assistant: Option<i64>,
     /// Operator-authored steering note injected into the system prompt (web cockpit).
     pub operator_memo: Option<String>,
+    /// When true, over-limit replies spill to PDF + public URL before channel send.
+    pub dense_delivery_enabled: bool,
+    /// Messaging-channel char cap override (NULL → 2000).
+    pub dense_delivery_messaging_max_chars: Option<i64>,
+    /// Web/other char cap override (NULL → 1000).
+    pub dense_delivery_web_max_chars: Option<i64>,
+    /// Summary excerpt cap override (NULL → 800).
+    pub dense_delivery_summary_chars: Option<i64>,
+    /// Per-persona agent engine (`classic` / `classic_cost_routing` / `cursor` / `deterministic`).
+    /// NULL/empty inherits the global `AGENT_ENGINE` setting.
+    pub agent_engine_override: Option<String>,
 }
 
 /// Maximum `operator_memo` length (characters) for storage and prompt injection.
@@ -837,6 +867,7 @@ impl Database {
         Self::migrate_background_jobs_lease_schema(&conn)?;
         Self::migrate_background_jobs_shell_schema(&conn)?;
         Self::migrate_personas_prompt_context(&conn)?;
+        Self::migrate_personas_dense_delivery_and_engine(&conn)?;
         Self::migrate_hook_policy_schema(&conn)?;
         Self::ensure_builtin_hook_definitions(&conn)?;
         Self::migrate_chat_sessions_schema(&conn)?;
@@ -1560,6 +1591,51 @@ impl Database {
         }
         if !Self::column_exists(conn, "personas", "operator_memo")? {
             conn.execute("ALTER TABLE personas ADD COLUMN operator_memo TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn migrate_personas_dense_delivery_and_engine(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        let mut added_enabled = false;
+        if !Self::column_exists(conn, "personas", "dense_delivery_enabled")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN dense_delivery_enabled INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            added_enabled = true;
+        }
+        if !Self::column_exists(conn, "personas", "dense_delivery_messaging_max_chars")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN dense_delivery_messaging_max_chars INTEGER",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "dense_delivery_web_max_chars")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN dense_delivery_web_max_chars INTEGER",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "dense_delivery_summary_chars")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN dense_delivery_summary_chars INTEGER",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "agent_engine_override")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN agent_engine_override TEXT",
+                [],
+            )?;
+        }
+        if added_enabled {
+            // One-time seed for selling_oversea (persona 28 / operator inbox).
+            conn.execute(
+                "UPDATE personas SET dense_delivery_enabled = 1 WHERE id = 28 AND chat_id = 997894126",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -3004,10 +3080,11 @@ impl Database {
                 | "builtin_turn_skill_gate"
                 | "builtin_deferred_commitment_guard"
                 | "builtin_loop_guard"
+                | "builtin_dense_delivery_guard"
         );
         if !valid_action_type {
             return Err(FinallyAValueBotError::ToolExecution(format!(
-                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard",
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard, builtin_dense_delivery_guard",
                 action_type
             )));
         }
@@ -6042,21 +6119,11 @@ impl Database {
 
     pub fn list_personas(&self, chat_id: i64) -> Result<Vec<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE chat_id = ?1 ORDER BY id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PERSONA_SELECT_COLS} FROM personas WHERE chat_id = ?1 ORDER BY id"
+        ))?;
         let personas = stmt
-            .query_map(params![chat_id], |row| {
-                Ok(Persona {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    name: row.get(2)?,
-                    model_override: row.get(3)?,
-                    recent_history_min_user: row.get(4)?,
-                    recent_history_min_assistant: row.get(5)?,
-                    operator_memo: row.get(6)?,
-                })
-            })?
+            .query_map(params![chat_id], persona_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(personas)
     }
@@ -6118,19 +6185,9 @@ impl Database {
     ) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE chat_id = ?1 AND name = ?2",
+            &format!("SELECT {PERSONA_SELECT_COLS} FROM personas WHERE chat_id = ?1 AND name = ?2"),
             params![chat_id, name],
-            |row| {
-                Ok(Persona {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    name: row.get(2)?,
-                    model_override: row.get(3)?,
-                    recent_history_min_user: row.get(4)?,
-                    recent_history_min_assistant: row.get(5)?,
-                    operator_memo: row.get(6)?,
-                })
-            },
+            persona_from_row,
         );
         match result {
             Ok(p) => Ok(Some(p)),
@@ -6142,19 +6199,9 @@ impl Database {
     pub fn get_persona(&self, id: i64) -> Result<Option<Persona>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo FROM personas WHERE id = ?1",
+            &format!("SELECT {PERSONA_SELECT_COLS} FROM personas WHERE id = ?1"),
             params![id],
-            |row| {
-                Ok(Persona {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    name: row.get(2)?,
-                    model_override: row.get(3)?,
-                    recent_history_min_user: row.get(4)?,
-                    recent_history_min_assistant: row.get(5)?,
-                    operator_memo: row.get(6)?,
-                })
-            },
+            persona_from_row,
         );
         match result {
             Ok(p) => Ok(Some(p)),
@@ -6261,7 +6308,46 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Full-text search over message history for a specific chat/persona.
+    pub fn set_persona_delivery_policy(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        dense_delivery_enabled: bool,
+        messaging_max_chars: Option<i64>,
+        web_max_chars: Option<i64>,
+        summary_chars: Option<i64>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE personas SET dense_delivery_enabled = ?1, dense_delivery_messaging_max_chars = ?2, dense_delivery_web_max_chars = ?3, dense_delivery_summary_chars = ?4 WHERE id = ?5 AND chat_id = ?6",
+            params![
+                if dense_delivery_enabled { 1 } else { 0 },
+                messaging_max_chars,
+                web_max_chars,
+                summary_chars,
+                persona_id,
+                chat_id
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn set_persona_engine_override(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        agent_engine_override: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let value = agent_engine_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let rows = conn.execute(
+            "UPDATE personas SET agent_engine_override = ?1 WHERE id = ?2 AND chat_id = ?3",
+            params![value, persona_id, chat_id],
+        )?;
+        Ok(rows > 0)
+    }
     /// Returns messages ranked by relevance (FTS5 rank).
     pub fn search_messages(
         &self,
@@ -7234,6 +7320,7 @@ mod tests {
             "pretool-turn-skill-gate",
             "prestop-deferred-commitment-guard",
             "postbatch-loop-guard",
+            "predelivery-dense-delivery-guard",
         ];
         for name in builtin_names {
             let hook = hooks
@@ -7258,6 +7345,48 @@ mod tests {
             "fresh DB should contain only the six shipped catalog hooks: {:?}",
             hooks.iter().map(|h| &h.name).collect::<Vec<_>>()
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_builtin_predelivery_dense_delivery_hook_seeded() {
+        let (db, dir) = test_db();
+        let hooks = db.list_hook_definitions().unwrap();
+        let hook = hooks
+            .iter()
+            .find(|h| h.name == "predelivery-dense-delivery-guard")
+            .expect("dense delivery hook must be seeded");
+        assert_eq!(hook.event_name, "PreDelivery");
+        assert_eq!(hook.action_type, "builtin_dense_delivery_guard");
+        assert!(hook.enabled);
+        assert!(hook.scoped_persona_ids.is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_delivery_policy_and_engine_override() {
+        let (db, dir) = test_db();
+        let chat_id = 42;
+        let pid = test_persona(&db, chat_id);
+        let p = db.get_persona(pid).unwrap().unwrap();
+        assert!(!p.dense_delivery_enabled);
+        assert!(p.agent_engine_override.is_none());
+
+        db.set_persona_delivery_policy(chat_id, pid, true, Some(1800), None, Some(600))
+            .unwrap();
+        db.set_persona_engine_override(chat_id, pid, Some("cursor"))
+            .unwrap();
+        let p = db.get_persona(pid).unwrap().unwrap();
+        assert!(p.dense_delivery_enabled);
+        assert_eq!(p.dense_delivery_messaging_max_chars, Some(1800));
+        assert_eq!(p.dense_delivery_web_max_chars, None);
+        assert_eq!(p.dense_delivery_summary_chars, Some(600));
+        assert_eq!(p.agent_engine_override.as_deref(), Some("cursor"));
+
+        db.set_persona_engine_override(chat_id, pid, Some("  "))
+            .unwrap();
+        let p = db.get_persona(pid).unwrap().unwrap();
+        assert!(p.agent_engine_override.is_none());
         cleanup(&dir);
     }
 

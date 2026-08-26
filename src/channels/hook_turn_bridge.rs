@@ -35,6 +35,7 @@ pub fn hook_event_summary(
     if result.matched_hook_ids.is_empty()
         && result.blocked_reason.is_none()
         && result.additional_contexts.is_empty()
+        && result.updated_assistant_text.is_none()
     {
         return None;
     }

@@ -9,6 +9,7 @@ const HOOK_LIFECYCLE_EVENTS = [
   'PostToolUse',
   'PostToolBatch',
   'PreStop',
+  'PreDelivery',
   'PostDelivery',
 ] as const
 
@@ -20,7 +21,8 @@ const HOOK_EVENT_HINTS: Record<HookLifecycleEvent, string> = {
   PostToolUse: 'After each tool call',
   PostToolBatch: 'After a batch of tool calls',
   PreStop: 'Before the agent stops',
-  PostDelivery: 'After the reply is delivered',
+  PreDelivery: 'After PDQE, before persist/send (dense delivery spill)',
+  PostDelivery: 'Before PDQE / focus-sync (despite the name)',
 }
 
 function hookUpsertPayload(

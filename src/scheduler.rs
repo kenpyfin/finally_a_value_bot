@@ -445,7 +445,14 @@ async fn run_scheduled_agent_and_finalize(
     };
 
     let agent_fut = {
-        let engine = state.runtime_toggles.agent_engine().as_str();
+        let global_engine = state.runtime_toggles.agent_engine();
+        let engine = crate::runtime_toggles::resolve_run_agent_engine_from_persona(
+            state.db.as_ref(),
+            chat_id,
+            persona_id,
+            global_engine,
+        )
+        .as_str();
         info!(
             "Scheduler: task #{} starting agent run (engine={engine}, persona={persona_id})",
             task_id,

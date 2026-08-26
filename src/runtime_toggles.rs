@@ -46,6 +46,21 @@ impl AgentEngine {
         }
     }
 
+    /// Strict parser for persona overrides. Unknown strings return `None` (inherit global)
+    /// instead of silently becoming Classic.
+    pub fn parse_override(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => None,
+            "classic" | "single_turn" | "single-turn" => Some(Self::Classic),
+            "classic_cost_routing" | "classic_routed" | "cost_routing" => {
+                Some(Self::ClassicCostRouting)
+            }
+            "deterministic" | "pipeline" => Some(Self::Deterministic),
+            "cursor" | "cursor_sdk" | "cursor-sdk" => Some(Self::Cursor),
+            _ => None,
+        }
+    }
+
     fn from_u8(v: u8) -> Self {
         match v {
             AGENT_ENGINE_DETERMINISTIC => Self::Deterministic,
@@ -273,6 +288,43 @@ fn persist_bool(db: &Database, key: &str, enabled: bool) -> Result<(), FinallyAV
     db.set_app_setting(key, if enabled { "true" } else { "false" })
 }
 
+/// Resolve the engine for a single run. `NULL`/empty/invalid override inherits `global`.
+pub fn resolve_run_agent_engine(
+    persona_override: Option<&str>,
+    global: AgentEngine,
+) -> AgentEngine {
+    let Some(raw) = persona_override.map(str::trim).filter(|s| !s.is_empty()) else {
+        return global;
+    };
+    match AgentEngine::parse_override(raw) {
+        Some(engine) => engine,
+        None => {
+            tracing::warn!(
+                override_value = raw,
+                "invalid persona agent_engine_override; inheriting global {}",
+                global.as_str()
+            );
+            global
+        }
+    }
+}
+
+pub fn resolve_run_agent_engine_from_persona(
+    db: &Database,
+    chat_id: i64,
+    persona_id: i64,
+    global: AgentEngine,
+) -> AgentEngine {
+    let ov = db.get_persona(persona_id).ok().flatten().and_then(|p| {
+        if p.chat_id == chat_id {
+            p.agent_engine_override
+        } else {
+            None
+        }
+    });
+    resolve_run_agent_engine(ov.as_deref(), global)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +342,29 @@ mod tests {
             AgentEngine::ClassicCostRouting
         );
         assert_eq!(AgentEngine::parse(""), AgentEngine::Classic);
+    }
+
+    #[test]
+    fn persona_override_null_inherits_global() {
+        assert_eq!(
+            resolve_run_agent_engine(None, AgentEngine::Classic),
+            AgentEngine::Classic
+        );
+        assert_eq!(
+            resolve_run_agent_engine(Some(""), AgentEngine::Cursor),
+            AgentEngine::Cursor
+        );
+        assert_eq!(
+            resolve_run_agent_engine(Some("cursor"), AgentEngine::Classic),
+            AgentEngine::Cursor
+        );
+        assert_eq!(
+            resolve_run_agent_engine(Some("not-an-engine"), AgentEngine::Cursor),
+            AgentEngine::Cursor
+        );
+        assert_ne!(
+            resolve_run_agent_engine(Some("not-an-engine"), AgentEngine::Cursor),
+            AgentEngine::Classic
+        );
     }
 }

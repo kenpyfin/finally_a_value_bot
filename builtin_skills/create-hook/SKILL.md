@@ -3,7 +3,7 @@ name: create-hook
 description: Author and register lifecycle hooks (block/add_context/command/prompt) in hook_definitions.
 when_to_use: |
   Use when the user wants deterministic automation around agent lifecycle events
-  (BeforeTurn, PreToolUse, PostToolUse, PostToolBatch, PreStop, PostDelivery),
+  (BeforeTurn, PreToolUse, PostToolUse, PostToolBatch, PreStop, PreDelivery, PostDelivery),
   including command-hook scripts and prompt-hook policy checks.
 license: MIT
 compatibility:

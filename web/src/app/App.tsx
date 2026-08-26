@@ -394,6 +394,7 @@ export function App({
     personaBookmarks,
     bulletinHistorySuffix,
     bulletinOperatorMemo,
+    denseDelivery,
     loadPersonaBulletin,
     reloadPersonaBulletin,
     removePersonaBookmark,
@@ -1959,6 +1960,7 @@ export function App({
                     onRemoveBookmark={removePersonaBookmark}
                     historySuffix={bulletinHistorySuffix}
                     operatorMemoServer={bulletinOperatorMemo}
+                    denseDelivery={denseDelivery}
                     reloadBulletin={reloadPersonaBulletin}
                     onBulletinStatus={handleBulletinStatus}
                     onExpandedChange={setCockpitExpanded}

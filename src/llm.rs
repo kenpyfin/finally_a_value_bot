@@ -784,30 +784,10 @@ async fn probe_openai_compatible_server(base_url: &str, model: &str) -> Result<(
     Ok(())
 }
 
-/// List model ids from an OpenAI-compatible local server (`GET /v1/models`).
-pub async fn fetch_openai_compatible_models(base_url: &str) -> Result<Vec<String>, String> {
-    let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("base_url is required".into());
-    }
-    let models_url = format!("{base}/models");
-    let client = probe_llm_http_client();
-    let resp = client
-        .get(&models_url)
-        .send()
-        .await
-        .map_err(|e| format!("Could not reach server at {base_url}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Server at {base_url} returned HTTP {status}. Response: {}",
-            llm_error_body_preview(&body, 200)
-        ));
-    }
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid models JSON: {e}"))?;
+const LIVE_CATALOG_TIMEOUT_SECS: u64 = 20;
+const LIVE_CATALOG_MAX_PAGES: usize = 5;
+
+fn parse_openai_compatible_model_ids(parsed: &serde_json::Value) -> Vec<String> {
     let mut ids: Vec<String> = parsed
         .get("data")
         .and_then(|d| d.as_array())
@@ -836,15 +816,258 @@ pub async fn fetch_openai_compatible_models(base_url: &str) -> Result<Vec<String
                 .collect();
         }
     }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn provider_models_http_error(label: &str, status: reqwest::StatusCode, body: &str) -> String {
+    format!(
+        "{label} returned HTTP {status}. Response: {}",
+        llm_error_body_preview(body, 200)
+    )
+}
+
+/// List model ids from an OpenAI-compatible server (`GET /v1/models`).
+pub async fn fetch_openai_compatible_models(base_url: &str) -> Result<Vec<String>, String> {
+    fetch_openai_compatible_models_authenticated(base_url, None).await
+}
+
+/// List model ids from an OpenAI-compatible `/models` endpoint, optionally sending a Bearer token.
+pub async fn fetch_openai_compatible_models_authenticated(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("base_url is required".into());
+    }
+    let models_url = format!("{base}/models");
+    let client = probe_llm_http_client();
+    let mut req = client.get(&models_url);
+    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    if base.contains("openrouter.ai") {
+        req = req
+            .header("HTTP-Referer", "https://github.com/finally-a-value-bot")
+            .header("X-Title", "finally-a-value-bot");
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach models endpoint at {base}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(provider_models_http_error(base, status, &body));
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid models JSON: {e}"))?;
+    let ids = parse_openai_compatible_model_ids(&parsed);
     if ids.is_empty() {
         return Err(format!(
-            "Server at {base_url} returned no models. Response: {}",
+            "Server at {base} returned no models. Response: {}",
             llm_error_body_preview(&text, 200)
         ));
     }
+    Ok(ids)
+}
+
+async fn fetch_anthropic_model_ids(api_key: &str) -> Result<Vec<String>, String> {
+    let client = probe_llm_http_client();
+    let mut ids = Vec::new();
+    let mut after_id: Option<String> = None;
+    for _ in 0..LIVE_CATALOG_MAX_PAGES {
+        let mut req = client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .query(&[("limit", "100")]);
+        if let Some(ref after) = after_id {
+            req = req.query(&[("after_id", after.as_str())]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Could not reach Anthropic models API: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(provider_models_http_error("Anthropic", status, &text));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("Invalid Anthropic models JSON: {e}"))?;
+        let page = parse_openai_compatible_model_ids(&parsed);
+        let last_id = parsed
+            .get("last_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| page.last().cloned());
+        let has_more = parsed
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        ids.extend(page);
+        if !has_more {
+            break;
+        }
+        match last_id {
+            Some(next) if after_id.as_ref() != Some(&next) => after_id = Some(next),
+            _ => break,
+        }
+    }
     ids.sort();
     ids.dedup();
+    if ids.is_empty() {
+        return Err("Anthropic models API returned no models".into());
+    }
     Ok(ids)
+}
+
+fn parse_gemini_native_model_ids(parsed: &serde_json::Value) -> Vec<String> {
+    parsed
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|entry| {
+                    let methods = entry
+                        .get("supportedGenerationMethods")
+                        .and_then(|v| v.as_array());
+                    if let Some(methods) = methods {
+                        let chat_ok = methods.iter().any(|m| {
+                            m.as_str()
+                                .is_some_and(|s| s.eq_ignore_ascii_case("generateContent"))
+                        });
+                        if !chat_ok {
+                            return None;
+                        }
+                    }
+                    entry
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .or_else(|| entry.get("id").and_then(|n| n.as_str()))
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn fetch_gemini_model_ids(api_key: &str) -> Result<Vec<String>, String> {
+    if let Ok(ids) = fetch_openai_compatible_models_authenticated(
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        Some(api_key),
+    )
+    .await
+    {
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+
+    let client = probe_llm_http_client();
+    let mut ids = Vec::new();
+    let mut page_token: Option<String> = None;
+    for _ in 0..LIVE_CATALOG_MAX_PAGES {
+        let mut req = client
+            .get("https://generativelanguage.googleapis.com/v1beta/models")
+            .header("x-goog-api-key", api_key)
+            .query(&[("pageSize", "100")]);
+        if let Some(ref token) = page_token {
+            req = req.query(&[("pageToken", token.as_str())]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|_| "Could not reach Gemini models API".to_string())?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(provider_models_http_error("Gemini", status, &text));
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("Invalid Gemini models JSON: {e}"))?;
+        ids.extend(parse_gemini_native_model_ids(&parsed));
+        let next = parsed
+            .get("nextPageToken")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|t| !t.is_empty());
+        match next {
+            Some(token) if page_token.as_ref() != Some(&token) => page_token = Some(token),
+            _ => break,
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err("Gemini models API returned no models".into());
+    }
+    Ok(ids)
+}
+
+/// Fetch live model ids for a catalog provider. Never logs or returns the API key.
+pub async fn fetch_live_provider_models(
+    provider_id: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let p = crate::llm_catalog::resolve_catalog_provider_id(provider_id);
+    let fetch = async {
+        match p.as_str() {
+            "azure" | "bedrock" | "custom" => Err(
+                "This provider does not expose a listable model catalog. Use a custom model id."
+                    .into(),
+            ),
+            "anthropic" => {
+                if api_key.trim().is_empty() {
+                    return Err("Anthropic API key is not configured in .env".into());
+                }
+                fetch_anthropic_model_ids(api_key).await
+            }
+            "google" => {
+                if api_key.trim().is_empty() {
+                    return Err("Gemini API key is not configured in .env".into());
+                }
+                fetch_gemini_model_ids(api_key).await
+            }
+            "ollama" | "llama" | "llamacpp" => {
+                let url = base_url
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .map(|u| crate::llm_catalog::normalize_local_base_url(u, &p))
+                    .or_else(|| {
+                        crate::llm_catalog::default_base_url_for_provider(&p).map(str::to_string)
+                    })
+                    .ok_or_else(|| "base_url is required for local providers".to_string())?;
+                fetch_openai_compatible_models(&url).await
+            }
+            _ => {
+                if api_key.trim().is_empty() {
+                    return Err(format!("API key is not configured in .env for {p}"));
+                }
+                let url = crate::llm_catalog::default_base_url_for_provider(&p)
+                    .filter(|u| !u.is_empty() && !u.contains("YOUR-"))
+                    .ok_or_else(|| format!("No default API base URL for provider {p}"))?;
+                fetch_openai_compatible_models_authenticated(url, Some(api_key)).await
+            }
+        }
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(LIVE_CATALOG_TIMEOUT_SECS),
+        fetch,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Live model catalog timed out after {LIVE_CATALOG_TIMEOUT_SECS}s"
+        )),
+    }
 }
 
 /// Test that a model override is reachable with the current provider/config.
@@ -3161,6 +3384,41 @@ mod tests {
         );
         assert_eq!(body["tool_choice"], json!("required"));
         assert!(body.get("tools").is_some());
+    }
+
+    #[test]
+    fn parse_openai_compatible_model_ids_reads_data_array() {
+        let parsed = json!({
+            "data": [
+                {"id": "gpt-5.4"},
+                {"id": "gpt-4o"},
+                {"id": "gpt-4o"}
+            ]
+        });
+        assert_eq!(
+            parse_openai_compatible_model_ids(&parsed),
+            vec!["gpt-4o".to_string(), "gpt-5.4".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_gemini_native_model_ids_keeps_generate_content() {
+        let parsed = json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "supportedGenerationMethods": ["embedContent"]
+                }
+            ]
+        });
+        assert_eq!(
+            parse_gemini_native_model_ids(&parsed),
+            vec!["models/gemini-2.5-flash".to_string()]
+        );
     }
 
     #[test]

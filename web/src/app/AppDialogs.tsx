@@ -40,19 +40,8 @@ import type {
   ScheduleTask,
 } from '../types'
 
-const SettingsLlmPanel = React.lazy(() =>
-  import('../components/settings-llm').then((m) => ({ default: m.SettingsLlmPanel })),
-)
-const SettingsLocalDelegatePanel = React.lazy(() =>
-  import('../components/settings-local-delegate').then((m) => ({ default: m.SettingsLocalDelegatePanel })),
-)
-const SettingsCursorPanel = React.lazy(() =>
-  import('../components/settings-cursor').then((m) => ({ default: m.SettingsCursorPanel })),
-)
-const SettingsDeterministicPipelinePanel = React.lazy(() =>
-  import('../components/settings-deterministic-pipeline').then((m) => ({
-    default: m.SettingsDeterministicPipelinePanel,
-  })),
+const SettingsAgentEnginePanel = React.lazy(() =>
+  import('../components/settings-agent-engine').then((m) => ({ default: m.SettingsAgentEnginePanel })),
 )
 const SettingsHooksSkillsPanel = React.lazy(() =>
   import('../components/settings-hooks-skills').then((m) => ({ default: m.SettingsHooksSkillsPanel })),
@@ -683,10 +672,7 @@ export function AppDialogs({
     <Tabs.Root defaultValue="overview">
       <Tabs.List size="1" className="mb-3 flex-wrap mc-settings-tabs-sticky">
         <Tabs.Trigger value="overview">Overview</Tabs.Trigger>
-        <Tabs.Trigger value="llm">LLM</Tabs.Trigger>
-        <Tabs.Trigger value="local-delegate">Local delegate</Tabs.Trigger>
-        <Tabs.Trigger value="cursor">Cursor</Tabs.Trigger>
-        <Tabs.Trigger value="deterministic">Deterministic</Tabs.Trigger>
+        <Tabs.Trigger value="agent-engine">Agent engine</Tabs.Trigger>
         <Tabs.Trigger value="hooks-skills">Hooks & Skills</Tabs.Trigger>
         <Tabs.Trigger value="integrations">Integrations</Tabs.Trigger>
         <Tabs.Trigger value="channels">Channels</Tabs.Trigger>
@@ -755,20 +741,13 @@ export function AppDialogs({
           <SettingsRuntimePanel api={api} onError={setSettingsError} />
         </div>
       </Tabs.Content>
-      <Tabs.Content value="llm">
-        <SettingsLlmPanel
+      <Tabs.Content value="agent-engine">
+        <SettingsAgentEnginePanel
           api={api}
           onError={setSettingsError}
+          chatId={chatId}
+          activePersonaId={activePersonaId}
         />
-      </Tabs.Content>
-      <Tabs.Content value="local-delegate">
-        <SettingsLocalDelegatePanel api={api} onError={setSettingsError} />
-      </Tabs.Content>
-      <Tabs.Content value="cursor">
-        <SettingsCursorPanel api={api} onError={setSettingsError} />
-      </Tabs.Content>
-      <Tabs.Content value="deterministic">
-        <SettingsDeterministicPipelinePanel api={api} onError={setSettingsError} />
       </Tabs.Content>
       <Tabs.Content value="hooks-skills">
         <SettingsHooksSkillsPanel

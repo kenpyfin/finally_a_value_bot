@@ -11,6 +11,7 @@ Hooks are evaluated at these boundaries:
 - `PostToolUse`
 - `PostToolBatch`
 - `PreStop`
+- `PreDelivery`
 - `PostDelivery`
 
 Runtime entry point:
@@ -19,7 +20,7 @@ Runtime entry point:
 
 ## Shipped hook catalog
 
-On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests from repository **`builtin_hooks/*.hook.json`** into SQLite (see `src/builtin_hooks.rs`). A fresh clone already includes five manifests:
+On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests from repository **`builtin_hooks/*.hook.json`** into SQLite (see `src/builtin_hooks.rs`). A fresh clone already includes six manifests:
 
 | Manifest file | Event | `action_type` |
 |---------------|-------|---------------|
@@ -28,6 +29,7 @@ On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests 
 | `pretool-turn-skill-gate.hook.json` | PreToolUse | `builtin_turn_skill_gate` |
 | `prestop-deferred-commitment-guard.hook.json` | PreStop | `builtin_deferred_commitment_guard` |
 | `postbatch-loop-guard.hook.json` | PostToolBatch | `builtin_loop_guard` |
+| `predelivery-dense-delivery-guard.hook.json` | PreDelivery | `builtin_dense_delivery_guard` |
 
 Handlers run in Rust (`hook_runtime.rs`). Manifests are the install-time catalog, not subprocess scripts.
 
@@ -60,6 +62,7 @@ Supported `action_type` values:
 - `builtin_turn_skill_gate` (PreToolUse schedule/modify activation gate)
 - `builtin_deferred_commitment_guard` (PreStop deferred-work guard; no-op when `stop_reason` is `ask_clarification`)
 - `builtin_loop_guard` (PostToolBatch discovery/edit loop guard)
+- `builtin_dense_delivery_guard` (PreDelivery persona-gated length spill to PDF + public URL; no-op when the persona toggle is off)
 
 `pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.
 
@@ -88,6 +91,7 @@ Hooks may return:
 - `reason`, `user_message`
 - `agent_message`, `additional_context`
 - `updated_tool_input`
+- `updated_assistant_text` (PreDelivery only; applied after PDQE, before persist/send)
 - `effects.memory_tier3_prune.terminal_pz_post_ids`
 
 Notes:
@@ -135,7 +139,7 @@ Command hooks may return `effects.memory_tier3_prune`; Rust applies writes via `
 
 ## Built-in Rust policy hooks
 
-`builtin_*` action types run inline in `hook_runtime.rs`. PostDelivery focus sync triggers `run_persona_focus_sync_after_delivery` when `builtin_persona_focus_sync` matches.
+`builtin_*` action types run inline in `hook_runtime.rs`. PostDelivery focus sync triggers `run_persona_focus_sync_after_delivery` when `builtin_persona_focus_sync` matches. PreDelivery `builtin_dense_delivery_guard` may replace `updated_assistant_text` after PDQE when the persona dense-delivery toggle is on and the reply exceeds the channel cap.
 
 ## Separation from delivery safeguards
 
@@ -143,7 +147,7 @@ Hooks are additive policy controls. Baseline delivery correctness and final-resp
 
 ## Cursor engine (bot-native hooks)
 
-When **Settings → Runtime → Agent engine** is **Cursor**, bot hooks still run in Rust — they are **not** Cursor IDE `.cursor/hooks.json` hooks.
+When **Settings → Agent engine** is **Cursor**, bot hooks still run in Rust — they are **not** Cursor IDE `.cursor/hooks.json` hooks.
 
 **Full integration guide** (tools via MCP, skills prompt + execution, hook dispatch per event): [`cursor-engine-integration.md`](cursor-engine-integration.md).
 
@@ -154,6 +158,7 @@ When **Settings → Runtime → Agent engine** is **Cursor**, bot hooks still ru
 | `PostToolUse` | Yes — loopback MCP `tools/call` | Yes |
 | `PostToolBatch` | Yes — end of Cursor sidecar turn | Yes |
 | `PreStop` | Yes — `end_turn` + deferred-commitment nudge loop (max 2 sidecar resumes) | Yes |
-| `PostDelivery` | Yes — via `pipeline_finish_turn` (assistant message appended first) | Yes |
+| `PreDelivery` | Yes — after PDQE accept/fail-open, before persist/send | Yes |
+| `PostDelivery` | Yes — via `pipeline_finish_turn` (assistant message appended first; runs before PDQE) | Yes |
 
 Shared turn-boundary helpers live in `src/channels/hook_turn_bridge.rs`. Tool hooks: `src/tool_hook_dispatch.rs`, `src/cursor_mcp_bridge.rs` (`POST /internal/cursor-mcp`). Cursor dispatch: `src/cursor_engine.rs` (`run_cursor_engine`).

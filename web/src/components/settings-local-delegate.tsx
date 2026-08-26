@@ -230,7 +230,7 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
       <Text size="1" color="gray">
         Configure a local OpenAI-compatible server for Classic · Cost routing (read-only discovery
         and delegated sub-jobs), PTE/PDQE sidecars, and Deterministic local phases. Enable cost
-        routing from Settings → Runtime → Classic · Cost routing.
+        routing from Settings → Agent engine (per persona, or the global inherit default).
       </Text>
 
       {!localToolsOk ? (
@@ -346,7 +346,7 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
           <span className="font-mono">
             {config.strategy_provider ?? 'anthropic'} / {config.strategy_model ?? 'claude-sonnet'}
           </span>{' '}
-          from Settings → LLM. Cost routing sends read-only tool chains to the local model above.
+          from Settings → Agent engine. Cost routing sends read-only tool chains to the local model above.
         </Text>
       </div>
 

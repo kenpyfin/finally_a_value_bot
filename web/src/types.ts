@@ -18,6 +18,8 @@ export type Persona = {
   /** Session that produced the latest bot message; null/undefined = main chat. */
   last_bot_message_session_id?: string | null
   last_bot_message_session_title?: string | null
+  agent_engine_override?: string | null
+  agent_engine_effective?: string
 }
 
 export type ChannelBinding = {
@@ -74,6 +76,7 @@ export type LlmCatalogModel = {
   cost_tier: string
   cost_summary: string
   from_active_config?: boolean
+  from_live?: boolean
 }
 
 export type CursorModelParam = {
@@ -334,6 +337,7 @@ export type LlmConfigResponse = {
   base_url_source?: 'app_settings' | 'default' | 'n/a'
   catalog?: LlmCatalogModel[]
   providers?: LlmProviderOption[]
+  catalog_source?: 'static_curated' | 'live' | 'static_fallback'
   cost_reference_note?: string
   custom_model_allowed?: boolean
   thinking_enabled?: boolean
@@ -341,6 +345,17 @@ export type LlmConfigResponse = {
   thinking_supported?: boolean
   show_thinking?: boolean
   show_thinking_source?: 'app_settings' | 'env' | 'default'
+}
+
+export type LlmLiveCatalogResponse = {
+  ok?: boolean
+  provider?: string
+  source?: 'live' | 'static_fallback'
+  truncated?: boolean
+  live_count?: number | null
+  models?: LlmCatalogModel[]
+  base_url?: string | null
+  message?: string | null
 }
 
 export type LocalDelegateConfigResponse = {
@@ -501,6 +516,20 @@ export type PersonaBulletinHistorySuffix = {
   min_user: PersonaHistorySuffixSide
   min_assistant: PersonaHistorySuffixSide
   defaults: { min_user: number; min_assistant: number }
+}
+
+export type PersonaDenseDeliveryInfo = {
+  enabled: boolean
+  messaging_max_chars: number
+  web_max_chars: number
+  summary_chars: number
+}
+
+export type PersonaAgentEngineInfo = {
+  override: string | null
+  global: string
+  effective: string
+  uses_default: boolean
 }
 
 /** Must match `OPERATOR_MEMO_MAX_CHARS` on the server. */
