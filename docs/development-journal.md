@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-26 — Node sidecar uses JsonlLocalAgentStore on Node 20
+
+- **Area:** Cursor SDK sidecar
+- **Summary:** `@cursor/sdk` local runtime defaults to `node:sqlite`, which needs Node >= 22.13. Host is Node 20, so `Agent.create`/`resume` failed with that error. Sidecar now passes `local.store = new JsonlLocalAgentStore(dir)` per persona/session under `{runtime}/cursor-sdk-state/`.
+- **Key files / symbols:** `localStoreFor` / `agentStoreRoot` in `scripts/cursor-sdk-runner.mjs`.
+- **Note:** Recycle sidecar (script mtime) so the runner reloads. No Node upgrade required.
+
 ### 2026-08-25 — Agent engine settings apply to the active persona only
 
 - **Area:** Settings / personas

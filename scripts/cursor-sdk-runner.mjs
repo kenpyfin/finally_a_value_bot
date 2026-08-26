@@ -12,6 +12,9 @@
  *   CURSOR_BRIDGE_POOL_MAX          max warm agent handles, default 16
  *   CURSOR_SIDECAR_MAX_UPTIME_SECS  idle self-recycle, default 86400
  *   CURSOR_SDK_NODE_PREFIX          runtime dir with sdk-shim.mjs + node_modules
+ *   CURSOR_SDK_STATE_ROOT           optional parent dir for JsonlLocalAgentStore
+ *
+ * Local agents use JsonlLocalAgentStore (not node:sqlite) so Node 20 works.
  *
  * API: GET /health  GET /models  POST /run  POST /admin/request_recycle
  */
@@ -21,7 +24,9 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_PORT = 3848;
 const DEFAULT_MODEL = "composer-2.5";
@@ -37,6 +42,8 @@ const STARTED_AT_MONOTONIC = process.hrtime.bigint();
 const STARTED_AT_UNIX = Date.now() / 1000;
 
 let sdkModule = null;
+/** @type {Map<string, unknown>} */
+const LOCAL_STORES = new Map();
 let runsInFlight = 0;
 let recycleRequested = false;
 let shutdownTriggered = false;
@@ -114,6 +121,35 @@ function isEphemeralSessionScope(sessionScope) {
   return UUID_RE.test(scope);
 }
 
+function agentStoreRoot(cwd, sessionScope) {
+  const key = poolKey(cwd, sessionScope).replace(":", "-");
+  const override = (process.env.CURSOR_SDK_STATE_ROOT || "").trim();
+  if (override) {
+    return path.join(override, key);
+  }
+  const runtime = (process.env.FINALLY_A_VALUE_BOT_RUNTIME_DATA || "").trim();
+  const runtimeDir =
+    runtime || path.join(SCRIPT_DIR, "..", "workspace", "runtime");
+  return path.join(runtimeDir, "cursor-sdk-state", key);
+}
+
+function localStoreFor(sdk, cwd, sessionScope) {
+  const Store = sdk?.JsonlLocalAgentStore;
+  if (typeof Store !== "function") {
+    throw new Error(
+      "JsonlLocalAgentStore is not exported from @cursor/sdk; upgrade the package",
+    );
+  }
+  const dir = agentStoreRoot(cwd, sessionScope);
+  fs.mkdirSync(dir, { recursive: true });
+  let store = LOCAL_STORES.get(dir);
+  if (!store) {
+    store = new Store(dir);
+    LOCAL_STORES.set(dir, store);
+  }
+  return store;
+}
+
 function poolKey(cwd, sessionScope) {
   let resolved = cwd;
   try {
@@ -153,9 +189,12 @@ async function loadSdk() {
   if (prefix) {
     const shim = path.join(prefix, "sdk-shim.mjs");
     sdkModule = await import(pathToFileURL(shim).href);
-    return sdkModule;
+  } else {
+    sdkModule = await import("@cursor/sdk");
   }
-  sdkModule = await import("@cursor/sdk");
+  logErr(
+    `loaded @cursor/sdk; local store=JsonlLocalAgentStore (node ${process.versions.node})`,
+  );
   return sdkModule;
 }
 
@@ -387,12 +426,13 @@ function emitStreamEvent(event, textParts, active) {
   }
 }
 
-async function openAgent(sdk, { agentId, model, modelParams, cwd, key, mcpServers }) {
+async function openAgent(sdk, { agentId, model, modelParams, cwd, key, mcpServers, sessionScope }) {
   const { Agent } = sdk;
+  const store = localStoreFor(sdk, cwd, sessionScope);
   const options = {
     apiKey: key,
     model: buildModelSelection(model, modelParams),
-    local: { cwd },
+    local: { cwd, store },
   };
   if (mcpServers) options.mcpServers = mcpServers;
 
@@ -400,7 +440,7 @@ async function openAgent(sdk, { agentId, model, modelParams, cwd, key, mcpServer
     return await Agent.create(options);
   }
   try {
-    const resumeOpts = { apiKey: key, local: { cwd } };
+    const resumeOpts = { apiKey: key, local: { cwd, store } };
     if (mcpServers) resumeOpts.mcpServers = mcpServers;
     if (options.model) resumeOpts.model = options.model;
     return await Agent.resume(agentId, resumeOpts);
@@ -544,6 +584,8 @@ async function handleHealth(_req, res) {
     ok: true,
     service: "cursor-sdk-runner",
     runtime: "node",
+    node_version: process.versions.node,
+    local_store: "jsonl",
     api_key_configured: Boolean(apiKey()),
     cursor_sdk_installed: installed,
     mcp_supported: true,
@@ -726,6 +768,7 @@ async function streamRun(body, active) {
             cwd,
             key,
             mcpServers,
+            sessionScope,
           });
         }
         return streamAgentTurn(slot.agent, prompt, mcpServers, active);
@@ -818,6 +861,13 @@ function runSelfTests() {
   }
   const key = poolKey(os.tmpdir(), "");
   if (!key.includes(":main")) throw new Error("pool key should use main scope");
+  const storeDir = agentStoreRoot(os.tmpdir(), "focus:x");
+  if (!storeDir.includes("cursor-sdk-state")) {
+    throw new Error("store root should live under cursor-sdk-state");
+  }
+  if (storeDir.includes(":")) {
+    throw new Error("store directory must not contain pool-key colons");
+  }
   if (runConcurrency() < 1) throw new Error("concurrency");
   if (agentIdleTtlSecs() < 60) throw new Error("idle ttl");
   if (sidecarMaxUptimeSecs() < 300) throw new Error("max uptime");

@@ -13,6 +13,13 @@ Template:
 - **Files/refs:** key paths, symbols, log signatures
 ```
 
+### 2026-08-26 — Cursor Node sidecar failed: node:sqlite required
+- **Symptom:** Cursor engine `/run` failed: `Default local agent storage requires the built-in node:sqlite module (Node >= 22.13…)`.
+- **Root cause:** `@cursor/sdk` local agents default to SQLite via `node:sqlite`. The host runs Node 20.20, which does not implement that module. Docs say the default *should* fall back to JSONL, but this SDK build throws instead.
+- **Fix:** Always pass `JsonlLocalAgentStore` on `Agent.create` / `Agent.resume` (`local.store`), keyed per cwd+session under `runtime/cursor-sdk-state/`.
+- **Prevention:** Do not rely on SDK sqlite auto-fallback. Pin an explicit store on every local create/resume when Node < 22.13.
+- **Files/refs:** `scripts/cursor-sdk-runner.mjs` (`localStoreFor`); log `local store=JsonlLocalAgentStore`.
+
 ### 2026-08-25 — Settings Cursor model list hit cursor-sdk-bridge connection fail
 - **Symptom:** Settings → Agent engine → Cursor **Refresh models** often failed with a sidecar 502 (`ConnectError` / connection refused / timed out waiting for bridge discovery). Turns could flake the same way.
 - **Root cause:** Python `cursor-sdk` wraps TypeScript `@cursor/sdk` by spawning `cursor-sdk-bridge.js` (Connect-RPC). `Cursor.models.list()` and every `/run` went through that subprocess. The bridge died or failed discovery while the Python sidecar kept a stale client.
