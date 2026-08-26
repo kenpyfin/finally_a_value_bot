@@ -1,4 +1,7 @@
-//! Auto-start the embedded Cursor SDK Python sidecar when the bot starts.
+//! Auto-start the embedded Cursor SDK sidecar when the bot starts.
+//!
+//! Default runtime is Node (`scripts/cursor-sdk-runner.mjs` + `@cursor/sdk`).
+//! Set `CURSOR_SDK_RUNNER_SCRIPT` to `scripts/cursor-sdk-runner.py` to roll back.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,13 +24,23 @@ const HEALTH_WAIT_MAX_SECS: u64 = 45;
 const SUPERVISOR_INTERVAL_SECS: u64 = 30;
 const SUPERVISOR_HEALTH_TIMEOUT_MS: u64 = 2_500;
 const SOFT_RECYCLE_WAIT_SECS: u64 = 120;
-const ORPHAN_BRIDGE_SLACK: u64 = 4;
 const SIDECAR_VENV_DIR_NAME: &str = "cursor-sdk-venv";
+const SIDECAR_NODE_DIR_NAME: &str = "cursor-sdk-node";
 const SIDECAR_PID_FILE: &str = "cursor-sdk-sidecar.pid";
 const SIDECAR_STDERR_LOG: &str = "cursor-sdk-sidecar.stderr.log";
 const SIDECAR_PYTHON_PACKAGES: &[&str] = &["cursor-sdk", "aiohttp"];
+const SIDECAR_NODE_PACKAGE: &str = "@cursor/sdk";
 const VENV_CREATE_TIMEOUT_SECS: u64 = 120;
 const PIP_INSTALL_TIMEOUT_SECS: u64 = 180;
+const NPM_INSTALL_TIMEOUT_SECS: u64 = 180;
+const NODE_SCRIPT_NAMES: &[&str] = &["cursor-sdk-runner.mjs", "cursor-sdk-runner.py"];
+const SDK_SHIM_SOURCE: &str = "export * from \"@cursor/sdk\";\n";
+const NODE_PACKAGE_JSON: &str = r#"{
+  "name": "cursor-sdk-sidecar",
+  "private": true,
+  "type": "module"
+}
+"#;
 
 #[derive(Clone)]
 struct SupervisorCtx {
@@ -37,6 +50,7 @@ struct SupervisorCtx {
     max_uptime_secs: u64,
     auto_install: bool,
     python_override: String,
+    node_override: String,
 }
 
 /// Keeps the sidecar child process alive and auto-recycles when idle / wedged.
@@ -52,6 +66,17 @@ pub fn default_local_runner_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+fn find_sidecar_script_in(dir: &Path) -> Option<PathBuf> {
+    let scripts = dir.join("scripts");
+    for name in NODE_SCRIPT_NAMES {
+        let path = scripts.join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 pub fn resolve_sidecar_script() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("CURSOR_SDK_RUNNER_SCRIPT") {
         let path = PathBuf::from(raw.trim());
@@ -60,20 +85,25 @@ pub fn resolve_sidecar_script() -> Option<PathBuf> {
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        let path = cwd.join("scripts").join("cursor-sdk-runner.py");
-        if path.is_file() {
+        if let Some(path) = find_sidecar_script_in(&cwd) {
             return Some(path);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().take(6) {
-            let path = ancestor.join("scripts").join("cursor-sdk-runner.py");
-            if path.is_file() {
+            if let Some(path) = find_sidecar_script_in(ancestor) {
                 return Some(path);
             }
         }
     }
     None
+}
+
+fn is_python_script(script: &Path) -> bool {
+    script
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
 fn is_local_runner_url(url: &str, port: u16) -> bool {
@@ -86,6 +116,14 @@ fn is_local_runner_url(url: &str, port: u16) -> bool {
 
 fn sidecar_venv_dir(config: &Config) -> PathBuf {
     PathBuf::from(config.runtime_data_dir()).join(SIDECAR_VENV_DIR_NAME)
+}
+
+fn sidecar_node_prefix_dir_from(runtime_data_dir: &str) -> PathBuf {
+    PathBuf::from(runtime_data_dir).join(SIDECAR_NODE_DIR_NAME)
+}
+
+fn sidecar_node_prefix_dir(config: &Config) -> PathBuf {
+    sidecar_node_prefix_dir_from(&config.runtime_data_dir())
 }
 
 fn sidecar_pid_path(config: &Config) -> PathBuf {
@@ -113,23 +151,59 @@ fn base_python_executable(config: &Config) -> String {
     }
 }
 
+fn base_node_executable(config: &Config) -> String {
+    let node = config.cursor_sdk_node.trim();
+    if node.is_empty() {
+        "node".to_string()
+    } else {
+        node.to_string()
+    }
+}
+
+fn interpreter_from_ctx(ctx: &SupervisorCtx, python: bool) -> PathBuf {
+    if python {
+        PathBuf::from(if ctx.python_override.trim().is_empty() {
+            "python3"
+        } else {
+            ctx.python_override.trim()
+        })
+    } else {
+        PathBuf::from(if ctx.node_override.trim().is_empty() {
+            "node"
+        } else {
+            ctx.node_override.trim()
+        })
+    }
+}
+
 async fn run_command_with_timeout(
     program: &str,
     args: &[&str],
     timeout_secs: u64,
 ) -> Result<(), String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        Command::new(program).args(args).output(),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "timed out after {timeout_secs}s: {program} {}",
-            args.join(" ")
-        )
-    })?
-    .map_err(|e| format!("failed to run {program}: {e}"))?;
+    run_command_with_timeout_in(program, args, timeout_secs, None).await
+}
+
+async fn run_command_with_timeout_in(
+    program: &str,
+    args: &[&str],
+    timeout_secs: u64,
+    cwd: Option<&Path>,
+) -> Result<(), String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {timeout_secs}s: {program} {}",
+                args.join(" ")
+            )
+        })?
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
 
     if output.status.success() {
         Ok(())
@@ -232,6 +306,72 @@ async fn resolve_sidecar_python(config: &Config) -> Result<PathBuf, String> {
     }
 }
 
+fn node_sdk_installed(prefix: &Path) -> bool {
+    prefix.join("sdk-shim.mjs").is_file()
+        && (prefix
+            .join("node_modules")
+            .join("@cursor")
+            .join("sdk")
+            .is_dir()
+            || prefix
+                .join("node_modules")
+                .join("@cursor")
+                .join("sdk")
+                .is_file())
+}
+
+async fn ensure_sidecar_node_prefix(config: &Config) -> Result<PathBuf, String> {
+    let prefix = sidecar_node_prefix_dir(config);
+    std::fs::create_dir_all(&prefix)
+        .map_err(|e| format!("failed to create Cursor SDK node prefix: {e}"))?;
+
+    let package_json = prefix.join("package.json");
+    if !package_json.is_file() {
+        std::fs::write(&package_json, NODE_PACKAGE_JSON)
+            .map_err(|e| format!("failed to write Cursor SDK package.json: {e}"))?;
+    }
+    std::fs::write(prefix.join("sdk-shim.mjs"), SDK_SHIM_SOURCE)
+        .map_err(|e| format!("failed to write Cursor SDK shim: {e}"))?;
+
+    if node_sdk_installed(&prefix) {
+        return Ok(prefix);
+    }
+
+    let node = base_node_executable(config);
+    info!(
+        "Installing {SIDECAR_NODE_PACKAGE} into {} using npm (node={node})",
+        prefix.display()
+    );
+    let prefix_str = prefix.to_string_lossy().to_string();
+    run_command_with_timeout(
+        "npm",
+        &["install", "--prefix", &prefix_str, SIDECAR_NODE_PACKAGE],
+        NPM_INSTALL_TIMEOUT_SECS,
+    )
+    .await
+    .map_err(|e| format!("Cursor SDK npm install failed: {e}"))?;
+
+    if !node_sdk_installed(&prefix) {
+        return Err(format!(
+            "{SIDECAR_NODE_PACKAGE} installed but sdk-shim check failed under {}",
+            prefix.display()
+        ));
+    }
+    info!(
+        "Cursor SDK sidecar Node environment ready at {}",
+        prefix.display()
+    );
+    Ok(prefix)
+}
+
+async fn resolve_sidecar_node_prefix(config: &Config) -> Result<PathBuf, String> {
+    if config.cursor_sdk_auto_install {
+        ensure_sidecar_node_prefix(config).await
+    } else {
+        Ok(sidecar_node_prefix_dir(config))
+    }
+}
+
 fn write_sidecar_pid(config: &Config, pid: u32) {
     let path = sidecar_pid_path(config);
     if let Err(e) = std::fs::write(&path, pid.to_string()) {
@@ -323,10 +463,7 @@ fn health_suggests_stale_attach(
             return true;
         }
     }
-    health.os_bridge_pids
-        > health
-            .persona_bridges_active
-            .saturating_add(ORPHAN_BRIDGE_SLACK)
+    false
 }
 
 #[cfg(unix)]
@@ -407,6 +544,7 @@ impl SidecarHandle {
                 max_uptime_secs: 86_400,
                 auto_install: true,
                 python_override: "python3".into(),
+                node_override: "node".into(),
             },
             managed_locally: false,
             runner_url: default_local_runner_url(3848),
@@ -492,39 +630,36 @@ impl SidecarHandle {
 
     async fn spawn_fresh(self: &Arc<Self>) -> Result<(), String> {
         let script = resolve_sidecar_script().ok_or_else(|| {
-            "cursor-sdk-runner.py not found (set CURSOR_SDK_RUNNER_SCRIPT or run from repo root)"
+            "cursor-sdk-runner.mjs not found (set CURSOR_SDK_RUNNER_SCRIPT or run from repo root)"
                 .to_string()
         })?;
-        // Build a minimal Config-like spawn using stored ctx.
-        let python = if self.ctx.auto_install {
-            // Reuse venv under runtime dir without full Config.
+        let python = is_python_script(&script);
+        let interpreter = if python && self.ctx.auto_install {
             let venv_dir = PathBuf::from(&self.ctx.runtime_data_dir).join(SIDECAR_VENV_DIR_NAME);
             let venv_py = venv_python_executable(&venv_dir);
             if venv_py.is_file() {
                 venv_py
             } else {
-                PathBuf::from(if self.ctx.python_override.trim().is_empty() {
-                    "python3"
-                } else {
-                    self.ctx.python_override.trim()
-                })
+                interpreter_from_ctx(&self.ctx, true)
             }
         } else {
-            PathBuf::from(if self.ctx.python_override.trim().is_empty() {
-                "python3"
-            } else {
-                self.ctx.python_override.trim()
-            })
+            interpreter_from_ctx(&self.ctx, python)
+        };
+        let node_prefix = if python {
+            None
+        } else {
+            Some(sidecar_node_prefix_dir_from(&self.ctx.runtime_data_dir))
         };
         let stderr_log = PathBuf::from(&self.ctx.runtime_data_dir).join(SIDECAR_STDERR_LOG);
         let proc = spawn_sidecar_process(
             &script,
             self.ctx.port,
-            &python,
+            &interpreter,
             &stderr_log,
             &self.ctx.runtime_data_dir,
             &self.ctx.workspace_root,
             self.ctx.max_uptime_secs,
+            node_prefix.as_deref(),
         )
         .await?;
         if let Some(pid) = proc.id() {
@@ -574,13 +709,6 @@ async fn supervise_sidecar(handle: Arc<SidecarHandle>) {
         let mut soft_reason: Option<&'static str> = None;
         if health.uptime_secs >= handle.ctx.max_uptime_secs && health.runs_in_flight == 0 {
             soft_reason = Some("max_uptime");
-        } else if health.os_bridge_pids
-            > health
-                .persona_bridges_active
-                .saturating_add(ORPHAN_BRIDGE_SLACK)
-            && health.runs_in_flight == 0
-        {
-            soft_reason = Some("orphan_bridges");
         } else if let Some(script) = resolve_sidecar_script() {
             if let Some(mtime) = script_mtime_unix(&script) {
                 if health.started_at_unix > 0
@@ -601,11 +729,12 @@ async fn supervise_sidecar(handle: Arc<SidecarHandle>) {
 async fn spawn_sidecar_process(
     script: &Path,
     port: u16,
-    python: &Path,
+    interpreter: &Path,
     stderr_log: &Path,
     runtime_data_dir: &str,
     workspace_root: &Path,
     max_uptime_secs: u64,
+    node_prefix: Option<&Path>,
 ) -> Result<Child, String> {
     let stderr_file = std::fs::OpenOptions::new()
         .create(true)
@@ -618,7 +747,7 @@ async fn spawn_sidecar_process(
             )
         })?;
 
-    let mut cmd = Command::new(python);
+    let mut cmd = Command::new(interpreter);
     cmd.arg(script)
         .arg(port.to_string())
         .kill_on_drop(true)
@@ -640,15 +769,18 @@ async fn spawn_sidecar_process(
         "CURSOR_SIDECAR_MAX_UPTIME_SECS",
         max_uptime_secs.max(300).to_string(),
     );
+    if let Some(prefix) = node_prefix {
+        cmd.env("CURSOR_SDK_NODE_PREFIX", prefix.as_os_str());
+    }
 
-    // Inherited by cursor-sdk-bridge shell tools so git does not bind the bot checkout
+    // Inherited by Cursor SDK local shell tools so git does not bind the bot checkout
     // when cwd is under WORKSPACE_DIR. Tier-1 target repos remain usable via explicit cd.
     crate::self_repo::apply_git_ceiling_env(&mut cmd, workspace_root);
 
     cmd.spawn().map_err(|e| {
         format!(
             "failed to spawn Cursor SDK sidecar ({}): {e}",
-            python.display()
+            interpreter.display()
         )
     })
 }
@@ -694,6 +826,7 @@ pub async fn bootstrap(
         max_uptime_secs: config.cursor_sidecar_max_uptime_secs.max(300),
         auto_install: config.cursor_sdk_auto_install,
         python_override: config.cursor_sdk_python.clone(),
+        node_override: config.cursor_sdk_node.clone(),
     };
     let mut managed_locally = false;
     let mut child: Option<Child> = None;
@@ -701,20 +834,34 @@ pub async fn bootstrap(
         config.cursor_sdk_auto_start && !in_docker() && is_local_runner_url(&runner_url, port);
 
     if supervise {
-        let sidecar_python = match resolve_sidecar_python(config).await {
-            Ok(python) => python,
-            Err(e) => {
-                warn!("Cursor SDK sidecar Python setup failed: {e}");
-                PathBuf::from(base_python_executable(config))
+        let script = resolve_sidecar_script();
+        let python_script = script.as_ref().is_some_and(|p| is_python_script(p));
+        let interpreter = if python_script {
+            match resolve_sidecar_python(config).await {
+                Ok(python) => python,
+                Err(e) => {
+                    warn!("Cursor SDK sidecar Python setup failed: {e}");
+                    PathBuf::from(base_python_executable(config))
+                }
             }
+        } else {
+            if let Err(e) = resolve_sidecar_node_prefix(config).await {
+                warn!("Cursor SDK sidecar Node setup failed: {e}");
+            }
+            PathBuf::from(base_node_executable(config))
+        };
+        let node_prefix = if python_script {
+            None
+        } else {
+            Some(sidecar_node_prefix_dir(config))
         };
 
         let mut health = cursor_engine_config::probe_sidecar_health(&runner_url).await;
-        if let Some(script) = resolve_sidecar_script() {
-            if health_suggests_stale_attach(&health, &ctx, &script) {
+        if let Some(ref script) = script {
+            if health_suggests_stale_attach(&health, &ctx, script) {
                 info!(
-                    "Cursor SDK sidecar at {runner_url} is stale (uptime={}s, orphans={}/{}); recycling before attach",
-                    health.uptime_secs, health.os_bridge_pids, health.persona_bridges_active
+                    "Cursor SDK sidecar at {runner_url} is stale (uptime={}s); recycling before attach",
+                    health.uptime_secs
                 );
                 let _ = request_soft_recycle(&runner_url).await;
                 let _ = wait_for_sidecar_gone(&runner_url, 30).await;
@@ -728,7 +875,7 @@ pub async fn bootstrap(
         if sidecar_needs_restart(&health) {
             if health.reachable && !health.cursor_sdk_installed {
                 info!(
-                    "Cursor SDK sidecar at {runner_url} is missing cursor-sdk; restarting with managed venv"
+                    "Cursor SDK sidecar at {runner_url} is missing @cursor/sdk; restarting with managed runtime"
                 );
                 stop_recorded_sidecar(config).await;
                 terminate_listener_on_port(port).await;
@@ -736,16 +883,17 @@ pub async fn bootstrap(
             }
 
             if sidecar_needs_restart(&health) {
-                if let Some(script) = resolve_sidecar_script() {
+                if let Some(ref script) = script {
                     let stderr_log = sidecar_stderr_log_path(config);
                     match spawn_sidecar_process(
-                        &script,
+                        script,
                         port,
-                        &sidecar_python,
+                        &interpreter,
                         &stderr_log,
                         &config.runtime_data_dir(),
                         &config.workspace_root_absolute(),
                         ctx.max_uptime_secs,
+                        node_prefix.as_deref(),
                     )
                     .await
                     {
@@ -754,10 +902,10 @@ pub async fn bootstrap(
                                 write_sidecar_pid(config, pid);
                             }
                             info!(
-                                "Started Cursor SDK sidecar on {} (script={}, python={})",
+                                "Started Cursor SDK sidecar on {} (script={}, interpreter={})",
                                 runner_url,
                                 script.display(),
-                                sidecar_python.display()
+                                interpreter.display()
                             );
                             child = Some(proc);
                             managed_locally = true;
@@ -768,7 +916,7 @@ pub async fn bootstrap(
                     }
                 } else {
                     warn!(
-                        "Cursor SDK sidecar script not found (expected scripts/cursor-sdk-runner.py); \
+                        "Cursor SDK sidecar script not found (expected scripts/cursor-sdk-runner.mjs); \
                          set CURSOR_SDK_RUNNER_SCRIPT or run from repo root"
                     );
                 }
@@ -797,7 +945,7 @@ pub async fn bootstrap(
         info!("Cursor SDK sidecar ready at {runner_url}");
     } else if health.reachable && !health.cursor_sdk_installed {
         warn!(
-            "Cursor SDK sidecar is up at {runner_url} but cursor-sdk is not installed in the sidecar Python; \
+            "Cursor SDK sidecar is up at {runner_url} but @cursor/sdk is not installed; \
              restart the bot to auto-install (CURSOR_SDK_AUTO_INSTALL=true)"
         );
     } else if health.reachable {
@@ -808,7 +956,7 @@ pub async fn bootstrap(
     } else if config.cursor_sdk_auto_start {
         warn!(
             "Cursor SDK sidecar not ready at {runner_url}. \
-             Ensure python3 is on PATH or set CURSOR_SDK_PYTHON."
+             Ensure node and npm are on PATH or set CURSOR_SDK_NODE."
         );
     }
 
@@ -850,6 +998,22 @@ mod tests {
         assert_eq!(
             venv_python_executable(&venv),
             PathBuf::from("/tmp/cursor-sdk-venv/bin/python")
+        );
+    }
+
+    #[test]
+    fn is_python_script_by_extension() {
+        assert!(is_python_script(Path::new("scripts/cursor-sdk-runner.py")));
+        assert!(!is_python_script(Path::new(
+            "scripts/cursor-sdk-runner.mjs"
+        )));
+    }
+
+    #[test]
+    fn node_prefix_dir_under_runtime() {
+        assert_eq!(
+            sidecar_node_prefix_dir_from("/tmp/runtime"),
+            PathBuf::from("/tmp/runtime/cursor-sdk-node")
         );
     }
 

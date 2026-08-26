@@ -302,9 +302,10 @@ export function SettingsCursorPanel({ api, onError }: Props) {
         </Text>
         <Text size="1" color="gray" className="mb-2 block">
           The sidecar starts automatically when the bot starts. The bot installs{' '}
-          <code>cursor-sdk</code> and <code>aiohttp</code> into a runtime venv on first boot.
-          The only required setup is <code>CURSOR_API_KEY</code> in repo-root <code>.env</code>{' '}
-          (never commit the value).
+          <code>@cursor/sdk</code> into a runtime Node prefix on first boot (no{' '}
+          <code>cursor-sdk-bridge</code> subprocess). The only required setup is{' '}
+          <code>CURSOR_API_KEY</code> in repo-root <code>.env</code> (never commit the value).
+          Node 20+ and npm must be on PATH.
         </Text>
         <Flex direction="column" gap="2">
           <Flex gap="2" wrap="wrap" align="center">

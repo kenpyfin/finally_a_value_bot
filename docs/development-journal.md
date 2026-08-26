@@ -4,6 +4,20 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-25 — Agent engine settings apply to the active persona only
+
+- **Area:** Settings / personas
+- **Summary:** Settings → Agent engine no longer lists every persona. The original engine-button UX is back, scoped to the sidebar’s current persona (name shown on the tab). Other personas keep their stored override or inherit the global default.
+- **Key files / symbols:** `settings-agent-engine.tsx`; PATCH `/api/personas/:id/bulletin` `agent_engine_override`.
+- **Note:** Rebuild `web/dist`. Switch persona in the sidebar, then open Settings to change that persona.
+
+### 2026-08-25 — Node Cursor SDK sidecar (no cursor-sdk-bridge)
+
+- **Area:** Cursor SDK sidecar / Settings
+- **Summary:** Default Cursor engine sidecar is now Node `scripts/cursor-sdk-runner.mjs` using `@cursor/sdk` in-process. Settings **Refresh models** (`GET /models` → `Cursor.models.list`) and turns no longer spawn Python's `cursor-sdk-bridge.js`, which was the source of connection-fail / bridge-discovery errors. Loopback MCP and persona cwd are unchanged. Python runner remains for rollback via `CURSOR_SDK_RUNNER_SCRIPT`. Supervisor npm-installs into `{runtime}/cursor-sdk-node` and dropped orphan-bridge recycle.
+- **Key files / symbols:** `scripts/cursor-sdk-runner.mjs`; `ensure_sidecar_node_prefix` / `resolve_sidecar_script` in `src/cursor_sdk_sidecar.rs`; `CURSOR_SDK_NODE`.
+- **Note:** Recycle/rebuild gateway. Need Node 20+ and npm on PATH. Optional rollback: `CURSOR_SDK_RUNNER_SCRIPT=scripts/cursor-sdk-runner.py`. Rebuild `web/dist` for Settings copy.
+
 ### 2026-08-25 — Per-persona agent engine in Settings
 
 - **Area:** Settings / personas / cockpit

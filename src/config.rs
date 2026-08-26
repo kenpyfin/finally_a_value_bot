@@ -157,6 +157,10 @@ fn default_cursor_sdk_python() -> String {
     "python3".into()
 }
 
+fn default_cursor_sdk_node() -> String {
+    "node".into()
+}
+
 fn default_cursor_sdk_auto_start() -> bool {
     true
 }
@@ -678,7 +682,7 @@ pub struct Config {
     /// When true (default), bot starts the local Cursor SDK sidecar on startup.
     #[serde(default = "default_cursor_sdk_auto_start")]
     pub cursor_sdk_auto_start: bool,
-    /// When true (default), bot creates a runtime venv and pip-installs cursor-sdk + aiohttp.
+    /// When true (default), bot installs @cursor/sdk into a runtime Node prefix (Python rollback uses a venv).
     #[serde(default = "default_cursor_sdk_auto_install")]
     pub cursor_sdk_auto_install: bool,
     /// Soft-recycle Cursor sidecar after this many seconds when idle (default 24h).
@@ -687,9 +691,12 @@ pub struct Config {
     /// Local port for the auto-started Cursor SDK sidecar. Default: 3848.
     #[serde(default = "default_cursor_sdk_runner_port")]
     pub cursor_sdk_runner_port: u16,
-    /// Python executable used to launch the Cursor SDK sidecar. Default: python3.
+    /// Python executable used only when CURSOR_SDK_RUNNER_SCRIPT points at the .py rollback runner.
     #[serde(default = "default_cursor_sdk_python")]
     pub cursor_sdk_python: String,
+    /// Node executable used to launch the Cursor SDK sidecar. Default: node.
+    #[serde(default = "default_cursor_sdk_node")]
+    pub cursor_sdk_node: String,
     /// Max wall-clock time (seconds) for a single scheduled-agent run. Default 3600.
     #[serde(default = "default_scheduler_task_timeout_secs")]
     pub scheduler_task_timeout_secs: u64,
@@ -1214,6 +1221,7 @@ impl Config {
                 .unwrap_or_else(default_cursor_sdk_runner_port),
             cursor_sdk_python: Self::env("CURSOR_SDK_PYTHON")
                 .unwrap_or_else(default_cursor_sdk_python),
+            cursor_sdk_node: Self::env("CURSOR_SDK_NODE").unwrap_or_else(default_cursor_sdk_node),
             scheduler_task_timeout_secs: Self::env_u64(
                 "SCHEDULER_TASK_TIMEOUT_SECS",
                 default_scheduler_task_timeout_secs(),
@@ -2003,6 +2011,7 @@ pub fn test_config() -> Config {
         cursor_sidecar_max_uptime_secs: default_cursor_sidecar_max_uptime_secs(),
         cursor_sdk_runner_port: default_cursor_sdk_runner_port(),
         cursor_sdk_python: default_cursor_sdk_python(),
+        cursor_sdk_node: default_cursor_sdk_node(),
         scheduler_task_timeout_secs: default_scheduler_task_timeout_secs(),
         scheduler_stale_running_reclaim_secs: default_scheduler_stale_running_reclaim_secs(),
         scheduler_max_concurrent_tasks: default_scheduler_max_concurrent_tasks(),

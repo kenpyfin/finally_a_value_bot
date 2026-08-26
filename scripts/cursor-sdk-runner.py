@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Cursor SDK sidecar for FinallyAValueBot's Cursor agent engine.
+"""Cursor SDK sidecar (Python rollback) for FinallyAValueBot.
+
+The default runner is scripts/cursor-sdk-runner.mjs (@cursor/sdk in-process).
+Keep this file for CURSOR_SDK_RUNNER_SCRIPT rollback only.
 
 Requires on the host:
   pip install cursor-sdk aiohttp

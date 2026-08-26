@@ -20,9 +20,9 @@ See also: [`hooks-architecture.md`](hooks-architecture.md) (hook catalog and sto
 
 | Requirement | Why |
 | --- | --- |
-| `AGENT_ENGINE=cursor` (Settings → Agent engine, per persona or inherit) | Selects `run_cursor_engine` instead of Classic loop |
+| `AGENT_ENGINE=cursor` (Settings → Agent engine, current persona) | Selects `run_cursor_engine` instead of Classic loop |
 | `WEB_ENABLED=true` | MCP endpoint is mounted on the web server |
-| `CURSOR_API_KEY` in repo-root `.env` | Sidecar (`cursor-sdk-runner.py`) authenticates to Cursor API |
+| `CURSOR_API_KEY` in repo-root `.env` | Sidecar (`cursor-sdk-runner.mjs`) authenticates to Cursor API |
 | Settings → Agent engine: Cursor panel **Expose bot tools (MCP)** on (default) | Registers MCP config on each sidecar `agent.send` |
 | Sidecar reachable (`CURSOR_SDK_RUNNER_URL`) | Rust POSTs `/run` and receives NDJSON stream |
 
@@ -44,8 +44,8 @@ run_cursor_engine  (src/cursor_engine.rs)
        ├─ Register run-scoped MCP token  (cursor_mcp_bridge)
        │
        ▼
-HTTP POST /run  →  cursor-sdk-runner.py
-       │              agent.send(prompt, { mcp_servers: { finally-a-value-bot: … } })
+HTTP POST /run  →  cursor-sdk-runner.mjs
+       │              agent.send(prompt, { mcpServers: { finally-a-value-bot: … } })
        ▼
 Cursor hosted agent loop  (remote planning)
        │
@@ -81,8 +81,8 @@ flowchart TB
     Prep --> BT
     BT --> Sidecar
   end
-  subgraph sidecar [cursor-sdk-runner.py]
-    Send[agent.send + mcp_servers]
+  subgraph sidecar [cursor-sdk-runner.mjs]
+    Send[agent.send + mcpServers]
   end
   subgraph cursor [Cursor hosted loop]
     Plan[Planning]
@@ -105,7 +105,7 @@ At the start of each Cursor turn (`run_cursor_engine`):
 
 1. `CursorMcpRegistry::register_run` stores `run_key`, `ToolAuthContext`, chat/persona/channel, and a random Bearer token (TTL ~1 hour).
 2. Rust builds inline MCP config: `http://127.0.0.1:{WEB_PORT}/internal/cursor-mcp` with `Authorization: Bearer <token>`.
-3. The sidecar passes `mcp_servers` on **every** `agent.send` (not persisted across resume by the SDK).
+3. The sidecar passes `mcpServers` on **every** `agent.send` (not persisted across resume by the SDK).
 
 ### MCP protocol surface
 
@@ -140,7 +140,7 @@ These tools are **not** exposed to Cursor MCP (avoid recursion and duplicate del
 | [`src/cursor_mcp_bridge.rs`](../src/cursor_mcp_bridge.rs) | Registry, JSON-RPC handler, `tools/list` / `tools/call` |
 | [`src/tool_hook_dispatch.rs`](../src/tool_hook_dispatch.rs) | Shared PreToolUse / PostToolUse / PostToolBatch for MCP (and future Classic reuse) |
 | [`src/cursor_engine.rs`](../src/cursor_engine.rs) | Turn orchestration, MCP registration, finish path |
-| [`scripts/cursor-sdk-runner.py`](../scripts/cursor-sdk-runner.py) | Passes `mcp_servers`, streams tool events |
+| [`scripts/cursor-sdk-runner.mjs`](../scripts/cursor-sdk-runner.mjs) | Passes `mcpServers`, streams tool events (`scripts/cursor-sdk-runner.py` is rollback) |
 | [`src/web.rs`](../src/web.rs) | Route `POST /internal/cursor-mcp` |
 
 ## Skills
@@ -241,7 +241,7 @@ Pipeline stage telemetry includes `delegation=full_slim|resume_delta|full_slim_s
 
 | Surface | Keys / behavior |
 | --- | --- |
-| Settings → Agent engine | Per-persona engine (`personas.agent_engine_override`); global default used when a persona inherits. Set a persona to Cursor here. |
+| Settings → Agent engine | Current persona's engine (`personas.agent_engine_override`); other personas keep their own override or inherit the global default. |
 | Settings → Agent engine (Cursor panel) | Model, sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt**, **resume delta prompts** |
 | DB app_settings | `CURSOR_MCP_TOOLS_ENABLED`, `CURSOR_MCP_EXPOSE_SEND_MESSAGE`, `CURSOR_DELEGATION_SLIM_PROMPT`, `CURSOR_DELEGATION_RESUME_DELTA` |
 | Doctor | `cursor_engine.mcp_bridge` when engine is Cursor |

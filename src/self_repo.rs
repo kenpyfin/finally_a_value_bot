@@ -23,7 +23,8 @@ pub fn looks_like_self_repo(dir: &Path) -> bool {
             }
         }
     }
-    dir.join("scripts").join("cursor-sdk-runner.py").is_file()
+    (dir.join("scripts").join("cursor-sdk-runner.py").is_file()
+        || dir.join("scripts").join("cursor-sdk-runner.mjs").is_file())
         && dir.join("src").join("lib.rs").is_file()
 }
 

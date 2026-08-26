@@ -531,6 +531,7 @@ fn default_config() -> Config {
         cursor_sidecar_max_uptime_secs: 86_400,
         cursor_sdk_runner_port: 3848,
         cursor_sdk_python: "python3".into(),
+        cursor_sdk_node: "node".into(),
         scheduler_task_timeout_secs: 3600,
         scheduler_stale_running_reclaim_secs: 7200,
         scheduler_max_concurrent_tasks: 2,

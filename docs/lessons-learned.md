@@ -13,6 +13,13 @@ Template:
 - **Files/refs:** key paths, symbols, log signatures
 ```
 
+### 2026-08-25 — Settings Cursor model list hit cursor-sdk-bridge connection fail
+- **Symptom:** Settings → Agent engine → Cursor **Refresh models** often failed with a sidecar 502 (`ConnectError` / connection refused / timed out waiting for bridge discovery). Turns could flake the same way.
+- **Root cause:** Python `cursor-sdk` wraps TypeScript `@cursor/sdk` by spawning `cursor-sdk-bridge.js` (Connect-RPC). `Cursor.models.list()` and every `/run` went through that subprocess. The bridge died or failed discovery while the Python sidecar kept a stale client.
+- **Fix:** Default sidecar is Node `scripts/cursor-sdk-runner.mjs` running `@cursor/sdk` in-process. `/models` is a direct API list (no agent, no bridge). Local cwd + loopback MCP unchanged so bot tools still work.
+- **Prevention:** Do not route Settings/model catalog or turns through `Client.launch_bridge`. Keep the Python runner only as `CURSOR_SDK_RUNNER_SCRIPT` rollback.
+- **Files/refs:** `scripts/cursor-sdk-runner.mjs`; `src/cursor_sdk_sidecar.rs`; log `Bridge request failed: ConnectError` / `Timed out waiting for bridge discovery`.
+
 ### 2026-08-25 — Cockpit queue idle while runs are queued
 - **Symptom:** Cockpit showed `idle` / no queue; backend still accepted runs (`Accepted stream run … queue_position=…`). `/api/queue_diagnostics` returned lanes; `/api/ops_poll` closed the connection.
 - **Root cause:** `json_background_job` sliced `result_text` with `&t[..200]` mid–UTF-8 character (em dash `—`). Panics on every ops poll: `end byte index 200 is not a char boundary`.

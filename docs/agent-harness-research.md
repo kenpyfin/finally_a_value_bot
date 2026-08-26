@@ -200,7 +200,7 @@ Shared spine: `prepare_agent_run` (prep) → engine-specific loop → `pipeline_
 | Aspect | Implementation |
 |--------|------------------|
 | Loop | Remote planning in Cursor hosted loop; bot tools via loopback MCP |
-| Bridge | Rust → sidecar → `cursor_sdk` → Cursor API; MCP → `ToolRegistry` |
+| Bridge | Rust → Node sidecar (`@cursor/sdk` in-process) → Cursor API; MCP → `ToolRegistry` |
 | Tools | Bot `ToolRegistry` over MCP when enabled; Cursor built-ins + MCP in remote loop |
 | Input | Flattened text prompt (`flatten_turn_prompt`, 120k cap); images unsupported v1 |
 | State | Resume `agent_id` per chat/persona/session in `cursor_engine_agents` |
@@ -211,7 +211,7 @@ Shared spine: `prepare_agent_run` (prep) → engine-specific loop → `pipeline_
 
 ---
 
-## Cursor SDK blackbox (five nested layers)
+## Cursor SDK runtime (Node sidecar)
 
 When Cursor engine is selected, one turn traverses:
 
@@ -219,35 +219,25 @@ When Cursor engine is selected, one turn traverses:
 [1] Rust bot          run_cursor_engine (src/cursor_engine.rs)
       │  HTTP POST /run → NDJSON stream
       ▼
-[2] Python sidecar    scripts/cursor-sdk-runner.py (aiohttp)
-      │  cursor_sdk: Agent.create / resume / send
+[2] Node sidecar      scripts/cursor-sdk-runner.mjs
+      │  @cursor/sdk: Agent.create / resume / send (in-process)
       ▼
-[3] Python → Node     cursor_sdk/_bridge.py spawns bundled node runtime
-      │  dist/bin/cursor-sdk-bridge.js (Connect-RPC server)
-      ▼
-[4] Node bridge       @cursor/sdk (TS) + Connect-RPC
-      │  talks to Cursor hosted backend
-      ▼
-[5] Cursor backend    model + agentic loop (remote)
-      │  local tool execution only:
-      └─ cursorsandbox + rg (ripgrep) against persona cwd
+[3] Cursor backend    model + agentic loop (remote)
+      │  local tool execution against persona cwd
+      └─ MCP tools/call → bot ToolRegistry (loopback HTTP)
 ```
 
-### Verified on disk (runtime venv)
+The previous Python `cursor-sdk` path spawned a bundled `cursor-sdk-bridge.js` Connect-RPC process (Settings model refresh and every turn hit it; `ConnectError` / bridge-discovery timeouts). That runner remains at `scripts/cursor-sdk-runner.py` for rollback via `CURSOR_SDK_RUNNER_SCRIPT`.
 
-Path: `workspace/runtime/cursor-sdk-venv/lib/python3.12/site-packages/cursor_sdk/`
+### Runtime prefix
 
-- `_vendor/bridge/` ships bundled **~129 MB Node** + JS bundle.
-- `@cursor/sdk-linux-x64/bin`: **`cursorsandbox`** (4.6 MB), **`rg`** (6.5 MB) — no local model binary.
-- SDK version observed: **1.0.19** (`manifest.json`).
-
-### Implication
+Path: `workspace/runtime/cursor-sdk-node/` (`npm install @cursor/sdk`, plus `sdk-shim.mjs`).
 
 "Local runtime" = **local file/shell access with remote brains**. Planning, tool-calling loop, and model routing run on Cursor's servers.
 
 ### Sidecar streaming
 
-`cursor-sdk-runner.py` `_stream_agent_turn` forwards assistant **text** plus optional **tool_use** / **tool_result** / **thinking** NDJSON events for observability. Bot tool execution and hooks run in Rust on MCP `tools/call`, not in the sidecar. See [`cursor-engine-integration.md`](cursor-engine-integration.md).
+`cursor-sdk-runner.mjs` forwards assistant **text** plus optional **tool_use** / **tool_result** / **thinking** NDJSON events for observability. Bot tool execution and hooks run in Rust on MCP `tools/call`, not in the sidecar. See [`cursor-engine-integration.md`](cursor-engine-integration.md).
 
 ### Security notes from SDK source
 
@@ -393,7 +383,7 @@ The Claude Code leak and OSS landscape both suggest the market invested in **one
 | `src/channels/telegram.rs` — `process_classic_agent_with_events` | Classic loop |
 | `src/agent_pipeline/mod.rs` — `run_deterministic_pipeline` | Deterministic pipeline |
 | `src/cursor_engine.rs` — `run_cursor_engine` | Cursor delegation |
-| `scripts/cursor-sdk-runner.py` | Python sidecar |
+| `scripts/cursor-sdk-runner.mjs` | Node sidecar (`@cursor/sdk` in-process) |
 | `src/cursor_sdk_sidecar.rs` — `bootstrap` | Sidecar lifecycle |
 | `src/runtime_toggles.rs` — `AgentEngine` | Hot-reloadable engine toggle |
 | `src/channels/agent_run_prep.rs` — `prepare_agent_run` | Shared prep |
@@ -421,9 +411,9 @@ The Claude Code leak and OSS landscape both suggest the market invested in **one
 
 ### Cursor SDK
 
-- [Cursor SDK docs (Python)](https://cursor.com/docs/sdk/python)
+- [Cursor SDK docs (TypeScript)](https://cursor.com/docs/sdk/typescript)
 - Local skill: `~/.cursor/skills-cursor/sdk/SKILL.md`
-- Installed package (runtime): `workspace/runtime/cursor-sdk-venv/.../cursor_sdk/`
+- Installed package (runtime): `workspace/runtime/cursor-sdk-node/`
 
 ### Anthropic harness engineering (official)
 

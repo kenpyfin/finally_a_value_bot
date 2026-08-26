@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Soft-drain then force-recycle the Cursor SDK sidecar (and orphan bridges).
+# Soft-drain then force-recycle the Cursor SDK sidecar.
 # Safe to source from reload.sh or run standalone from the repo root.
+# During migration, leftover cursor-sdk-bridge.js PIDs from the Python runner are reaped.
 set -euo pipefail
 
 log_info() { printf "\x1b[34m[INFO]\x1b[0m %s\n" "$*"; }

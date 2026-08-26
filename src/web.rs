@@ -6244,8 +6244,9 @@ fn cursor_engine_json(
         "mcp_bridge_ready": web_enabled && cfg.mcp_tools_enabled,
         "install_steps": [
             "Set CURSOR_API_KEY in repo-root .env (Cursor Dashboard → Integrations)",
-            "Restart the bot — it auto-creates a runtime venv and installs cursor-sdk + aiohttp",
-            "Optional: CURSOR_SDK_AUTO_INSTALL=false to manage Python deps yourself",
+            "Restart the bot — it installs @cursor/sdk into a runtime Node prefix",
+            "Optional: CURSOR_SDK_AUTO_INSTALL=false to manage Node deps yourself",
+            "Rollback: CURSOR_SDK_RUNNER_SCRIPT=scripts/cursor-sdk-runner.py",
         ],
         "sidecar_error": health.error,
     })
