@@ -13,6 +13,13 @@ Template:
 - **Files/refs:** key paths, symbols, log signatures
 ```
 
+### 2026-08-25 — Cockpit queue idle while runs are queued
+- **Symptom:** Cockpit showed `idle` / no queue; backend still accepted runs (`Accepted stream run … queue_position=…`). `/api/queue_diagnostics` returned lanes; `/api/ops_poll` closed the connection.
+- **Root cause:** `json_background_job` sliced `result_text` with `&t[..200]` mid–UTF-8 character (em dash `—`). Panics on every ops poll: `end byte index 200 is not a char boundary`.
+- **Fix:** Truncate with `floor_char_boundary(200)` via `background_job_result_preview`.
+- **Prevention:** Never byte-slice user/job text without a char boundary helper; cover em-dash-at-boundary in a unit test.
+- **Files/refs:** `src/web.rs` (`json_background_job`, `background_job_result_preview`); journalctl `panicked at src/web.rs:1544`.
+
 ### 2026-08-25 — PreDelivery PDF guard shipped without module
 - **Symptom:** Tree failed to build / hook stubbed; `pub mod delivery_char_limit_pdf_guard` referenced a file that was never committed.
 - **Root cause:** Incomplete PreDelivery char-limit PDF spill was mixed into a larger hang-fix commit; only wiring landed, not the implementation module.

@@ -4,6 +4,13 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-25 — Fix ops_poll UTF-8 panic (cockpit queue blank)
+
+- **Area:** web / cockpit ops poll
+- **Summary:** Cockpit queue went blank because `/api/ops_poll` panicked when truncating a background job `result_text` at byte 200 inside a multi-byte em dash. Queue data was fine (`/api/queue_diagnostics` still worked). Fixed with `floor_char_boundary`.
+- **Key files / symbols:** `background_job_result_preview` / `json_background_job` in `src/web.rs`.
+- **Note:** Restart gateway to pick up.
+
 ### 2026-08-25 — Cursor sidecar idle-safe auto-recycle
 
 - **Area:** Cursor SDK sidecar / deploy

@@ -1530,6 +1530,15 @@ async fn api_stream(
     ))
 }
 
+/// Preview for ops poll / background job JSON. Byte-capped on a UTF-8 boundary.
+fn background_job_result_preview(text: &str) -> &str {
+    if text.len() > 200 {
+        &text[..text.floor_char_boundary(200)]
+    } else {
+        text
+    }
+}
+
 fn json_background_job(j: &crate::db::BackgroundJob) -> serde_json::Value {
     json!({
         "id": j.id,
@@ -1541,7 +1550,7 @@ fn json_background_job(j: &crate::db::BackgroundJob) -> serde_json::Value {
         "created_at": j.created_at,
         "started_at": j.started_at,
         "finished_at": j.finished_at,
-        "result_preview": j.result_text.as_deref().map(|t| if t.len() > 200 { &t[..200] } else { t }),
+        "result_preview": j.result_text.as_deref().map(background_job_result_preview),
         "error_text": j.error_text,
         "lease_owner": j.lease_owner,
         "lease_expires_at": j.lease_expires_at,
@@ -7494,6 +7503,19 @@ mod tests {
         assert!(!ops_poll_include_personas(Some("0")));
         assert!(!ops_poll_include_personas(Some("false")));
         assert!(!ops_poll_include_personas(Some("OFF")));
+    }
+
+    #[test]
+    fn test_background_job_result_preview_utf8_boundary() {
+        // Em dash is 3 bytes; a raw `&t[..200]` panic sits inside it when byte 199 is mid-char.
+        let prefix = "a".repeat(199);
+        let text = format!("{prefix}—more");
+        assert!(text.is_char_boundary(0));
+        assert!(!text.is_char_boundary(200));
+        let preview = background_job_result_preview(&text);
+        assert!(preview.len() < 200);
+        assert!(preview.ends_with('a'));
+        assert!(!preview.contains('—'));
     }
 
     #[test]
