@@ -199,4 +199,7 @@ Runtime prompts also inject a compact `<memory_field_legend>` plus both `<memory
 
 ## License
 
-MIT
+Mixed license. See [LICENSE](LICENSE).
+
+- **kenpyfin modifications and new files (Copyright 2026):** proprietary, source-available — not MIT. Personal, non-commercial use of this tree is allowed; copying, redistributing, or relicensing those changes is not.
+- **Original work by everettjf (Copyright 2025):** MIT, retained as required.

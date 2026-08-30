@@ -12,6 +12,7 @@ Environment:
   CURSOR_RUN_CONCURRENCY  Max concurrent /run turns (default 4)
   CURSOR_BRIDGE_*  Idle TTL, pool max, orphan grace, launch timeout
   CURSOR_SIDECAR_MAX_UPTIME_SECS  Soft self-recycle when idle (default 86400)
+  CURSOR_RUN_WAIT_TIMEOUT_MS      Hang watchdog for run.wait() after stream (default 120000; not a turn budget)
 
 API:
   GET  /health
@@ -63,6 +64,7 @@ DEFAULT_BRIDGE_REAPER_INTERVAL_SECS = 60
 DEFAULT_BRIDGE_ORPHAN_GRACE_SECS = 120
 DEFAULT_RUN_CONCURRENCY = 4
 DEFAULT_SIDECAR_MAX_UPTIME_SECS = 86400
+DEFAULT_RUN_WAIT_TIMEOUT_MS = 120_000
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -129,6 +131,18 @@ def _sidecar_max_uptime_secs() -> int:
         return DEFAULT_SIDECAR_MAX_UPTIME_SECS
 
 
+def _run_wait_timeout_secs() -> float:
+    raw = os.environ.get("CURSOR_RUN_WAIT_TIMEOUT_MS", "").strip()
+    if not raw:
+        n = DEFAULT_RUN_WAIT_TIMEOUT_MS
+    else:
+        try:
+            n = int(raw)
+        except ValueError:
+            n = DEFAULT_RUN_WAIT_TIMEOUT_MS
+    return max(3000, n) / 1000.0
+
+
 def _is_ephemeral_session_scope(session_scope: str) -> bool:
     """One-shot scopes that must never keep a warm bridge after /run.
 
@@ -178,6 +192,7 @@ class _ActiveTurn:
     """Tracks the in-flight sync SDK run so disconnect can call run.cancel()."""
 
     cancel_requested: bool = False
+    evict: bool = False
     run: Any | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -199,8 +214,44 @@ def _cancel_sdk_run(run: Any) -> None:
 def _request_turn_cancel(active: _ActiveTurn) -> None:
     with active.lock:
         active.cancel_requested = True
+        active.evict = True
         run = active.run
     _cancel_sdk_run(run)
+
+
+def _wait_sdk_run(run: Any, timeout_s: float) -> Any | None:
+    """Hang watchdog for run.wait() after the stream has already ended.
+
+    Tool rounds and long replies live in run.messages() and are not timed here.
+    A hung wait() would otherwise pin _RUNS_IN_FLIGHT and block idle recycle.
+    """
+    wait = getattr(run, "wait", None)
+    if not callable(wait):
+        return None
+    box: dict[str, Any] = {"done": False, "result": None, "err": None}
+
+    def _call() -> None:
+        try:
+            box["result"] = wait()
+        except Exception as err:  # pragma: no cover - SDK/runtime
+            box["err"] = err
+        finally:
+            box["done"] = True
+
+    thread = threading.Thread(target=_call, name="cursor-run-wait", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if not box["done"]:
+        print(
+            f"[cursor-sdk-runner] run.wait timed out after {timeout_s:.0f}s; cancelling",
+            file=sys.stderr,
+        )
+        _cancel_sdk_run(run)
+        return None
+    if box["err"] is not None:
+        print(f"[cursor-sdk-runner] run.wait failed: {box['err']}", file=sys.stderr)
+        return None
+    return box["result"]
 
 
 async def _try_begin_run() -> bool:
@@ -279,6 +330,18 @@ def _api_key() -> str:
 def _is_stale_agent_error(err: Exception) -> bool:
     msg = str(getattr(err, "message", err)).lower()
     return "not found" in msg and "agent" in msg
+
+
+def _is_busy_agent_error(err: Exception) -> bool:
+    name = type(err).__name__
+    if "AgentBusy" in name:
+        return True
+    msg = str(getattr(err, "message", err)).lower()
+    return (
+        "already has active run" in msg
+        or "agent is busy" in msg
+        or "agent_busy" in msg
+    )
 
 
 def _is_retryable_bridge_error(err: Exception) -> bool:
@@ -874,6 +937,19 @@ async def _stream_run(
                 continue
             if (
                 attempt + 1 < BRIDGE_RETRY_MAX_ATTEMPTS
+                and _is_busy_agent_error(err)
+            ):
+                print(
+                    "[cursor-sdk-runner] agent busy "
+                    f"(attempt {attempt + 1}/{BRIDGE_RETRY_MAX_ATTEMPTS}): {err}",
+                    file=sys.stderr,
+                )
+                await _evict_pooled_bridge(pool_key)
+                if attempt >= 1:
+                    resume_id = None
+                continue
+            if (
+                attempt + 1 < BRIDGE_RETRY_MAX_ATTEMPTS
                 and _is_retryable_bridge_error(err)
             ):
                 print(
@@ -897,6 +973,19 @@ async def _stream_run(
         except Exception as err:  # pragma: no cover - surfaced to bot logs
             if (
                 attempt + 1 < BRIDGE_RETRY_MAX_ATTEMPTS
+                and _is_busy_agent_error(err)
+            ):
+                print(
+                    "[cursor-sdk-runner] agent busy "
+                    f"(attempt {attempt + 1}/{BRIDGE_RETRY_MAX_ATTEMPTS}): {err}",
+                    file=sys.stderr,
+                )
+                await _evict_pooled_bridge(pool_key)
+                if attempt >= 1:
+                    resume_id = None
+                continue
+            if (
+                attempt + 1 < BRIDGE_RETRY_MAX_ATTEMPTS
                 and _is_retryable_bridge_error(err)
             ):
                 print(
@@ -918,7 +1007,14 @@ async def _stream_run(
                 active_turn_slot[0] = None
             _close_agent_only(agent)
             # One-shot scheduled/background scopes must not keep bridges warm.
-            if pooled is not None and _is_ephemeral_session_scope(session_scope):
+            # Cancelled / wait-timeout turns evict after pooled.lock is released.
+            should_evict = False
+            if active_turn is not None:
+                with active_turn.lock:
+                    should_evict = active_turn.cancel_requested or active_turn.evict
+            if pooled is not None and (
+                should_evict or _is_ephemeral_session_scope(session_scope)
+            ):
                 await _evict_pooled_bridge(pool_key)
             elif pooled is not None:
                 pooled.last_used_monotonic = time.monotonic()
@@ -975,18 +1071,22 @@ def _stream_agent_turn(
 ):
     final_text_parts: list[str] = []
     status = "error"
-    send_options: dict[str, Any] | None = None
+    # Expire a leftover local run so the next user message is not blocked
+    # with "Agent … already has active run".
+    send_options: dict[str, Any] = {"local": {"force": True}}
     if mcp_servers:
-        send_options = {"mcp_servers": mcp_servers}
+        send_options["mcp_servers"] = mcp_servers
 
     returned_agent_id: str | None = getattr(agent, "agent_id", None) or resume_id
-    run = agent.send(prompt, send_options) if send_options else agent.send(prompt)
+    run = agent.send(prompt, send_options)
     if active is not None:
         with active.lock:
             active.run = run
             cancel_now = active.cancel_requested
         if cancel_now:
             _cancel_sdk_run(run)
+            with active.lock:
+                active.evict = True
             yield json.dumps(
                 {"type": "error", "message": "Run cancelled"}
             ) + "\n"
@@ -995,12 +1095,15 @@ def _stream_agent_turn(
     for message in run.messages():
         if active is not None:
             with active.lock:
-                if active.cancel_requested:
-                    _cancel_sdk_run(run)
-                    yield json.dumps(
-                        {"type": "error", "message": "Run cancelled"}
-                    ) + "\n"
-                    return
+                cancel_now = active.cancel_requested
+                if cancel_now:
+                    active.evict = True
+            if cancel_now:
+                _cancel_sdk_run(run)
+                yield json.dumps(
+                    {"type": "error", "message": "Run cancelled"}
+                ) + "\n"
+                return
         msg_type = getattr(message, "type", None)
         # Some SDK builds use "assistant"; also accept common aliases.
         if msg_type not in (None, "assistant", "assistant_message", "message"):
@@ -1060,14 +1163,32 @@ def _stream_agent_turn(
 
     if active is not None:
         with active.lock:
+            cancel_after_stream = active.cancel_requested
+            if cancel_after_stream:
+                active.evict = True
+        if cancel_after_stream:
+            _cancel_sdk_run(run)
+            yield json.dumps(
+                {"type": "error", "message": "Run cancelled"}
+            ) + "\n"
+            return
+
+    result = _wait_sdk_run(run, _run_wait_timeout_secs())
+    if active is not None:
+        with active.lock:
             if active.cancel_requested:
                 _cancel_sdk_run(run)
-                yield json.dumps(
-                    {"type": "error", "message": "Run cancelled"}
-                ) + "\n"
-                return
-
-    result = run.wait()
+                active.evict = True
+                cancelled = True
+            else:
+                cancelled = False
+                if result is None:
+                    active.evict = True
+        if cancelled:
+            yield json.dumps(
+                {"type": "error", "message": "Run cancelled"}
+            ) + "\n"
+            return
     status = getattr(result, "status", None) or "finished"
     result_text = getattr(result, "result", None)
     if isinstance(result_text, str) and result_text.strip():
@@ -1076,7 +1197,7 @@ def _stream_agent_turn(
             final_text_parts = [result_text]
     returned_agent_id = getattr(agent, "agent_id", None) or returned_agent_id
 
-    joined = "".join(final_text_parts)
+    joined = "\n\n".join(p.strip() for p in final_text_parts if p.strip())
     yield json.dumps(
         {
             "type": "done",
@@ -1268,6 +1389,12 @@ def _run_self_tests() -> None:
     )
     assert _is_retryable_bridge_error(RuntimeError("bridge discovery failed"))
     assert not _is_retryable_bridge_error(RuntimeError("prompt required"))
+    assert _is_busy_agent_error(
+        RuntimeError(
+            "Agent agent-1c9d98ad-57cf-46ae-87ac-f6c5910b081c already has active run"
+        )
+    )
+    assert not _is_busy_agent_error(RuntimeError("prompt required"))
     assert _bridge_launch_timeout_secs() >= 30
     os.environ["CURSOR_BRIDGE_LAUNCH_TIMEOUT_SECS"] = "45"
     assert _bridge_launch_timeout_secs() == 45

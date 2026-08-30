@@ -223,7 +223,8 @@ html.dark .aui-root {
   --aui-border: 154 26% 20%;
   --aui-input: 154 26% 22%;
   --aui-ring: var(--mc-accent-hsl);
-  --aui-thread-max-width: 72rem;
+  /* Full chat column width on wide screens (vendor default is 42rem). */
+  --aui-thread-max-width: 100%;
 }
 
 html.dark .aui-thread-root {
@@ -257,18 +258,26 @@ html:not(.dark) .aui-assistant-message-root > .mc-assistant-placeholder {
   grid-row: auto;
 }
 
-html.dark .aui-assistant-message-root > .mc-msg-meta-row,
-html:not(.dark) .aui-assistant-message-root > .mc-msg-meta-row {
+html.dark .aui-assistant-message-root > .mc-msg-footer,
+html:not(.dark) .aui-assistant-message-root > .mc-msg-footer,
+html.dark .aui-assistant-message-root > .mc-msg-mobile-actions,
+html:not(.dark) .aui-assistant-message-root > .mc-msg-mobile-actions {
   grid-column: 1;
   grid-row: auto;
+}
+
+html.dark .aui-assistant-message-root,
+html.dark .aui-assistant-message-root .aui-assistant-message-content {
+  max-width: 100%;
 }
 
 html.dark .aui-assistant-message-content {
   grid-column: 1 / -1;
   grid-row: auto;
-  max-width: calc(var(--aui-thread-max-width) * 0.98);
+  max-width: 100%;
+  width: 100%;
   border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #10181a);
-  border-radius: 14px;
+  border-radius: 18px 18px 18px 6px;
   background: linear-gradient(
     180deg,
     color-mix(in srgb, var(--mc-accent) 17%, #0a1314),
@@ -277,7 +286,8 @@ html.dark .aui-assistant-message-content {
   padding: 12px 14px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
   color: hsl(146 26% 92%);
-  line-height: 1.7;
+  line-height: 1.65;
+  font-size: 0.9375rem;
   user-select: text;
   -webkit-user-select: text;
 }
@@ -349,45 +359,84 @@ html.dark .aui-assistant-message-content blockquote {
 }
 
 .mc-md-table-scroll {
-  margin: 10px 0;
+  margin: 12px 0;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #1a2530);
+  background: color-mix(in srgb, var(--mc-accent) 6%, #090f12);
 }
 
-html.dark .aui-assistant-message-content .aui-md-table {
-  width: max-content;
+html.dark .aui-assistant-message-content .aui-md-table,
+html:not(.dark) .aui-assistant-message-content .aui-md-table,
+html.dark .aui-md-root .aui-md-table,
+html:not(.dark) .aui-md-root .aui-md-table {
+  width: 100%;
   min-width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.8125rem;
 }
 
 html.dark .aui-assistant-message-content .aui-md-th,
-html.dark .aui-assistant-message-content .aui-md-td {
-  border: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #1a2530);
-  padding: 6px 10px;
-  white-space: nowrap;
+html.dark .aui-assistant-message-content .aui-md-td,
+html.dark .aui-md-root .aui-md-th,
+html.dark .aui-md-root .aui-md-td {
+  border-bottom: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #1a2530);
+  border-right: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #1a2530);
+  padding: 7px 10px;
+  white-space: normal;
+  word-break: break-word;
+  vertical-align: top;
 }
 
-html.dark .aui-assistant-message-content .aui-md-th {
+html.dark .aui-assistant-message-content .aui-md-th,
+html.dark .aui-md-root .aui-md-th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   background: color-mix(in srgb, var(--mc-accent) 18%, #0b1216);
   color: hsl(145 26% 90%);
+  font-weight: 600;
 }
 
-html.dark .aui-assistant-message-content .aui-md-td {
+html.dark .aui-assistant-message-content .aui-md-td,
+html.dark .aui-md-root .aui-md-td {
   background: color-mix(in srgb, var(--mc-accent) 8%, #090f12);
 }
 
+html.dark .aui-assistant-message-content .aui-md-tr:last-child .aui-md-th,
+html.dark .aui-assistant-message-content .aui-md-tr:last-child .aui-md-td,
+html.dark .aui-md-root .aui-md-tr:last-child .aui-md-th,
+html.dark .aui-md-root .aui-md-tr:last-child .aui-md-td {
+  border-bottom: 0;
+}
+
+html.dark .aui-assistant-message-content .aui-md-th:last-child,
+html.dark .aui-assistant-message-content .aui-md-td:last-child,
+html.dark .aui-md-root .aui-md-th:last-child,
+html.dark .aui-md-root .aui-md-td:last-child {
+  border-right: 0;
+}
+
+/* Flat user text: beat vendor .aui-user-message-content bubble (muted bg + radius). */
+html.dark .aui-user-message-root .aui-user-message-content,
 html.dark .aui-user-message-content {
-  max-width: calc(var(--aui-thread-max-width) * 0.85);
+  max-width: min(72%, 40rem);
   margin-left: auto;
-  border: 1px solid color-mix(in srgb, var(--mc-accent) 52%, #10181a);
-  border-radius: 12px;
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--mc-accent) 28%, #0a1314),
-    color-mix(in srgb, var(--mc-accent) 18%, #081112)
-  );
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  background-color: transparent;
+  padding: 4px 2px;
   color: hsl(146 26% 92%);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  line-height: 1.55;
+  font-size: 0.9375rem;
+  box-shadow: none;
+  text-align: right;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
 }
@@ -459,7 +508,7 @@ html.dark .rt-BaseButton:where(.rt-variant-solid):active {
 }
 
 html:not(.dark) .aui-root {
-  --aui-thread-max-width: 72rem;
+  --aui-thread-max-width: 100%;
 }
 
 html:not(.dark) .aui-thread-root {
@@ -481,12 +530,18 @@ html:not(.dark) .aui-assistant-message-root {
   gap: 0;
 }
 
+html:not(.dark) .aui-assistant-message-root,
+html:not(.dark) .aui-assistant-message-root .aui-assistant-message-content {
+  max-width: 100%;
+}
+
 html:not(.dark) .aui-assistant-message-content {
   grid-column: 1 / -1;
   grid-row: auto;
-  max-width: calc(var(--aui-thread-max-width) * 0.98);
+  max-width: 100%;
+  width: 100%;
   border: 1px solid color-mix(in srgb, var(--mc-accent) 34%, #cbd5e1);
-  border-radius: 14px;
+  border-radius: 18px 18px 18px 6px;
   background: linear-gradient(
     180deg,
     #ffffff,
@@ -495,7 +550,8 @@ html:not(.dark) .aui-assistant-message-content {
   padding: 12px 14px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
   color: var(--mc-text-primary);
-  line-height: 1.7;
+  line-height: 1.65;
+  font-size: 0.9375rem;
   user-select: text;
   -webkit-user-select: text;
 }
@@ -535,41 +591,64 @@ html:not(.dark) .aui-assistant-message-content blockquote {
   color: hsl(216 22% 32%);
 }
 
-html:not(.dark) .aui-assistant-message-content .aui-md-table {
-  width: max-content;
-  min-width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
+html:not(.dark) .aui-assistant-message-content .aui-md-th,
+html:not(.dark) .aui-assistant-message-content .aui-md-td,
+html:not(.dark) .aui-md-root .aui-md-th,
+html:not(.dark) .aui-md-root .aui-md-td {
+  border-bottom: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #cbd5e1);
+  border-right: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #cbd5e1);
+  padding: 7px 10px;
+  white-space: normal;
+  word-break: break-word;
+  vertical-align: top;
 }
 
 html:not(.dark) .aui-assistant-message-content .aui-md-th,
-html:not(.dark) .aui-assistant-message-content .aui-md-td {
-  border: 1px solid color-mix(in srgb, var(--mc-accent) 42%, #cbd5e1);
-  padding: 6px 10px;
-  white-space: nowrap;
-}
-
-html:not(.dark) .aui-assistant-message-content .aui-md-th {
+html:not(.dark) .aui-md-root .aui-md-th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   background: color-mix(in srgb, var(--mc-accent) 12%, #f8fafc);
   color: hsl(218 30% 17%);
+  font-weight: 600;
 }
 
-html:not(.dark) .aui-assistant-message-content .aui-md-td {
+html:not(.dark) .aui-assistant-message-content .aui-md-td,
+html:not(.dark) .aui-md-root .aui-md-td {
   background: #ffffff;
 }
 
+html:not(.dark) .aui-assistant-message-content .aui-md-tr:last-child .aui-md-th,
+html:not(.dark) .aui-assistant-message-content .aui-md-tr:last-child .aui-md-td,
+html:not(.dark) .aui-md-root .aui-md-tr:last-child .aui-md-th,
+html:not(.dark) .aui-md-root .aui-md-tr:last-child .aui-md-td {
+  border-bottom: 0;
+}
+
+html:not(.dark) .aui-assistant-message-content .aui-md-th:last-child,
+html:not(.dark) .aui-assistant-message-content .aui-md-td:last-child,
+html:not(.dark) .aui-md-root .aui-md-th:last-child,
+html:not(.dark) .aui-md-root .aui-md-td:last-child {
+  border-right: 0;
+}
+
+html:not(.dark) .aui-user-message-root .aui-user-message-content,
 html:not(.dark) .aui-user-message-content {
-  max-width: calc(var(--aui-thread-max-width) * 0.85);
+  max-width: min(72%, 40rem);
   margin-left: auto;
-  border: 1px solid color-mix(in srgb, var(--mc-accent) 48%, var(--mc-border-soft));
-  border-radius: 12px;
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--mc-accent) 22%, var(--mc-surface-elevated)),
-    color-mix(in srgb, var(--mc-accent) 32%, var(--mc-surface-main))
-  );
-  color: color-mix(in srgb, var(--mc-accent) 55%, var(--mc-text-primary));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  background-color: transparent;
+  padding: 4px 2px;
+  color: var(--mc-text-primary);
+  line-height: 1.55;
+  font-size: 0.9375rem;
+  box-shadow: none;
+  text-align: right;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
 }
@@ -617,6 +696,104 @@ html:not(.dark) .aui-composer-send:hover {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
+  width: 100%;
+}
+
+/* Consecutive same-sender messages share tighter spacing and linked corner radii. */
+.aui-assistant-message-root.mc-msg-group,
+.aui-user-message-root.mc-msg-group {
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+
+.aui-assistant-message-root.mc-msg-group-single,
+.aui-user-message-root.mc-msg-group-single {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.aui-assistant-message-root.mc-msg-group-start,
+.aui-user-message-root.mc-msg-group-start {
+  padding-top: 10px;
+  padding-bottom: 2px;
+}
+
+.aui-assistant-message-root.mc-msg-group-end,
+.aui-user-message-root.mc-msg-group-end {
+  padding-top: 2px;
+  padding-bottom: 10px;
+}
+
+.aui-assistant-message-root.mc-msg-group-start .aui-assistant-message-content,
+.aui-assistant-message-root.mc-msg-group-middle .aui-assistant-message-content {
+  border-bottom-left-radius: 6px;
+  border-bottom-right-radius: 6px;
+}
+
+.aui-assistant-message-root.mc-msg-group-middle .aui-assistant-message-content,
+.aui-assistant-message-root.mc-msg-group-end .aui-assistant-message-content {
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+}
+
+.aui-user-message-root.mc-msg-group-start .aui-user-message-content,
+.aui-user-message-root.mc-msg-group-middle .aui-user-message-content,
+.aui-user-message-root.mc-msg-group-middle .aui-user-message-content,
+.aui-user-message-root.mc-msg-group-end .aui-user-message-content {
+  border-radius: 0;
+}
+
+.mc-msg-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
+  min-height: 1.5rem;
+  width: 100%;
+}
+
+.mc-msg-footer-user {
+  justify-content: flex-end;
+  padding-right: 0.15rem;
+}
+
+.mc-msg-footer-assistant {
+  justify-content: flex-start;
+  padding-left: 0.15rem;
+}
+
+.mc-msg-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.1rem;
+  padding: 0.12rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--mc-border-soft) 88%, transparent);
+  background: color-mix(in srgb, var(--mc-surface-elevated, #0f172a) 94%, transparent);
+  box-shadow: 0 1px 2px color-mix(in srgb, #000 12%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease, transform 150ms ease;
+  transform: translateY(2px);
+}
+
+.aui-assistant-message-root:hover .mc-msg-actions,
+.aui-user-message-root:hover .mc-msg-actions,
+.aui-assistant-message-root:focus-within .mc-msg-actions,
+.aui-user-message-root:focus-within .mc-msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.mc-msg-action-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.mc-msg-action-icon-success {
+  color: var(--mc-accent);
 }
 
 .mc-msg-time {
@@ -646,14 +823,16 @@ html:not(.dark) .aui-composer-send:hover {
   color: var(--mc-accent);
   cursor: pointer;
   display: inline-flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-width: 1.75rem;
-  min-height: 1.75rem;
-  padding: 0.2rem;
-  border-radius: 0.375rem;
+  gap: 0.1rem;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border-radius: 999px;
   transition: color 150ms ease, opacity 150ms ease, background-color 150ms ease;
-  opacity: 0.85;
+  opacity: 0.92;
 }
 
 .mc-bookmark-btn:hover {
@@ -679,14 +858,29 @@ html:not(.dark) .aui-composer-send:hover {
   letter-spacing: 0.01em;
   line-height: 1;
   display: inline-flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-width: 1.75rem;
-  min-height: 1.75rem;
-  padding: 0.35rem 0.45rem;
-  border-radius: 0.375rem;
+  gap: 0.1rem;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border-radius: 999px;
   transition: color 150ms ease, opacity 150ms ease, background-color 150ms ease;
-  opacity: 0.85;
+  opacity: 0.92;
+}
+
+.mc-msg-mobile-actions .mc-msg-action-btn,
+.mc-msg-mobile-actions .mc-bookmark-btn {
+  width: auto;
+  min-width: 3.25rem;
+  height: auto;
+  min-height: 2.75rem;
+  padding: 0.35rem 0.5rem;
+}
+
+.mc-msg-action-btn-muted {
+  color: var(--mc-text-muted, #94a3b8);
 }
 
 .mc-msg-action-btn:hover {
@@ -755,6 +949,15 @@ html:not(.dark) .aui-composer-send:hover {
   word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
+}
+
+.aui-user-message-content .mc-reply-quote-preview {
+  text-align: left;
+  width: 100%;
+}
+
+.aui-user-message-content .mc-reply-follow-up {
+  text-align: right;
 }
 
 .mc-reply-quote-dismiss {
@@ -1223,29 +1426,80 @@ html.dark *::-webkit-scrollbar-thumb:hover {
 
   html.dark .aui-assistant-message-root,
   html:not(.dark) .aui-assistant-message-root {
-    padding-top: 8px;
-    padding-bottom: 8px;
+    padding-top: 4px;
+    padding-bottom: 4px;
   }
 
   html.dark .aui-assistant-message-content,
   html:not(.dark) .aui-assistant-message-content {
-    border: none;
-    background: transparent;
-    box-shadow: none;
-    border-radius: 0;
-    /* Extra inset so long paragraphs do not feel glued to the gutter line */
+    border: 1px solid color-mix(in srgb, var(--mc-accent) 28%, var(--mc-border-soft, #cbd5e1));
+    background: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--mc-accent) 8%, var(--mc-surface-elevated, #ffffff)),
+      color-mix(in srgb, var(--mc-accent) 4%, var(--mc-surface-main, #f8fafc))
+    );
+    box-shadow: 0 1px 2px color-mix(in srgb, #000 8%, transparent);
+    border-radius: 18px 18px 18px 6px;
     max-width: 100%;
-    padding: 0.125rem 0.5rem;
+    padding: 0.75rem 0.875rem;
     margin-top: 0;
     margin-bottom: 0;
     overflow-wrap: anywhere;
     word-break: break-word;
+    line-height: 1.62;
+    font-size: 0.9375rem;
   }
 
+  html.dark .aui-assistant-message-content {
+    border-color: color-mix(in srgb, var(--mc-accent) 34%, #10181a);
+    background: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--mc-accent) 17%, #0a1314),
+      color-mix(in srgb, var(--mc-accent) 11%, #081112)
+    );
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .aui-assistant-message-root.mc-msg-group-start .aui-assistant-message-content,
+  .aui-assistant-message-root.mc-msg-group-middle .aui-assistant-message-content {
+    border-bottom-left-radius: 6px;
+    border-bottom-right-radius: 6px;
+  }
+
+  .aui-assistant-message-root.mc-msg-group-middle .aui-assistant-message-content,
+  .aui-assistant-message-root.mc-msg-group-end .aui-assistant-message-content {
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+  }
+
+  html.dark .aui-user-message-root .aui-user-message-content,
+  html:not(.dark) .aui-user-message-root .aui-user-message-content,
   html.dark .aui-user-message-content,
   html:not(.dark) .aui-user-message-content {
-    max-width: 92%;
-    padding: 0.625rem 0.875rem;
+    max-width: 88%;
+    padding: 0.25rem 0.125rem;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+    text-align: right;
+  }
+
+  .aui-user-message-root.mc-msg-group-start .aui-user-message-content,
+  .aui-user-message-root.mc-msg-group-middle .aui-user-message-content,
+  .aui-user-message-root.mc-msg-group-middle .aui-user-message-content,
+  .aui-user-message-root.mc-msg-group-end .aui-user-message-content {
+    border-radius: 0;
+  }
+
+  .aui-assistant-message-content .aui-md-th,
+  .aui-assistant-message-content .aui-md-td,
+  .aui-md-root .aui-md-th,
+  .aui-md-root .aui-md-td {
+    max-width: 14rem;
+    font-size: 0.75rem;
+    padding: 5px 8px;
   }
 
   html.dark .aui-assistant-message-content pre,
@@ -1347,14 +1601,22 @@ html.dark *::-webkit-scrollbar-thumb:hover {
 
   .mc-msg-mobile-actions {
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    justify-content: flex-start;
     gap: 0.35rem;
-    margin-top: 0.35rem;
-    padding: 0.35rem 0.25rem;
-    border-radius: 0.5rem;
-    background: color-mix(in srgb, var(--mc-accent) 6%, transparent);
+    margin-top: 0.45rem;
+    padding: 0.4rem;
+    border-radius: 0.75rem;
+    background: color-mix(in srgb, var(--mc-accent) 8%, transparent);
     border: 1px solid var(--mc-border-soft);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .mc-msg-mobile-actions .mc-msg-action-btn,
+  .mc-msg-mobile-actions .mc-bookmark-btn {
+    flex: 1 0 auto;
   }
 
   .mc-thread-welcome-hints {
@@ -1374,7 +1636,14 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   .mc-bookmark-btn {
     min-width: 2.75rem;
     min-height: 2.75rem;
-    font-size: 0.8rem;
+  }
+
+  @media (hover: none) {
+    .mc-msg-actions {
+      opacity: 1;
+      pointer-events: auto;
+      transform: none;
+    }
   }
 }
 

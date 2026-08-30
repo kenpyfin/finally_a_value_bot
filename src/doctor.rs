@@ -754,14 +754,17 @@ fn check_node_and_browser(report: &mut DoctorReport) {
     let steel_cdp_port = Config::load()
         .map(|c| c.steel_cdp_port)
         .unwrap_or(crate::config::default_steel_cdp_port());
-    let steel_health_url = format!("{}/api/health", steel_url.trim_end_matches('/'));
-    let steel_ok = std::process::Command::new("curl")
-        .args(["-sf", "--max-time", "3", &steel_health_url])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let steel_base = steel_url.trim_end_matches('/');
+    let steel_ok = ["v1/health", "api/health"].iter().any(|path| {
+        let steel_health_url = format!("{steel_base}/{path}");
+        std::process::Command::new("curl")
+            .args(["-sf", "--max-time", "3", &steel_health_url])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
     let steel_venv = Config::load()
         .ok()
         .map(|c| {

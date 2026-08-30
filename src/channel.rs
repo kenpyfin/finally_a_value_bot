@@ -9,7 +9,9 @@ use crate::channels::telegram::{
 };
 use crate::channels::wecom::WecomGateway;
 use crate::db::{call_blocking, message_origin_interactive, Database, StoredMessage};
-use crate::final_delivery_dedupe::{plan_agent_final_delivery, AgentFinalDeliveryPlan};
+use crate::final_delivery_dedupe::{
+    plan_agent_final_delivery, AgentFinalDeliveryPlan, EMPTY_TURN_NOTICE,
+};
 use crate::final_delivery_media::{
     materialize_web_delivery_file_links, normalize_assistant_artifact_references,
 };
@@ -587,13 +589,29 @@ pub async fn deliver_agent_final_to_contact_with_origin(
             })
         }
         AgentFinalDeliveryPlan::Skip => {
-            tracing::info!(
+            tracing::warn!(
                 target: "channel",
                 chat_id = canonical_chat_id,
-                "Skipping agent final delivery (empty body)"
+                persona_id,
+                "empty agent final; storing user-visible notice instead of skipping"
             );
+            deliver_to_contact_with_origin(
+                db.clone(),
+                telegram_bots,
+                discord_http,
+                wecom,
+                bot_username,
+                canonical_chat_id,
+                persona_id,
+                EMPTY_TURN_NOTICE,
+                workspace_root,
+                scope,
+                session_id,
+                message_origin,
+            )
+            .await?;
             Ok(AgentFinalDeliveryOutcome {
-                response_for_client: String::new(),
+                response_for_client: EMPTY_TURN_NOTICE.to_string(),
             })
         }
     }

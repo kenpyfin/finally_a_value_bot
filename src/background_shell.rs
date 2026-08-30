@@ -141,6 +141,7 @@ pub async fn try_enqueue_background_shell(
     label: Option<String>,
     trigger_reason: &str,
     channel: &str,
+    chat_session_id: Option<String>,
 ) -> ShellEnqueueOutcome {
     if !tmux_available(&state.config) {
         return ShellEnqueueOutcome::TmuxUnavailable(
@@ -251,6 +252,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
     let label_for_db = display_label.clone();
     let cmd_for_db = command.clone();
     let session_for_db = tmux_session.clone();
+    let chat_session_for_db = chat_session_id.clone();
 
     match call_blocking(state.db.clone(), move |db| {
         db.create_background_shell_job(
@@ -263,6 +265,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
             &session_for_db,
             &output_path_str,
             &reason,
+            chat_session_for_db.as_deref(),
         )
     })
     .await
@@ -301,6 +304,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
                 &job_id,
                 chat_id,
                 persona_id,
+                chat_session_id.clone(),
                 &display_label,
                 &msg,
             )
@@ -333,6 +337,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
                 &job_id,
                 chat_id,
                 persona_id,
+                chat_session_id.clone(),
                 &display_label,
                 &msg,
             )
@@ -353,6 +358,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
                 &job_id,
                 chat_id,
                 persona_id,
+                chat_session_id.clone(),
                 &display_label,
                 &msg,
             )
@@ -402,7 +408,7 @@ Run the bot on a host with tmux, or use inline bash for short commands."
         &ack,
         Some(state.config.workspace_root_absolute()),
         DeliveryScope::StoreOnly,
-        None,
+        chat_session_id,
     )
     .await
     {
@@ -506,7 +512,15 @@ pub async fn cancel_background_shell_job(
         "Background command cancelled (job `{}`).\nTask: {label}\nReason: {reason_owned}",
         job.id
     );
-    if let Err(e) = deliver_shell_notification(state, job.chat_id, job.persona_id, &notice).await {
+    if let Err(e) = deliver_shell_notification(
+        state,
+        job.chat_id,
+        job.persona_id,
+        job.session_id.clone(),
+        &notice,
+    )
+    .await
+    {
         warn!(job_id = %job.id, "Failed to deliver shell job cancel notice: {e}");
     } else {
         let jid = job.id.clone();
@@ -630,13 +644,15 @@ async fn notify_shell_job_enqueue_failure(
     job_id: &str,
     chat_id: i64,
     persona_id: i64,
+    session_id: Option<String>,
     label: &str,
     reason: &str,
 ) {
     let text = format!(
         "Background command could not be started (job `{job_id}`).\nTask: {label}\n\n{reason}"
     );
-    if let Err(e) = deliver_shell_notification(state, chat_id, persona_id, &text).await {
+    if let Err(e) = deliver_shell_notification(state, chat_id, persona_id, session_id, &text).await
+    {
         warn!(job_id, "Failed to deliver shell job enqueue failure: {e}");
     } else {
         let jid = job_id.to_string();
@@ -651,6 +667,7 @@ async fn deliver_shell_notification(
     state: &Arc<AppState>,
     chat_id: i64,
     persona_id: i64,
+    session_id: Option<String>,
     text: &str,
 ) -> Result<(), String> {
     deliver_to_contact(
@@ -664,7 +681,7 @@ async fn deliver_shell_notification(
         text,
         Some(state.config.workspace_root_absolute()),
         DeliveryScope::StoreOnly,
-        None,
+        session_id,
     )
     .await
 }
@@ -781,7 +798,7 @@ pub async fn finalize_shell_job(
         &delivery_text,
         Some(state.config.workspace_root_absolute()),
         DeliveryScope::StoreOnly,
-        None,
+        job.session_id.clone(),
     )
     .await
     {
@@ -1009,6 +1026,7 @@ async fn maybe_enqueue_shell_success_agent_followup(
         prompt,
         &trigger,
         channel,
+        job.session_id.clone(),
     )
     .await
     {
@@ -1099,6 +1117,7 @@ async fn maybe_enqueue_shell_failure_agent_retry(
         prompt,
         &trigger,
         channel,
+        job.session_id.clone(),
     )
     .await
     {
@@ -1253,6 +1272,7 @@ mod tests {
             output_path: None,
             exit_code: None,
             label: Some("my-task".into()),
+            session_id: None,
         }
     }
 

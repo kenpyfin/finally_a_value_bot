@@ -2,7 +2,7 @@
 name = "finally-a-value-bot"
 version = "0.0.37"
 edition = "2021"
-license = "MIT"
+license-file = "LICENSE"
 
 [lints.clippy]
 too_many_arguments = "allow"

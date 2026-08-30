@@ -378,6 +378,7 @@ fn should_redact_env_key(key: &str) -> bool {
         || k.contains("PRIVATE_KEY")
         || k.contains("CREDENTIAL")
         || k.contains("DATABASE_URL")
+        || k.contains("USERHASH")
         || k == "DSN"
         || k.ends_with("_DSN")
     {
@@ -541,6 +542,7 @@ mod tests {
         assert!(should_redact_env_key("TELEGRAM_BOT_TOKEN"));
         assert!(should_redact_env_key("OPENAI_API_KEY"));
         assert!(should_redact_env_key("SOCIAL_TIKTOK_CLIENT_SECRET"));
+        assert!(should_redact_env_key("CATBOX_USERHASH"));
         assert!(!should_redact_env_key("WORKSPACE_DIR"));
         assert!(!should_redact_env_key("SOCIAL_TIKTOK_CLIENT_ID"));
         assert!(!should_redact_env_key("ORCHESTRATOR_MODEL"));

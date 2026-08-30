@@ -88,6 +88,339 @@ fn is_cursor_empty_user_facing_text(text: &str) -> bool {
     trimmed.is_empty() || trimmed == CURSOR_EMPTY_OUTPUT_PLACEHOLDER
 }
 
+fn cursor_planning_opener(text: &str) -> bool {
+    let first = text
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    first.starts_with("i'll ")
+        || first.starts_with("i will ")
+        || first.starts_with("let me ")
+        || first.starts_with("first i")
+        || first.starts_with("next i")
+        || first.starts_with("i'm ")
+        || first.starts_with("i am ")
+        || first.starts_with("i already")
+}
+
+/// Cursor emits one assistant `text` event per tool-round. Those are complete utterances,
+/// not token deltas — concatenating them without a break produces `process.The ratio`.
+fn cursor_utterance_looks_like_final_answer(text: &str) -> bool {
+    let t = text.trim();
+    let chars = t.chars().count();
+    if chars < 220 {
+        return false;
+    }
+    let lines = t.lines().filter(|l| !l.trim().is_empty()).count();
+    if cursor_planning_opener(t) && lines <= 2 && chars < 480 {
+        return false;
+    }
+    lines >= 3 || t.contains("### ") || t.contains("\n- ") || chars >= 400
+}
+
+fn push_cursor_utterance(parts: &mut Vec<String>, delta: &str) {
+    let t = delta.trim();
+    if t.is_empty() {
+        return;
+    }
+    if let Some(last) = parts.last_mut() {
+        if last == t || last.ends_with(t) {
+            return;
+        }
+        if t.starts_with(last.as_str()) && t.len() > last.len() {
+            *last = t.to_string();
+            return;
+        }
+    }
+    parts.push(t.to_string());
+}
+
+/// Cursor sometimes emits many tiny `text` events (token-sized) instead of `text_delta`.
+fn cursor_text_event_is_stream_fragment(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains("\n\n") || t.starts_with("### ") {
+        return false;
+    }
+    if cursor_planning_opener(t) {
+        return false;
+    }
+    let chars = t.chars().count();
+    if chars > 72 {
+        return false;
+    }
+    if chars >= 20
+        && t.split_whitespace().count() >= 4
+        && (t.ends_with('.') || t.ends_with('!') || t.ends_with('?'))
+    {
+        return false;
+    }
+    true
+}
+
+fn cursor_fragment_join_needs_space(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if right.starts_with(char::is_whitespace) {
+        return false;
+    }
+    if right.starts_with(|c: char| {
+        matches!(
+            c,
+            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'' | '-' | '/'
+        )
+    }) {
+        return false;
+    }
+    if left.ends_with(['(', '[', '{', '"', '\'', '-', '/']) {
+        return false;
+    }
+    if left.ends_with(char::is_whitespace) {
+        return false;
+    }
+    // Token continuation such as "hot" + "ify" → "hotify".
+    if left.ends_with(|c: char| c.is_ascii_alphanumeric())
+        && right.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && right.chars().count() <= 24
+        && !right.contains('\n')
+    {
+        return false;
+    }
+    true
+}
+
+fn join_cursor_stream_fragments(parts: &[String]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        let chunk = part.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str(chunk);
+            continue;
+        }
+        if cursor_fragment_join_needs_space(&out, chunk) {
+            out.push(' ');
+        }
+        out.push_str(chunk);
+    }
+    out
+}
+
+fn cursor_parts_look_like_fragment_stream(parts: &[String]) -> bool {
+    let trimmed: Vec<&str> = parts
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if trimmed.len() < 12 {
+        return false;
+    }
+    let short = trimmed
+        .iter()
+        .filter(|s| s.chars().count() <= 72 && !s.contains("\n\n"))
+        .count();
+    if short * 100 / trimmed.len().max(1) < 85 {
+        return false;
+    }
+    trimmed.iter().filter(|s| cursor_planning_opener(s)).count() <= 2
+}
+
+fn cursor_text_looks_like_per_word_newlines(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() < 12 {
+        return false;
+    }
+    let short = lines.iter().filter(|l| l.chars().count() <= 72).count();
+    short * 100 / lines.len().max(1) >= 85
+}
+
+fn append_cursor_stream_fragment(parts: &mut Vec<String>, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if fragment.starts_with(char::is_whitespace) {
+        if let Some(last) = parts.last_mut() {
+            last.push_str(fragment);
+            return;
+        }
+    }
+    let chunk = fragment.trim_start();
+    if chunk.is_empty() {
+        return;
+    }
+    if let Some(last) = parts.last_mut() {
+        if cursor_fragment_join_needs_space(last, chunk) {
+            last.push(' ');
+        }
+        last.push_str(chunk);
+    } else {
+        parts.push(chunk.to_string());
+    }
+}
+
+fn append_cursor_token_delta(parts: &mut Vec<String>, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if let Some(last) = parts.last_mut() {
+        last.push_str(delta);
+    } else if !delta.trim().is_empty() {
+        parts.push(delta.to_string());
+    }
+}
+
+/// Prefer the last real write-up over a glued stream of "I'll look / Next I'll / …".
+pub fn coalesce_cursor_delivery_text(parts: &[String], done_result: Option<&str>) -> String {
+    if let Some(raw) = done_result.map(str::trim).filter(|s| !s.is_empty()) {
+        let result = normalize_cursor_done_result(raw);
+        if cursor_utterance_looks_like_final_answer(&result) {
+            return result;
+        }
+        let streamed = coalesce_cursor_streamed_parts(parts);
+        if !streamed.is_empty()
+            && result.len() > streamed.len() + 80
+            && (result.contains(streamed.as_str())
+                || cursor_text_looks_like_duplicate_delivery(&streamed, &result))
+        {
+            return result;
+        }
+    }
+
+    let mut parts: Vec<String> = parts
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(raw) = done_result.map(str::trim).filter(|s| !s.is_empty()) {
+        let result = normalize_cursor_done_result(raw);
+        let already = parts.iter().any(|p| p == &result);
+        if !already {
+            if parts
+                .last()
+                .is_some_and(|p| result.contains(p.as_str()) && result.len() > p.len() + 20)
+            {
+                parts.pop();
+            }
+            parts.push(result);
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    if let Some(last) = parts.last() {
+        if cursor_utterance_looks_like_final_answer(last) {
+            return dedupe_cursor_delivery_text(last);
+        }
+    }
+    for part in parts.iter().rev() {
+        if cursor_utterance_looks_like_final_answer(part) {
+            return dedupe_cursor_delivery_text(part);
+        }
+    }
+    if cursor_parts_look_like_fragment_stream(&parts) {
+        return join_cursor_stream_fragments(&parts);
+    }
+    dedupe_cursor_delivery_text(&parts.join("\n\n"))
+}
+
+fn normalize_cursor_done_result(raw: &str) -> String {
+    let repaired = if cursor_text_looks_like_per_word_newlines(raw) {
+        join_cursor_stream_fragments(
+            &raw.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        raw.to_string()
+    };
+    dedupe_cursor_delivery_text(&repaired)
+}
+
+fn coalesce_cursor_streamed_parts(parts: &[String]) -> String {
+    let trimmed: Vec<String> = parts
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if cursor_parts_look_like_fragment_stream(&trimmed) {
+        join_cursor_stream_fragments(&trimmed)
+    } else {
+        trimmed.join("\n\n")
+    }
+}
+
+fn cursor_text_looks_like_broken_token_spacing(text: &str) -> bool {
+    text.contains(" ## ")
+        || text.contains("R 4 ")
+        || text.contains("CLIP Seg ")
+        || text.contains("Aug 26 – ")
+        || text.contains("PZ _ ")
+}
+
+fn cursor_text_looks_like_duplicate_delivery(streamed: &str, done: &str) -> bool {
+    let a = streamed.trim();
+    let b = done.trim();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    for marker in [
+        "## 1.",
+        "The last experiment block is",
+        "### What was fixed",
+    ] {
+        if b.matches(marker).count() >= 2 {
+            return true;
+        }
+        if a.contains(marker) && b.contains(marker) && b.len() > a.len() + 200 {
+            return true;
+        }
+    }
+    false
+}
+
+fn dedupe_cursor_delivery_text(text: &str) -> String {
+    let t = text.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    for marker in [
+        "The last experiment block is",
+        "## 1. Current track",
+        "## 1.",
+        "### What was fixed",
+    ] {
+        if let Some(first) = t.find(marker) {
+            if let Some(second_rel) = t[first + marker.len()..].find(marker) {
+                let split_at = first + marker.len() + second_rel;
+                let head = t[..split_at].trim();
+                let tail = t[split_at..].trim();
+                if cursor_text_looks_like_broken_token_spacing(head)
+                    || tail.len() >= head.len().saturating_sub(200)
+                {
+                    return tail.to_string();
+                }
+            }
+        }
+    }
+    t.to_string()
+}
+
 fn empty_output_nudge_prompt() -> String {
     concat!(
         "[system_runtime_context]\n",
@@ -120,6 +453,17 @@ fn recover_user_text_from_tool_records(records: &[ToolCallRecord]) -> Option<Str
 fn is_stale_cursor_agent_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("not found") && lower.contains("agent")
+}
+
+fn is_busy_cursor_agent_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("already has active run")
+        || lower.contains("agent is busy")
+        || lower.contains("agent_busy")
+}
+
+fn is_unusable_cursor_agent_error(message: &str) -> bool {
+    is_stale_cursor_agent_error(message) || is_busy_cursor_agent_error(message)
 }
 
 fn is_cursor_sidecar_recoverable_error(message: &str) -> bool {
@@ -223,6 +567,7 @@ async fn consume_sidecar_stream(
     mcp_tool_count: &mut usize,
 ) -> Result<SidecarRunOutcome, anyhow::Error> {
     let mut final_text = String::new();
+    let mut text_parts: Vec<String> = Vec::new();
     let mut returned_agent_id: Option<String> = None;
     let mut run_status = String::from("unknown");
     let mut sidecar_error: Option<String> = None;
@@ -263,14 +608,39 @@ async fn consume_sidecar_stream(
                         }
                     };
                     match event.event_type.as_str() {
-                        "text" | "text_delta" => {
+                        "text" => {
+                            let delta = if event.text.is_empty() {
+                                event.message
+                            } else {
+                                event.text
+                            };
+                            if !delta.trim().is_empty() {
+                                if cursor_text_event_is_stream_fragment(&delta) {
+                                    append_cursor_stream_fragment(&mut text_parts, &delta);
+                                    if let Some(tx) = event_tx {
+                                        let _ = tx.send(AgentEvent::TextDelta { delta });
+                                    }
+                                } else {
+                                    let emit = if text_parts.is_empty() {
+                                        delta.trim().to_string()
+                                    } else {
+                                        format!("\n\n{}", delta.trim())
+                                    };
+                                    push_cursor_utterance(&mut text_parts, &delta);
+                                    if let Some(tx) = event_tx {
+                                        let _ = tx.send(AgentEvent::TextDelta { delta: emit });
+                                    }
+                                }
+                            }
+                        }
+                        "text_delta" => {
                             let delta = if event.text.is_empty() {
                                 event.message
                             } else {
                                 event.text
                             };
                             if !delta.is_empty() {
-                                final_text.push_str(&delta);
+                                append_cursor_token_delta(&mut text_parts, &delta);
                                 if let Some(tx) = event_tx {
                                     let _ = tx.send(AgentEvent::TextDelta { delta });
                                 }
@@ -283,11 +653,10 @@ async fn consume_sidecar_stream(
                                 event.status
                             };
                             returned_agent_id = event.agent_id;
-                            if let Some(result) = event.result.filter(|s| !s.is_empty()) {
-                                if final_text.is_empty() {
-                                    final_text = result;
-                                }
-                            }
+                            final_text = coalesce_cursor_delivery_text(
+                                &text_parts,
+                                event.result.as_deref(),
+                            );
                         }
                         "error" => {
                             sidecar_error = Some(if event.message.is_empty() {
@@ -359,6 +728,10 @@ async fn consume_sidecar_stream(
         }
     }
 
+    if final_text.is_empty() {
+        final_text = coalesce_cursor_delivery_text(&text_parts, None);
+    }
+
     Ok(SidecarRunOutcome {
         final_text,
         returned_agent_id,
@@ -428,12 +801,13 @@ async fn invoke_sidecar_turn(
     .await?;
 
     if let Some(ref err) = outcome.sidecar_error {
-        if resume_id.is_some() && is_stale_cursor_agent_error(err) {
+        if resume_id.is_some() && is_unusable_cursor_agent_error(err) {
             warn!(
                 chat_id,
                 persona_id,
                 stale_agent_id = resume_id.as_deref().unwrap_or(""),
-                "Stale Cursor agent id; clearing for fresh delegation prompt"
+                busy = is_busy_cursor_agent_error(err),
+                "Unusable Cursor agent id; clearing for fresh delegation prompt"
             );
             let db = state.db.clone();
             let session_scope_for_db = session_scope.to_string();
@@ -969,6 +1343,106 @@ mod tests {
             "Cursor SDK startup failed: Agent agent-cea12fe8-fdd5-4fa4-880b-d8f7f6225a54 not found"
         ));
         assert!(!is_stale_cursor_agent_error("prompt required"));
+    }
+
+    #[test]
+    fn is_busy_cursor_agent_error_detects_active_run() {
+        assert!(is_busy_cursor_agent_error(
+            "Agent agent-1c9d98ad-57cf-46ae-87ac-f6c5910b081c already has active run"
+        ));
+        assert!(is_unusable_cursor_agent_error(
+            "Cursor SDK startup failed: Agent agent-1c9d98ad-57cf-46ae-87ac-f6c5910b081c already has active run"
+        ));
+        assert!(!is_busy_cursor_agent_error("prompt required"));
+    }
+
+    #[test]
+    fn coalesce_cursor_progress_gets_paragraph_breaks() {
+        let parts = vec![
+            "I'll diagnose the flat loaf from your ratio photo.".into(),
+            "The ratio screenshot is in. Next I’ll check your vault notes.".into(),
+            "The ratio math is clear: 90% whole wheat. I'll archive that diagnosis.".into(),
+        ];
+        let out = coalesce_cursor_delivery_text(&parts, None);
+        assert!(out.contains("\n\n"));
+        assert!(!out.contains("photo.The ratio"));
+        assert!(out.contains("90% whole wheat"));
+    }
+
+    #[test]
+    fn coalesce_cursor_prefers_last_real_writeup() {
+        let parts = vec![
+            "I'll inspect the landing page and how steps 2–5 are rendered.".into(),
+            "Implementing per-step mobile illustrations.".into(),
+            "I've fixed the missing illustrations and the ads on both landing pages.\n\n### What was fixed\n\n1. Hardcoded illustrations into each of the five steps so they show on load.\n2. Mobile opacity is 100% so the mocks stay visible.\n3. Ads scripts are on both landing pages.\n\nPlease check the deploy.".into(),
+        ];
+        let out = coalesce_cursor_delivery_text(&parts, None);
+        assert!(out.starts_with("I've fixed the missing illustrations"));
+        assert!(!out.contains("I'll inspect the landing page"));
+        assert!(out.contains("### What was fixed"));
+    }
+
+    #[test]
+    fn coalesce_cursor_joins_word_fragment_streams() {
+        let parts = vec![
+            "Use".into(),
+            "production".into(),
+            "pz".into(),
+            "-".into(),
+            "hot".into(),
+            "ify".into(),
+            "on".into(),
+            "R4".into(),
+            "base".into(),
+            "instead".into(),
+            "of".into(),
+            "lingerie".into(),
+            "-".into(),
+            "transfer".into(),
+        ];
+        let out = coalesce_cursor_delivery_text(&parts, None);
+        assert_eq!(
+            out,
+            "Use production pz-hotify on R4 base instead of lingerie-transfer"
+        );
+        assert!(!out.contains("\n\n"));
+    }
+
+    #[test]
+    fn coalesce_cursor_repairs_done_result_with_per_word_newlines() {
+        let broken = "Use\n\nproduction\n\npz\n\n-\n\nhot\n\nify\n\non\n\nR4\n\nbase";
+        let out = coalesce_cursor_delivery_text(&[], Some(broken));
+        assert_eq!(out, "Use production pz-hotify on R4 base");
+    }
+
+    #[test]
+    fn coalesce_cursor_prefers_sdk_done_result_over_streamed_prefix() {
+        let streamed = "I'll pull the experiment notes and SOP. The last experiment block is ** Aug 26 – 27 **.";
+        let sdk = "The last experiment block is **Aug 26–27**, not the July CLIPSeg runs.\n\n## 1. Current track\n\nGoal: prove Stage 1→2.";
+        let parts = vec![streamed.to_string()];
+        let out = coalesce_cursor_delivery_text(&parts, Some(sdk));
+        assert_eq!(out, sdk);
+        assert!(!out.contains("I'll pull the experiment notes"));
+    }
+
+    #[test]
+    fn dedupe_cursor_delivery_text_drops_repeated_writeup() {
+        let broken = "I'll search notes. The last experiment block is ** Aug 26 – 27 **.\n\n---\n\n## 1. Track A";
+        let clean = "The last experiment block is **Aug 26–27**.\n\n---\n\n## 1. Track B";
+        let combined = format!("{broken}\n\n{clean}");
+        let out = coalesce_cursor_delivery_text(&[], Some(&combined));
+        assert!(out.starts_with("The last experiment block is **Aug 26–27**"));
+        assert!(!out.contains("I'll search notes"));
+        assert!(out.contains("Track B"));
+    }
+
+    #[test]
+    fn cursor_text_event_is_stream_fragment_skips_planning_utterances() {
+        assert!(!cursor_text_event_is_stream_fragment(
+            "I'll diagnose the flat loaf from your ratio photo."
+        ));
+        assert!(cursor_text_event_is_stream_fragment("hot"));
+        assert!(cursor_text_event_is_stream_fragment("ify"));
     }
 
     #[test]

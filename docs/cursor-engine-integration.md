@@ -212,7 +212,7 @@ Before `pipeline_finish_turn`, Cursor engine **appends the delivered assistant m
 7. **PostToolBatch** — loop/discovery stall hints from batch stats.
 8. **Append assistant** to `messages`.
 9. **PostDelivery** — `pipeline_finish_turn` (bulletin focus sync flag, quality gate).
-10. **PreDelivery** — after PDQE accept/fail-open; persona dense-delivery may replace the delivered text with a summary + public PDF URL.
+10. **PreDelivery** — after PDQE accept/fail-open; persona dense-delivery may replace the delivered text with a natural LLM summary plus a public PDF URL (full report uploaded to catbox, not a local path).
 
 Agent history records a synthetic iteration with tool rows when MCP tools ran (`had_tool_calls` set for focus-sync heuristics).
 
@@ -233,7 +233,7 @@ Classic and Deterministic engines still receive the full `build_system_prompt` o
 
 **PostDelivery focus sync** (`postdelivery-persona-focus-sync`): after delivery, a lightweight strategy LLM sub-call syncs bulletin/Tier 3. Task deliveries (`had_tool_calls`, long replies, or non-conversational) require `update_bulletin_focus`; sync context uses the delivered assistant text and a **fresh DB bulletin read** (not stale prep `[persona_context]`). Logs: `focus_sync_started`, `focus_sync_completed`, `focus_sync_noop`.
 
-**Stale agent id:** if the sidecar reports a missing `agent_id`, the DB id is cleared and the turn retries once with a **full slim** prompt (not delta).
+**Stale / busy agent id:** if the sidecar reports a missing `agent_id` or `already has active run`, the DB id is cleared and the turn retries once with a **full slim** prompt (not delta). The Node sidecar also sends `local.force` so a leftover local run is expired instead of blocking the next message.
 
 Pipeline stage telemetry includes `delegation=full_slim|resume_delta|full_slim_stale_retry` and `prompt_chars=…`.
 

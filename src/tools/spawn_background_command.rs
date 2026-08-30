@@ -133,6 +133,7 @@ impl Tool for SpawnBackgroundCommandTool {
             label,
             "tool",
             &channel,
+            auth.chat_session_id(),
         )
         .await
         {

@@ -2397,6 +2397,7 @@ pub(crate) async fn process_classic_agent_with_events(
         caller_persona_id: persona_id,
         control_chat_ids: state.config.control_chat_ids.clone(),
         is_scheduled_task: context.is_scheduled_task,
+        session_id: context.session_id.clone(),
     };
 
     // Token-aware trimming: drop oldest messages only while over budget and only if the
@@ -7020,6 +7021,7 @@ async fn run_persona_focus_sync_after_delivery(
         caller_persona_id: persona_id,
         control_chat_ids: state.config.control_chat_ids.clone(),
         is_scheduled_task: false,
+        session_id: None,
     };
 
     let max_iters = if task_delivery {

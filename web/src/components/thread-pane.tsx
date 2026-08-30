@@ -1,6 +1,6 @@
 import React from 'react'
 import { ThreadHistorySkeleton } from './skeleton'
-import { IconStar } from './icons'
+import { IconCopy, IconReply, IconStar, IconTrash } from './icons'
 import {
   AssistantRuntimeProvider,
   CompositeAttachmentAdapter,
@@ -33,6 +33,10 @@ import {
 import remarkGfm from 'remark-gfm'
 import { historiesEqual, isHistoryPrepend } from '../lib/history-sync'
 import { messageTextForClipboard, parseReplyForDisplay, type DisplayReplyQuote, type PendingReplyQuote } from '../lib/reply-quote'
+import { MarkdownTable } from './markdown-table'
+import { copyTextToClipboard } from '../lib/copy-to-clipboard'
+import { messageGroupClass, messageGroupPosition } from '../lib/message-group'
+
 import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 
 /** Module-scoped so ThreadPane re-renders do not remount every markdown message. */
@@ -51,11 +55,7 @@ const MarkdownText = makeMarkdownText({
       const mergedRel = [props.rel, 'noopener', 'noreferrer'].filter(Boolean).join(' ')
       return <a {...props} target="_blank" rel={mergedRel} />
     },
-    table: ({ className, ...props }) => (
-      <div className="mc-md-table-scroll">
-        <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
-      </div>
-    ),
+    table: MarkdownTable,
   },
 })
 
@@ -250,16 +250,21 @@ function UserMessageDisplayBody() {
 function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
   const {
     mobileActionMessageId,
+    bookmarkedMessageIds,
     onToggleBookmark,
     onReplyToMessage,
     onDeleteMessage,
     onMobileMessageTap,
   } = React.useContext(ThreadPaneUiContext)
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  const isBookmarked = useMessage((m) => {
+    const id = typeof m.id === 'string' ? m.id : ''
+    return id.length > 0 && (bookmarkedMessageIds?.has(id) ?? false)
+  })
   if (!messageId || mobileActionMessageId !== messageId) return null
   return (
     <div className="mc-msg-mobile-actions" role="toolbar" aria-label="Message actions">
-      <MessageCopyButton />
+      <MessageCopyButton showLabel />
       {onReplyToMessage ? (
         <button
           type="button"
@@ -268,8 +273,11 @@ function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
             onReplyToMessage(messageId)
             onMobileMessageTap?.('')
           }}
+          title="Reply with quote"
+          aria-label="Reply with quote"
         >
-          Reply
+          <IconReply />
+          <span className="mc-msg-action-label">Reply</span>
         </button>
       ) : null}
       {onToggleBookmark ? (
@@ -277,9 +285,11 @@ function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
           type="button"
           className="mc-bookmark-btn cursor-pointer"
           onClick={() => onToggleBookmark(messageId, role)}
-          aria-label="Bookmark message"
+          aria-label={isBookmarked ? 'Remove bookmark' : 'Bookmark message'}
+          title={isBookmarked ? 'Remove bookmark' : 'Bookmark message'}
         >
-          <IconStar />
+          <IconStar filled={isBookmarked} />
+          <span className="mc-msg-action-label">{isBookmarked ? 'Saved' : 'Save'}</span>
         </button>
       ) : null}
       {onDeleteMessage ? (
@@ -290,17 +300,21 @@ function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
             onDeleteMessage(messageId)
             onMobileMessageTap?.('')
           }}
+          title="Delete message"
+          aria-label="Delete message"
         >
-          Delete
+          <IconTrash />
+          <span className="mc-msg-action-label">Delete</span>
         </button>
       ) : null}
       <button
         type="button"
-        className="mc-msg-action-btn cursor-pointer"
+        className="mc-msg-action-btn mc-msg-action-btn-muted cursor-pointer"
         onClick={() => onMobileMessageTap?.('')}
         aria-label="Close actions"
+        title="Close"
       >
-        Close
+        <span className="mc-msg-action-label">Close</span>
       </button>
     </div>
   )
@@ -350,27 +364,49 @@ function useMobileMessageTapProps(messageId: string) {
   }
 }
 
-function MessageCopyButton() {
+function useMessageGroupProps(role: 'user' | 'assistant') {
+  const groupPosition = useAuiState(({ thread, message }) =>
+    messageGroupPosition(thread.messages, message.index),
+  )
+  return {
+    'data-group': groupPosition,
+    className: messageGroupClass(groupPosition, role),
+  } as const
+}
+
+function MessageCopyButton({ showLabel = false }: { showLabel?: boolean }) {
   const textToCopy = useMessage((m) => {
     if (m.role === 'assistant' && m.status?.type === 'running') return ''
     return getMessageClipboardText(m.content)
   })
   const [copied, setCopied] = React.useState(false)
+  const [failed, setFailed] = React.useState(false)
   if (!textToCopy.trim()) return null
+
+  const label = copied ? 'Copied' : failed ? 'Copy failed' : 'Copy message'
+  const shortLabel = copied ? 'Copied' : failed ? 'Failed' : 'Copy'
+
   return (
     <button
       type="button"
       className="mc-msg-action-btn"
       onClick={() => {
-        void navigator.clipboard.writeText(textToCopy).then(() => {
-          setCopied(true)
-          window.setTimeout(() => setCopied(false), 2000)
+        void copyTextToClipboard(textToCopy).then((ok) => {
+          if (ok) {
+            setCopied(true)
+            setFailed(false)
+            window.setTimeout(() => setCopied(false), 2000)
+            return
+          }
+          setFailed(true)
+          window.setTimeout(() => setFailed(false), 2500)
         })
       }}
-      title={copied ? 'Copied' : 'Copy message'}
-      aria-label={copied ? 'Copied' : 'Copy message'}
+      title={label}
+      aria-label={label}
     >
-      {copied ? 'Copied' : 'Copy'}
+      <IconCopy className={copied ? 'mc-msg-action-icon-success' : undefined} />
+      {showLabel ? <span className="mc-msg-action-label">{shortLabel}</span> : null}
     </button>
   )
 }
@@ -400,7 +436,7 @@ function MessageBookmarkButton({
   )
 }
 
-function MessageReplyButton() {
+function MessageReplyButton({ showLabel = false }: { showLabel?: boolean }) {
   const { onReplyToMessage } = React.useContext(ThreadPaneUiContext)
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   if (!onReplyToMessage || !messageId) return null
@@ -412,12 +448,12 @@ function MessageReplyButton() {
       title="Reply with quote"
       aria-label="Reply with quote"
     >
-      Reply
+      {showLabel ? 'Reply' : <IconReply />}
     </button>
   )
 }
 
-function MessageDeleteButton() {
+function MessageDeleteButton({ showLabel = false }: { showLabel?: boolean }) {
   const { onDeleteMessage } = React.useContext(ThreadPaneUiContext)
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   if (!onDeleteMessage || !messageId) return null
@@ -429,14 +465,47 @@ function MessageDeleteButton() {
       title="Delete message"
       aria-label="Delete message"
     >
-      Delete
+      {showLabel ? 'Delete' : <IconTrash />}
     </button>
+  )
+}
+
+function MessageActionBar({
+  role,
+  showLabels = false,
+}: {
+  role: 'user' | 'assistant'
+  showLabels?: boolean
+}) {
+  const groupPosition = useAuiState(({ thread, message }) =>
+    messageGroupPosition(thread.messages, message.index),
+  )
+  const showTimestamp = groupPosition === 'single' || groupPosition === 'end'
+
+  return (
+    <div
+      className={[
+        'mc-msg-footer',
+        role === 'user' ? 'mc-msg-footer-user' : 'mc-msg-footer-assistant',
+      ].join(' ')}
+    >
+      <div className="mc-msg-actions mc-msg-meta-row-desktop" role="toolbar" aria-label="Message actions">
+        <MessageCopyButton showLabel={showLabels} />
+        <MessageReplyButton showLabel={showLabels} />
+        <MessageBookmarkButton role={role} />
+        <MessageDeleteButton showLabel={showLabels} />
+      </div>
+      {showTimestamp ? (
+        <MessageTimestamp align={role === 'user' ? 'right' : 'left'} />
+      ) : null}
+    </div>
   )
 }
 
 function CustomAssistantMessage() {
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   const mobileTap = useMobileMessageTapProps(messageId)
+  const groupProps = useMessageGroupProps('assistant')
   const hasRenderableContent = useMessage((m) =>
     Array.isArray(m.content)
       ? m.content.some((part) => {
@@ -447,7 +516,7 @@ function CustomAssistantMessage() {
   )
 
   return (
-    <AssistantMessage.Root data-message-id={messageId || undefined} {...mobileTap}>
+    <AssistantMessage.Root data-message-id={messageId || undefined} {...groupProps} {...mobileTap}>
       {hasRenderableContent ? (
         <AssistantMessage.Content />
       ) : (
@@ -459,13 +528,7 @@ function CustomAssistantMessage() {
         </div>
       )}
       <BranchPicker />
-      <div className="mc-msg-meta-row mc-msg-meta-row-desktop">
-        <MessageBookmarkButton role="assistant" />
-        <MessageCopyButton />
-        <MessageReplyButton />
-        <MessageDeleteButton />
-        <MessageTimestamp align="left" />
-      </div>
+      <MessageActionBar role="assistant" />
       <MessageMobileActionSheet role="assistant" />
     </AssistantMessage.Root>
   )
@@ -474,21 +537,16 @@ function CustomAssistantMessage() {
 function CustomUserMessage() {
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   const mobileTap = useMobileMessageTapProps(messageId)
+  const groupProps = useMessageGroupProps('user')
   return (
-    <UserMessage.Root data-message-id={messageId || undefined} {...mobileTap}>
+    <UserMessage.Root data-message-id={messageId || undefined} {...groupProps} {...mobileTap}>
       <UserMessage.Attachments />
       <MessagePrimitive.If hasContent>
-        <div className="mc-msg-meta-row mc-msg-meta-row-user mc-msg-meta-row-desktop">
-          <MessageBookmarkButton role="user" />
-          <MessageCopyButton />
-          <MessageReplyButton />
-          <MessageDeleteButton />
-        </div>
-        <MessageMobileActionSheet role="user" />
         <div className="mc-user-content-wrap">
           <UserMessageDisplayBody />
-          <MessageTimestamp align="right" />
         </div>
+        <MessageActionBar role="user" />
+        <MessageMobileActionSheet role="user" />
       </MessagePrimitive.If>
       <BranchPicker />
     </UserMessage.Root>

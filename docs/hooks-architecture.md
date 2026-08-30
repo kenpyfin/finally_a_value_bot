@@ -62,7 +62,7 @@ Supported `action_type` values:
 - `builtin_turn_skill_gate` (PreToolUse schedule/modify activation gate)
 - `builtin_deferred_commitment_guard` (PreStop deferred-work guard; no-op when `stop_reason` is `ask_clarification`)
 - `builtin_loop_guard` (PostToolBatch discovery/edit loop guard)
-- `builtin_dense_delivery_guard` (PreDelivery persona-gated length spill to PDF + public URL; no-op when the persona toggle is off)
+- `builtin_dense_delivery_guard` (PreDelivery persona-gated length spill: LLM summary + full-report PDF uploaded to a public HTTPS URL; no-op when the persona toggle is off)
 
 `pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.
 
@@ -139,7 +139,7 @@ Command hooks may return `effects.memory_tier3_prune`; Rust applies writes via `
 
 ## Built-in Rust policy hooks
 
-`builtin_*` action types run inline in `hook_runtime.rs`. PostDelivery focus sync triggers `run_persona_focus_sync_after_delivery` when `builtin_persona_focus_sync` matches. PreDelivery `builtin_dense_delivery_guard` may replace `updated_assistant_text` after PDQE when the persona dense-delivery toggle is on and the reply exceeds the channel cap.
+`builtin_*` action types run inline in `hook_runtime.rs`. PostDelivery focus sync triggers `run_persona_focus_sync_after_delivery` when `builtin_persona_focus_sync` matches. PreDelivery `builtin_dense_delivery_guard` may replace `updated_assistant_text` after PDQE when the persona dense-delivery toggle is on and the reply exceeds the channel cap. The replacement is a natural LLM summary (extractive fallback) that offers the public PDF URL; the PDF is the full original report (env secrets redacted) uploaded to catbox, not an internal path.
 
 ## Separation from delivery safeguards
 

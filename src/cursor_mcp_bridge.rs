@@ -546,7 +546,7 @@ async fn handle_tools_call(
         is_background_job: false,
         run_key: Some(run_key.clone()),
         reply_bot_instance_id: None,
-        session_id: None,
+        session_id: tool_auth.session_id.clone(),
     };
 
     let mut dispatch_state = {

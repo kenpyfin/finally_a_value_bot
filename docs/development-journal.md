@@ -4,6 +4,112 @@ Chronological log of **non-trivial** implementation work: features, refactors, a
 
 Use **newest entries first** (reverse chronological). Each entry should be self-contained enough that a future reader (or agent) can find code and rationale quickly.
 
+### 2026-08-27 — Background command notices follow the focused session
+
+- **Area:** background_shell / focused sessions / delivery
+- **Summary:** `spawn_background_command` start/finish/cancel notices (and the agent follow-up after the job) now store on the focused web session that spawned them, not always main chat. `session_id` is on `ToolAuthContext` and persisted on `background_jobs`.
+- **Rationale:** Operators running long shell work from a focused session never saw the “Background command started…” ack in that thread (`deliver_to_contact` used `session_id: None`).
+- **Key files / symbols:** `ToolAuthContext.session_id`; `create_background_shell_job` / `create_background_job`; `try_enqueue_background_shell`; `deliver_shell_notification`; `try_enqueue_background_handoff`; `spawn_background_job`.
+- **Note:** Restart the gateway so the SQLite `background_jobs.session_id` migration runs. Telegram/Discord/WeCom inbound stays main-chat (`session_id: None`).
+
+### 2026-08-26 — Mixed license: proprietary edits, MIT original
+
+- **Area:** licensing
+- **Summary:** Replaced the dual-copyright MIT file with a mixed license. kenpyfin modifications and new files are proprietary source-available (personal non-commercial run/modify only). Original everettjf portions stay MIT. Cargo.toml now uses `license-file` instead of `license = "MIT"`.
+- **Rationale:** MIT cannot be removed from the upstream code, but new work does not have to be MIT. The combined tree is no longer permissively licensed.
+- **Key files / symbols:** `LICENSE` Parts 1–2; `Cargo.toml` `license-file`; `README.md` License section.
+
+### 2026-08-26 — Dual copyright on MIT license
+
+- **Area:** licensing
+- **Summary:** LICENSE now lists kenpyfin (2026) alongside the original everettjf (2025) MIT copyright, with a short derivative-work note. README License section matches.
+- **Rationale:** This tree started from everettjf's MIT-licensed project and now contains substantial original work; MIT requires keeping the upstream notice while adding the current author's copyright.
+- **Key files / symbols:** `LICENSE`; `README.md` License section.
+- **Note:** License type remains MIT (`Cargo.toml` `license = "MIT"`).
+
+### 2026-08-27 — Steel health path + unmanaged wait blocked Web UI
+
+- **Area:** Steel browser bootstrap / gateway startup
+- **Summary:** Gateway waited ~90s (wrong `/api/health` 404) before binding Web UI even when `BROWSER_MANAGED` was off. Probe now tries `/v1/health` then `/api/health`; health wait only runs when managed mode is enabled.
+- **Key files / symbols:** `probe_steel_health`, `bootstrap` in `src/steel_browser_sidecar.rs`; doctor check in `src/doctor.rs`.
+
+### 2026-08-27 — Wider assistant bubbles; flat user messages
+
+- **Area:** Web UI / thread pane
+- **Summary:** `--aui-thread-max-width` is `100%` of the chat column (was vendor `42rem` / our `72rem`). Assistant bubbles fill that width; user messages are flat right-aligned text (no muted bubble) with higher-specificity overrides against `@assistant-ui` defaults.
+- **Key files / symbols:** `.aui-assistant-message-content`, `.aui-user-message-content` in `web/src/styles.css`.
+- **Note:** Rebuild `web/dist` and restart gateway (assets are embedded). Hard-refresh the browser.
+
+### 2026-08-26 — Cursor duplicated stream + SDK result in one reply
+
+- **Area:** Cursor sidecar / delivery coalesce
+- **Summary:** Influencer_PZ_3 summary reply stored the same write-up twice (broken token stream, then clean markdown). Sidecar now delivers SDK `wait().result` alone when available; Rust dedupes repeated sections if both still arrive.
+- **Key files / symbols:** `streamAgentTurn` in `scripts/cursor-sdk-runner.mjs`; `coalesce_cursor_delivery_text` / `dedupe_cursor_delivery_text` in `src/cursor_engine.rs`.
+- **Note:** Recycle sidecar + restart gateway. Existing duplicated DB rows are not auto-fixed.
+
+### 2026-08-26 — Web chat message formatting (bubbles, tables, actions)
+
+- **Area:** Web UI / thread pane
+- **Summary:** Improved chat readability: rounded grouped bubbles on mobile and desktop (consecutive same-sender messages visually link via shared corner radii and tighter spacing), capped assistant line width (~42rem), and restored assistant bubbles on mobile instead of flat text. Markdown tables use a shared wrapper with sticky headers, cell wrapping, and horizontal scroll. Message actions are a hover-reveal icon pill (copy/reply/bookmark/delete) with fixed clipboard copy (API + execCommand fallback) and full reply text on copy.
+- **Key files / symbols:** `thread-pane.tsx`, `styles.css`, `markdown-table.tsx`, `copy-to-clipboard.ts`, `message-group.ts`, `reply-quote.ts`.
+- **Note:** Rebuild `web/dist`.
+
+### 2026-08-26 — Cursor word-per-line replies (fragment stream coalescing)
+
+- **Area:** Cursor engine / sidecar delivery
+- **Summary:** Cursor SDK sometimes emits many tiny `text` events (one token/word each). Rust and the sidecar treated each as a separate utterance and joined with `\n\n`, producing unreadable one-word-per-line chat. Short fragments now append in-place (space-aware, including token continuations like `hot`+`ify`), `done.result` with per-word newlines is repaired, and full progress sentences still get paragraph breaks.
+- **Key files / symbols:** `cursor_text_event_is_stream_fragment`, `join_cursor_stream_fragments`, `coalesce_cursor_delivery_text` in `src/cursor_engine.rs`; `pushCursorTextPart`, `joinCursorUtterances` in `scripts/cursor-sdk-runner.mjs`.
+- **Note:** Recycle sidecar (script mtime) and restart gateway.
+
+### 2026-08-26 — Web agent failures left user messages unanswered
+
+- **Area:** Web delivery / Cursor engine
+- **Summary:** A stored web user message could finish with no bot row when Cursor (or classic LLM) returned `Err` or empty text. Stream showed a transient error, history poll then looked like the bot ignored the user. After the user message is stored, web always delivers a visible notice on failure/empty; empty `deliver_agent_final` Skip now stores `EMPTY_TURN_NOTICE` instead of dropping the turn. The chat UI reloads history on stream `error` as well as `done`.
+- **Key files / symbols:** `send_and_store_response_with_events` in `src/web.rs`; `failed_turn_notice` / `ensure_visible_turn_text` in `src/final_delivery_dedupe.rs`; `AgentFinalDeliveryPlan::Skip` in `src/channel.rs`; stream `error` in `web/src/app/App.tsx`.
+- **Note:** Restart gateway and rebuild `web/dist`. Residual risk: a hard process kill after `store_message(user)` and before the notice still orphans a turn (queue hard-abort already covers timeout/panic).
+
+### 2026-08-26 — Cursor follow-up failed with "already has active run"
+
+- **Area:** Cursor SDK sidecar
+- **Summary:** Sending a new chat message reused a local Cursor agent whose previous run was still marked active (stream ended / wait timed out / cancel incomplete). `agent.send()` then threw `Agent … already has active run`. Sidecar now passes `local.force` on every send to expire the leftover run, retries busy errors after dropping the pooled handle, and skips idle-reaping in-use slots. Rust treats the same error like a stale agent id (clear + full-slim retry).
+- **Key files / symbols:** `buildSendOptions` / `isBusyAgentError` / `streamRun` in `scripts/cursor-sdk-runner.mjs`; `_is_busy_agent_error` in `scripts/cursor-sdk-runner.py`; `is_busy_cursor_agent_error` in `src/cursor_engine.rs`.
+- **Note:** Recycle sidecar (script mtime). Rebuild gateway for the Rust fallback.
+
+### 2026-08-26 — Cap Cursor run.wait so sidecar recycle cannot stall
+
+- **Area:** Cursor SDK sidecar
+- **Summary:** Joining `wait().result` after the stream could hang forever, keeping `runs_in_flight > 0` so idle recycle (`POST /admin/request_recycle`, max uptime, script mtime) never fired and pooled handles stayed warm. `run.wait()` is now a **post-stream hang watchdog** (`CURSOR_RUN_WAIT_TIMEOUT_MS`, default 120s): timeout cancels the SDK run, delivers streamed text, and evicts the pooled agent/bridge **after** the slot lock is released. This does not limit tool rounds or long replies (those stay in the unbounded stream loop). Cancelled disconnects also evict. Node default runner does not spawn `cursor-sdk-bridge.js`; Python rollback uses the same wait bound.
+- **Key files / symbols:** `waitForRunResult` / `streamAgentTurn` in `scripts/cursor-sdk-runner.mjs`; `_wait_sdk_run` in `scripts/cursor-sdk-runner.py`.
+- **Note:** Recycle sidecar (script mtime). Optional `CURSOR_RUN_WAIT_TIMEOUT_MS`.
+
+### 2026-08-26 — Cursor replies were glued progress fragments (sourdough)
+
+- **Area:** Cursor engine / delivery
+- **Summary:** Sourdough (persona 26, dense delivery **off**) stored mid-turn Cursor status lines as the chat reply: `process.The ratio screenshot is in.` The SDK emits one assistant `text` event per tool round; the runner/Rust concatenated them with no break and ignored `wait().result` once any text existed. Delivery now treats each `text` event as an utterance (`\n\n`), and persists the last real write-up when it looks like a final answer.
+- **Key files / symbols:** `coalesce_cursor_delivery_text` / `consume_sidecar_stream` in `src/cursor_engine.rs`; `joinCursorUtterances` in `scripts/cursor-sdk-runner.mjs`.
+- **Note:** Recycle sidecar (script mtime). Not dense delivery.
+
+### 2026-08-26 — Dense delivery: public PDF link after catbox 403
+
+- **Area:** hooks / delivery
+- **Summary:** Catbox-only uploads with the default reqwest User-Agent were 403ing, so replies had no link (or an internal path). Uploader now chains catbox → litterbox → tmpfiles → pixeldrain with a browser UA, parses messy JSON/HTML responses, and rejects localhost/`/api/uploads/`. The chat summary no longer owns the URL: a verified public https:// link is always appended as the last line.
+- **Key files / symbols:** `PublicHostUploader`, `extract_public_https_url`, `finalize_delivery_message` in `src/dense_delivery_guard.rs`.
+- **Note:** Restart gateway. Leave `DELIVERY_UPLOAD_PROVIDER` unset or `catbox` (not `none`). Optional `CATBOX_USERHASH`.
+
+### 2026-08-26 — Dense delivery: natural LLM summary + public PDF
+
+- **Area:** hooks / delivery
+- **Summary:** Dense-delivery chat text is no longer a rigid “title — summary / bullets / character count” template. A second LLM call (hook/orchestrator/main model; extractive fallback) writes a natural reply and offers the public PDF URL. The PDF is the **full** original report (tables and other distinctive payload preserved; env secrets redacted) rendered then uploaded to catbox (retry, pandoc fallback after md2pdf). User-facing text never offers an internal/workspace path.
+- **Key files / symbols:** `maybe_apply_dense_delivery_with` / `LlmDeliverySummarizer` / `upload_public_with_retry` in `src/dense_delivery_guard.rs`; `builtin_dense_delivery_guard` in `hook_runtime.rs`.
+- **Note:** Restart gateway. Keep `DELIVERY_UPLOAD_PROVIDER=catbox` (not `none`) so the reply can include an external HTTPS link.
+
+### 2026-08-26 — Node sidecar polyfills global Web Crypto on Node 18
+
+- **Area:** Cursor SDK sidecar
+- **Summary:** Cursor turns failed with `crypto is not defined`. `@cursor/sdk` calls global `crypto.randomUUID()`; systemd's `/usr/bin/node` 18.19 does not define that global for `.mjs` files. Runner now assigns `node:crypto.webcrypto` to `globalThis.crypto` before loading the SDK.
+- **Key files / symbols:** `scripts/cursor-sdk-runner.mjs` (webcrypto polyfill; self-test `globalThis.crypto.randomUUID`).
+- **Note:** Recycle sidecar (script mtime / idle recycle). No Node upgrade required. Complements JsonlLocalAgentStore for Node < 22.13.
+
 ### 2026-08-26 — Node sidecar uses JsonlLocalAgentStore on Node 20
 
 - **Area:** Cursor SDK sidecar

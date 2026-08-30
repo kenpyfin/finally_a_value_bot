@@ -1013,6 +1013,16 @@ export function App({
                 }
                 setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
                 setStatusText('Error')
+                if (chatIdForRun != null) {
+                  try {
+                    await loadHistory(chatIdForRun, personaIdForRun ?? undefined)
+                    if (personaIdForRun != null && personaIdForRun > 0) {
+                      await loadPersonaBulletin(personaIdForRun)
+                    }
+                  } catch {
+                    // History sync failed; streamed error text remains visible.
+                  }
+                }
                 const doneLatencyMs = Date.now() - sseSubscribeStartMs
                 if (import.meta.env?.DEV && typeof console !== 'undefined' && console.debug) {
                   console.debug('[web][stream][error]', {

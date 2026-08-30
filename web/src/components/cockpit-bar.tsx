@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { EmptyState } from './empty-state'
+import { MarkdownTable } from './markdown-table'
 import { Button, Dialog, Flex, Select, Switch, Text, TextArea } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
@@ -721,14 +722,7 @@ export const CockpitBar = React.memo(function CockpitBar({
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm]}
                       components={{
-                        table: ({ className, ...props }) => (
-                          <div className="mc-md-table-scroll">
-                            <table
-                              className={['aui-md-table', className].filter(Boolean).join(' ')}
-                              {...props}
-                            />
-                          </div>
-                        ),
+                        table: MarkdownTable,
                       }}
                     >
                       {(() => {

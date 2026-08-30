@@ -381,6 +381,7 @@ pub async fn run_hooks_for_event_async(
                         input.persona_id,
                         &input.caller_channel,
                         text,
+                        env_redactor,
                     )
                     .await
                     {

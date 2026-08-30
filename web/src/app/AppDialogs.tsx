@@ -13,6 +13,7 @@ import {
 } from '@radix-ui/themes'
 import remarkGfm from 'remark-gfm'
 import ReactMarkdown from 'react-markdown'
+import { MarkdownTable } from '../components/markdown-table'
 import { InboxPanel } from '../components/inbox-panel'
 import { InitialRunPromptView } from '../components/initial-run-prompt-view'
 import {
@@ -269,11 +270,7 @@ function AgentHistoryMarkdownBody({ markdown }: { markdown: string }) {
         remarkPlugins={[remarkGfm]}
         components={{
           a: (props) => <MarkdownExternalLink {...props} />,
-          table: ({ className, ...props }) => (
-            <div className="mc-md-table-scroll">
-              <table className={['aui-md-table', className].filter(Boolean).join(' ')} {...props} />
-            </div>
-          ),
+          table: MarkdownTable,
         }}
       >
         {markdown}

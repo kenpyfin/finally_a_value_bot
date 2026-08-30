@@ -82,14 +82,24 @@ export function formatReplyForSend(quote: PendingReplyQuote, userText: string): 
   return block
 }
 
-/** Human-readable clipboard text for reply messages (snippet + follow-up, not raw quote block). */
+/** Human-readable clipboard text for reply messages (full quote + follow-up, not raw block). */
 export function messageTextForClipboard(text: string): string {
   const parsed = parseReplyForDisplay(text)
   if (!parsed) return text
+
+  const openMatch = text.match(QUOTED_MESSAGE_OPEN_RE)
+  if (!openMatch) return text
+
+  const afterOpen = text.slice(openMatch[0].length)
+  const closeMarker = '\n[/quoted_message]'
+  const closeIdx = afterOpen.indexOf(closeMarker)
+  if (closeIdx < 0) return text
+
+  const quotedContent = afterOpen.slice(0, closeIdx).trim()
   const label = parsed.quote.role === 'assistant'
     ? 'assistant'
     : (parsed.quote.sender.trim() || 'user')
-  let out = `Replying to ${label}: ${parsed.quote.snippet}`
+  let out = `Replying to ${label}:\n${quotedContent}`
   if (parsed.followUp.trim()) {
     out += `\n\n${parsed.followUp.trim()}`
   }

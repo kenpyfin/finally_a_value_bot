@@ -539,6 +539,7 @@ async fn run_scheduled_agent_and_finalize(
                     prompt.clone(),
                     "scheduler",
                     channel,
+                    None,
                 )
                 .await
                 {

@@ -129,6 +129,7 @@ pub async fn try_enqueue_background_handoff(
     full_prompt: String,
     trigger_reason_db: &str,
     caller_channel: &str,
+    session_id: Option<String>,
 ) -> HandoffEnqueueOutcome {
     let now = chrono::Utc::now().to_rfc3339();
     let pending_timeout_secs = state.config.background_job_pending_start_timeout_secs as i64;
@@ -151,8 +152,16 @@ pub async fn try_enqueue_background_handoff(
     let jid = job_id.clone();
     let prompt_for_db = full_prompt.clone();
     let reason = trigger_reason_db.to_string();
+    let session_for_db = session_id.clone();
     match call_blocking(state.db.clone(), move |db| {
-        db.create_background_job(&jid, chat_id, persona_id, &prompt_for_db, &reason)
+        db.create_background_job(
+            &jid,
+            chat_id,
+            persona_id,
+            &prompt_for_db,
+            &reason,
+            session_for_db.as_deref(),
+        )
     })
     .await
     {
@@ -164,6 +173,7 @@ pub async fn try_enqueue_background_handoff(
                 persona_id,
                 full_prompt,
                 caller_channel,
+                session_id,
             );
             HandoffEnqueueOutcome::Queued { job_id, start_ack }
         }
@@ -199,6 +209,7 @@ pub fn spawn_background_job(
     persona_id: i64,
     prompt: String,
     caller_channel: &str,
+    session_id: Option<String>,
 ) -> oneshot::Receiver<BackgroundStartAck> {
     let caller_channel = caller_channel.to_string();
     let (start_tx, start_rx) = oneshot::channel::<BackgroundStartAck>();
@@ -306,7 +317,7 @@ pub fn spawn_background_job(
                 is_background_job: true,
                 run_key: Some(job_id.clone()),
                 reply_bot_instance_id: None,
-                session_id: None,
+                session_id: session_id.clone(),
             },
             Some(&prompt),
             None,
@@ -413,7 +424,7 @@ pub fn spawn_background_job(
                     &final_text,
                     Some(state.config.workspace_root_absolute()),
                     DeliveryScope::StoreOnly,
-                    None,
+                    session_id.clone(),
                 )
                 .await
                 {
@@ -462,7 +473,7 @@ pub fn spawn_background_job(
                     &fallback,
                     Some(state.config.workspace_root_absolute()),
                     DeliveryScope::StoreOnly,
-                    None,
+                    session_id.clone(),
                 )
                 .await;
 

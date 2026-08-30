@@ -437,9 +437,11 @@ pub struct BackgroundJob {
     pub output_path: Option<String>,
     pub exit_code: Option<i32>,
     pub label: Option<String>,
+    /// Focused web session this job belongs to (`None` = main chat).
+    pub session_id: Option<String>,
 }
 
-const BG_JOB_SELECT: &str = "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage, job_kind, shell_command, workdir, tmux_session, output_path, exit_code, label";
+const BG_JOB_SELECT: &str = "SELECT id, chat_id, persona_id, prompt, status, trigger_reason, created_at, started_at, finished_at, result_text, error_text, lease_owner, lease_expires_at, last_progress_at, last_stage, job_kind, shell_command, workdir, tmux_session, output_path, exit_code, label, session_id";
 
 fn map_background_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundJob> {
     Ok(BackgroundJob {
@@ -467,6 +469,7 @@ fn map_background_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Backgroun
         output_path: row.get(19)?,
         exit_code: row.get(20)?,
         label: row.get(21)?,
+        session_id: row.get(22)?,
     })
 }
 
@@ -866,6 +869,7 @@ impl Database {
         Self::migrate_workflow_learning_schema(&conn)?;
         Self::migrate_background_jobs_lease_schema(&conn)?;
         Self::migrate_background_jobs_shell_schema(&conn)?;
+        Self::migrate_background_jobs_session_schema(&conn)?;
         Self::migrate_personas_prompt_context(&conn)?;
         Self::migrate_personas_dense_delivery_and_engine(&conn)?;
         Self::migrate_hook_policy_schema(&conn)?;
@@ -1835,6 +1839,20 @@ impl Database {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_background_jobs_job_kind_status
              ON background_jobs(job_kind, status)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_background_jobs_session_schema(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "background_jobs", "session_id")? {
+            conn.execute("ALTER TABLE background_jobs ADD COLUMN session_id TEXT", [])?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_background_jobs_session_id
+             ON background_jobs(session_id)",
             [],
         )?;
         Ok(())
@@ -4835,13 +4853,15 @@ impl Database {
         persona_id: i64,
         prompt: &str,
         trigger_reason: &str,
+        session_id: Option<&str>,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
+        let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
         conn.execute(
-            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage, job_kind)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'agent')",
-            params![id, chat_id, persona_id, prompt, trigger_reason, now],
+            "INSERT INTO background_jobs (id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage, job_kind, session_id)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'agent', ?7)",
+            params![id, chat_id, persona_id, prompt, trigger_reason, now, session_id],
         )?;
         Ok(())
     }
@@ -4875,14 +4895,16 @@ impl Database {
         tmux_session: &str,
         output_path: &str,
         trigger_reason: &str,
+        session_id: Option<&str>,
     ) -> Result<(), FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
+        let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
         conn.execute(
             "INSERT INTO background_jobs (
                 id, chat_id, persona_id, prompt, status, trigger_reason, created_at, last_progress_at, last_stage,
-                job_kind, shell_command, workdir, tmux_session, output_path, label
-             ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'shell', ?7, ?8, ?9, ?10, ?11)",
+                job_kind, shell_command, workdir, tmux_session, output_path, label, session_id
+             ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6, 'pending', 'shell', ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 chat_id,
@@ -4895,6 +4917,7 @@ impl Database {
                 tmux_session,
                 output_path,
                 label,
+                session_id,
             ],
         )?;
         Ok(())
@@ -7485,6 +7508,32 @@ mod tests {
             .expect("disabled status");
         assert!(!active);
 
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_background_shell_job_persists_session_id() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 42);
+        db.create_background_shell_job(
+            "job-sess",
+            42,
+            pid,
+            "label",
+            "echo hi",
+            "/tmp",
+            "tmux-sess",
+            "/tmp/out.log",
+            "tool",
+            Some("focused-session-1"),
+        )
+        .unwrap();
+        let job = db.get_background_job("job-sess").unwrap().unwrap();
+        assert_eq!(job.session_id.as_deref(), Some("focused-session-1"));
+        db.create_background_job("job-main", 42, pid, "prompt", "timeout", None)
+            .unwrap();
+        let main = db.get_background_job("job-main").unwrap().unwrap();
+        assert!(main.session_id.is_none());
         cleanup(&dir);
     }
 }

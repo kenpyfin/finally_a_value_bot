@@ -233,6 +233,8 @@ The previous Python `cursor-sdk` path spawned a bundled `cursor-sdk-bridge.js` C
 
 Path: `workspace/runtime/cursor-sdk-node/` (`npm install @cursor/sdk`, plus `sdk-shim.mjs`).
 
+The sidecar process is often system Node 18 (`/usr/bin/node`) even when interactive shells use nvm 20. `@cursor/sdk` requires Node >= 22.13 for `node:sqlite` and assumes a global `crypto`. The runner pins `JsonlLocalAgentStore` and polyfills `globalThis.crypto` from `node:crypto.webcrypto` so Node 18–20 keep working.
+
 "Local runtime" = **local file/shell access with remote brains**. Planning, tool-calling loop, and model routing run on Cursor's servers.
 
 ### Sidecar streaming

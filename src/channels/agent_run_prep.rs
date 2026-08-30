@@ -332,6 +332,7 @@ pub async fn prepare_agent_run(
         caller_persona_id: persona_id,
         control_chat_ids: state.config.control_chat_ids.clone(),
         is_scheduled_task: context.is_scheduled_task,
+        session_id: context.session_id.clone(),
     };
 
     let tool_defs = state.tools.definitions();

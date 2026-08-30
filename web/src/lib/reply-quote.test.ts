@@ -68,6 +68,6 @@ describe('messageTextForClipboard', () => {
       },
       'follow up',
     )
-    expect(messageTextForClipboard(body)).toBe('Replying to assistant: full body with lines\n\nfollow up')
+    expect(messageTextForClipboard(body)).toBe('Replying to assistant:\nfull body\nwith lines\n\nfollow up')
   })
 })

@@ -13,6 +13,62 @@ Template:
 - **Files/refs:** key paths, symbols, log signatures
 ```
 
+### 2026-08-27 — Background command notices landed in main chat
+- **Symptom:** In a focused web session, the "Background command started (job …). You'll receive another message when it finishes." notice (and later finished/failed notices) appeared in Main instead of that session.
+- **Root cause:** `ToolAuthContext` had no session id. `deliver_to_contact` / `deliver_agent_final_to_contact` for shell jobs always passed `session_id: None`.
+- **Fix:** Thread `session_id` through tool auth, persist it on `background_jobs`, and use it for start/finish/cancel delivery plus the post-shell agent handoff.
+- **Prevention:** Any delayed bot notice (shell, handoff, optimizer) must copy the originating run’s `session_id`. Do not hardcode `None` on `deliver_to_contact` for work started from a focused session.
+- **Files/refs:** `ToolAuthContext.session_id`; `background_jobs.session_id`; `try_enqueue_background_shell`; `deliver_shell_notification`; log `Background shell job started in tmux`.
+
+### 2026-08-27 — Web UI delayed ~90s: Steel probe used wrong health path
+- **Symptom:** After reload, gateway logged Cursor sidecar ready then stayed silent; `:10961` refused connections for ~2–3 minutes.
+- **Root cause:** `steel_browser_sidecar::bootstrap` always called `wait_for_steel_health`, which probed `{STEEL_API_URL}/api/health` (404 on current Steel images; healthy path is `/v1/health`). Polls ran the full 90s even when `BROWSER_MANAGED=false`.
+- **Fix:** Probe `/v1/health` then `/api/health`. Skip the health wait unless `browser_managed` is true.
+- **Prevention:** Do not block gateway startup on optional browser sidecars when unmanaged. Keep doctor checks aligned with the live health path.
+- **Files/refs:** `probe_steel_health` / `bootstrap` in `src/steel_browser_sidecar.rs`; `deps.steel_browser` in `src/doctor.rs`; log gap after `Cursor SDK sidecar ready` before `Starting Web UI`.
+
+### 2026-08-26 — Cursor reply duplicated (stream + SDK result glued)
+- **Symptom:** Influencer_PZ_3 stored a ~11k-char reply that repeated the same experiment summary twice: first half had token-fragment spacing (`R 4`, `CLIP Seg`); second half was the clean markdown write-up with tables and upload links.
+- **Root cause:** Sidecar `streamAgentTurn` joined streamed token fragments via `joinCursorUtterances(textParts)`, then appended SDK `wait().result` and emitted it again. `done.result` carried both; Rust coalesce treated the combined blob as one final answer.
+- **Fix:** Sidecar `done.result` now uses SDK `wait().result` when present, else streamed text only (never both). Rust coalesce prefers authoritative `done.result`, detects stream+result duplicates, and dedupes repeated section markers.
+- **Prevention:** Never concatenate Cursor stream accumulation with SDK `result`. Recycle sidecar after runner edits; rebuild gateway for Rust coalesce.
+- **Files/refs:** `streamAgentTurn` in `scripts/cursor-sdk-runner.mjs`; `coalesce_cursor_delivery_text`, `dedupe_cursor_delivery_text` in `src/cursor_engine.rs`; message `0396401f-f5ad-40d7-848e-7339cebdeb6f` persona 24.
+
+### 2026-08-26 — Web turns could store a user message and never reply
+- **Symptom:** Influencer_PZ_3 (and other Cursor web chats) showed user messages with no bot reply. Stream finished in ~1–7s (`Accepted stream run` then `Stream run finished`); no agent-history file. User had to resend (“yes. do it”, “what happened?”).
+- **Root cause:** `/api/send_stream` stores the user row *before* `process_with_agent`. Cursor/sidecar `Err` mapped to HTTP 500 / stream `error` only — nothing written to `messages`. Empty finals hit `plan_agent_final_delivery` → `Skip` (Telegram substitutes `"Done."`; web did not). The UI yielded `Error: …` in the live thread, did not `loadHistory` on `error`, then the 30s history poll replaced the thread with DB (user row only).
+- **Fix:** After a stored user turn, always persist a bot row: failure notice on agent `Err`, empty-turn notice instead of Skip. Stream `error` also reloads history.
+- **Prevention:** Never `store_message(user)` without a following bot row for that turn. Do not treat stream-only errors as delivery. Recycle sidecar after runner edits.
+- **Files/refs:** `send_and_store_response_with_events` in `src/web.rs`; `failed_turn_notice` / `EMPTY_TURN_NOTICE` in `src/final_delivery_dedupe.rs`; Skip arm in `src/channel.rs`; `web/src/app/App.tsx` stream `error`; log `agent run failed after user message stored`
+
+### 2026-08-26 — Cursor follow-up: Agent already has active run
+- **Symptom:** Sending a chat message failed with `Error: Agent agent-… already has active run`.
+- **Root cause:** Local Cursor agents allow only one run at a time. The sidecar reused a pooled/resumed handle after the previous stream ended without a fully terminal `wait()`/`cancel()`, so `agent.send()` rejected the follow-up.
+- **Fix:** Pass `local.force` on every sidecar send (SDK: expire stuck local run). Retry busy errors after dropping the handle; skip idle-reaping in-use pool slots. Rust clears the stored `agent_id` and retries with a full slim prompt if the error still surfaces.
+- **Prevention:** Never call `agent.send()` on a local handle without `local.force` in this chatbot path. Recycle the sidecar after runner edits.
+- **Files/refs:** `buildSendOptions` / `isBusyAgentError` in `scripts/cursor-sdk-runner.mjs`; `_is_busy_agent_error` in `scripts/cursor-sdk-runner.py`; `is_busy_cursor_agent_error` in `src/cursor_engine.rs`; log `agent busy`; error `already has active run`.
+
+### 2026-08-26 — Cursor chat replies looked fragmented (progress glued together)
+- **Symptom:** Sourdough web replies were run-on planning scraps (`process.The ratio screenshot is in`) even with dense delivery off. User had to ask “what's the diagnosis?” twice.
+- **Root cause:** Cursor SDK streams one assistant message per tool round. Sidecar joined those with `""` and Rust `push_str`’d every `text` event into `final_text`. `done.result` was ignored once any stream text existed. Dense delivery was a no-op (`personas.dense_delivery_enabled=0`).
+- **Fix:** Join utterances with `\n\n`; persist the last substantial write-up when it looks like a final answer, otherwise the paragraph-joined progress. After the stream ends, `run.wait()` is a hang watchdog (`CURSOR_RUN_WAIT_TIMEOUT_MS`, default 120s — not a turn budget) and cancelled/timed-out turns evict the pooled agent/bridge so `runs_in_flight` cannot stay > 0 and block idle recycle.
+- **Prevention:** Never treat Cursor `text` events as token deltas. Never await unbounded SDK finish while holding the run counter. Recycle sidecar after runner edits.
+- **Files/refs:** `coalesce_cursor_delivery_text` in `src/cursor_engine.rs`; `waitForRunResult` in `scripts/cursor-sdk-runner.mjs`; `_wait_sdk_run` in `scripts/cursor-sdk-runner.py`; sourdough history `20260826-202917.md` / `20260826-203201.md`.
+
+### 2026-08-26 — Dense delivery dropped public PDF link
+- **Symptom:** Dense-delivery replies omitted the PDF URL, or offered an internal `/api/uploads/` / localhost path instead of a public https:// link.
+- **Root cause:** Upload used only catbox with reqwest's default User-Agent (Cloudflare 403/HTML). Failed uploads left `public_url=None`, so the message had no link. URL validation accepted any `https://` string, including localhost. The LLM was asked to "naturally" include the URL and often omitted it; truncation could drop it.
+- **Fix:** Public-host chain (catbox → litterbox → tmpfiles → pixeldrain) with a browser UA; parse/validate only public https hosts; always append the verified URL on its own last line with a reserved character budget.
+- **Prevention:** Never treat a single anonymous host as sufficient; never let the LLM be the only place the URL is inserted; reject loopback and `/api/uploads/` as "public".
+- **Files/refs:** `PublicHostUploader` / `extract_public_https_url` / `finalize_delivery_message` in `src/dense_delivery_guard.rs`; log `dense_delivery: public host rejected upload` / `public HTTPS upload succeeded`.
+
+### 2026-08-26 — Node sidecar: crypto is not defined
+- **Symptom:** Cursor engine turns failed with `Error: crypto is not defined` after the Node `@cursor/sdk` sidecar upgrade.
+- **Root cause:** `@cursor/sdk` 1.0.28 calls global `crypto.randomUUID()` for agent/run ids. The sidecar is `node scripts/cursor-sdk-runner.mjs`. Node 18.19 (`/usr/bin/node`, typical systemd PATH) exposes global Web Crypto for `node -e` but **not** for `.mjs` files. Interactive nvm Node 20 does have the global, so the bug only shows on the supervised sidecar.
+- **Fix:** At runner startup, if `globalThis.crypto` is missing, assign `node:crypto.webcrypto` before the dynamic `import("@cursor/sdk")`.
+- **Prevention:** Do not assume Node 18 file ESM has browser-like `crypto`. Keep the polyfill next to JsonlLocalAgentStore (the other Node < 22.13 workaround). Recycle the sidecar after runner edits (script mtime).
+- **Files/refs:** `scripts/cursor-sdk-runner.mjs` (webcrypto polyfill); log `webcrypto=function`; error `crypto is not defined`.
+
 ### 2026-08-26 — Cursor Node sidecar failed: node:sqlite required
 - **Symptom:** Cursor engine `/run` failed: `Default local agent storage requires the built-in node:sqlite module (Node >= 22.13…)`.
 - **Root cause:** `@cursor/sdk` local agents default to SQLite via `node:sqlite`. The host runs Node 20.20, which does not implement that module. Docs say the default *should* fall back to JSONL, but this SDK build throws instead.

@@ -32,6 +32,7 @@ use crate::db::{
     call_blocking, ChannelBotInstance, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage,
     BOT_INSTANCE_WEB,
 };
+use crate::final_delivery_dedupe::{ensure_visible_turn_text, failed_turn_notice};
 use crate::hook_executor::validate_command_payload;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
@@ -1563,6 +1564,7 @@ fn json_background_job(j: &crate::db::BackgroundJob) -> serde_json::Value {
         "output_path": j.output_path,
         "exit_code": j.exit_code,
         "label": j.label,
+        "session_id": j.session_id,
     })
 }
 
@@ -2240,7 +2242,7 @@ async fn send_and_store_response_with_events(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let agent_out = process_with_agent_with_events(
+    let agent_result = process_with_agent_with_events(
         &state.app_state,
         AgentRequestContext {
             caller_channel: "web",
@@ -2258,10 +2260,24 @@ async fn send_and_store_response_with_events(
         event_tx,
         cancel,
     )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .await;
 
-    let mut response = agent_out.response;
+    // User message is already stored. Never leave the turn without a bot row:
+    // Cursor/sidecar errors used to return 500 here, so the stream flashed Error
+    // and history polling then showed only the user message.
+    let mut response = match agent_result {
+        Ok(agent_out) => ensure_visible_turn_text(&agent_out.response),
+        Err(e) => {
+            warn!(
+                target: "web",
+                chat_id,
+                persona_id,
+                error = %e,
+                "agent run failed after user message stored; delivering failure notice"
+            );
+            failed_turn_notice(&e.to_string())
+        }
+    };
 
     let mut background_job_id: Option<String> = None;
     let mut background_job_queued = false;
@@ -2275,6 +2291,7 @@ async fn send_and_store_response_with_events(
             full_prompt_for_handoff,
             trig,
             "web",
+            body.session_id.clone(),
         )
         .await
         {
@@ -8452,6 +8469,87 @@ mod tests {
         assert!(
             text.contains("event: delta") || text.contains("event: replay_meta"),
             "stream should include deltas or replay metadata; body was: {text}"
+        );
+    }
+
+    struct FailingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::claude::ToolDefinition>>,
+        ) -> Result<crate::claude::MessagesResponse, FinallyAValueBotError> {
+            Err(FinallyAValueBotError::LlmApi("sidecar boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_stream_agent_error_still_stores_bot_notice() {
+        let web_state = test_web_state(
+            test_llm_from_provider(Arc::new(FailingLlm)),
+            None,
+            WebLimits::default(),
+        );
+        let db = web_state.app_state.db.clone();
+        let chat_id = web_state
+            .app_state
+            .config
+            .universal_chat_id
+            .unwrap_or(997894126_i64);
+        let app = build_router(web_state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/send_stream")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sender_name":"u","message":"what should we do then?"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = v.get("run_id").and_then(|x| x.as_str()).unwrap();
+
+        let req_stream = Request::builder()
+            .method("GET")
+            .uri(format!("/api/stream?run_id={run_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_stream = app.oneshot(req_stream).await.unwrap();
+        assert_eq!(resp_stream.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp_stream.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("event: done"),
+            "failed turn must complete as done with a stored notice; body was: {text}"
+        );
+        assert!(
+            text.contains("failed before a reply") || text.contains("sidecar boom"),
+            "done payload should include the failure notice; body was: {text}"
+        );
+
+        let pid = db.get_current_persona_id(chat_id).unwrap_or(0);
+        let messages = db.get_all_messages(chat_id, pid).unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| !m.is_from_bot && m.content.contains("what should we do then")),
+            "user message must be stored"
+        );
+        assert!(
+            messages.iter().any(|m| m.is_from_bot
+                && (m.content.contains("failed before a reply")
+                    || m.content.contains("sidecar boom"))),
+            "bot failure notice must be stored; messages={messages:?}"
         );
     }
 

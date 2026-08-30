@@ -2,6 +2,31 @@
 
 use crate::db::StoredMessage;
 
+/// User-visible copy when an agent turn ends with no assistant text.
+pub const EMPTY_TURN_NOTICE: &str =
+    "This run finished with no reply text. Please send your request again.";
+
+/// User-visible copy when the agent errors after the user message was already stored.
+pub fn failed_turn_notice(error: &str) -> String {
+    let error = error.trim();
+    if error.is_empty() {
+        "This run failed before a reply was ready. Please send your request again.".to_string()
+    } else {
+        format!(
+            "This run failed before a reply was ready: {error}\nPlease send your request again."
+        )
+    }
+}
+
+/// Replace a blank (or persona-prefix-only) final with a visible notice.
+pub fn ensure_visible_turn_text(response: &str) -> String {
+    if strip_leading_persona_tokens(response).trim().is_empty() {
+        EMPTY_TURN_NOTICE.to_string()
+    } else {
+        response.to_string()
+    }
+}
+
 /// After persona normalization, what to actually deliver to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentFinalDeliveryPlan {
@@ -82,6 +107,24 @@ mod tests {
     fn plan_skips_empty_body() {
         let plan = plan_agent_final_delivery(None, "   ");
         assert_eq!(plan, AgentFinalDeliveryPlan::Skip);
+    }
+
+    #[test]
+    fn ensure_visible_turn_text_replaces_blank_and_persona_prefix() {
+        assert_eq!(ensure_visible_turn_text("   "), EMPTY_TURN_NOTICE);
+        assert_eq!(
+            ensure_visible_turn_text("[Influencer_PZ_3]  \n"),
+            EMPTY_TURN_NOTICE
+        );
+        assert_eq!(ensure_visible_turn_text("hello"), "hello");
+    }
+
+    #[test]
+    fn failed_turn_notice_includes_error() {
+        let text = failed_turn_notice("sidecar HTTP 500");
+        assert!(text.contains("sidecar HTTP 500"));
+        assert!(text.contains("send your request again"));
+        assert!(failed_turn_notice("  ").contains("failed before a reply"));
     }
 
     #[test]

@@ -144,6 +144,15 @@ pub struct ToolAuthContext {
     pub control_chat_ids: Vec<i64>,
     /// True when the agent run was started by the scheduler (cron / one-shot task).
     pub is_scheduled_task: bool,
+    /// Focused web session for this run (`None` = main chat).
+    pub session_id: Option<String>,
+}
+
+/// Trim and drop empty session ids so they store as main chat (`NULL`).
+pub fn normalize_session_id(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 impl ToolAuthContext {
@@ -160,6 +169,10 @@ impl ToolAuthContext {
         self.is_control_chat()
             || (self.caller_chat_id == target_chat_id
                 && self.caller_persona_id == target_persona_id)
+    }
+
+    pub fn chat_session_id(&self) -> Option<String> {
+        normalize_session_id(self.session_id.as_deref())
     }
 }
 
@@ -197,12 +210,14 @@ pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthCont
         .get("is_scheduled_task")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let session_id = normalize_session_id(ctx.get("session_id").and_then(|v| v.as_str()));
     Some(ToolAuthContext {
         caller_channel,
         caller_chat_id,
         caller_persona_id,
         control_chat_ids,
         is_scheduled_task,
+        session_id,
     })
 }
 
@@ -248,6 +263,7 @@ pub fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> 
             "caller_persona_id": auth.caller_persona_id,
             "control_chat_ids": auth.control_chat_ids,
             "is_scheduled_task": auth.is_scheduled_task,
+            "session_id": auth.session_id,
         }),
     );
     serde_json::Value::Object(obj)
@@ -923,8 +939,34 @@ mod tests {
         let auth = auth_context_from_input(&input).unwrap();
         assert_eq!(auth.caller_channel, "telegram");
         assert_eq!(auth.caller_chat_id, 123);
+        assert!(auth.session_id.is_none());
         assert!(auth.is_control_chat());
         assert!(auth.can_access_chat(456));
+    }
+
+    #[test]
+    fn test_auth_context_session_id_roundtrip() {
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+            session_id: Some("sess-abc".into()),
+        };
+        let injected = inject_auth_context(json!({"command": "echo"}), &auth);
+        let parsed = auth_context_from_input(&injected).unwrap();
+        assert_eq!(parsed.chat_session_id().as_deref(), Some("sess-abc"));
+        let blank = json!({
+            "__finally_a_value_bot_auth": {
+                "caller_chat_id": 10,
+                "session_id": "  "
+            }
+        });
+        assert!(auth_context_from_input(&blank)
+            .unwrap()
+            .session_id
+            .is_none());
     }
 
     #[test]
@@ -1019,6 +1061,7 @@ mod tests {
             caller_persona_id: 2,
             control_chat_ids: vec![],
             is_scheduled_task: false,
+            session_id: None,
         };
         let cwd = resolve_tool_working_dir_for_auth(&root, Some(&auth));
         assert_eq!(
@@ -1041,6 +1084,7 @@ mod tests {
             caller_persona_id: 2,
             control_chat_ids: vec![],
             is_scheduled_task: false,
+            session_id: None,
         };
         let mine = persona_shared_dir(&root, 10, 2).join("x.txt");
         let other = persona_shared_dir(&root, 10, 3).join("x.txt");
@@ -1065,6 +1109,7 @@ mod tests {
             caller_persona_id: 2,
             control_chat_ids: vec![],
             is_scheduled_task: false,
+            session_id: None,
         };
         let flat = root.join("shared").join("scripts").join("a.py");
         std::fs::create_dir_all(flat.parent().unwrap()).unwrap();

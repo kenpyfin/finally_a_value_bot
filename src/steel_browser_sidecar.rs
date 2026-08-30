@@ -90,8 +90,13 @@ async fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Steel Browser health paths (current images use `/v1/health`; older docs said `/api/health`).
+fn steel_health_urls(api_url: &str) -> [String; 2] {
+    let base = api_url.trim_end_matches('/');
+    [format!("{base}/v1/health"), format!("{base}/api/health")]
+}
+
 pub async fn probe_steel_health(api_url: &str) -> bool {
-    let health_url = format!("{}/api/health", api_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -99,10 +104,13 @@ pub async fn probe_steel_health(api_url: &str) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    match client.get(&health_url).send().await {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+    for health_url in steel_health_urls(api_url) {
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => return true,
+            _ => {}
+        }
     }
+    false
 }
 
 async fn wait_for_steel_health(api_url: &str) -> bool {
@@ -257,8 +265,10 @@ pub async fn bootstrap(config: &Config) -> Arc<SteelBrowserHandle> {
 
     ensure_process_steel_api_url(&api_url);
 
-    let healthy = wait_for_steel_health(&api_url).await;
+    // Only block startup when managed browser mode is on (otherwise /v1 health polls
+    // add a useless multi-minute wait before Web UI binds).
     if config.browser_managed {
+        let healthy = wait_for_steel_health(&api_url).await;
         if healthy {
             info!("Steel browser ready at {api_url}");
         } else {
@@ -294,5 +304,12 @@ mod tests {
             default_local_steel_api_url(13_920),
             "http://127.0.0.1:13920"
         );
+    }
+
+    #[test]
+    fn steel_health_urls_prefer_v1() {
+        let urls = steel_health_urls("http://127.0.0.1:13920/");
+        assert_eq!(urls[0], "http://127.0.0.1:13920/v1/health");
+        assert_eq!(urls[1], "http://127.0.0.1:13920/api/health");
     }
 }
