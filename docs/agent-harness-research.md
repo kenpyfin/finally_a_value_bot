@@ -203,8 +203,8 @@ Shared spine: `prepare_agent_run` (prep) → engine-specific loop → `pipeline_
 | Bridge | Rust → Node sidecar (`@cursor/sdk` in-process) → Cursor API; MCP → `ToolRegistry` |
 | Tools | Bot `ToolRegistry` over MCP when enabled; Cursor built-ins + MCP in remote loop |
 | Input | Flattened text prompt (`flatten_turn_prompt`, 120k cap); images unsupported v1 |
-| State | Resume `agent_id` per chat/persona/session in `cursor_engine_agents` |
-| Fallback | Auto-fallback to Classic on sidecar failure (non-scheduled) |
+| State | Fresh Cursor session per user message; ephemeral Jsonl store deleted when `/run` ends |
+| Fallback | Recoverable sidecar errors return a notice (no silent Classic/Gemini) |
 | Observability | `cursor_sdk` stage + per-tool rows when MCP tools run |
 
 **Authoritative integration doc:** [`cursor-engine-integration.md`](cursor-engine-integration.md).
@@ -220,7 +220,7 @@ When Cursor engine is selected, one turn traverses:
       │  HTTP POST /run → NDJSON stream
       ▼
 [2] Node sidecar      scripts/cursor-sdk-runner.mjs
-      │  @cursor/sdk: Agent.create / resume / send (in-process)
+      │  @cursor/sdk: Agent.create / send (in-process; no resume)
       ▼
 [3] Cursor backend    model + agentic loop (remote)
       │  local tool execution against persona cwd
@@ -347,7 +347,7 @@ The sidecar process is often system Node 18 (`/usr/bin/node`) even when interact
 | Tool visibility | Full trace | Per-step trace | Text only | Full (in app) | Full in sandbox |
 | Permissions | ToolAuthContext | + allowlists | None (external) | Deny-first 7 modes | Docker + policy |
 | Compaction | ~1 tier | Same | N/A (flattened prompt) | 5 graduated tiers | Provider memory |
-| Quality eval | PDQE | PDQE | PDQE on finish | Hooks + verifier agent | — |
+| Quality eval | PDQE | PDQE | **Skipped** (Classic/Deterministic only) | Hooks + verifier agent | — |
 | Subagents | `sub_agent.rs` | Pipeline steps | — | Sidechain summaries | Autonomous PR |
 | Persistence | SQLite | SQLite | Cursor agent_id | Append-only JSONL | Docker state |
 

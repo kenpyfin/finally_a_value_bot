@@ -93,11 +93,11 @@ export function SettingsCursorPanel({ api, onError }: Props) {
   const [cliModel, setCliModel] = useState('')
   const [cliRunnerUrl, setCliRunnerUrl] = useState('')
   const [timeoutSecs, setTimeoutSecs] = useState('3600')
+  const [interactiveTimeoutSecs, setInteractiveTimeoutSecs] = useState('900')
   const [tmuxEnabled, setTmuxEnabled] = useState(true)
   const [mcpToolsEnabled, setMcpToolsEnabled] = useState(true)
   const [mcpExposeSendMessage, setMcpExposeSendMessage] = useState(false)
   const [delegationSlimPrompt, setDelegationSlimPrompt] = useState(true)
-  const [delegationResumeDelta, setDelegationResumeDelta] = useState(true)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -111,11 +111,11 @@ export function SettingsCursorPanel({ api, onError }: Props) {
       setCliModel(data.cli_model ?? '')
       setCliRunnerUrl(data.cli_runner_url ?? '')
       setTimeoutSecs(String(data.timeout_secs ?? 3600))
+      setInteractiveTimeoutSecs(String(data.interactive_timeout_secs ?? 900))
       setTmuxEnabled(data.tmux_enabled ?? true)
       setMcpToolsEnabled(data.mcp_tools_enabled ?? true)
       setMcpExposeSendMessage(data.mcp_expose_send_message ?? false)
       setDelegationSlimPrompt(data.delegation_slim_prompt ?? true)
-      setDelegationResumeDelta(data.delegation_resume_delta ?? true)
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       setConfig(null)
@@ -235,6 +235,7 @@ export function SettingsCursorPanel({ api, onError }: Props) {
     setSaveNotice(null)
     try {
       const secs = Number.parseInt(timeoutSecs, 10)
+      const interactiveSecs = Number.parseInt(interactiveTimeoutSecs, 10)
       const res = await api<CursorEngineConfigResponse>('/api/cursor-engine', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -245,11 +246,11 @@ export function SettingsCursorPanel({ api, onError }: Props) {
           cli_model: cliModel,
           cli_runner_url: cliRunnerUrl,
           timeout_secs: Number.isFinite(secs) ? secs : 3600,
+          interactive_timeout_secs: Number.isFinite(interactiveSecs) ? interactiveSecs : 900,
           tmux_enabled: tmuxEnabled,
           mcp_tools_enabled: mcpToolsEnabled,
           mcp_expose_send_message: mcpExposeSendMessage,
           delegation_slim_prompt: delegationSlimPrompt,
-          delegation_resume_delta: delegationResumeDelta,
         }),
       })
       setSaveNotice(res.message ?? 'Saved.')
@@ -430,14 +431,16 @@ export function SettingsCursorPanel({ api, onError }: Props) {
               onCheckedChange={setDelegationSlimPrompt}
             />
           </Flex>
-          <Flex align="center" justify="between" gap="3">
-            <Text size="2">Resume delta prompts (smaller follow-up turns)</Text>
-            <Switch
-              size="2"
-              checked={delegationResumeDelta}
-              onCheckedChange={setDelegationResumeDelta}
-            />
-          </Flex>
+          <Text size="1" color="gray">
+            Interactive chat turns use the shorter timeout below; scheduled/background jobs use the
+            CLI timeout field.
+          </Text>
+          <Text size="2">Interactive turn timeout (seconds)</Text>
+          <TextField.Root
+            placeholder="900"
+            value={interactiveTimeoutSecs}
+            onChange={(e) => setInteractiveTimeoutSecs(e.target.value)}
+          />
         </Flex>
       </div>
 

@@ -36,6 +36,8 @@ export type PdqeStep = {
 
 export type ParsedAgentHistory = {
   runHeader: string
+  /** `Engine: …` line from the run header, when present. */
+  engine?: string
   iterations: { index: number; body: string; tier?: TierRouteInfo }[]
   /** Pretty JSON from the server (`initial_llm_request_v1`); null for runs saved before snapshots existed. */
   initialPromptJson: string | null
@@ -46,6 +48,15 @@ export type ParsedAgentHistory = {
 /** Must match `TierEndpointSnapshot::format_tier_line` / iteration markdown in Rust. */
 const TIER_LINE_RE =
   /^Model tier:\s*([^|]+)\|\s*provider:\s*([^|]+)\|\s*model:\s*([^|]+)\|\s*endpoint:\s*(.+)$/m
+
+/** Must match `AgentRunRecord::to_markdown` engine line. */
+const ENGINE_LINE_RE = /^Engine:\s*(.+)$/m
+
+export function parseEngineLine(header: string): string | null {
+  const match = header.match(ENGINE_LINE_RE)
+  const engine = match?.[1]?.trim()
+  return engine ? engine : null
+}
 
 const PTE_LINE_RE =
   /^- PTE: (?:(disabled)|skipped — (.+)|(\w+)(?: \((\d+)ms\))?(?: — "(.*)")?(?: \[(.+)\])?)$/m
@@ -235,7 +246,19 @@ export function parseAgentHistoryMarkdown(traceMarkdown: string): Omit<
       iterations.push({ index: idx, body, tier })
     }
   }
-  return { runHeader, iterations }
+  const engine = parseEngineLine(runHeader) ?? undefined
+  return { runHeader, ...(engine ? { engine } : {}), iterations }
+}
+
+/** Compact label for the run-header engine badge. */
+export function formatEngineBadgeLabel(engine: string): string {
+  const trimmed = engine.trim()
+  if (!trimmed) return 'unknown'
+  if (trimmed === 'cursor') return 'Cursor'
+  if (trimmed === 'classic') return 'Classic'
+  if (trimmed.startsWith('classic')) return trimmed
+  if (trimmed === 'deterministic') return 'Deterministic'
+  return trimmed
 }
 
 /** Compact label for iteration stepper badge. */

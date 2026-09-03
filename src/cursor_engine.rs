@@ -1,9 +1,9 @@
 //! Cursor SDK agent engine: delegates a full turn to a local Python sidecar wrapping `cursor_sdk`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ use crate::channels::telegram::hook_turn_bridge::{
     PreStopFollowUp, DEFERRED_COMMITMENT_MAX_NUDGES,
 };
 use crate::channels::telegram::{
-    pipeline_finish_turn, process_classic_agent_with_events, AgentEvent, AgentProcessResult,
-    AgentRequestContext, AgentRunPrep, AppState,
+    pipeline_finish_turn, AgentEvent, AgentProcessResult, AgentRequestContext, AgentRunPrep,
+    AppState,
 };
 use crate::claude::{Message, MessageContent};
 use crate::cursor_delegation_prompt::{
@@ -40,11 +40,11 @@ struct SidecarRunRequest<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
     session_scope: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    agent_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     model_params: Option<&'a [crate::cursor_engine_config::CursorModelParam]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp_servers: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_kind: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,8 +57,6 @@ struct SidecarStreamEvent {
     message: String,
     #[serde(default)]
     status: String,
-    #[serde(default)]
-    agent_id: Option<String>,
     #[serde(default)]
     result: Option<String>,
     #[serde(default)]
@@ -75,10 +73,8 @@ struct SidecarStreamEvent {
 
 struct SidecarRunOutcome {
     final_text: String,
-    returned_agent_id: Option<String>,
     run_status: String,
     sidecar_error: Option<String>,
-    cleared_stale_resume: bool,
 }
 
 const CURSOR_EMPTY_OUTPUT_PLACEHOLDER: &str = "(Cursor agent completed with no text output.)";
@@ -431,6 +427,10 @@ fn empty_output_nudge_prompt() -> String {
     .to_string()
 }
 
+fn append_follow_up_to_prompt(base: &str, follow_up: &str) -> String {
+    format!("{base}\n\n# Follow-up instruction\n\n{follow_up}")
+}
+
 /// Prefer a short non-JSON tool result when Cursor returns no assistant text.
 fn recover_user_text_from_tool_records(records: &[ToolCallRecord]) -> Option<String> {
     for record in records.iter().rev() {
@@ -450,11 +450,13 @@ fn recover_user_text_from_tool_records(records: &[ToolCallRecord]) -> Option<Str
     None
 }
 
+#[cfg(test)]
 fn is_stale_cursor_agent_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("not found") && lower.contains("agent")
 }
 
+#[cfg(test)]
 fn is_busy_cursor_agent_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("already has active run")
@@ -462,8 +464,436 @@ fn is_busy_cursor_agent_error(message: &str) -> bool {
         || lower.contains("agent_busy")
 }
 
+#[cfg(test)]
 fn is_unusable_cursor_agent_error(message: &str) -> bool {
     is_stale_cursor_agent_error(message) || is_busy_cursor_agent_error(message)
+}
+
+fn is_cursor_turn_timeout_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("timed out") || lower.contains("timeout") || lower.contains("idle_timeout")
+}
+
+fn is_cursor_sidecar_stream_transport_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("error decoding response body")
+        || lower.contains("connection reset")
+        || lower.contains("unexpected eof")
+        || lower.contains("incomplete message")
+        || lower.contains("connection closed")
+        || lower.contains("broken pipe")
+        || lower.contains("error sending request")
+}
+
+fn is_cursor_stream_interrupt_status(status: &str) -> bool {
+    matches!(status, "http_timeout" | "stream_interrupted")
+}
+
+fn tools_started_background_work(records: &[ToolCallRecord]) -> bool {
+    records.iter().any(|r| {
+        !r.is_error
+            && matches!(
+                r.name.as_str(),
+                "spawn_background_command" | "register_tracked_job"
+            )
+    })
+}
+
+fn format_sidecar_stream_chunk_error(err: &reqwest::Error) -> (String, &'static str) {
+    if err.is_timeout() {
+        (
+            format!("Cursor sidecar stream error: timed out: {err}"),
+            "http_timeout",
+        )
+    } else {
+        (
+            format!("Cursor sidecar stream error: {err}"),
+            "stream_interrupted",
+        )
+    }
+}
+
+fn compose_cursor_interrupt_reply(
+    partial_text: &str,
+    timeout_secs: u64,
+    timed_out: bool,
+    background_still_running: bool,
+) -> String {
+    let notice = crate::cursor_engine_config::cursor_stream_interrupt_notice(
+        timeout_secs,
+        timed_out,
+        background_still_running,
+    );
+    if is_cursor_empty_user_facing_text(partial_text) {
+        notice
+    } else {
+        format!("{}\n\n{notice}", partial_text.trim())
+    }
+}
+
+async fn chat_persona_has_unfinished_background_jobs(
+    state: &AppState,
+    chat_id: i64,
+    persona_id: i64,
+) -> bool {
+    call_blocking(state.db.clone(), move |db| {
+        db.has_unfinished_background_jobs_for_chat_persona(chat_id, persona_id)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn compose_cursor_interrupt_notice(
+    state: &AppState,
+    chat_id: i64,
+    persona_id: i64,
+    timeout_secs: u64,
+    timed_out: bool,
+    partial_text: &str,
+    tool_records: &[ToolCallRecord],
+) -> String {
+    let from_tools = tools_started_background_work(tool_records);
+    let from_db = chat_persona_has_unfinished_background_jobs(state, chat_id, persona_id).await;
+    let body = if is_cursor_empty_user_facing_text(partial_text) {
+        recover_user_text_from_tool_records(tool_records).unwrap_or_default()
+    } else {
+        partial_text.to_string()
+    };
+    compose_cursor_interrupt_reply(&body, timeout_secs, timed_out, from_tools || from_db)
+}
+
+const STATUS_RECHECK_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+const STATUS_RECHECK_MAX_FILES: usize = 10;
+
+fn current_request_inner_text(text: &str) -> String {
+    let t = text.trim();
+    if let Some(tag) = t.find("[current_request") {
+        if let Some(rel) = t[tag..].find(']') {
+            let after = &t[tag + rel + 1..];
+            let body = after.split("[/current_request]").next().unwrap_or(after);
+            return body.trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
+pub(crate) fn is_status_recheck_request(text: &str) -> bool {
+    let lower = current_request_inner_text(text).to_lowercase();
+    let compact = lower
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_string();
+    if compact.len() > 120 {
+        return false;
+    }
+    if matches!(
+        compact.as_str(),
+        "check again"
+            | "check it again"
+            | "check the queue"
+            | "check queue"
+            | "any update"
+            | "any updates"
+            | "did it finish"
+            | "is it done"
+            | "is it finished"
+            | "what's the status"
+            | "whats the status"
+            | "status"
+            | "status check"
+            | "still running"
+            | "queue empty"
+            | "what happened"
+    ) {
+        return true;
+    }
+    const NEEDLES: &[&str] = &[
+        "check again",
+        "check what's the status",
+        "check whats the status",
+        "what's the status",
+        "whats the status",
+        "what happened",
+        "not responding",
+        "are you there",
+        "still running",
+        "queue empty",
+        "any update",
+    ];
+    const WORK: &[&str] = &[
+        "generate", "hotify", "flux", "rerun", "publish", "create", "edit the",
+    ];
+    compact.len() <= 80
+        && NEEDLES.iter().any(|n| compact.contains(n))
+        && !WORK.iter().any(|w| compact.contains(w))
+}
+
+struct PersonaArtifact {
+    name: String,
+}
+
+fn is_persona_delivery_image(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif"
+            )
+        })
+}
+
+fn collect_recent_persona_images(
+    dir: &Path,
+    max_age: Duration,
+    limit: usize,
+) -> Vec<PersonaArtifact> {
+    collect_persona_images(dir, Some(max_age), limit)
+}
+
+fn collect_persona_images(
+    dir: &Path,
+    max_age: Option<Duration>,
+    limit: usize,
+) -> Vec<PersonaArtifact> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let cutoff = max_age.and_then(|age| SystemTime::now().checked_sub(age));
+    let mut found: Vec<(SystemTime, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || !is_persona_delivery_image(name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if cutoff.is_some_and(|c| modified < c) {
+            continue;
+        }
+        found.push((modified, name.to_string()));
+    }
+    found.sort_by_key(|b| std::cmp::Reverse(b.0));
+    if found.is_empty() && max_age.is_some() {
+        return collect_persona_images(dir, None, limit);
+    }
+    found
+        .into_iter()
+        .take(limit)
+        .map(|(_, name)| PersonaArtifact { name })
+        .collect()
+}
+
+fn format_status_recheck_reply(artifacts: &[PersonaArtifact], jobs_running: bool) -> String {
+    let mut lines = Vec::new();
+    if jobs_running {
+        lines.push(
+            "Background jobs for this chat are still running. I did not start a new Comfy or hotify job.".to_string(),
+        );
+    } else {
+        lines.push(
+            "The Comfy/bot queue is idle and I did not start a new generation. This is a status check only.".to_string(),
+        );
+    }
+    if artifacts.is_empty() {
+        lines.push(
+            "No image files in the persona folder. If you want another edit, say so explicitly."
+                .to_string(),
+        );
+        return lines.join("\n\n");
+    }
+    lines.push("Newest files on disk:".to_string());
+    for art in artifacts {
+        lines.push(format!("![{name}]({name})", name = art.name));
+    }
+    lines.push(
+        "These may have landed after the live Cursor stream ended. Say if you want a different edit.".to_string(),
+    );
+    lines.join("\n\n")
+}
+
+struct CursorFinishArgs<'a> {
+    run_start: Instant,
+    model: &'a str,
+    runner_url: &'a str,
+    final_text: String,
+    stop_reason: &'a str,
+    pipeline_stages: Vec<PipelineStageRecord>,
+    history_tool_records: Vec<ToolCallRecord>,
+    history_hook_events: Vec<String>,
+    run_tool_names: Vec<String>,
+    had_tool_calls: bool,
+}
+
+async fn finish_cursor_engine_turn(
+    state: &AppState,
+    context: &AgentRequestContext<'_>,
+    prep: &AgentRunPrep,
+    event_tx: Option<&UnboundedSender<AgentEvent>>,
+    args: CursorFinishArgs<'_>,
+) -> anyhow::Result<AgentProcessResult> {
+    let extras = PipelineFinishExtras {
+        pipeline_stages: args.pipeline_stages,
+        cloud_calls: 0,
+        agent_engine: "cursor".into(),
+    };
+    let mut messages = prep.messages.clone();
+    messages.push(Message {
+        role: "assistant".into(),
+        content: MessageContent::Text(args.final_text.clone()),
+    });
+    let mut pdqe_retries = 0usize;
+    let mut pdqe_steps: Vec<EvaluatorStepRecord> = Vec::new();
+    let history_iterations = if args.history_tool_records.is_empty() {
+        Vec::new()
+    } else {
+        vec![IterationRecord {
+            iteration: 1,
+            stop_reason: "tool_use".into(),
+            assistant_text_preview: if args.final_text.len() <= 200 {
+                args.final_text.clone()
+            } else {
+                format!(
+                    "{}...",
+                    &args.final_text[..args.final_text.floor_char_boundary(200)]
+                )
+            },
+            tool_calls: args.history_tool_records,
+            hook_events: args.history_hook_events,
+            pte: None,
+            model_tier: "cursor".into(),
+            provider: "cursor_sdk".into(),
+            model: args.model.to_string(),
+            endpoint: args.runner_url.to_string(),
+        }]
+    };
+    let mut agent_history_basename: Option<String> = None;
+    let mut final_text = args.final_text;
+    loop {
+        let mut iterations = history_iterations.clone();
+        match pipeline_finish_turn(
+            state,
+            context,
+            event_tx,
+            &prep.run_key,
+            context.chat_id,
+            context.persona_id,
+            args.stop_reason,
+            final_text.clone(),
+            &prep.system_prompt,
+            &mut messages,
+            prep.protected_message_count,
+            &mut pdqe_retries,
+            &mut pdqe_steps,
+            &mut iterations,
+            &prep.principles_content,
+            prep.is_conversational,
+            &args.run_tool_names,
+            &mut agent_history_basename,
+            args.had_tool_calls,
+            &prep.user_msg_preview,
+            args.run_start,
+            &prep.initial_llm_snapshot_json,
+            &prep.local_delegate_run_summary,
+            Some(&extras),
+        )
+        .await?
+        {
+            Some(result) => return Ok(result),
+            None => {
+                if let Some(Message {
+                    content: MessageContent::Text(t),
+                    ..
+                }) = messages.last()
+                {
+                    if t != &final_text {
+                        final_text = t.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn deliver_cursor_interrupt(
+    state: &AppState,
+    context: &AgentRequestContext<'_>,
+    prep: &AgentRunPrep,
+    event_tx: Option<&UnboundedSender<AgentEvent>>,
+    run_start: Instant,
+    model: &str,
+    runner_url: &str,
+    timeout_secs: u64,
+    timed_out: bool,
+    partial_text: &str,
+    tool_records: &[ToolCallRecord],
+    hook_summaries: Vec<String>,
+    stage_ms: u128,
+) -> anyhow::Result<AgentProcessResult> {
+    let notice = compose_cursor_interrupt_notice(
+        state,
+        context.chat_id,
+        context.persona_id,
+        timeout_secs,
+        timed_out,
+        partial_text,
+        tool_records,
+    )
+    .await;
+    let run_tool_names: Vec<String> = tool_records.iter().map(|r| r.name.clone()).collect();
+    let had_tool_calls = !run_tool_names.is_empty();
+    finish_cursor_engine_turn(
+        state,
+        context,
+        prep,
+        event_tx,
+        CursorFinishArgs {
+            run_start,
+            model,
+            runner_url,
+            final_text: notice,
+            stop_reason: "cursor_engine_stream_interrupted",
+            pipeline_stages: vec![PipelineStageRecord {
+                stage: "cursor_sdk".into(),
+                detail: format!(
+                    "status={} timed_out={} tools={}",
+                    if timed_out {
+                        "http_timeout"
+                    } else {
+                        "stream_interrupted"
+                    },
+                    timed_out,
+                    run_tool_names.join(",")
+                ),
+                duration_ms: stage_ms,
+            }],
+            history_tool_records: tool_records.to_vec(),
+            history_hook_events: hook_summaries,
+            run_tool_names,
+            had_tool_calls,
+        },
+    )
+    .await
+}
+
+fn sidecar_run_kind(context: &AgentRequestContext<'_>) -> &'static str {
+    if context.is_scheduled_task || context.is_background_job {
+        "scheduled"
+    } else {
+        "interactive"
+    }
 }
 
 fn is_cursor_sidecar_recoverable_error(message: &str) -> bool {
@@ -524,39 +954,31 @@ fn cursor_session_scope(context: &AgentRequestContext<'_>) -> String {
     String::new()
 }
 
-async fn cursor_engine_classic_fallback(
-    state: &AppState,
-    context: AgentRequestContext<'_>,
-    prep: &AgentRunPrep,
-    event_tx: Option<&UnboundedSender<AgentEvent>>,
-    cancel: Option<Arc<AtomicBool>>,
+fn cursor_sidecar_unavailable_notice(reason: &str) -> String {
+    let reason = reason.trim();
+    format!(
+        "The Cursor engine could not complete this turn ({reason}). \
+This persona is configured to use Cursor, so Classic/Gemini was not used. \
+Check Cursor sidecar health or retry shortly."
+    )
+}
+
+/// Cursor personas must not silently run Classic/Gemini. Return a notice instead.
+fn cursor_engine_unavailable_result(
+    context: &AgentRequestContext<'_>,
     reason: &str,
-) -> anyhow::Result<AgentProcessResult> {
-    if context.is_scheduled_task || context.is_background_job {
-        let prompt = prep.latest_user_text.trim();
-        let override_prompt = if prompt.is_empty() {
-            None
-        } else {
-            Some(prompt)
-        };
-        let kind = if context.is_scheduled_task {
-            "scheduled task"
-        } else {
-            "background job"
-        };
-        warn!("Cursor engine fallback to classic for {kind}: {reason}");
-        return process_classic_agent_with_events(
-            state,
-            context,
-            override_prompt,
-            None,
-            event_tx,
-            cancel,
-        )
-        .await;
+) -> AgentProcessResult {
+    warn!(
+        chat_id = context.chat_id,
+        persona_id = context.persona_id,
+        scheduled = context.is_scheduled_task,
+        background = context.is_background_job,
+        reason,
+        "cursor_engine_fallback_suppressed"
+    );
+    AgentProcessResult {
+        response: cursor_sidecar_unavailable_notice(reason),
     }
-    warn!("Cursor engine fallback to classic: {reason}");
-    process_classic_agent_with_events(state, context, None, None, event_tx, cancel).await
 }
 
 async fn consume_sidecar_stream(
@@ -568,7 +990,6 @@ async fn consume_sidecar_stream(
 ) -> Result<SidecarRunOutcome, anyhow::Error> {
     let mut final_text = String::new();
     let mut text_parts: Vec<String> = Vec::new();
-    let mut returned_agent_id: Option<String> = None;
     let mut run_status = String::from("unknown");
     let mut sidecar_error: Option<String> = None;
     let mut buffer = String::new();
@@ -592,7 +1013,28 @@ async fn consume_sidecar_stream(
                 if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
                     return Err(anyhow::anyhow!("Run cancelled"));
                 }
-                let chunk = chunk.map_err(|e| anyhow::anyhow!("Cursor sidecar stream error: {e}"))?;
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let (mapped, interrupt_status) = format_sidecar_stream_chunk_error(&e);
+                        warn!(
+                            status = interrupt_status,
+                            error = %mapped,
+                            "Cursor sidecar NDJSON stream interrupted"
+                        );
+                        if final_text.is_empty() {
+                            final_text = coalesce_cursor_delivery_text(&text_parts, None);
+                        }
+                        if run_status == "unknown" {
+                            run_status = interrupt_status.to_string();
+                        }
+                        return Ok(SidecarRunOutcome {
+                            final_text,
+                            run_status,
+                            sidecar_error: None,
+                        });
+                    }
+                };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim().to_string();
@@ -652,7 +1094,6 @@ async fn consume_sidecar_stream(
                             } else {
                                 event.status
                             };
-                            returned_agent_id = event.agent_id;
                             final_text = coalesce_cursor_delivery_text(
                                 &text_parts,
                                 event.result.as_deref(),
@@ -734,10 +1175,8 @@ async fn consume_sidecar_stream(
 
     Ok(SidecarRunOutcome {
         final_text,
-        returned_agent_id,
         run_status,
         sidecar_error,
-        cleared_stale_resume: false,
     })
 }
 
@@ -747,17 +1186,14 @@ fn state_show_thinking(event_tx: Option<&UnboundedSender<AgentEvent>>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn invoke_sidecar_turn(
-    state: &AppState,
     client: &reqwest::Client,
     sidecar_url: &str,
     prompt: &str,
     cwd: &str,
     model: &str,
     model_params: Option<&[crate::cursor_engine_config::CursorModelParam]>,
-    resume_id: Option<String>,
-    chat_id: i64,
-    persona_id: i64,
     session_scope: &str,
+    run_kind: &str,
     event_tx: Option<&UnboundedSender<AgentEvent>>,
     cancel: Option<&Arc<AtomicBool>>,
     mcp_servers: Option<serde_json::Value>,
@@ -769,9 +1205,9 @@ async fn invoke_sidecar_turn(
         cwd,
         model,
         session_scope,
-        agent_id: resume_id.as_deref(),
         model_params,
         mcp_servers: mcp_servers.clone(),
+        run_kind: Some(run_kind),
     };
 
     let response = client
@@ -801,28 +1237,6 @@ async fn invoke_sidecar_turn(
     .await?;
 
     if let Some(ref err) = outcome.sidecar_error {
-        if resume_id.is_some() && is_unusable_cursor_agent_error(err) {
-            warn!(
-                chat_id,
-                persona_id,
-                stale_agent_id = resume_id.as_deref().unwrap_or(""),
-                busy = is_busy_cursor_agent_error(err),
-                "Unusable Cursor agent id; clearing for fresh delegation prompt"
-            );
-            let db = state.db.clone();
-            let session_scope_for_db = session_scope.to_string();
-            let _ = call_blocking(db, move |database| {
-                database.clear_cursor_engine_agent_id(chat_id, persona_id, &session_scope_for_db)
-            })
-            .await;
-            return Ok(SidecarRunOutcome {
-                final_text: String::new(),
-                returned_agent_id: None,
-                run_status: "stale_agent_id".into(),
-                sidecar_error: None,
-                cleared_stale_resume: true,
-            });
-        }
         return Err(anyhow::anyhow!(err.clone()));
     }
 
@@ -863,15 +1277,10 @@ pub async fn run_cursor_engine(
     let base_url = settings.sdk_runner_url.trim();
 
     if base_url.is_empty() {
-        return cursor_engine_classic_fallback(
-            state,
-            context,
-            &prep,
-            event_tx,
-            cancel,
+        return Ok(cursor_engine_unavailable_result(
+            &context,
             "CURSOR_SDK_RUNNER_URL unset",
-        )
-        .await;
+        ));
     }
 
     let chat_id = context.chat_id;
@@ -912,31 +1321,71 @@ pub async fn run_cursor_engine(
         model
     };
 
-    let resume_agent_id = call_blocking(state.db.clone(), {
-        let session_scope = session_scope.clone();
-        move |db| db.get_cursor_engine_agent_id(chat_id, persona_id, &session_scope)
-    })
-    .await
-    .ok()
-    .flatten();
+    if !context.is_scheduled_task
+        && !context.is_background_job
+        && is_status_recheck_request(&prep.latest_user_text)
+    {
+        let jobs_running =
+            chat_persona_has_unfinished_background_jobs(state, chat_id, persona_id).await;
+        let artifacts = collect_recent_persona_images(
+            &working_dir,
+            STATUS_RECHECK_MAX_AGE,
+            STATUS_RECHECK_MAX_FILES,
+        );
+        let final_text = format_status_recheck_reply(&artifacts, jobs_running);
+        info!(
+            chat_id,
+            persona_id,
+            files = artifacts.len(),
+            jobs_running,
+            "cursor_status_recheck_delivered"
+        );
+        return finish_cursor_engine_turn(
+            state,
+            &context,
+            &prep,
+            event_tx,
+            CursorFinishArgs {
+                run_start,
+                model,
+                runner_url: &settings.sdk_runner_url,
+                final_text,
+                stop_reason: "cursor_status_recheck",
+                pipeline_stages: vec![PipelineStageRecord {
+                    stage: "cursor_status_recheck".into(),
+                    detail: format!(
+                        "no_sidecar files={} jobs_running={}",
+                        artifacts.len(),
+                        jobs_running
+                    ),
+                    duration_ms: run_start.elapsed().as_millis(),
+                }],
+                history_tool_records: Vec::new(),
+                history_hook_events: hook_summaries,
+                run_tool_names: Vec::new(),
+                had_tool_calls: false,
+            },
+        )
+        .await;
+    }
 
     let sidecar_url = format!("{}/run", base_url.trim_end_matches('/'));
-    let timeout_secs = settings.timeout_secs.max(60);
+    let timeout_secs = crate::cursor_engine_config::cursor_turn_timeout_secs(
+        &settings,
+        context.is_scheduled_task,
+        context.is_background_job,
+    );
+    let run_kind = sidecar_run_kind(&context);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs + 30))
         .build()
     {
         Ok(c) => c,
         Err(e) => {
-            return cursor_engine_classic_fallback(
-                state,
-                context,
-                &prep,
-                event_tx,
-                cancel,
+            return Ok(cursor_engine_unavailable_result(
+                &context,
                 &format!("HTTP client build failed: {e}"),
-            )
-            .await;
+            ));
         }
     };
 
@@ -972,7 +1421,6 @@ pub async fn run_cursor_engine(
 
     let started_at = chrono::Utc::now().to_rfc3339();
     let sidecar_started = Instant::now();
-    let mut resume_id = resume_agent_id.clone();
 
     let slim_enabled = settings.delegation_slim_prompt && mcp_enabled;
     let delegation_system = slim_delegation_system_prompt(&prep.system_prompt, slim_enabled);
@@ -981,12 +1429,8 @@ pub async fn run_cursor_engine(
         persona_id,
         mcp_enabled,
     };
-    let mut delegation_mode = select_delegation_prompt_mode(
-        resume_agent_id.as_deref(),
-        context.is_scheduled_task,
-        settings.delegation_resume_delta,
-    );
-    let mut delegation_mode_label = delegation_mode.as_str().to_string();
+    let delegation_mode = select_delegation_prompt_mode(None, context.is_scheduled_task, false);
+    let delegation_mode_label = delegation_mode.as_str().to_string();
     let initial_prompt = rebuild_delegation_prompt(
         delegation_mode,
         &delegation_system,
@@ -1000,24 +1444,20 @@ pub async fn run_cursor_engine(
     let mut nudge_count = 0usize;
     let mut final_text;
     let mut run_status;
-    let mut returned_agent_id: Option<String> = None;
     let mut stream_tool_records: Vec<ToolCallRecord> = Vec::new();
     let mut mcp_tool_count_total = 0usize;
 
     loop {
         let mut mcp_tool_count_turn = 0usize;
         let outcome = match invoke_sidecar_turn(
-            state,
             &client,
             &sidecar_url,
             &prompt,
             &cwd,
             model,
             model_params,
-            resume_id.clone(),
-            chat_id,
-            persona_id,
             &session_scope,
+            run_kind,
             event_tx,
             cancel.as_ref(),
             mcp_servers.clone(),
@@ -1028,13 +1468,30 @@ pub async fn run_cursor_engine(
         {
             Ok(o) => o,
             Err(e) => {
-                // McpTokenGuard Drop revokes on abort/cancel/error.
                 let msg = e.to_string();
-                if is_cursor_sidecar_recoverable_error(&msg) {
-                    return cursor_engine_classic_fallback(
-                        state, context, &prep, event_tx, cancel, &msg,
+                if is_cursor_turn_timeout_error(&msg)
+                    || is_cursor_sidecar_stream_transport_error(&msg)
+                {
+                    return deliver_cursor_interrupt(
+                        state,
+                        &context,
+                        &prep,
+                        event_tx,
+                        run_start,
+                        model,
+                        &settings.sdk_runner_url,
+                        timeout_secs,
+                        is_cursor_turn_timeout_error(&msg),
+                        "",
+                        &stream_tool_records,
+                        hook_summaries.clone(),
+                        sidecar_started.elapsed().as_millis(),
                     )
                     .await;
+                }
+                // McpTokenGuard Drop revokes on abort/cancel/error.
+                if is_cursor_sidecar_recoverable_error(&msg) {
+                    return Ok(cursor_engine_unavailable_result(&context, &msg));
                 }
                 return Err(e);
             }
@@ -1042,31 +1499,38 @@ pub async fn run_cursor_engine(
 
         mcp_tool_count_total = mcp_tool_count_total.saturating_add(mcp_tool_count_turn);
 
-        if outcome.cleared_stale_resume {
-            resume_id = None;
-            delegation_mode = DelegationPromptMode::FullSlim;
-            delegation_mode_label = "full_slim_stale_retry".into();
-            prompt = rebuild_delegation_prompt(
-                delegation_mode,
-                &delegation_system,
-                &hook_messages,
-                &runtime_header,
-                context.is_scheduled_task,
-                prep.has_image_input,
-            );
-            continue;
+        if is_cursor_stream_interrupt_status(&outcome.run_status) {
+            return deliver_cursor_interrupt(
+                state,
+                &context,
+                &prep,
+                event_tx,
+                run_start,
+                model,
+                &settings.sdk_runner_url,
+                timeout_secs,
+                outcome.run_status == "http_timeout",
+                &outcome.final_text,
+                &stream_tool_records,
+                hook_summaries.clone(),
+                sidecar_started.elapsed().as_millis(),
+            )
+            .await;
         }
 
         final_text = outcome.final_text;
         run_status = outcome.run_status;
-        if let Some(agent_id) = outcome.returned_agent_id {
-            returned_agent_id = Some(agent_id);
-            resume_id = returned_agent_id.clone();
+        if run_status == "idle_timeout" {
+            let notice = crate::cursor_engine_config::cursor_turn_timeout_notice(timeout_secs);
+            if final_text.trim().is_empty() {
+                final_text = notice;
+            } else {
+                final_text = format!("{final_text}\n\n{notice}");
+            }
         }
 
         if final_text.trim().is_empty() {
-            let can_nudge_empty =
-                nudge_count < DEFERRED_COMMITMENT_MAX_NUDGES && returned_agent_id.is_some();
+            let can_nudge_empty = nudge_count < DEFERRED_COMMITMENT_MAX_NUDGES;
             if can_nudge_empty {
                 warn!(
                     chat_id,
@@ -1075,7 +1539,7 @@ pub async fn run_cursor_engine(
                     "Cursor agent returned empty text; nudging for user-facing reply"
                 );
                 nudge_count += 1;
-                prompt = empty_output_nudge_prompt();
+                prompt = append_follow_up_to_prompt(&initial_prompt, &empty_output_nudge_prompt());
                 continue;
             }
             if let Some(recovered) = recover_user_text_from_tool_records(&stream_tool_records) {
@@ -1118,10 +1582,7 @@ pub async fn run_cursor_engine(
                 prompt: nudge_prompt,
             } => {
                 nudge_count += 1;
-                prompt = nudge_prompt;
-                if returned_agent_id.is_none() {
-                    break;
-                }
+                prompt = append_follow_up_to_prompt(&initial_prompt, &nudge_prompt);
                 continue;
             }
         }
@@ -1184,21 +1645,6 @@ pub async fn run_cursor_engine(
         format!("{}...", &final_text[..final_text.floor_char_boundary(500)])
     };
 
-    if let Some(ref agent_id) = returned_agent_id {
-        let db = state.db.clone();
-        let session_scope_for_db = session_scope.clone();
-        let agent_id_owned = agent_id.clone();
-        let _ = call_blocking(db.clone(), move |database| {
-            database.set_cursor_engine_agent_id(
-                chat_id,
-                persona_id,
-                &session_scope_for_db,
-                &agent_id_owned,
-            )
-        })
-        .await;
-    }
-
     let channel = context.caller_channel.to_string();
     let workdir_owned = cwd.clone();
     let _ = call_blocking(state.db.clone(), move |database| {
@@ -1233,9 +1679,8 @@ pub async fn run_cursor_engine(
     let pipeline_stages = vec![PipelineStageRecord {
         stage: "cursor_sdk".into(),
         detail: format!(
-            "model={} resume={} status={} nudges={} mcp={} delegation={} prompt_chars={}{}{}",
+            "model={} fresh_session=true status={} nudges={} mcp={} delegation={} prompt_chars={}{}{}",
             model,
-            resume_agent_id.is_some(),
             run_status,
             nudge_count,
             mcp_enabled,
@@ -1246,91 +1691,38 @@ pub async fn run_cursor_engine(
         ),
         duration_ms: sidecar_started.elapsed().as_millis(),
     }];
-    let extras = PipelineFinishExtras {
-        pipeline_stages,
-        cloud_calls: 0,
-        agent_engine: "cursor".into(),
-    };
-
-    let mut messages = prep.messages.clone();
-    messages.push(Message {
-        role: "assistant".into(),
-        content: MessageContent::Text(final_text.clone()),
-    });
-    let mut pdqe_retries = 0usize;
-    let mut pdqe_steps: Vec<EvaluatorStepRecord> = Vec::new();
-    let history_iterations = if history_tool_records.is_empty() {
-        Vec::new()
-    } else {
-        vec![IterationRecord {
-            iteration: 1,
-            stop_reason: "tool_use".into(),
-            assistant_text_preview: if final_text.len() <= 200 {
-                final_text.clone()
-            } else {
-                format!("{}...", &final_text[..final_text.floor_char_boundary(200)])
-            },
-            tool_calls: history_tool_records,
-            hook_events: history_hook_events,
-            pte: None,
-            model_tier: "cursor".into(),
-            provider: "cursor_sdk".into(),
-            model: model.to_string(),
-            endpoint: settings.sdk_runner_url.clone(),
-        }]
-    };
-    let mut agent_history_basename: Option<String> = None;
-
     info!(
         chat_id,
         persona_id,
         model,
-        resume = resume_agent_id.is_some(),
         status = %run_status,
         nudges = nudge_count,
         "Cursor SDK engine finished sidecar run"
     );
 
-    loop {
-        let mut iterations = history_iterations.clone();
-        match pipeline_finish_turn(
-            state,
-            &context,
-            event_tx,
-            &prep.run_key,
-            chat_id,
-            persona_id,
-            if success {
+    finish_cursor_engine_turn(
+        state,
+        &context,
+        &prep,
+        event_tx,
+        CursorFinishArgs {
+            run_start,
+            model,
+            runner_url: &settings.sdk_runner_url,
+            final_text,
+            stop_reason: if success {
                 "cursor_engine_complete"
             } else {
                 "cursor_engine_error"
             },
-            final_text.clone(),
-            &prep.system_prompt,
-            &mut messages,
-            prep.protected_message_count,
-            &mut pdqe_retries,
-            &mut pdqe_steps,
-            &mut iterations,
-            &prep.principles_content,
-            true,
-            &run_tool_names,
-            &mut agent_history_basename,
+            pipeline_stages,
+            history_tool_records,
+            history_hook_events,
+            run_tool_names,
             had_tool_calls,
-            &prep.user_msg_preview,
-            run_start,
-            &prep.initial_llm_snapshot_json,
-            &prep.local_delegate_run_summary,
-            Some(&extras),
-        )
-        .await?
-        {
-            Some(result) => return Ok(result),
-            None => {
-                // PDQE requested revision; re-enter the finish loop until the gate delivers.
-            }
-        }
-    }
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1497,6 +1889,106 @@ mod tests {
             "Cursor sidecar at capacity (CURSOR_RUN_CONCURRENCY=4)"
         ));
         assert!(!is_cursor_sidecar_recoverable_error("prompt required"));
+    }
+
+    #[test]
+    fn stream_transport_errors_are_not_classic_fallback() {
+        assert!(is_cursor_sidecar_stream_transport_error(
+            "Cursor sidecar stream error: error decoding response body"
+        ));
+        assert!(is_cursor_turn_timeout_error(
+            "Cursor sidecar stream error: timed out: error decoding response body"
+        ));
+        assert!(!is_cursor_sidecar_recoverable_error(
+            "Cursor sidecar stream error: error decoding response body"
+        ));
+        assert!(is_cursor_stream_interrupt_status("http_timeout"));
+        assert!(is_cursor_stream_interrupt_status("stream_interrupted"));
+        assert!(!is_cursor_stream_interrupt_status("finished"));
+    }
+
+    #[test]
+    fn compose_interrupt_reply_keeps_partial_text_and_warns_against_resend() {
+        let reply = compose_cursor_interrupt_reply(
+            "Background command started (job abc).",
+            900,
+            true,
+            true,
+        );
+        assert!(reply.starts_with("Background command started"));
+        assert!(reply.contains("still running"));
+        assert!(reply.contains("Do not send the same request again"));
+        assert!(!reply
+            .to_lowercase()
+            .contains("please send your request again"));
+
+        let empty = compose_cursor_interrupt_reply("", 900, true, true);
+        assert!(empty.contains("background work"));
+        assert!(!empty.contains("Background command started"));
+    }
+
+    #[test]
+    fn tools_started_background_work_detects_shell_and_tracked_jobs() {
+        let records = vec![ToolCallRecord {
+            name: "spawn_background_command".into(),
+            input_preview: "{}".into(),
+            result_preview: "started".into(),
+            duration_ms: 1,
+            is_error: false,
+        }];
+        assert!(tools_started_background_work(&records));
+        let tracked = vec![ToolCallRecord {
+            name: "register_tracked_job".into(),
+            input_preview: "{}".into(),
+            result_preview: "ok".into(),
+            duration_ms: 1,
+            is_error: false,
+        }];
+        assert!(tools_started_background_work(&tracked));
+        assert!(!tools_started_background_work(&[]));
+    }
+
+    #[test]
+    #[test]
+    fn status_recheck_request_is_short_status_only() {
+        assert!(is_status_recheck_request("check again"));
+        assert!(is_status_recheck_request(
+            "[current_request sender=\"web-user\"]\ncheck again\n[/current_request]"
+        ));
+        assert!(is_status_recheck_request("What happened?"));
+        assert!(is_status_recheck_request("Check what's the status?"));
+        assert!(is_status_recheck_request(
+            "what happened to you. you are not responding"
+        ));
+        assert!(!is_status_recheck_request(
+            "check again and then generate another flux fill hotify"
+        ));
+        assert!(!is_status_recheck_request(
+            "Yes, let's generate another edit in the base image and do the hotification with the flux fill method."
+        ));
+    }
+
+    #[test]
+    fn status_recheck_reply_lists_recent_images_and_skips_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("PZ-V2-FLUXFILL.png"), b"img").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"skip").unwrap();
+        let arts = collect_recent_persona_images(dir.path(), STATUS_RECHECK_MAX_AGE, 10);
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].name, "PZ-V2-FLUXFILL.png");
+        let reply = format_status_recheck_reply(&arts, false);
+        assert!(reply.contains("did not start a new generation"));
+        assert!(reply.contains("PZ-V2-FLUXFILL.png"));
+        assert!(!reply.to_lowercase().contains("narrower request"));
+    }
+
+    fn cursor_sidecar_unavailable_notice_refuses_classic_gemini() {
+        let notice = cursor_sidecar_unavailable_notice(
+            "sidecar HTTP 503: Cursor sidecar at capacity (CURSOR_RUN_CONCURRENCY=4)",
+        );
+        assert!(notice.contains("configured to use Cursor"));
+        assert!(notice.contains("Classic/Gemini was not used"));
+        assert!(notice.contains("at capacity"));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   formatConfidence,
+  formatEngineBadgeLabel,
   formatTierBadgeLabel,
   parseAgentHistoryMarkdown,
+  parseEngineLine,
   parsePdqeEvalDetail,
   parsePdqeSteps,
   parsePteDecisions,
@@ -30,7 +32,33 @@ Assistant: "hello"`
   })
 })
 
+describe('parseEngineLine', () => {
+  it('reads the Engine line from a run header', () => {
+    const header = `# Run 2026-08-31
+Channel: web | User: "retry the fill"
+Engine: cursor
+Total: 1 iteration(s)`
+    expect(parseEngineLine(header)).toBe('cursor')
+    expect(formatEngineBadgeLabel('cursor')).toBe('Cursor')
+  })
+
+  it('returns null when the header has no Engine line', () => {
+    expect(parseEngineLine('# Run legacy\nTotal: 1')).toBeNull()
+  })
+})
+
 describe('parseAgentHistoryMarkdown', () => {
+  it('extracts engine from the run header', () => {
+    const md = `# Run 2026-08-31
+Engine: cursor
+Cursor sidecar: composer-2.5 @ http://127.0.0.1:3848
+
+## Iteration 1
+Stop: tool_use`
+    const parsed = parseAgentHistoryMarkdown(md)
+    expect(parsed.engine).toBe('cursor')
+  })
+
   it('extracts tier from iterations when present', () => {
     const md = `# Run 2026-06-17
 Multi-model: enabled

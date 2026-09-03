@@ -1,5 +1,7 @@
 //! Post-Tool Evaluator (PTE): evaluates whether a task is complete after tool execution.
-//! Called after each tool iteration to decide whether to continue the agent loop or synthesize a final response.
+//! Called after each tool iteration on the Classic / ClassicCostRouting agent loop only
+//! (Cursor and Deterministic do not use this path).
+//! Decides whether to continue the agent loop or synthesize a final response.
 
 use crate::agent_turn_context::extract_session_goal;
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock};

@@ -12,14 +12,17 @@
  *   CURSOR_BRIDGE_POOL_MAX          max warm agent handles, default 16
  *   CURSOR_SIDECAR_MAX_UPTIME_SECS  idle self-recycle, default 86400
  *   CURSOR_RUN_WAIT_TIMEOUT_MS      hang watchdog for run.wait() AFTER stream ends, default 120000 (not a turn budget)
+ *   CURSOR_STREAM_IDLE_TIMEOUT_MS   cancel SDK stream when no events for this long, default 900000 (15 min)
+ *   CURSOR_RUN_INTERACTIVE_RESERVE  slots reserved for interactive chat (scheduled waits), default 1
  *   CURSOR_SDK_NODE_PREFIX          runtime dir with sdk-shim.mjs + node_modules
- *   CURSOR_SDK_STATE_ROOT           optional parent dir for JsonlLocalAgentStore
  *
- * Local agents use JsonlLocalAgentStore (not node:sqlite) so Node 18–20 works.
+ * Every /run is a new Cursor session: Agent.create only (never Agent.resume).
+ * JsonlLocalAgentStore lives under {runtime}/cursor-sdk-ephemeral/{runId} and
+ * is deleted when the HTTP response is finished so no checkpoint dir dangles.
+ * Gateway already sends full persona + chat context each turn.
  * Node 18 file ESM has no global `crypto`; polyfill Web Crypto before loading
  * `@cursor/sdk` (it calls `crypto.randomUUID()` for agent/run ids).
- * Follow-up sends pass `local.force` so a leftover run cannot block the next
- * user message (`Agent … already has active run`).
+ * Sends pass `local.force` so a leftover run cannot block the next message.
  *
  * API: GET /health  GET /models  POST /run  POST /admin/request_recycle
  */
@@ -64,6 +67,8 @@ const DEFAULT_AGENT_IDLE_TTL_SECS = 600;
 const DEFAULT_AGENT_POOL_MAX = 16;
 const DEFAULT_SIDECAR_MAX_UPTIME_SECS = 86400;
 const DEFAULT_RUN_WAIT_TIMEOUT_MS = 120_000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900_000;
+const DEFAULT_RUN_INTERACTIVE_RESERVE = 1;
 const DEFAULT_REAPER_INTERVAL_SECS = 60;
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -72,9 +77,9 @@ const STARTED_AT_MONOTONIC = process.hrtime.bigint();
 const STARTED_AT_UNIX = Date.now() / 1000;
 
 let sdkModule = null;
-/** @type {Map<string, unknown>} */
-const LOCAL_STORES = new Map();
-let runsInFlight = 0;
+/** @type {Map<string, { runKind: string, startedMonotonic: number, lastEventMonotonic: number, cancelFn: (() => Promise<void>)|null }>} */
+const activeRuns = new Map();
+let nextRunSeq = 1;
 let recycleRequested = false;
 let shutdownTriggered = false;
 let reaperTimer = null;
@@ -140,6 +145,68 @@ function runWaitTimeoutMs() {
   return envInt("CURSOR_RUN_WAIT_TIMEOUT_MS", DEFAULT_RUN_WAIT_TIMEOUT_MS, 3000);
 }
 
+function streamIdleTimeoutMs() {
+  return envInt(
+    "CURSOR_STREAM_IDLE_TIMEOUT_MS",
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    60_000,
+  );
+}
+
+function interactiveReserve() {
+  return envInt(
+    "CURSOR_RUN_INTERACTIVE_RESERVE",
+    DEFAULT_RUN_INTERACTIVE_RESERVE,
+    0,
+  );
+}
+
+function monotonicNow() {
+  return Number(process.hrtime.bigint()) / 1e9;
+}
+
+function runsInFlightCount() {
+  return activeRuns.size;
+}
+
+function oldestRunAgeSecs() {
+  const now = monotonicNow();
+  let oldest = 0;
+  for (const rec of activeRuns.values()) {
+    const age = now - rec.startedMonotonic;
+    if (age > oldest) oldest = age;
+  }
+  return Math.floor(oldest);
+}
+
+function beginTrackedRun(runKind) {
+  const id = String(nextRunSeq++);
+  const now = monotonicNow();
+  activeRuns.set(id, {
+    runKind,
+    startedMonotonic: now,
+    lastEventMonotonic: now,
+    cancelFn: null,
+  });
+  return id;
+}
+
+function touchRunActivity(runId) {
+  const rec = activeRuns.get(runId);
+  if (rec) rec.lastEventMonotonic = monotonicNow();
+}
+
+function endTrackedRun(runId) {
+  if (runId) activeRuns.delete(runId);
+}
+
+function isScheduledRunBody(body) {
+  const scope = String(body?.session_scope || "").trim();
+  if (scope.startsWith("scheduled:")) return true;
+  if (scope.startsWith("background:") || scope.startsWith("bg:")) return true;
+  return body?.run_kind === "scheduled";
+}
+
 function uptimeSecs() {
   return Number(process.hrtime.bigint() - STARTED_AT_MONOTONIC) / 1e9;
 }
@@ -156,33 +223,52 @@ function isEphemeralSessionScope(sessionScope) {
   return UUID_RE.test(scope);
 }
 
-function agentStoreRoot(cwd, sessionScope) {
-  const key = poolKey(cwd, sessionScope).replace(":", "-");
-  const override = (process.env.CURSOR_SDK_STATE_ROOT || "").trim();
-  if (override) {
-    return path.join(override, key);
-  }
+function runtimeDataDir() {
   const runtime = (process.env.FINALLY_A_VALUE_BOT_RUNTIME_DATA || "").trim();
-  const runtimeDir =
-    runtime || path.join(SCRIPT_DIR, "..", "workspace", "runtime");
-  return path.join(runtimeDir, "cursor-sdk-state", key);
+  return runtime || path.join(SCRIPT_DIR, "..", "workspace", "runtime");
 }
 
-function localStoreFor(sdk, cwd, sessionScope) {
+function ephemeralStoreDir(runId) {
+  const safe = String(runId || crypto.randomUUID()).replace(
+    /[^a-zA-Z0-9._-]/g,
+    "_",
+  );
+  return path.join(runtimeDataDir(), "cursor-sdk-ephemeral", safe);
+}
+
+function createEphemeralStore(sdk, storeDir) {
   const Store = sdk?.JsonlLocalAgentStore;
   if (typeof Store !== "function") {
     throw new Error(
       "JsonlLocalAgentStore is not exported from @cursor/sdk; upgrade the package",
     );
   }
-  const dir = agentStoreRoot(cwd, sessionScope);
-  fs.mkdirSync(dir, { recursive: true });
-  let store = LOCAL_STORES.get(dir);
-  if (!store) {
-    store = new Store(dir);
-    LOCAL_STORES.set(dir, store);
+  fs.mkdirSync(storeDir, { recursive: true });
+  return new Store(storeDir);
+}
+
+function removeStoreDir(storeDir) {
+  if (!storeDir) return;
+  try {
+    fs.rmSync(storeDir, { recursive: true, force: true });
+  } catch (err) {
+    logErr(`ephemeral store cleanup failed (${storeDir}): ${err}`);
   }
-  return store;
+}
+
+function pruneLegacyResumeStores() {
+  const runtime = runtimeDataDir();
+  for (const name of ["cursor-sdk-state", "cursor-sdk-ephemeral"]) {
+    const dir = path.join(runtime, name);
+    try {
+      if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        logErr(`pruned ${dir}`);
+      }
+    } catch (err) {
+      logErr(`failed to prune ${dir}: ${err}`);
+    }
+  }
 }
 
 function poolKey(cwd, sessionScope) {
@@ -246,11 +332,6 @@ function sdkInstalledSync() {
   }
 }
 
-function isStaleAgentError(err) {
-  const msg = String(err?.message || err).toLowerCase();
-  return msg.includes("not found") && msg.includes("agent");
-}
-
 function isBusyAgentError(err) {
   const name = String(err?.name || err?.constructor?.name || "");
   if (name.includes("AgentBusy")) return true;
@@ -278,11 +359,6 @@ function isRetryableSdkError(err) {
     msg.includes("socket hang up") ||
     msg.includes("fetch failed")
   );
-}
-
-function agentIdOf(agent) {
-  if (!agent) return null;
-  return agent.agentId || agent.agent_id || null;
 }
 
 async function disposeAgent(agent) {
@@ -430,9 +506,35 @@ function writeNdjson(res, obj) {
   return res.write(ndjson(obj));
 }
 
-async function streamAgentTurn(agent, prompt, mcpServers, active) {
+async function nextStreamEventWithIdleTimeout(iter, idleMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      iter.next(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error("STREAM_IDLE_TIMEOUT");
+          err.code = "STREAM_IDLE_TIMEOUT";
+          reject(err);
+        }, idleMs);
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function streamAgentTurn(agent, prompt, mcpServers, active, runId) {
   const run = await agent.send(prompt, buildSendOptions(mcpServers));
   active.run = run;
+  const rec = activeRuns.get(runId);
+  if (rec) {
+    rec.cancelFn = async () => {
+      active.cancelRequested = true;
+      await cancelRun(run);
+    };
+  }
   try {
     if (active.cancelRequested) {
       await cancelRun(run);
@@ -441,12 +543,35 @@ async function streamAgentTurn(agent, prompt, mcpServers, active) {
 
     const textParts = [];
     const stream = typeof run.stream === "function" ? run.stream() : run.messages();
-    for await (const event of stream) {
+    const streamIter = stream[Symbol.asyncIterator]();
+    const idleMs = streamIdleTimeoutMs();
+
+    while (true) {
       if (active.cancelRequested) {
         await cancelRun(run);
         return { cancelled: true, status: "cancelled", text: "", evict: true };
       }
-      emitStreamEvent(event, textParts, active);
+      let result;
+      try {
+        result = await nextStreamEventWithIdleTimeout(streamIter, idleMs);
+        touchRunActivity(runId);
+      } catch (err) {
+        if (err?.code === "STREAM_IDLE_TIMEOUT") {
+          logErr(
+            `stream idle timeout after ${idleMs}ms (runId=${runId}); cancelling`,
+          );
+          await cancelRun(run);
+          return {
+            cancelled: false,
+            status: "idle_timeout",
+            text: joinCursorUtterances(textParts),
+            evict: true,
+          };
+        }
+        throw err;
+      }
+      if (result.done) break;
+      emitStreamEvent(result.value, textParts, active);
     }
 
     if (active.cancelRequested) {
@@ -674,30 +799,15 @@ function emitStreamEvent(event, textParts, active) {
   }
 }
 
-async function openAgent(sdk, { agentId, model, modelParams, cwd, key, mcpServers, sessionScope }) {
+async function openAgent(sdk, { model, modelParams, cwd, key, mcpServers, store }) {
   const { Agent } = sdk;
-  const store = localStoreFor(sdk, cwd, sessionScope);
   const options = {
     apiKey: key,
     model: buildModelSelection(model, modelParams),
-    local: { cwd, store },
+    local: { cwd, store, force: true },
   };
   if (mcpServers) options.mcpServers = mcpServers;
-
-  if (!agentId) {
-    return await Agent.create(options);
-  }
-  try {
-    const resumeOpts = { apiKey: key, local: { cwd, store } };
-    if (mcpServers) resumeOpts.mcpServers = mcpServers;
-    if (options.model) resumeOpts.model = options.model;
-    return await Agent.resume(agentId, resumeOpts);
-  } catch (err) {
-    if (isStaleAgentError(err)) {
-      return await Agent.create(options);
-    }
-    throw err;
-  }
+  return await Agent.create(options);
 }
 
 async function evictPooled(key) {
@@ -767,13 +877,35 @@ async function triggerCleanShutdown(reason) {
   process.exit(0);
 }
 
+async function cancelStuckRuns() {
+  const now = monotonicNow();
+  const idleLimitSec = streamIdleTimeoutMs() / 1000;
+  for (const [id, rec] of [...activeRuns.entries()]) {
+    const idleAge = now - rec.lastEventMonotonic;
+    const wallAge = now - rec.startedMonotonic;
+    if (idleAge <= idleLimitSec * 1.05 && wallAge <= idleLimitSec * 2) {
+      continue;
+    }
+    logErr(
+      `reaper cancelling stuck run id=${id} kind=${rec.runKind} idle=${idleAge.toFixed(0)}s wall=${wallAge.toFixed(0)}s`,
+    );
+    try {
+      if (rec.cancelFn) await rec.cancelFn();
+    } catch (err) {
+      logErr(`stuck run cancel failed id=${id}: ${err}`);
+    }
+    activeRuns.delete(id);
+  }
+}
+
 async function reaperTick() {
   try {
+    await cancelStuckRuns();
     await evictIdleAndOverCap();
     if (uptimeSecs() >= sidecarMaxUptimeSecs()) {
       recycleRequested = true;
     }
-    if (recycleRequested && runsInFlight === 0) {
+    if (recycleRequested && runsInFlightCount() === 0) {
       await triggerCleanShutdown("idle_recycle");
     }
   } catch (err) {
@@ -781,15 +913,21 @@ async function reaperTick() {
   }
 }
 
-function tryBeginRun() {
+function tryBeginRun(body) {
   const limit = runConcurrency();
-  if (runsInFlight >= limit) return false;
-  runsInFlight += 1;
-  return true;
+  const reserve = interactiveReserve();
+  const inFlight = runsInFlightCount();
+  if (inFlight >= limit) return null;
+  const scheduled = isScheduledRunBody(body);
+  const scheduledCap = Math.max(1, limit - reserve);
+  if (scheduled && inFlight >= scheduledCap) {
+    return null;
+  }
+  return beginTrackedRun(scheduled ? "scheduled" : "interactive");
 }
 
-function endRun() {
-  runsInFlight = Math.max(0, runsInFlight - 1);
+function endRun(runId) {
+  endTrackedRun(runId);
 }
 
 function jsonResponse(res, status, body) {
@@ -845,7 +983,9 @@ async function handleHealth(_req, res) {
     bridge_idle_ttl_secs: agentIdleTtlSecs(),
     bridge_pool_max: agentPoolMax(),
     run_concurrency: runConcurrency(),
-    runs_in_flight: runsInFlight,
+    runs_in_flight: runsInFlightCount(),
+    interactive_reserve: interactiveReserve(),
+    oldest_run_age_secs: oldestRunAgeSecs(),
     os_bridge_pids: 0,
     started_at_unix: Math.floor(STARTED_AT_UNIX),
     uptime_secs: Math.floor(uptimeSecs()),
@@ -892,10 +1032,10 @@ async function handleRequestRecycle(req, res) {
     jsonResponse(res, 403, { accepted: false, reason: "loopback_only" });
     return;
   }
-  if (runsInFlight > 0) {
+  if (runsInFlightCount() > 0) {
     jsonResponse(res, 202, {
       accepted: false,
-      runs_in_flight: runsInFlight,
+      runs_in_flight: runsInFlightCount(),
       reason: "busy",
     });
     return;
@@ -922,10 +1062,11 @@ async function handleRun(req, res) {
     });
     return;
   }
-  if (!tryBeginRun()) {
+  const runId = tryBeginRun(body);
+  if (!runId) {
     jsonResponse(res, 503, {
       type: "error",
-      message: `Cursor sidecar at capacity (CURSOR_RUN_CONCURRENCY=${runConcurrency()})`,
+      message: `Cursor sidecar at capacity (CURSOR_RUN_CONCURRENCY=${runConcurrency()}, interactive_reserve=${interactiveReserve()})`,
     });
     return;
   }
@@ -940,6 +1081,7 @@ async function handleRun(req, res) {
     cancelRequested: false,
     run: null,
     res,
+    runId,
   };
   const onClose = () => {
     if (active.cancelRequested) return;
@@ -958,7 +1100,7 @@ async function handleRun(req, res) {
   } finally {
     req.off("close", onClose);
     if (!res.writableEnded) res.end();
-    endRun();
+    endRun(runId);
   }
 }
 
@@ -967,7 +1109,6 @@ async function streamRun(body, active) {
   const cwd = String(body.cwd || ".").trim() || ".";
   const model = String(body.model || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
   const modelParams = Array.isArray(body.model_params) ? body.model_params : null;
-  let resumeId = String(body.agent_id || "").trim() || null;
   const sessionScope = String(body.session_scope || "").trim();
   let mcpServers = body.mcp_servers;
   if (!mcpServers || typeof mcpServers !== "object" || Array.isArray(mcpServers)) {
@@ -998,56 +1139,55 @@ async function streamRun(body, active) {
     return;
   }
 
+  const storeDir = ephemeralStoreDir(active.runId);
   const slot = await getPooledSlot(cwd, sessionScope);
   slot.inUse += 1;
   const maxAttempts = 3;
   const backoff = [500, 1500, 3000];
 
   try {
+    let store;
+    try {
+      store = createEphemeralStore(sdk, storeDir);
+    } catch (err) {
+      writeNdjson(active.res, {
+        type: "error",
+        message: String(err?.message || err),
+      });
+      return;
+    }
+
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
         const outcome = await slot.lock.run(async () => {
           slot.lastUsedMonotonic = Number(process.hrtime.bigint()) / 1e9;
+          let agent = null;
           try {
-            const cachedId = agentIdOf(slot.agent);
-            if (slot.agent && resumeId && cachedId && cachedId !== resumeId) {
-              const stale = slot.agent;
+            if (slot.agent) {
+              const leftover = slot.agent;
               slot.agent = null;
-              await disposeAgent(stale);
+              await disposeAgent(leftover);
             }
-            if (!slot.agent) {
-              slot.agent = await openAgent(sdk, {
-                agentId: resumeId,
-                model,
-                modelParams,
-                cwd,
-                key,
-                mcpServers,
-                sessionScope,
-              });
-            }
+            agent = await openAgent(sdk, {
+              model,
+              modelParams,
+              cwd,
+              key,
+              mcpServers,
+              store,
+            });
+            slot.agent = agent;
             const result = await streamAgentTurn(
-              slot.agent,
+              agent,
               prompt,
               mcpServers,
               active,
+              active.runId,
             );
-            result.agentId = agentIdOf(slot.agent) || resumeId;
-            if (
-              result.cancelled ||
-              result.evict ||
-              isEphemeralSessionScope(sessionScope)
-            ) {
-              const doomed = slot.agent;
-              slot.agent = null;
-              await disposeAgent(doomed);
-            }
             return result;
-          } catch (err) {
-            const doomed = slot.agent;
+          } finally {
             slot.agent = null;
-            await disposeAgent(doomed);
-            throw err;
+            await disposeAgent(agent);
           }
         });
 
@@ -1058,21 +1198,15 @@ async function streamRun(body, active) {
         writeNdjson(active.res, {
           type: "done",
           status: outcome.status,
-          agent_id: outcome.agentId || resumeId,
           result: outcome.text,
         });
         slot.lastUsedMonotonic = Number(process.hrtime.bigint()) / 1e9;
         return;
       } catch (err) {
-        if (attempt === 0 && resumeId && isStaleAgentError(err)) {
-          resumeId = null;
-          continue;
-        }
         if (attempt + 1 < maxAttempts && isBusyAgentError(err)) {
           logErr(
-            `agent busy (attempt ${attempt + 1}/${maxAttempts}); dropping handle and retrying with local.force: ${err}`,
+            `agent busy (attempt ${attempt + 1}/${maxAttempts}); retrying with local.force: ${err}`,
           );
-          if (attempt >= 1) resumeId = null;
           continue;
         }
         if (attempt + 1 < maxAttempts && isRetryableSdkError(err)) {
@@ -1097,6 +1231,7 @@ async function streamRun(body, active) {
     }
   } finally {
     slot.inUse = Math.max(0, slot.inUse - 1);
+    removeStoreDir(storeDir);
   }
 }
 
@@ -1143,12 +1278,12 @@ function runSelfTests() {
   }
   const key = poolKey(os.tmpdir(), "");
   if (!key.includes(":main")) throw new Error("pool key should use main scope");
-  const storeDir = agentStoreRoot(os.tmpdir(), "focus:x");
-  if (!storeDir.includes("cursor-sdk-state")) {
-    throw new Error("store root should live under cursor-sdk-state");
+  const storeDir = ephemeralStoreDir("run-self-test");
+  if (!storeDir.includes("cursor-sdk-ephemeral")) {
+    throw new Error("store root should live under cursor-sdk-ephemeral");
   }
   if (storeDir.includes(":")) {
-    throw new Error("store directory must not contain pool-key colons");
+    throw new Error("store directory must not contain colons");
   }
   if (runConcurrency() < 1) throw new Error("concurrency");
   if (agentIdleTtlSecs() < 60) throw new Error("idle ttl");
@@ -1168,6 +1303,24 @@ function runSelfTests() {
   if (isBusyAgentError(new Error("prompt required"))) {
     throw new Error("prompt required is not a busy error");
   }
+  {
+    const scheduledIds = [];
+    const scheduledCap = Math.max(1, runConcurrency() - interactiveReserve());
+    for (let i = 0; i < scheduledCap; i += 1) {
+      const id = tryBeginRun({ run_kind: "scheduled" });
+      if (!id) throw new Error(`scheduled slot ${i} should start`);
+      scheduledIds.push(id);
+    }
+    if (tryBeginRun({ run_kind: "scheduled" }) != null) {
+      throw new Error("scheduled should be blocked at capacity minus reserve");
+    }
+    const interactiveId = tryBeginRun({ run_kind: "interactive" });
+    if (!interactiveId && runsInFlightCount() < runConcurrency()) {
+      throw new Error("interactive should get a slot when below total concurrency");
+    }
+    for (const id of scheduledIds) endTrackedRun(id);
+    if (interactiveId) endTrackedRun(interactiveId);
+  }
   const sendOpts = buildSendOptions(null);
   if (!sendOpts.local?.force) {
     throw new Error("send should force-expire stuck local runs");
@@ -1180,6 +1333,7 @@ function main() {
     runSelfTests();
     return;
   }
+  pruneLegacyResumeStores();
   const port = Number.parseInt(process.argv[2] || String(DEFAULT_PORT), 10);
   const server = http.createServer((req, res) => {
     void handleRequest(req, res);

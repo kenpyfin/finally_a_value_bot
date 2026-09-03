@@ -18,8 +18,8 @@ use super::{
     ensure_persona_memory_file_exists, format_bookmarks_section, format_bulletin_focus_section,
     history_to_claude_messages, latest_user_text, latest_user_text_from_message,
     load_messages_from_db, sops_prompt_sections, split_trailing_user_request,
-    trim_to_recent_balanced, trim_to_token_budget, workspace_data_path_display,
-    AgentRequestContext, AppState,
+    trim_to_recent_balanced, trim_to_token_budget, user_request_is_conversational,
+    workspace_data_path_display, AgentRequestContext, AppState,
 };
 
 /// Bootstrap output shared by classic and deterministic agent engines.
@@ -35,6 +35,7 @@ pub struct AgentRunPrep {
     pub user_msg_preview: String,
     pub initial_llm_snapshot_json: String,
     pub local_delegate_run_summary: LocalDelegateRunSummary,
+    pub is_conversational: bool,
     pub tool_auth: ToolAuthContext,
     pub persona_memory_state: Option<PersonaMemoryState>,
     pub min_user_suffix: usize,
@@ -375,7 +376,19 @@ pub async fn prepare_agent_run(
     );
     let mm_cfg = state.llm.local_delegate_config();
     let cost_routing = crate::local_delegate::cost_routing_active(agent_engine, &mm_cfg);
-    let local_delegate_run_summary = state.llm.local_delegate_run_summary(cost_routing);
+    let is_conversational = user_request_is_conversational(&latest_user_text, has_image_input);
+    let local_delegate_run_summary = if agent_engine == crate::runtime_toggles::AgentEngine::Cursor
+    {
+        let (model, url) = state
+            .cursor_settings
+            .read()
+            .ok()
+            .map(|cfg| (cfg.sdk_model.clone(), cfg.sdk_runner_url.clone()))
+            .unwrap_or_default();
+        LocalDelegateRunSummary::for_cursor_sidecar(&model, &url)
+    } else {
+        state.llm.local_delegate_run_summary(cost_routing)
+    };
     let iter0_tier = crate::local_delegate::RouteTarget::Strategy;
     let iter0_tier_snap = state.llm.tier_endpoint_snapshot(iter0_tier);
     let routing_v1 = local_delegate_run_summary.routing_v1_json(&iter0_tier_snap);
@@ -418,6 +431,7 @@ pub async fn prepare_agent_run(
         user_msg_preview,
         initial_llm_snapshot_json,
         local_delegate_run_summary,
+        is_conversational,
         tool_auth,
         persona_memory_state,
         min_user_suffix,

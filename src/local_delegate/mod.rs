@@ -112,7 +112,34 @@ pub struct LocalDelegateRunSummary {
 pub type MultimodelRunSummary = LocalDelegateRunSummary;
 
 impl LocalDelegateRunSummary {
+    pub fn for_cursor_sidecar(model: &str, runner_url: &str) -> Self {
+        let model = if model.trim().is_empty() {
+            "composer-2.5"
+        } else {
+            model.trim()
+        };
+        Self {
+            cost_routing_active: false,
+            strategy_provider: "cursor_sdk".into(),
+            strategy_model: model.to_string(),
+            strategy_endpoint: runner_url.trim().to_string(),
+            local_model: String::new(),
+            local_endpoint: String::new(),
+        }
+    }
+
     pub fn format_markdown_block(&self) -> String {
+        if self.strategy_provider == "cursor_sdk" {
+            return format!(
+                "Cursor sidecar: {} @ {}\n",
+                self.strategy_model,
+                if self.strategy_endpoint.is_empty() {
+                    "(runner unset)"
+                } else {
+                    self.strategy_endpoint.as_str()
+                },
+            );
+        }
         if self.cost_routing_active {
             format!(
                 "Local delegate: cost routing active\n\
@@ -632,5 +659,15 @@ mod tests {
             ..Default::default()
         };
         assert!(!cost_routing_active(AgentEngine::ClassicCostRouting, &cfg));
+    }
+
+    #[test]
+    fn cursor_sidecar_summary_does_not_mention_classic_strategy() {
+        let summary =
+            LocalDelegateRunSummary::for_cursor_sidecar("composer-2.5", "http://127.0.0.1:3848");
+        let md = summary.format_markdown_block();
+        assert!(md.contains("Cursor sidecar: composer-2.5 @ http://127.0.0.1:3848"));
+        assert!(!md.contains("Local delegate"));
+        assert!(!md.to_lowercase().contains("gemini"));
     }
 }

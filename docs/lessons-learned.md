@@ -1,17 +1,66 @@
-# Lessons Learned
+### 2026-09-03 — PTE/PDQE Classic+Deterministic only (Cursor skipped)
 
-Running log of incidents, root causes, and durable fixes. Newest first. Each entry should let a future reader avoid repeating the same mistake without re-doing the investigation.
+- **Symptom:** Cursor turns waited on PDQE after the sidecar reply (and previously could hang or fail-open with a user-visible notice).
+- **Root cause:** `pipeline_finish_turn` ran PDQE for every engine. Cursor has no classic tool loop for PTE and cannot re-enter the sidecar for a PDQE retry.
+- **Fix:** Skip PDQE when `PipelineFinishExtras.agent_engine` starts with `cursor`. Remove the Cursor fail-open retry branch. PTE stays on the Classic tool loop only.
+- **Prevention:** Do not re-enable PDQE for Cursor without a real sidecar revise path. Keep evaluator toggles for Classic/Deterministic.
+- **Files/refs:** `finish_turn_with_quality_gate` in `src/channels/telegram.rs`; history step `quality_eval_skipped` `{"reason":"cursor_engine"}`.
 
-Template:
+### 2026-09-03 — Cursor FullSlim follow-ups felt disconnected from the prior turn
 
-```
-### YYYY-MM-DD — Short title
-- **Symptom:** what was observed
-- **Root cause:** the underlying reason
-- **Fix:** what resolved it (data and/or code)
-- **Prevention:** how to avoid recurrence
-- **Files/refs:** key paths, symbols, log signatures
-```
+- **Symptom:** Influencer_PZ_3 (persona 24, Cursor) treated a short follow-up (`V6`) as a new task (Alamo HOTIFY / daily SOP) instead of the Fort Mason FILL series the user was answering.
+- **Root cause:** Every Cursor message is a fresh session (intentional). FullSlim flattened history but (1) told the model to treat `[current_request]` as standalone unless it was a short reply, (2) did not highlight the last interactive pair or `[quoted_message]`, (3) could truncate the **end** of the 120k prompt, which is where the live ask sits. A scheduled assistant dump immediately before the follow-up also became the disambiguation target.
+- **Fix:** Keep `Agent.create` per message. Inject `[continuation_context]` on FullSlim (quote, else last interactive pair). Skip scheduler/shell history for that pair and for PDQE short-reply disambiguation. Drop oldest `prior_turn` text when over budget instead of cutting the tail.
+- **Prevention:** Do not re-enable Cursor resume/jsonl to fix chat continuity. Continuity belongs in the gateway prompt pack. Recycle sidecar is not required for this Rust-only change; rebuild/restart gateway (`./reload.sh`).
+- **Files/refs:** `attach_full_slim_continuation` / `flatten_preserving_recent` in `src/cursor_delegation_prompt.rs`; `parse_quoted_message_block` in `src/agent_turn_context.rs`; PZ3 `V6` message `eae46cab-eeb9-4e97-9a0e-5f688103ac9e`.
+
+### 2026-09-01 — Sidecar resume store duplicated gateway context and OOMed
+
+- **Symptom:** PZ3 Cursor turns stalled ~15 minutes then stream-dropped. Sidecar later `FATAL ERROR: Reached heap limit` during `JSON.parse`. `workspace/runtime/cursor-sdk-state/` was ~1.1 GB; one chat's `checkpoints.ndjson` ~280 MB.
+- **Root cause:** `Agent.resume` + persistent `JsonlLocalAgentStore` keyed by cwd+session accumulated every tool I/O. Gateway already sends full persona + bounded chat via `prepare_agent_run` each turn, so the store duplicated context and never shrank. After HTTP drop/recycle the next turn often `Agent.create` anyway but left the giant jsonl for the next resume.
+- **Fix:** Every message is a new Cursor session. Sidecar always `Agent.create`, uses `{runtime}/cursor-sdk-ephemeral/{runId}`, disposes the agent and deletes the store when `/run` finishes. Rust no longer loads/saves `cursor_engine_agents`. Always FullSlim; resume-delta UI removed.
+- **Prevention:** Do not persist Cursor SDK checkpoints across user messages. Close the session when the reply is delivered. Recycle sidecar after runner edits.
+- **Files/refs:** `scripts/cursor-sdk-runner.mjs` (`openAgent`, `ephemeralStoreDir`); `run_cursor_engine`; log `pruned …/cursor-sdk-state`.
+
+### 2026-09-01 — PZ3 status phrases still launched 15-minute empty Cursor turns
+
+- **Symptom:** After reload, `Check what's the status?` and `what happened to you. you are not responding` still burned ~930s with `tools=` empty, then stream-drop. Exact `check again` ran the status path but reported no files (6h window missed 21:56 V2). Sidecar later wrote Conservatory V3 at 05:35 without delivering. Sidecar OOM'd (~4GB JSON.parse).
+- **Root cause:** Status matcher required the entire message to equal a phrase. PDQE still ran (and hung 35s on dead :8080) after interrupt/status. Queue empties when the HTTP turn ends, not when the user task finishes. Silent 15-min sidecar streams record no tools.
+- **Fix:** Containment match for short status/health lines; 24h then newest-files fallback; skip PDQE on `cursor_status_recheck` / `cursor_engine_stream_interrupted`.
+- **Prevention:** Do not start Cursor for “are you there / what happened / check status” variants. Empty `tools=` + 930s is a wedged sidecar, not user error.
+- **Files/refs:** `is_status_recheck_request` / `collect_persona_images` in `src/cursor_engine.rs`; `should_skip_pdqe`; history `20260901-045511.md`, `20260901-051330.md`, `20260901-053022.md`; sidecar heap OOM in `cursor-sdk-sidecar.stderr.log`.
+
+### 2026-08-31 — “check again” after Cursor stream drop started another 15-minute generation
+
+- **Symptom:** Influencer_PZ_3 Comfy queue was already empty. User sent `check again` and got another “live Cursor stream dropped” notice ~15 minutes later. They thought the request was dropped or they had made a user error.
+- **Root cause:** `check again` is a short Task intent, so Cursor started a full sidecar turn. The previous Flux Fill had already written `PZ-20260831-ATTICWINDOW-V2-*` at 21:47–21:56 after the HTTP stream died at 21:23. Interrupt copy said “try a narrower request,” which encouraged resend. Interrupt also skipped `pipeline_finish_turn`, so those turns never wrote history.
+- **Fix:** Status phrases (`check again`, `what happened`, …) skip the sidecar and deliver recent persona images (last 6h) plus an explicit “did not start a new generation” line. Interrupt notice now points at `check again` as summarize-only. Interrupt/status paths write history via `finish_cursor_engine_turn`.
+- **Prevention:** Never treat a status poll as a new Comfy/hotify job. Empty GPU queue after a stream drop means look at disk, do not relaunch. Log `cursor_status_recheck_delivered`.
+- **Files/refs:** `is_status_recheck_request` / `deliver_cursor_interrupt` in `src/cursor_engine.rs`; `cursor_stream_interrupt_notice` in `src/cursor_engine_config.rs`; PZ3 messages `ac39d612`…`a2a258b9`; artifacts `PZ-20260831-ATTICWINDOW-V2-FLUXFILL.png`.
+
+### 2026-08-31 — Cursor persona history showed Gemini; finish stalled on PDQE retry
+
+- **Symptom:** Influencer_PZ_3 (persona 24, engine override Cursor) showed Gemini in agent history for one run, and long PZ actions often failed to finalize.
+- **Root cause:** (1) Cursor history always stamped classic `LocalDelegateRunSummary` (Settings → LLM Google/Gemini) in the run header; `Engine:` was only written inside the pipeline section. (2) Recoverable sidecar errors (503 at capacity, connect/bridge) silently called `cursor_engine_classic_fallback` → Classic Gemini, while `agent_engine` still recorded the persona override `cursor`. (3) PDQE `Retry` re-entered `pipeline_finish_turn` with the same Cursor `final_text` (no sidecar nudge), adding ~150s per retry.
+- **Fix:** Always emit `Engine: {actual}`. Cursor runs record `Cursor sidecar: model @ url`. Interactive/scheduled/background Cursor no longer falls back to Classic; user sees a sidecar-unavailable notice (`cursor_engine_fallback_suppressed`). PDQE fail on Cursor fail-opens with the existing delivery notice.
+- **Prevention:** Never stamp the classic strategy LLM on a Cursor run. Never treat sidecar 503 as permission to switch engines. Cursor has no classic tool loop — do not return `FinishTurnOutcome::Retry` for `extras.agent_engine` starting with `cursor`.
+- **Files/refs:** `prepare_agent_run` in `src/channels/agent_run_prep.rs`; `cursor_engine_unavailable_result` in `src/cursor_engine.rs`; PDQE fail-open in `finish_turn_with_quality_gate`; `parseEngineLine` in `web/src/parse-agent-history.ts`; log `cursor_engine_fallback_suppressed`.
+
+### 2026-08-31 — Cursor stream decode error while background jobs still ran
+
+- **Symptom:** Videographer chat showed `This run failed before a reply was ready: Cursor sidecar stream error: error decoding response body` / `Please send your request again` (~06:40Z) while shell job `75f6fb2c` (Wait LTX Tokyo10 FLF2V concat) and several tracked Comfy jobs stayed `running`.
+- **Root cause:** Interactive reqwest client uses `interactive_timeout_secs + 30` (default 930s). When that wall clock fires mid-NDJSON body, reqwest Display is `error decoding response body` (not `timed out`), so the turn was treated as a hard `Err`. Web wrapped it with `failed_turn_notice`. Spawned tmux/tracked jobs are independent of the HTTP stream and kept running.
+- **Fix:** Map body-read timeout/reset to `http_timeout` / `stream_interrupted` instead of `Err`. If unfinished background jobs exist (or this turn called `spawn_background_command` / `register_tracked_job`), deliver a “work still running, do not resend” notice and keep any partial stream text.
+- **Prevention:** Never treat a sidecar HTTP body decode failure as “the job is dead.” Check `background_jobs.finished_at IS NULL` before telling the user to send again. Reqwest timeout-during-body must be classified via `Error::is_timeout()`, not Display.
+- **Files/refs:** `consume_sidecar_stream` / `cursor_interrupt_result` in `src/cursor_engine.rs`; `cursor_stream_interrupt_notice` in `src/cursor_engine_config.rs`; `has_unfinished_background_jobs_for_chat_persona` in `src/db.rs`; message `bffaf78a-c4e2-43f4-960a-e9c02c9b06cc`; job `75f6fb2c-65d5-4011-92e1-b59cd5bb417c`.
+
+### 2026-08-30 — Cursor engine slow / wedged sidecar capacity
+
+- **Symptom:** Interactive Cursor turns waited 45–60+ minutes; `/health` showed `runs_in_flight: 3` with only two live TCP connections; pep and Influencer_PZ_3 runs had `run_started` but no `run_finished`.
+- **Root cause:** SDK stream loop had no inactivity watchdog (only post-stream `run.wait()` 120s bound). Hung streams pinned `runs_in_flight`, blocking idle recycle and filling concurrency. Scheduled crons shared the pool with chat under a 3600s wall clock.
+- **Fix:** Sidecar stream idle timeout (`CURSOR_STREAM_IDLE_TIMEOUT_MS`, default 15m), tracked active runs + reaper force-cancel, interactive slot reserve for scheduled traffic, shorter interactive HTTP budget (`interactive_timeout_secs`, default 900s), supervisor force-recycle when `oldest_run_age_secs` stays high.
+- **Prevention:** Never rely on post-stream `wait()` alone for hang detection. Alert when `runs_in_flight` exceeds open `/run` sockets or `oldest_run_age_secs` ≫ interactive timeout. Recycle sidecar after runner edits.
+- **Files/refs:** `streamAgentTurn` / `tryBeginRun` in `scripts/cursor-sdk-runner.mjs`; `cursor_turn_timeout_secs` in `src/cursor_engine_config.rs`; `supervise_sidecar` in `src/cursor_sdk_sidecar.rs`; log `stream idle timeout`; `/health` `oldest_run_age_secs`.
 
 ### 2026-08-27 — Background command notices landed in main chat
 - **Symptom:** In a focused web session, the "Background command started (job …). You'll receive another message when it finishes." notice (and later finished/failed notices) appeared in Main instead of that session.

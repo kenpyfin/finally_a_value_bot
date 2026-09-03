@@ -125,6 +125,7 @@ export type CursorEngineConfigResponse = {
   cli_runner_url?: string
   cli_on_path?: boolean
   timeout_secs?: number
+  interactive_timeout_secs?: number
   tmux_enabled?: boolean
   mcp_tools_enabled?: boolean
   mcp_expose_send_message?: boolean

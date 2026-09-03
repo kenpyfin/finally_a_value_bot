@@ -1,4 +1,5 @@
 //! Pre-delivery Quality Evaluator (PDQE): synchronous QC before the user receives a reply.
+//! Runs for Classic and Deterministic engines only — Cursor finish skips PDQE.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,7 +101,10 @@ pub fn should_skip_pdqe(
     if !quality_eval_channel_allowed(config, &ctx.caller_channel) {
         return Some("channel_not_allowed");
     }
-    if ctx.stop_reason == "cancelled" {
+    if ctx.stop_reason == "cancelled"
+        || ctx.stop_reason == "cursor_status_recheck"
+        || ctx.stop_reason == "cursor_engine_stream_interrupted"
+    {
         return Some("stop_reason");
     }
     if ctx.delivered_text.trim().is_empty() {

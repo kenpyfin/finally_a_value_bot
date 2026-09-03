@@ -5417,6 +5417,24 @@ impl Database {
         Ok(count)
     }
 
+    /// True when this persona still has unfinished background work (shell, agent, or tracked).
+    pub fn has_unfinished_background_jobs_for_chat_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             WHERE chat_id = ?1 AND persona_id = ?2
+               AND finished_at IS NULL
+               AND status IN ('pending', 'running', 'completed_raw', 'main_agent_processing')",
+            params![chat_id, persona_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn list_background_jobs_for_chat(
         &self,
         chat_id: i64,

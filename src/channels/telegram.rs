@@ -3794,7 +3794,8 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
                 finish_turn!("memory_write_short_circuit", final_text);
             }
 
-            // Post-Tool Evaluator: check if task is complete after tool execution
+            // Post-Tool Evaluator (Classic / ClassicCostRouting only — Cursor and
+            // Deterministic do not enter this tool loop).
             if !iteration_timed_out {
                 if state.runtime_toggles.post_tool_evaluator_enabled() {
                     info!(
@@ -4458,7 +4459,20 @@ async fn finish_turn_with_quality_gate(
         runtime_data_dir: state.config.runtime_data_dir(),
     };
 
-    if crate::response_quality_evaluator::should_skip_pdqe(
+    // PTE/PDQE are Classic + Deterministic only. Cursor has no classic tool loop (no PTE)
+    // and must not wait on local/evaluator PDQE after the sidecar reply.
+    let cursor_engine = pipeline_extras
+        .map(|ex| ex.agent_engine.as_str())
+        .unwrap_or("")
+        .starts_with("cursor");
+    if cursor_engine {
+        push_pdqe_step(
+            pdqe_steps,
+            "quality_eval_skipped",
+            r#"{"reason":"cursor_engine"}"#,
+            "",
+        );
+    } else if crate::response_quality_evaluator::should_skip_pdqe(
         state.runtime_toggles.response_quality_evaluator_enabled(),
         &state.config,
         &pdqe_ctx,
@@ -5015,6 +5029,13 @@ fn assistant_text_asks_clarification(text: &str) -> bool {
         "which option",
     ];
     PHRASES.iter().any(|p| lower.contains(p))
+}
+
+pub(crate) fn user_request_is_conversational(text: &str, has_image_input: bool) -> bool {
+    matches!(
+        classify_user_intent(text, has_image_input),
+        UserIntent::Conversational
+    )
 }
 
 fn classify_user_intent(text: &str, has_image_input: bool) -> UserIntent {

@@ -1,8 +1,15 @@
-//! Cursor-only prompt shaping: slim system text and resume deltas for sidecar delegation.
+//! Cursor-only prompt shaping: slim system text for sidecar delegation.
+//!
+//! Every message is a new Cursor session (FullSlim). Resume-delta helpers remain
+//! for tests/compat but are not selected by the engine.
 //!
 //! Does not alter `prepare_agent_run` / `build_system_prompt`; Classic and Deterministic
 //! engines are unaffected.
 
+use crate::agent_turn_context::{
+    is_non_interactive_history_text, parse_current_request_content, parse_quoted_message_block,
+    QuotedMessageRef,
+};
 use crate::claude::{ContentBlock, Message, MessageContent};
 use crate::cursor_mcp_bridge::MCP_SERVER_NAME;
 
@@ -58,18 +65,12 @@ impl DelegationPromptMode {
 }
 
 pub fn select_delegation_prompt_mode(
-    resume_agent_id: Option<&str>,
-    is_scheduled_task: bool,
-    delegation_resume_delta: bool,
+    _resume_agent_id: Option<&str>,
+    _is_scheduled_task: bool,
+    _delegation_resume_delta: bool,
 ) -> DelegationPromptMode {
-    if is_scheduled_task {
-        return DelegationPromptMode::FullSlim;
-    }
-    if delegation_resume_delta && resume_agent_id.is_some() {
-        DelegationPromptMode::ResumeDelta
-    } else {
-        DelegationPromptMode::FullSlim
-    }
+    // Every user message is a new Cursor session; gateway always sends FullSlim.
+    DelegationPromptMode::FullSlim
 }
 
 /// When MCP is live and slim is enabled, replace the long tool-groups block with MCP delegation prose.
@@ -208,21 +209,39 @@ fn is_trusted_delta_message(text: &str) -> bool {
         || t.starts_with("[continuation_context]")
 }
 
-/// Last `prior_turn` user message and its immediately following assistant reply before `[current_request]`.
-pub fn extract_last_prior_turn_pair(messages: &[Message]) -> Option<(Message, Message)> {
-    let current_idx = messages.iter().rposition(|m| {
-        m.role == "user" && message_text(m).trim().starts_with("[current_request")
-    })?;
-    let before = &messages[..current_idx];
-    let user_idx = before
+fn current_request_index(messages: &[Message]) -> Option<usize> {
+    messages
         .iter()
-        .rposition(|m| m.role == "user" && is_prior_turn_message(&message_text(m)))?;
-    let user_msg = before[user_idx].clone();
-    let assistant_msg = before
-        .get(user_idx + 1)
-        .filter(|m| m.role == "assistant")?
-        .clone();
-    Some((user_msg, assistant_msg))
+        .rposition(|m| m.role == "user" && message_text(m).trim().starts_with("[current_request"))
+}
+
+fn already_has_continuation(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .any(|m| message_text(m).trim().starts_with("[continuation_context]"))
+}
+
+/// Last interactive `prior_turn` user message and a following assistant reply before `[current_request]`.
+/// Skips scheduler/shell plumbing so short follow-ups latch onto the live chat, not a cron dump.
+pub fn extract_last_prior_turn_pair(messages: &[Message]) -> Option<(Message, Message)> {
+    let current_idx = current_request_index(messages)?;
+    let before = &messages[..current_idx];
+    let mut search_end = before.len();
+    while search_end > 0 {
+        let user_idx = before[..search_end].iter().rposition(|m| {
+            m.role == "user"
+                && is_prior_turn_message(&message_text(m))
+                && !is_non_interactive_history_text(&message_text(m))
+        })?;
+        if let Some(assistant_msg) = before[user_idx + 1..]
+            .iter()
+            .find(|m| m.role == "assistant" && !is_non_interactive_history_text(&message_text(m)))
+        {
+            return Some((before[user_idx].clone(), assistant_msg.clone()));
+        }
+        search_end = user_idx;
+    }
+    None
 }
 
 fn build_continuation_context_message(user: &Message, assistant: &Message) -> Message {
@@ -240,6 +259,49 @@ fn build_continuation_context_message(user: &Message, assistant: &Message) -> Me
         role: "user".into(),
         content: MessageContent::Text(body),
     }
+}
+
+fn build_quoted_continuation_message(quote: &QuotedMessageRef) -> Message {
+    let follow = if quote.follow_up.trim().is_empty() {
+        "(no extra text — respond to the quoted message)".to_string()
+    } else {
+        quote.follow_up.clone()
+    };
+    let body = format!(
+        "[continuation_context]\n\
+         The user quoted a prior message. Treat [current_request] as a follow-up to that quote; \
+         [current_request] remains primary.\n\n\
+         ## quoted_{} (sender={} id={})\n{}\n\n\
+         ## user follow-up\n{}\n\
+         [/continuation_context]",
+        quote.role, quote.sender, quote.id, quote.content, follow
+    );
+    Message {
+        role: "user".into(),
+        content: MessageContent::Text(body),
+    }
+}
+
+fn continuation_message_for(messages: &[Message]) -> Option<Message> {
+    let current_idx = current_request_index(messages)?;
+    let current_body = parse_current_request_content(&message_text(&messages[current_idx]))?;
+    if let Some(quote) = parse_quoted_message_block(&current_body) {
+        return Some(build_quoted_continuation_message(&quote));
+    }
+    let (user, assistant) = extract_last_prior_turn_pair(messages)?;
+    Some(build_continuation_context_message(&user, &assistant))
+}
+
+/// FullSlim still uses a fresh Cursor session; this only highlights the live exchange in the prompt.
+pub fn attach_full_slim_continuation(messages: &[Message]) -> Vec<Message> {
+    let mut out = messages.to_vec();
+    if already_has_continuation(&out) {
+        return out;
+    }
+    if let Some(continuation) = continuation_message_for(&out) {
+        insert_continuation_before_current_request(&mut out, continuation);
+    }
+    out
 }
 
 fn insert_continuation_before_current_request(delta: &mut Vec<Message>, continuation: Message) {
@@ -292,12 +354,15 @@ pub fn build_cursor_delegation_prompt(
     has_image_input: bool,
 ) -> String {
     let mut prompt = match mode {
-        DelegationPromptMode::FullSlim => flatten_turn_prompt(delegation_system, messages),
+        DelegationPromptMode::FullSlim => {
+            let shaped = attach_full_slim_continuation(messages);
+            flatten_preserving_recent(delegation_system, &shaped, MAX_PROMPT_LEN)
+        }
         DelegationPromptMode::ResumeDelta => {
             let tier1_anchor = extract_tier1_anchor(delegation_system);
             let delta_messages = build_resume_delta_messages(messages);
             let runtime_header = build_minimal_runtime_header(header, tier1_anchor.as_deref());
-            flatten_turn_prompt(&runtime_header, &delta_messages)
+            flatten_preserving_recent(&runtime_header, &delta_messages, MAX_PROMPT_LEN)
         }
     };
 
@@ -314,10 +379,114 @@ pub fn build_cursor_delegation_prompt(
         );
     }
     if prompt.len() > MAX_PROMPT_LEN {
-        prompt.truncate(prompt.floor_char_boundary(MAX_PROMPT_LEN));
-        prompt.push_str("\n\n(prompt truncated for Cursor engine limit)");
+        prompt = clamp_string_keeping_current_request(prompt, MAX_PROMPT_LEN);
     }
     prompt
+}
+
+fn is_prefix_context_message(text: &str) -> bool {
+    let t = text.trim();
+    t.contains("[system_runtime_context")
+        || t.starts_with("[persona_context]")
+        || t.starts_with("[session_context")
+}
+
+fn split_messages_for_budget(messages: &[Message]) -> (Vec<Message>, Vec<Message>, Vec<Message>) {
+    let Some(current_idx) = current_request_index(messages) else {
+        return (messages.to_vec(), Vec::new(), Vec::new());
+    };
+    let suffix_start = messages[..current_idx]
+        .iter()
+        .rposition(|m| message_text(m).trim().starts_with("[continuation_context]"))
+        .unwrap_or(current_idx);
+    let mut prefix_end = 0usize;
+    for (i, msg) in messages[..suffix_start].iter().enumerate() {
+        if is_prefix_context_message(&message_text(msg)) {
+            prefix_end = i + 1;
+        } else {
+            break;
+        }
+    }
+    (
+        messages[..prefix_end].to_vec(),
+        messages[prefix_end..suffix_start].to_vec(),
+        messages[suffix_start..].to_vec(),
+    )
+}
+
+fn flatten_preserving_recent(system_prompt: &str, messages: &[Message], max: usize) -> String {
+    let (prefix, mut middle, suffix) = split_messages_for_budget(messages);
+    loop {
+        let combined = concat_message_slices(&prefix, &middle, &suffix);
+        let prompt = flatten_turn_prompt(system_prompt, &combined);
+        if prompt.len() <= max {
+            return prompt;
+        }
+        if middle.is_empty() {
+            break;
+        }
+        middle.remove(0);
+    }
+
+    const NOTICE: &str = "\n\n(older conversation trimmed for Cursor engine limit)";
+    let mut sys = system_prompt.to_string();
+    while sys.len() > 2048 {
+        let combined = concat_message_slices(&prefix, &[], &suffix);
+        let mut prompt = flatten_turn_prompt(&sys, &combined);
+        if prompt.len() + NOTICE.len() <= max {
+            prompt.push_str(NOTICE);
+            return prompt;
+        }
+        let new_len = sys.len().saturating_sub(4096).max(2048);
+        sys.truncate(sys.floor_char_boundary(new_len));
+    }
+
+    let combined = concat_message_slices(&prefix, &[], &suffix);
+    let prompt = flatten_turn_prompt(&sys, &combined);
+    if prompt.len() <= max {
+        return prompt;
+    }
+    clamp_string_keeping_current_request(prompt, max)
+}
+
+fn concat_message_slices(
+    prefix: &[Message],
+    middle: &[Message],
+    suffix: &[Message],
+) -> Vec<Message> {
+    let mut out = Vec::with_capacity(prefix.len() + middle.len() + suffix.len());
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(middle);
+    out.extend_from_slice(suffix);
+    out
+}
+
+fn clamp_string_keeping_current_request(prompt: String, max: usize) -> String {
+    if prompt.len() <= max {
+        return prompt;
+    }
+    const NOTICE: &str = "\n\n(older conversation trimmed for Cursor engine limit)\n\n";
+    let Some(req_at) = prompt.rfind("[current_request") else {
+        let keep = max.saturating_sub(NOTICE.len()).max(1);
+        let mut out = prompt;
+        out.truncate(out.floor_char_boundary(keep));
+        out.push_str(NOTICE.trim_end());
+        return out;
+    };
+    let tail = &prompt[req_at..];
+    let budget = max.saturating_sub(tail.len() + NOTICE.len());
+    if budget == 0 {
+        let mut out = tail.to_string();
+        if out.len() > max {
+            out.truncate(out.floor_char_boundary(max));
+        }
+        return out;
+    }
+    let mut head = prompt[..req_at].to_string();
+    if head.len() > budget {
+        head.truncate(head.floor_char_boundary(budget));
+    }
+    format!("{head}{NOTICE}{tail}")
 }
 
 fn flatten_turn_prompt(system_prompt: &str, messages: &[Message]) -> String {
@@ -456,18 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn mode_selection_scheduled_always_full_slim() {
+    fn mode_selection_always_full_slim() {
         assert_eq!(
             select_delegation_prompt_mode(Some("agent-1"), true, true),
             DelegationPromptMode::FullSlim
         );
-    }
-
-    #[test]
-    fn mode_selection_resume_uses_delta_when_enabled() {
         assert_eq!(
             select_delegation_prompt_mode(Some("agent-1"), false, true),
-            DelegationPromptMode::ResumeDelta
+            DelegationPromptMode::FullSlim
         );
         assert_eq!(
             select_delegation_prompt_mode(Some("agent-1"), false, false),
@@ -627,5 +792,135 @@ mod tests {
             .position(|t| t.starts_with("[current_request"))
             .expect("current_request");
         assert!(cont_idx < req_idx);
+    }
+
+    fn test_header() -> DelegationRuntimeHeader {
+        DelegationRuntimeHeader {
+            chat_id: 1,
+            persona_id: 24,
+            mcp_enabled: false,
+        }
+    }
+
+    #[test]
+    fn full_slim_injects_interactive_continuation() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "<user_message context=\"prior_turn\">for the next one, use a more direct prompt</user_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\">FILL V13 keeps the whole-skirt mask.</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\">Scheduled daily PZ pipeline is the task.</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\nV6\n[/current_request]".into(),
+                ),
+            },
+        ];
+        let prompt = build_cursor_delegation_prompt(
+            DelegationPromptMode::FullSlim,
+            "sys",
+            &messages,
+            &test_header(),
+            false,
+            false,
+        );
+        assert!(prompt.contains("[continuation_context]"));
+        assert!(prompt.contains("FILL V13"));
+        let cont_at = prompt.find("[continuation_context]").unwrap();
+        let cont_end = prompt.find("[/continuation_context]").unwrap();
+        let continuation = &prompt[cont_at..cont_end];
+        assert!(!continuation.contains("Scheduled daily"));
+        assert!(prompt.contains("[current_request"));
+        assert!(prompt.contains("V6"));
+    }
+
+    #[test]
+    fn full_slim_quoted_message_is_continuation() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "<user_message context=\"prior_turn\">unrelated</user_message>".into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\">Alamo HOTIFY-V2</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\n[quoted_message id=\"v5\" role=\"assistant\" sender=\"bot\"]\nFort Mason FILL V5 is not a keep.\n[/quoted_message]\n\nV6\n[/current_request]"
+                        .into(),
+                ),
+            },
+        ];
+        let prompt = build_cursor_delegation_prompt(
+            DelegationPromptMode::FullSlim,
+            "sys",
+            &messages,
+            &test_header(),
+            false,
+            false,
+        );
+        let cont_at = prompt.find("[continuation_context]").unwrap();
+        let cont_end = prompt.find("[/continuation_context]").unwrap();
+        let continuation = &prompt[cont_at..cont_end];
+        assert!(continuation.contains("Fort Mason FILL V5"));
+        assert!(continuation.contains("V6"));
+        assert!(!continuation.contains("Alamo HOTIFY-V2"));
+    }
+
+    #[test]
+    fn flatten_preserves_current_request_when_over_budget() {
+        let old = "x".repeat(4000);
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(format!(
+                    "<user_message context=\"prior_turn\">{old}</user_message>"
+                )),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(format!(
+                    "<assistant_message context=\"prior_turn\">{old}</assistant_message>"
+                )),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\nUNIQUE_LIVE_ASK\n[/current_request]".into(),
+                ),
+            },
+        ];
+        let prompt =
+            flatten_preserving_recent("sys", &attach_full_slim_continuation(&messages), 1500);
+        assert!(prompt.contains("UNIQUE_LIVE_ASK"));
+        assert!(prompt.contains("[current_request"));
+        assert!(
+            prompt.contains("older conversation trimmed") || !prompt.contains(&old),
+            "expected oldest history dropped or trim notice"
+        );
     }
 }

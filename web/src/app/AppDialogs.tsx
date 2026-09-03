@@ -24,6 +24,7 @@ import {
 } from '../components/skeleton'
 import {
   formatConfidence,
+  formatEngineBadgeLabel,
   formatTierBadgeLabel,
   pdqeStepBadgeKind,
   pdqeStepLabel,
@@ -489,6 +490,29 @@ function AgentHistoryEvaluatorsPanel({ parsed }: { parsed: ParsedAgentHistory })
         )}
       </div>
     </Flex>
+  )
+}
+
+function engineBadgeClass(engine: string): string {
+  const key = engine.trim().split(/\s+/)[0] ?? ''
+  switch (key) {
+    case 'cursor':
+      return 'border-[color:var(--mc-accent-primary)]/35 bg-[color:var(--mc-accent-primary)]/10 text-[color:var(--mc-accent-primary)]'
+    case 'classic':
+      return 'border-[color:var(--mc-accent-secondary)]/35 bg-[color:var(--mc-accent-secondary)]/10 text-[color:var(--mc-text-secondary)]'
+    default:
+      return 'border-[color:var(--mc-border-strong)] bg-[color:var(--mc-surface-elevated)] text-[color:var(--mc-text-primary)]'
+  }
+}
+
+function AgentHistoryEngineBadge({ engine }: { engine: string }) {
+  return (
+    <span
+      className={`inline-flex max-w-full items-center rounded-md border px-2 py-0.5 font-mono text-[11px] leading-snug ${engineBadgeClass(engine)}`}
+      title={engine}
+    >
+      Engine · {formatEngineBadgeLabel(engine)}
+    </span>
   )
 }
 
@@ -1707,6 +1731,11 @@ export function AppDialogs({
         </Tabs.List>
         <Tabs.Content value="trace">
           <>
+            {agentHistoryParsed.engine ? (
+              <div className="mb-2">
+                <AgentHistoryEngineBadge engine={agentHistoryParsed.engine} />
+              </div>
+            ) : null}
             {agentHistoryParsed.runHeader.trim() ? (
               <div
                 className={

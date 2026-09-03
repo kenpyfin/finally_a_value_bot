@@ -63,7 +63,7 @@ NDJSON text (+ optional tool_use / tool_result events) back to Rust
        ├─ PreStop hooks  (hook_turn_bridge)
        ├─ PostToolBatch  (cursor_mcp.finish_run)
        ├─ Append assistant message to messages
-       └─ pipeline_finish_turn  → PostDelivery hooks, PDQE, PreDelivery dense spill, history
+       └─ pipeline_finish_turn  → PostDelivery hooks, (no PDQE), PreDelivery dense spill, history
 ```
 
 ```mermaid
@@ -191,9 +191,9 @@ Bot hooks are defined in SQLite (`hook_definitions`) and evaluated by `hook_runt
 | `PreToolUse` | Yes | Inside MCP `tools/call` via `tool_hook_dispatch` |
 | `PostToolUse` | Yes | Inside MCP `tools/call` after tool result |
 | `PostToolBatch` | Yes | `cursor_mcp.finish_run` after sidecar completes (one batch per sidecar invocation) |
-| `PreStop` | Yes | `hook_turn_bridge` after sidecar text; deferred-commitment nudge loop (max 2 resumes) |
-| `PostDelivery` | Yes | `pipeline_finish_turn` — focus sync flag, then PDQE |
-| `PreDelivery` | Yes | `pipeline_finish_turn` after PDQE accept/fail-open — persona dense-delivery spill |
+| `PreStop` | Yes | `hook_turn_bridge` after sidecar text; deferred-commitment nudge as a new `/run` (max 2) |
+| `PostDelivery` | Yes | `pipeline_finish_turn` — focus sync flag (PDQE is **not** run for Cursor) |
+| `PreDelivery` | Yes | `pipeline_finish_turn` after PostDelivery — persona dense-delivery spill |
 
 Shipped builtins that matter for tool-heavy personas: `pretool-turn-skill-gate`, `postbatch-loop-guard`, `postdelivery-persona-focus-sync`, `prestop-deferred-commitment-guard`, `beforeturn-scheduler-policy-context`, `predelivery-dense-delivery-guard`. See [`hooks-architecture.md`](hooks-architecture.md).
 
@@ -204,46 +204,43 @@ Before `pipeline_finish_turn`, Cursor engine **appends the delivered assistant m
 ## Turn lifecycle (ordered)
 
 1. **BeforeTurn** — policy context or block.
-2. **Prompt build** — full prep for finish path; sidecar gets slim or resume-delta delegation prompt (see Context deduplication).
+2. **Prompt build** — full prep for finish path; sidecar always gets a **full slim** delegation prompt (persona + bounded chat). No resume-delta / `agent_id` session.
 3. **MCP register** — run token + inline `mcp_servers` for sidecar.
-4. **Sidecar** — `agent.send`; Cursor remote loop may call MCP tools.
+4. **Sidecar** — `Agent.create` + `agent.send`; Cursor remote loop may call MCP tools. The local store is ephemeral and deleted when `/run` finishes.
 5. **Per MCP tool** — PreToolUse → execute → PostToolUse.
-6. **PreStop** — end-turn guard; optional nudge + resume with same `agent_id`.
+6. **PreStop** — end-turn guard; optional nudge as a **new** sidecar `/run` with the original FullSlim prompt plus a follow-up instruction (the previous session is already closed).
 7. **PostToolBatch** — loop/discovery stall hints from batch stats.
 8. **Append assistant** to `messages`.
-9. **PostDelivery** — `pipeline_finish_turn` (bulletin focus sync flag, quality gate).
-10. **PreDelivery** — after PDQE accept/fail-open; persona dense-delivery may replace the delivered text with a natural LLM summary plus a public PDF URL (full report uploaded to catbox, not a local path).
+9. **PostDelivery** — `pipeline_finish_turn` (bulletin focus sync flag). **PDQE is skipped** for Cursor (`quality_eval_skipped` / `cursor_engine`); PTE never runs (no classic tool loop).
+10. **PreDelivery** — persona dense-delivery may replace the delivered text with a natural LLM summary plus a public PDF URL (full report uploaded to catbox, not a local path).
 
 Agent history records a synthetic iteration with tool rows when MCP tools ran (`had_tool_calls` set for focus-sync heuristics).
 
-## Context deduplication (Cursor-only)
+## Context (Cursor-only)
 
 Classic and Deterministic engines still receive the full `build_system_prompt` output unchanged. Only the **sidecar delegation prompt** is shaped in [`src/cursor_delegation_prompt.rs`](../src/cursor_delegation_prompt.rs) inside `run_cursor_engine`.
 
-| Mode | When | Sidecar receives |
-| --- | --- | --- |
-| **Full slim** | First turn, scheduled tasks, stale-agent retry, or resume-delta disabled | Slim system prompt (tool catalog stripped when MCP on) + full `hook_messages` flatten |
-| **Resume delta** | Resumed Cursor session (`agent_id` in DB) on interactive turns | Minimal runtime header (Tier 1 anchor + git discipline when applicable) + trusted delta messages (`[system_runtime_context]`, `[persona_context]`, `[session_context]`, `[hook_context]`, **`[continuation_context]`** last prior turn pair, `[current_request]`) |
+Every interactive and scheduled Cursor turn uses **Full slim**: slim system prompt (tool catalog stripped when MCP on) + full `hook_messages` flatten. The gateway already sends persona + bounded chat history each message; the sidecar does **not** resume a prior Cursor agent or keep a Jsonl checkpoint store.
 
-**Unchanged for finish path:** `prep.system_prompt` (full) still feeds `pipeline_finish_turn`, PDQE, and agent history.
+FullSlim additionally inserts `[continuation_context]` immediately before `[current_request]`: a user `[quoted_message]` block if present, otherwise the last interactive user/assistant pair (scheduler and background-shell notices are skipped). If the flattened prompt exceeds 120k characters, oldest `prior_turn` messages are dropped first; the live `[current_request]` is not chopped off the end.
+
+**Finish path:** `prep.system_prompt` (full) still feeds `pipeline_finish_turn` and agent history. **PTE and PDQE run only on Classic and Deterministic** — Cursor skips both.
 
 **Slim prompt** (`delegation_slim_prompt`, default on): when MCP is live, replaces the `## Tool groups` prose block with a short MCP delegation section pointing at `finally-a-value-bot`. Shortens the `# Agent Skills` intro but keeps `<available_skills>` metadata for routing.
 
-**Resume delta** (`delegation_resume_delta`, default on): avoids re-sending principles + full chat history when Cursor retains session memory via `agent_id`. Always includes the **last prior_turn user+assistant pair** as `[continuation_context]` so follow-ups like "commit and push" retain repo/task context. Tier 1 identity/repo facts are extracted from the full delegation system prompt into the minimal header. Scheduled jobs always use full slim.
-
 **PostDelivery focus sync** (`postdelivery-persona-focus-sync`): after delivery, a lightweight strategy LLM sub-call syncs bulletin/Tier 3. Task deliveries (`had_tool_calls`, long replies, or non-conversational) require `update_bulletin_focus`; sync context uses the delivered assistant text and a **fresh DB bulletin read** (not stale prep `[persona_context]`). Logs: `focus_sync_started`, `focus_sync_completed`, `focus_sync_noop`.
 
-**Stale / busy agent id:** if the sidecar reports a missing `agent_id` or `already has active run`, the DB id is cleared and the turn retries once with a **full slim** prompt (not delta). The Node sidecar also sends `local.force` so a leftover local run is expired instead of blocking the next message.
+The Node sidecar sends `local.force` on create/send so a leftover local run is expired instead of blocking the next message. The agent handle and ephemeral store directory are disposed when the `/run` HTTP response completes.
 
-Pipeline stage telemetry includes `delegation=full_slim|resume_delta|full_slim_stale_retry` and `prompt_chars=…`.
+Pipeline stage telemetry includes `delegation=full_slim`, `fresh_session=true`, and `prompt_chars=…`.
 
 ## Settings and operations
 
 | Surface | Keys / behavior |
 | --- | --- |
 | Settings → Agent engine | Current persona's engine (`personas.agent_engine_override`); other personas keep their own override or inherit the global default. |
-| Settings → Agent engine (Cursor panel) | Model, sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt**, **resume delta prompts** |
-| DB app_settings | `CURSOR_MCP_TOOLS_ENABLED`, `CURSOR_MCP_EXPOSE_SEND_MESSAGE`, `CURSOR_DELEGATION_SLIM_PROMPT`, `CURSOR_DELEGATION_RESUME_DELTA` |
+| Settings → Agent engine (Cursor panel) | Model, sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt** |
+| DB app_settings | `CURSOR_MCP_TOOLS_ENABLED`, `CURSOR_MCP_EXPOSE_SEND_MESSAGE`, `CURSOR_DELEGATION_SLIM_PROMPT` |
 | Doctor | `cursor_engine.mcp_bridge` when engine is Cursor |
 | API | `GET/PATCH /api/cursor-engine` includes `mcp_endpoint_url`, `mcp_bridge_ready` |
 

@@ -22,6 +22,8 @@ use crate::error::FinallyAValueBotError;
 const HEALTH_POLL_INTERVAL_MS: u64 = 250;
 const HEALTH_WAIT_MAX_SECS: u64 = 45;
 const SUPERVISOR_INTERVAL_SECS: u64 = 30;
+/// Force-recycle when `/health` reports runs older than this (well past interactive idle budget).
+const STUCK_RUN_FORCE_RECYCLE_SECS: u64 = 1200;
 const SUPERVISOR_HEALTH_TIMEOUT_MS: u64 = 2_500;
 const SOFT_RECYCLE_WAIT_SECS: u64 = 120;
 const SIDECAR_VENV_DIR_NAME: &str = "cursor-sdk-venv";
@@ -688,6 +690,7 @@ impl SidecarHandle {
 
 async fn supervise_sidecar(handle: Arc<SidecarHandle>) {
     let mut wedged_streak: u8 = 0;
+    let mut stuck_runs_streak: u8 = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(SUPERVISOR_INTERVAL_SECS)).await;
         let health = cursor_engine_config::probe_sidecar_health_with_timeout(
@@ -698,6 +701,7 @@ async fn supervise_sidecar(handle: Arc<SidecarHandle>) {
 
         if !health.reachable {
             wedged_streak = wedged_streak.saturating_add(1);
+            stuck_runs_streak = 0;
             if wedged_streak >= 2 {
                 wedged_streak = 0;
                 handle.force_recycle_and_respawn("wedged_health").await;
@@ -705,6 +709,24 @@ async fn supervise_sidecar(handle: Arc<SidecarHandle>) {
             continue;
         }
         wedged_streak = 0;
+
+        if health.runs_in_flight > 0 && health.oldest_run_age_secs >= STUCK_RUN_FORCE_RECYCLE_SECS {
+            stuck_runs_streak = stuck_runs_streak.saturating_add(1);
+            if stuck_runs_streak >= 3 {
+                stuck_runs_streak = 0;
+                warn!(
+                    runs_in_flight = health.runs_in_flight,
+                    oldest_run_age_secs = health.oldest_run_age_secs,
+                    "Cursor sidecar stuck runs detected; force recycling"
+                );
+                handle
+                    .force_recycle_and_respawn("stuck_runs_in_flight")
+                    .await;
+                continue;
+            }
+        } else {
+            stuck_runs_streak = 0;
+        }
 
         let mut soft_reason: Option<&'static str> = None;
         if health.uptime_secs >= handle.ctx.max_uptime_secs && health.runs_in_flight == 0 {

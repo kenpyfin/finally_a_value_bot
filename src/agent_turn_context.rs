@@ -13,6 +13,82 @@ pub struct SessionGoalContext {
 
 const SHORT_REPLY_MAX_CHARS: usize = 40;
 
+/// A web/Telegram reply-to block stored at the start of the user message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotedMessageRef {
+    pub id: String,
+    pub role: String,
+    pub sender: String,
+    pub content: String,
+    pub follow_up: String,
+}
+
+/// Parse `[quoted_message …]…[/quoted_message]` plus optional follow-up text.
+pub fn parse_quoted_message_block(text: &str) -> Option<QuotedMessageRef> {
+    let text = text.trim();
+    const PREFIX: &str = "[quoted_message ";
+    const CLOSE: &str = "[/quoted_message]";
+    if !text.starts_with(PREFIX) {
+        return None;
+    }
+    let after_prefix = &text[PREFIX.len()..];
+    let tag_end = after_prefix.find(']')?;
+    let attrs = &after_prefix[..tag_end];
+    let rest = after_prefix[tag_end + 1..].trim_start();
+    let close_idx = rest.find(CLOSE)?;
+    let content = rest[..close_idx].trim().to_string();
+    let follow_up = rest[close_idx + CLOSE.len()..].trim().to_string();
+    Some(QuotedMessageRef {
+        id: extract_quoted_attr(attrs, "id").unwrap_or_default(),
+        role: extract_quoted_attr(attrs, "role").unwrap_or_else(|| "assistant".into()),
+        sender: extract_quoted_attr(attrs, "sender").unwrap_or_default(),
+        content,
+        follow_up,
+    })
+}
+
+fn extract_quoted_attr(attrs: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = attrs.find(&needle)? + needle.len();
+    let rest = &attrs[start..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+            continue;
+        }
+        if c == '"' {
+            break;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// True when history text is scheduler/shell plumbing, not an interactive reply to latch onto.
+pub fn is_non_interactive_history_text(text: &str) -> bool {
+    let unwrapped = strip_stored_dialogue_markup(text);
+    let t = unwrapped.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    t.starts_with("##INTERNAL_SHELL_SUCCESS_FOLLOWUP##")
+        || t.starts_with("##INTERNAL_SHELL_FAILURE_RETRY##")
+        || t.starts_with("[scheduler]")
+        || t.starts_with("[scheduler]:")
+        || t.starts_with("Background command started (job `")
+        || t.starts_with("Background command cancelled (job `")
+        || t.starts_with("Background command could not be started (job `")
+        || t.starts_with("Your background command finished.")
+        || t.starts_with("The background command failed.")
+        || t.starts_with("Background job `")
+        || lower.starts_with("scheduled daily")
+}
+
 /// Parse body from `[current_request]...[/current_request]`.
 pub fn parse_current_request_content(text: &str) -> Option<String> {
     let text = text.trim();
@@ -228,22 +304,33 @@ pub fn extract_session_goal(
         current_request = latest_user_text_fallback(messages);
     }
 
-    let is_short_reply = is_short_reply_request(&current_request);
+    let quoted = parse_quoted_message_block(&current_request);
+    let is_short_reply = quoted
+        .as_ref()
+        .map(|q| q.follow_up.trim().is_empty() || is_short_reply_request(&q.follow_up))
+        .unwrap_or_else(|| is_short_reply_request(&current_request));
 
-    let disambiguation_assistant = if is_short_reply {
-        current_request_idx.and_then(|idx| {
-            messages[..idx].iter().rev().find_map(|m| {
-                let t = assistant_text_from_message(m);
-                if t.trim().is_empty() {
-                    None
-                } else {
-                    Some(truncate_for_eval(&t, 800, redactor))
-                }
+    let disambiguation_assistant =
+        if let Some(q) = quoted.as_ref().filter(|q| q.role == "assistant") {
+            if q.content.trim().is_empty() {
+                None
+            } else {
+                Some(truncate_for_eval(&q.content, 800, redactor))
+            }
+        } else if is_short_reply {
+            current_request_idx.and_then(|idx| {
+                messages[..idx].iter().rev().find_map(|m| {
+                    let t = assistant_text_from_message(m);
+                    if t.trim().is_empty() || is_non_interactive_history_text(&t) {
+                        None
+                    } else {
+                        Some(truncate_for_eval(&t, 800, redactor))
+                    }
+                })
             })
-        })
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     SessionGoalContext {
         current_request: truncate_for_eval(&current_request, 2000, redactor),
@@ -304,6 +391,79 @@ mod tests {
         assert!(!is_short_reply_request(
             "please regenerate the image with the blue background"
         ));
+    }
+
+    #[test]
+    fn parse_quoted_message_block_extracts_follow_up() {
+        let raw = "[quoted_message id=\"abc\" role=\"assistant\" sender=\"bot\"]\nV5 is not a keep.\n[/quoted_message]\n\nV6";
+        let q = parse_quoted_message_block(raw).expect("quote");
+        assert_eq!(q.id, "abc");
+        assert_eq!(q.role, "assistant");
+        assert_eq!(q.content, "V5 is not a keep.");
+        assert_eq!(q.follow_up, "V6");
+    }
+
+    #[test]
+    fn extract_session_goal_prefers_quoted_assistant() {
+        let messages = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\">Scheduled daily PZ pipeline is the task.</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\n[quoted_message id=\"x\" role=\"assistant\" sender=\"bot\"]\nFort Mason FILL V5\n[/quoted_message]\n\nV6\n[/current_request]"
+                        .into(),
+                ),
+            },
+        ];
+        let goal = extract_session_goal(&messages, None);
+        assert!(goal.is_short_reply);
+        assert!(goal
+            .disambiguation_assistant
+            .as_ref()
+            .unwrap()
+            .contains("Fort Mason FILL V5"));
+        assert!(!goal
+            .disambiguation_assistant
+            .as_ref()
+            .unwrap()
+            .contains("Scheduled daily"));
+    }
+
+    #[test]
+    fn extract_session_goal_skips_scheduled_assistant() {
+        let messages = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\">FILL V13 keeps the whole-skirt mask.</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(
+                    "<assistant_message context=\"prior_turn\">Scheduled daily PZ pipeline is the task.</assistant_message>"
+                        .into(),
+                ),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text(
+                    "[current_request sender=\"u\"]\nV6\n[/current_request]".into(),
+                ),
+            },
+        ];
+        let goal = extract_session_goal(&messages, None);
+        assert!(goal.is_short_reply);
+        let d = goal.disambiguation_assistant.unwrap();
+        assert!(d.contains("FILL V13"));
+        assert!(!d.contains("Scheduled daily"));
     }
 
     #[test]

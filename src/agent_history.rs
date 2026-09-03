@@ -350,10 +350,15 @@ impl AgentRunRecord {
         let mut md = String::with_capacity(32768);
 
         md.push_str(&format!(
-            "# Run {}\nChannel: {} | User: \"{}\"\nTotal: {} iteration(s) | Stop: {} | Duration: {} ms\n",
+            "# Run {}\nChannel: {} | User: \"{}\"\nEngine: {}\nTotal: {} iteration(s) | Stop: {} | Duration: {} ms\n",
             self.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
             self.channel,
             self.user_message_preview,
+            if self.agent_engine.trim().is_empty() {
+                "unknown"
+            } else {
+                self.agent_engine.trim()
+            },
             self.total_iterations,
             self.stop_reason,
             self.total_duration_ms,
@@ -647,6 +652,7 @@ mod tests {
             agent_engine: "classic".into(),
         };
         let md = record.to_markdown();
+        assert!(md.contains("Engine: classic"));
         assert!(md.contains("Local delegate: cost routing active"));
         assert!(md.contains("Local (read-only): qwen-test @ http://127.0.0.1:8080/v1"));
         assert!(md.contains(

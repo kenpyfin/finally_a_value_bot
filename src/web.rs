@@ -6252,6 +6252,7 @@ fn cursor_engine_json(
         "cli_runner_url": cfg.cli_runner_url,
         "cli_on_path": crate::cursor_engine_config::cli_on_path(&cfg.cli_path),
         "timeout_secs": cfg.timeout_secs,
+        "interactive_timeout_secs": cfg.interactive_timeout_secs,
         "tmux_enabled": cfg.tmux_enabled,
         "mcp_tools_enabled": cfg.mcp_tools_enabled,
         "mcp_expose_send_message": cfg.mcp_expose_send_message,
@@ -6342,6 +6343,9 @@ async fn api_cursor_engine_patch(
     if let Some(secs) = body.timeout_secs {
         cfg.timeout_secs = secs.clamp(60, 86_400);
     }
+    if let Some(secs) = body.interactive_timeout_secs {
+        cfg.interactive_timeout_secs = secs.clamp(60, 86_400);
+    }
     if let Some(enabled) = body.tmux_enabled {
         cfg.tmux_enabled = enabled;
     }
@@ -6354,9 +6358,7 @@ async fn api_cursor_engine_patch(
     if let Some(enabled) = body.delegation_slim_prompt {
         cfg.delegation_slim_prompt = enabled;
     }
-    if let Some(enabled) = body.delegation_resume_delta {
-        cfg.delegation_resume_delta = enabled;
-    }
+    cfg.delegation_resume_delta = false;
 
     if cfg.sdk_model.trim().is_empty() {
         cfg.sdk_model = crate::config::default_cursor_sdk_model();

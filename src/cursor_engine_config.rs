@@ -14,6 +14,7 @@ pub const APP_SETTING_CURSOR_AGENT_CLI_PATH: &str = "CURSOR_AGENT_CLI_PATH";
 pub const APP_SETTING_CURSOR_AGENT_MODEL: &str = "CURSOR_AGENT_MODEL";
 pub const APP_SETTING_CURSOR_AGENT_RUNNER_URL: &str = "CURSOR_AGENT_RUNNER_URL";
 pub const APP_SETTING_CURSOR_AGENT_TIMEOUT_SECS: &str = "CURSOR_AGENT_TIMEOUT_SECS";
+pub const APP_SETTING_CURSOR_INTERACTIVE_TIMEOUT_SECS: &str = "CURSOR_INTERACTIVE_TIMEOUT_SECS";
 pub const APP_SETTING_CURSOR_AGENT_TMUX_ENABLED: &str = "CURSOR_AGENT_TMUX_ENABLED";
 pub const APP_SETTING_CURSOR_SDK_MODEL_PARAMS: &str = "CURSOR_SDK_MODEL_PARAMS";
 pub const APP_SETTING_CURSOR_MCP_TOOLS_ENABLED: &str = "CURSOR_MCP_TOOLS_ENABLED";
@@ -73,6 +74,8 @@ pub struct CursorEngineSettings {
     pub cli_model: String,
     pub cli_runner_url: String,
     pub timeout_secs: u64,
+    /// Wall-clock budget for interactive Cursor turns (scheduled/background use `timeout_secs`).
+    pub interactive_timeout_secs: u64,
     pub tmux_enabled: bool,
     /// Expose bot ToolRegistry to Cursor via loopback MCP (default on).
     pub mcp_tools_enabled: bool,
@@ -80,7 +83,7 @@ pub struct CursorEngineSettings {
     pub mcp_expose_send_message: bool,
     /// Strip tool catalog from Cursor sidecar system prompt when MCP is live (default on).
     pub delegation_slim_prompt: bool,
-    /// On resumed Cursor sessions, send delta prompts instead of full flatten (default on).
+    /// Deprecated: resume-delta sessions are retired. Always false; ignored by the engine.
     pub delegation_resume_delta: bool,
 }
 
@@ -95,13 +98,18 @@ impl Default for CursorEngineSettings {
             cli_model: String::new(),
             cli_runner_url: String::new(),
             timeout_secs: 3600,
+            interactive_timeout_secs: 900,
             tmux_enabled: true,
             mcp_tools_enabled: true,
             mcp_expose_send_message: false,
             delegation_slim_prompt: true,
-            delegation_resume_delta: true,
+            delegation_resume_delta: false,
         }
     }
+}
+
+fn default_interactive_timeout_secs() -> u64 {
+    900
 }
 
 impl CursorEngineSettings {
@@ -128,11 +136,12 @@ impl CursorEngineSettings {
                 .trim()
                 .to_string(),
             timeout_secs: config.cursor_agent_timeout_secs,
+            interactive_timeout_secs: default_interactive_timeout_secs(),
             tmux_enabled: config.cursor_agent_tmux_enabled,
             mcp_tools_enabled: true,
             mcp_expose_send_message: false,
             delegation_slim_prompt: true,
-            delegation_resume_delta: true,
+            delegation_resume_delta: false,
         }
     }
 
@@ -166,6 +175,8 @@ pub struct SidecarHealth {
     pub started_at_unix: u64,
     #[serde(default)]
     pub recycle_requested: bool,
+    #[serde(default)]
+    pub oldest_run_age_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -227,6 +238,11 @@ pub fn load_from_db(
             cfg.timeout_secs = n.clamp(60, 86_400);
         }
     }
+    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_INTERACTIVE_TIMEOUT_SECS) {
+        if let Ok(n) = v.parse::<u64>() {
+            cfg.interactive_timeout_secs = n.clamp(60, 86_400);
+        }
+    }
     if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_AGENT_TMUX_ENABLED) {
         cfg.tmux_enabled = parse_bool(&v);
     }
@@ -239,9 +255,8 @@ pub fn load_from_db(
     if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_DELEGATION_SLIM_PROMPT) {
         cfg.delegation_slim_prompt = parse_bool(&v);
     }
-    if let Some(v) = read_setting(&rows, APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA) {
-        cfg.delegation_resume_delta = parse_bool(&v);
-    }
+    // Resume-delta is retired; every message is a fresh Cursor session.
+    cfg.delegation_resume_delta = false;
 
     if cfg.sdk_model.trim().is_empty() {
         cfg.sdk_model = crate::config::default_cursor_sdk_model();
@@ -280,6 +295,10 @@ pub fn persist_to_db(
         &cfg.timeout_secs.to_string(),
     )?;
     db.set_app_setting(
+        APP_SETTING_CURSOR_INTERACTIVE_TIMEOUT_SECS,
+        &cfg.interactive_timeout_secs.to_string(),
+    )?;
+    db.set_app_setting(
         APP_SETTING_CURSOR_AGENT_TMUX_ENABLED,
         if cfg.tmux_enabled { "true" } else { "false" },
     )?;
@@ -307,15 +326,64 @@ pub fn persist_to_db(
             "false"
         },
     )?;
-    db.set_app_setting(
-        APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA,
-        if cfg.delegation_resume_delta {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
+    db.set_app_setting(APP_SETTING_CURSOR_DELEGATION_RESUME_DELTA, "false")?;
     Ok(())
+}
+
+/// Effective HTTP wall-clock for a Cursor sidecar turn.
+pub fn cursor_turn_timeout_secs(
+    settings: &CursorEngineSettings,
+    is_scheduled_task: bool,
+    is_background_job: bool,
+) -> u64 {
+    let max = settings.timeout_secs.max(60);
+    if is_scheduled_task || is_background_job {
+        max
+    } else {
+        settings.interactive_timeout_secs.max(60).min(max)
+    }
+}
+
+pub fn cursor_turn_timeout_notice(timeout_secs: u64) -> String {
+    format!(
+        "This Cursor turn stopped after {timeout_secs}s without a final reply. \
+Generation may already have finished on disk (the Comfy queue can be empty). \
+Reply `check again` to summarize existing files only — that does not start a new job."
+    )
+}
+
+/// User-facing copy when the sidecar HTTP/NDJSON stream dies but work may still be running.
+pub fn cursor_stream_interrupt_notice(
+    timeout_secs: u64,
+    timed_out: bool,
+    background_still_running: bool,
+) -> String {
+    if background_still_running {
+        if timed_out {
+            format!(
+                "The live Cursor turn stopped after {timeout_secs}s, but background work for this chat is still running. \
+You'll get another message when it finishes. Do not send the same request again unless you want to start a new job."
+            )
+        } else {
+            "The live Cursor stream dropped, but background work for this chat is still running. \
+You'll get another message when it finishes. Do not send the same request again unless you want to start a new job."
+                .to_string()
+        }
+    } else if timed_out {
+        cursor_turn_timeout_notice(timeout_secs)
+    } else {
+        "The live Cursor stream dropped before a final reply was ready. \
+Generation may already have finished on disk (the Comfy queue can be empty). \
+Reply `check again` to summarize existing files only — that does not start a new job."
+            .to_string()
+    }
+}
+
+pub fn is_cursor_interrupt_notice(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("live cursor stream dropped")
+        || lower.contains("live cursor turn stopped after")
+        || lower.contains("this cursor turn stopped after")
 }
 
 pub fn validate_runner_url(url: &str) -> Result<(), String> {
@@ -395,6 +463,10 @@ pub async fn probe_sidecar_health_with_timeout(base_url: &str, timeout: Duration
                     .get("recycle_requested")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                oldest_run_age_secs: body
+                    .get("oldest_run_age_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 error: None,
             },
             Err(e) => SidecarHealth {
@@ -505,6 +577,8 @@ pub struct CursorEnginePatchRequest {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
+    pub interactive_timeout_secs: Option<u64>,
+    #[serde(default)]
     pub tmux_enabled: Option<bool>,
     #[serde(default)]
     pub mcp_tools_enabled: Option<bool>,
@@ -543,5 +617,43 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.engine_ready(&health));
+    }
+
+    #[test]
+    fn cursor_turn_timeout_secs_prefers_interactive_budget() {
+        let cfg = CursorEngineSettings {
+            timeout_secs: 3600,
+            interactive_timeout_secs: 900,
+            ..Default::default()
+        };
+        assert_eq!(cursor_turn_timeout_secs(&cfg, false, false), 900);
+        assert_eq!(cursor_turn_timeout_secs(&cfg, true, false), 3600);
+        assert_eq!(cursor_turn_timeout_secs(&cfg, false, true), 3600);
+    }
+
+    #[test]
+    fn cursor_stream_interrupt_notice_mentions_background_and_skips_resend() {
+        let with_bg = cursor_stream_interrupt_notice(900, true, true);
+        assert!(with_bg.contains("background work"));
+        assert!(with_bg.contains("Do not send the same request again"));
+        assert!(!with_bg
+            .to_lowercase()
+            .contains("please send your request again"));
+
+        let decode = cursor_stream_interrupt_notice(900, false, true);
+        assert!(decode.contains("stream dropped"));
+        assert!(decode.contains("still running"));
+
+        let timeout_only = cursor_stream_interrupt_notice(900, true, false);
+        assert!(timeout_only.contains("stopped after 900s"));
+        assert!(timeout_only.contains("check again"));
+        assert!(!timeout_only.contains("background work"));
+        assert!(!timeout_only.to_lowercase().contains("narrower request"));
+
+        let decode_idle = cursor_stream_interrupt_notice(900, false, false);
+        assert!(decode_idle.contains("stream dropped"));
+        assert!(decode_idle.contains("check again"));
+        assert!(decode_idle.contains("does not start a new job"));
+        assert!(is_cursor_interrupt_notice(&decode_idle));
     }
 }
