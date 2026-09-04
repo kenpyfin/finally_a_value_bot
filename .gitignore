@@ -26,5 +26,8 @@ workspace/shared/.venv-vault/
 workspace/**/.env
 workspace/**/node_modules/
 
+shared/
+ORIGIN/
+
 docs/development-journal.md
 builtin_skills/steel-browser/__pycache__/*
