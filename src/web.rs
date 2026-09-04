@@ -37,8 +37,9 @@ use crate::hook_executor::validate_command_payload;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
 use crate::social_oauth;
 use crate::telegram::{
-    archive_conversation, process_with_agent, process_with_agent_with_events, AgentEvent,
-    AgentRequestContext, AppState,
+    archive_conversation, history_to_claude_messages, process_with_agent,
+    process_with_agent_with_events, trim_to_recent_balanced, AgentEvent, AgentRequestContext,
+    AppState,
 };
 use crate::web_terminal::{self, TerminalHub};
 use std::time::SystemTime;
@@ -333,6 +334,30 @@ struct SendRequest {
     session_id: Option<String>,
     #[serde(default)]
     attachments: Vec<SendAttachmentRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchPersonaMessageBody {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubthreadHistoryTurn {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubthreadStreamRequest {
+    chat_id: Option<i64>,
+    persona_id: Option<i64>,
+    anchor_message_id: String,
+    message: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Prior ephemeral turns in this side chat (not including the current message).
+    #[serde(default)]
+    history: Vec<SubthreadHistoryTurn>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1445,6 +1470,462 @@ async fn api_send_stream(
     })))
 }
 
+/// Ephemeral side-chat stream: seeds context from the anchor bot message + cockpit window,
+/// then runs the shared agent without persisting side-chat turns into main history.
+async fn api_subthread_stream(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<SubthreadStreamRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let start = Instant::now();
+
+    let text = body.message.trim().to_string();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message is required".into()));
+    }
+    if text.chars().count() > 100_000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "message exceeds 100000 character limit".into(),
+        ));
+    }
+    if body.history.len() > 40 {
+        return Err((StatusCode::BAD_REQUEST, "history exceeds 40 turns".into()));
+    }
+
+    let anchor_message_id = body.anchor_message_id.trim().to_string();
+    if anchor_message_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "anchor_message_id is required".into(),
+        ));
+    }
+
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let key = format!("chat:{}", chat_id);
+    if let Err((status, msg)) = state.request_hub.begin(&key, &state.limits).await {
+        return Err((status, msg));
+    }
+
+    let cid = chat_id;
+    let persona_id = if let Some(pid) = body.persona_id {
+        pid
+    } else {
+        match call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_current_persona_id(cid)
+        })
+        .await
+        {
+            Ok(pid) => pid,
+            Err(e) => {
+                state.request_hub.end_with_limits(&key, &state.limits).await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        }
+    };
+
+    let pid_check = persona_id;
+    let exists = match call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid_check)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            state.request_hub.end_with_limits(&key, &state.limits).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+    if !exists {
+        state.request_hub.end_with_limits(&key, &state.limits).await;
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let pid_lookup = persona_id;
+    let anchor = match call_blocking(state.app_state.db.clone(), {
+        let anchor_message_id = anchor_message_id.clone();
+        move |db| db.get_message_for_persona(chat_id, pid_lookup, &anchor_message_id)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            state.request_hub.end_with_limits(&key, &state.limits).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+    let Some(anchor) = anchor else {
+        state.request_hub.end_with_limits(&key, &state.limits).await;
+        return Err((StatusCode::NOT_FOUND, "anchor message not found".into()));
+    };
+    if !anchor.is_from_bot {
+        state.request_hub.end_with_limits(&key, &state.limits).await;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "anchor must be a bot response".into(),
+        ));
+    }
+
+    let session_id = body
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // Prefer the anchor's own session scope when present.
+    let session_for_seed = session_id.clone().or_else(|| anchor.session_id.clone());
+
+    let pid_hist = persona_id;
+    let max_ts = anchor.timestamp.clone();
+    let session_for_query = session_for_seed.clone();
+    let prior = match call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_messages_up_to(chat_id, pid_hist, &max_ts, session_for_query.as_deref())
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            state.request_hub.end_with_limits(&key, &state.limits).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+
+    let pid_persona = persona_id;
+    let persona_row = match call_blocking(state.app_state.db.clone(), move |db| {
+        db.get_persona(pid_persona)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            state.request_hub.end_with_limits(&key, &state.limits).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+
+    let min_user = persona_row
+        .as_ref()
+        .and_then(|p| p.recent_history_min_user)
+        .map(|n| (n as usize).clamp(1, 25))
+        .unwrap_or_else(|| {
+            state
+                .app_state
+                .config
+                .recent_history_min_user_messages
+                .clamp(1, 25)
+        });
+    let min_asst = persona_row
+        .as_ref()
+        .and_then(|p| p.recent_history_min_assistant)
+        .map(|n| (n as usize).clamp(1, 25))
+        .unwrap_or_else(|| {
+            state
+                .app_state
+                .config
+                .recent_history_min_assistant_messages
+                .clamp(1, 25)
+        });
+
+    let mut seeded = history_to_claude_messages(&prior, &state.app_state.config.bot_username, true);
+    seeded = trim_to_recent_balanced(seeded, min_user, min_asst);
+
+    for turn in &body.history {
+        let role = turn.role.trim().to_ascii_lowercase();
+        let content = turn.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let role = match role.as_str() {
+            "assistant" | "bot" => "assistant",
+            _ => "user",
+        };
+        seeded.push(Message {
+            role: role.into(),
+            content: MessageContent::Text(content.to_string()),
+        });
+    }
+    seeded.push(Message {
+        role: "user".into(),
+        content: MessageContent::Text(text.clone()),
+    });
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    state.run_hub.create(&run_id).await;
+    let queue_label = format!("subthread: {}", text.chars().take(100).collect::<String>());
+    let abort_hook = {
+        let run_hub = state.run_hub.clone();
+        let run_id_abort = run_id.clone();
+        let limits = state.limits.clone();
+        std::sync::Arc::new(move |reason: String| {
+            let run_hub = run_hub.clone();
+            let run_id_abort = run_id_abort.clone();
+            let limits = limits.clone();
+            let reason_for_hub = reason.clone();
+            Box::pin(async move {
+                run_hub
+                    .publish(
+                        &run_id_abort,
+                        "error",
+                        serde_json::json!({ "error": reason_for_hub }).to_string(),
+                        limits.run_history_limit,
+                    )
+                    .await;
+                run_hub.remove_later(run_id_abort, 300).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        })
+    };
+    let queue_meta = QueueEnqueueMeta {
+        run_id: run_id.clone(),
+        persona_id,
+        source: QueueSource::Web,
+        label: queue_label,
+        project_id: None,
+        workflow_id: None,
+        on_hard_abort: Some(abort_hook),
+    };
+
+    let state_for_task = state.clone();
+    let run_id_for_task = run_id.clone();
+    let limits = state.limits.clone();
+    let history_override = seeded;
+    let session_id_for_run = session_for_seed;
+    let (queue_position, _) = state
+        .app_state
+        .chat_queue
+        .enqueue_with_meta(chat_id, queue_meta, |cancel| async move {
+            let run_start = Instant::now();
+            state_for_task
+                .run_hub
+                .publish(
+                    &run_id_for_task,
+                    "status",
+                    json!({"message": "running"}).to_string(),
+                    limits.run_history_limit,
+                )
+                .await;
+
+            let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            let run_hub = state_for_task.run_hub.clone();
+            let run_id_for_events = run_id_for_task.clone();
+            let run_history_limit = limits.run_history_limit;
+            let forward = tokio::spawn(async move {
+                while let Some(evt) = evt_rx.recv().await {
+                    match evt {
+                        AgentEvent::Iteration { iteration } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "status",
+                                    json!({"message": format!("iteration {iteration}")})
+                                        .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::ToolStart {
+                            tool_use_id,
+                            name,
+                            input,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "tool_start",
+                                    json!({
+                                        "tool_use_id": tool_use_id,
+                                        "name": name,
+                                        "input": input
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::ToolResult {
+                            tool_use_id,
+                            name,
+                            is_error,
+                            output,
+                            duration_ms,
+                            status_code,
+                            bytes,
+                            error_type,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "tool_result",
+                                    json!({
+                                        "tool_use_id": tool_use_id,
+                                        "name": name,
+                                        "is_error": is_error,
+                                        "output": output,
+                                        "duration_ms": duration_ms,
+                                        "status_code": status_code,
+                                        "bytes": bytes,
+                                        "error_type": error_type
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::TextDelta { delta } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "delta",
+                                    json!({"delta": delta}).to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::Hook {
+                            event_name,
+                            tool_name,
+                            matched_hook_ids,
+                            blocked_reason,
+                            additional_context_count,
+                        } => {
+                            run_hub
+                                .publish(
+                                    &run_id_for_events,
+                                    "hook",
+                                    json!({
+                                        "event_name": event_name,
+                                        "tool_name": tool_name,
+                                        "matched_hook_ids": matched_hook_ids,
+                                        "blocked_reason": blocked_reason,
+                                        "additional_context_count": additional_context_count,
+                                    })
+                                    .to_string(),
+                                    run_history_limit,
+                                )
+                                .await;
+                        }
+                        AgentEvent::FinalResponse { text } => {
+                            if !text.is_empty() {
+                                run_hub
+                                    .publish(
+                                        &run_id_for_events,
+                                        "delta",
+                                        json!({"delta": text}).to_string(),
+                                        run_history_limit,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let agent_result = process_with_agent_with_events(
+                &state_for_task.app_state,
+                AgentRequestContext {
+                    caller_channel: "web",
+                    chat_id,
+                    chat_type: "private",
+                    persona_id,
+                    is_scheduled_task: false,
+                    is_background_job: false,
+                    run_key: Some(run_id_for_task.clone()),
+                    reply_bot_instance_id: None,
+                    session_id: session_id_for_run,
+                    history_override: Some(history_override),
+                },
+                None,
+                None,
+                Some(&evt_tx),
+                Some(cancel),
+            )
+            .await;
+
+            // Never persist sub-thread turns — stream result only.
+            let response = match agent_result {
+                Ok(agent_out) => ensure_visible_turn_text(&agent_out.response),
+                Err(e) => {
+                    warn!(
+                        target: "web",
+                        chat_id,
+                        persona_id,
+                        error = %e,
+                        "subthread agent run failed"
+                    );
+                    failed_turn_notice(&e.to_string())
+                }
+            };
+
+            state_for_task
+                .run_hub
+                .publish(
+                    &run_id_for_task,
+                    "done",
+                    json!({ "response": response, "ephemeral": true }).to_string(),
+                    limits.run_history_limit,
+                )
+                .await;
+
+            drop(evt_tx);
+            let _ = forward.await;
+            info!(
+                target: "web",
+                endpoint = "/api/subthread_stream",
+                chat_id = chat_id,
+                run_id = %run_id_for_task,
+                latency_ms = run_start.elapsed().as_millis(),
+                "Subthread stream run finished"
+            );
+
+            state_for_task
+                .run_hub
+                .remove_later(run_id_for_task, 300)
+                .await;
+        })
+        .await;
+
+    state
+        .run_hub
+        .publish(
+            &run_id,
+            "status",
+            json!({
+                "message": if queue_position > 1 {
+                    format!("queued ({} ahead)", queue_position.saturating_sub(1))
+                } else {
+                    "queued".to_string()
+                }
+            })
+            .to_string(),
+            limits.run_history_limit,
+        )
+        .await;
+    state.request_hub.end_with_limits(&key, &state.limits).await;
+    info!(
+        target: "web",
+        endpoint = "/api/subthread_stream",
+        chat_id = chat_id,
+        run_id = %run_id,
+        queue_position = queue_position,
+        latency_ms = start.elapsed().as_millis(),
+        "Accepted subthread stream run"
+    );
+
+    Ok(Json(json!({
+        "ok": true,
+        "run_id": run_id,
+        "state": "queued",
+        "queue_position": queue_position,
+        "ephemeral": true,
+        "context_window": {
+            "min_user": min_user,
+            "min_assistant": min_asst,
+        },
+    })))
+}
+
 async fn api_stream(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -2254,6 +2735,7 @@ async fn send_and_store_response_with_events(
             run_key: run_key.map(|s| s.to_string()),
             reply_bot_instance_id: None,
             session_id: body.session_id.clone(),
+            history_override: None,
         },
         None,
         image_data,
@@ -3148,6 +3630,7 @@ async fn bootstrap_chat_session_context(
             run_key: None,
             reply_bot_instance_id: None,
             session_id: Some(session_id.clone()),
+            history_override: None,
         },
         Some(&bootstrap_prompt),
         None,
@@ -4278,6 +4761,64 @@ async fn api_persona_message_get(
             "is_from_bot": m.is_from_bot,
             "timestamp": m.timestamp,
         }
+    })))
+}
+
+async fn api_persona_message_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaMessagePathParams>,
+    Json(body): Json<PatchPersonaMessageBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let message_id = path.message_id.trim().to_string();
+    if message_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id is required".into()));
+    }
+
+    let content = body.content.trim().to_string();
+    if content.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "content is required".into()));
+    }
+    if content.chars().count() > 100_000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "content exceeds 100000 character limit".into(),
+        ));
+    }
+
+    let pid_update = path.persona_id;
+    let updated = call_blocking(state.app_state.db.clone(), {
+        let message_id = message_id.clone();
+        let content = content.clone();
+        move |db| db.update_message_content(chat_id, pid_update, &message_id, &content)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "message not found".into()));
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "message_id": message_id,
+        "content": content,
+        "updated": true,
     })))
 }
 
@@ -7632,6 +8173,10 @@ fn build_router(web_state: WebState) -> Router {
             "/api/send_stream",
             post(api_send_stream).layer(DefaultBodyLimit::max(json_limit)),
         )
+        .route(
+            "/api/subthread_stream",
+            post(api_subthread_stream).layer(DefaultBodyLimit::max(json_limit)),
+        )
         .route("/api/stream", get(api_stream))
         .route("/api/run_status", get(api_run_status))
         .route("/api/queue_diagnostics", get(api_queue_diagnostics))
@@ -7675,7 +8220,9 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route(
             "/api/personas/:persona_id/messages/:message_id",
-            get(api_persona_message_get).delete(api_persona_message_delete),
+            get(api_persona_message_get)
+                .patch(api_persona_message_patch)
+                .delete(api_persona_message_delete),
         )
         .route(
             "/api/personas/:persona_id/memory",

@@ -29,9 +29,11 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
   const [modelsNotice, setModelsNotice] = useState<string | null>(null)
   const lastLoadedKeyRef = useRef('')
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setSaveNotice(null)
+  const load = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) {
+      setLoading(true)
+      setSaveNotice(null)
+    }
     try {
       const data = await api<LlmConfigResponse>('/api/llm')
       setLlm(data)
@@ -112,7 +114,12 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
         setCustomModel('')
         return
       }
-      if (!current && models[0]) {
+      if (current) {
+        setUseCustom(true)
+        setCustomModel(current)
+        return
+      }
+      if (models[0]) {
         setUseCustom(false)
         setSelectedModel(models[0].id)
       }
@@ -240,7 +247,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
         }),
       })
       setSaveNotice(res.message ?? 'Saved.')
-      await load()
+      await load({ silent: true })
       onSaved?.(res.model ?? model)
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
@@ -352,11 +359,11 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
             {loadingModels ? 'Loading…' : 'Refresh models'}
           </Button>
         </Flex>
-        {!useCustom ? (
+        {!useCustom && selectedModel && catalogForProvider.some((m) => m.id === selectedModel) ? (
           <Select.Root value={selectedModel} onValueChange={setSelectedModel}>
             <Select.Trigger placeholder="Select model" />
             <Select.Content>
-              {catalogForProvider.map((m) => (
+              {catalogForProvider.filter((m) => m.id).map((m) => (
                 <Select.Item key={m.id} value={m.id}>
                   {catalogLabel(m)}
                 </Select.Item>

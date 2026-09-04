@@ -584,6 +584,7 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                                     crate::db::BOT_INSTANCE_WHATSAPP_PRIMARY,
                                 ),
                                 session_id: None,
+                                history_override: None,
                             },
                             None,
                             image_data,

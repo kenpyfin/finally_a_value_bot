@@ -2003,6 +2003,7 @@ mod tests {
             run_key: Some("scheduled:42:2026-01-01T00:00:00Z".into()),
             reply_bot_instance_id: None,
             session_id: None,
+            history_override: None,
         };
         assert_eq!(
             cursor_session_scope(&ctx),

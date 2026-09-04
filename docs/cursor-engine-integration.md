@@ -238,7 +238,7 @@ Pipeline stage telemetry includes `delegation=full_slim`, `fresh_session=true`, 
 
 | Surface | Keys / behavior |
 | --- | --- |
-| Settings → Agent engine | Current persona's engine (`personas.agent_engine_override`); other personas keep their own override or inherit the global default. |
+| Settings → Agent engine | Click an engine pill to save for the **current persona** (`personas.agent_engine_override`). **Inherit default** clears the override. **Inherit default** dropdown PATCHes global `AGENT_ENGINE` for personas without an override. The **Show settings for** dropdown only previews knobs and does not save. |
 | Settings → Agent engine (Cursor panel) | Model, sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt** |
 | DB app_settings | `CURSOR_MCP_TOOLS_ENABLED`, `CURSOR_MCP_EXPOSE_SEND_MESSAGE`, `CURSOR_DELEGATION_SLIM_PROMPT` |
 | Doctor | `cursor_engine.mcp_bridge` when engine is Cursor |

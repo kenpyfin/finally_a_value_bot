@@ -7,6 +7,7 @@ import '../styles.css'
 import { api, makeHeaders } from '../api/client'
 import { CockpitBar } from '../components/cockpit-bar'
 import { SessionSidebar } from '../components/session-sidebar'
+import { SubthreadSidePane } from '../components/subthread-side-pane'
 import { ThreadPane } from '../components/thread-pane'
 import { useConfirmDialog } from '../components/confirm-dialog'
 import { ErrorBanner } from '../components/error-banner'
@@ -42,6 +43,7 @@ import {
   type AgentHistoryOptimizeRequest,
   type AgentHistoryOptimizeResponse,
   type BackgroundJobItem,
+  type BackendMessage,
   type ChannelBinding,
   type InstallationStatus,
   type QueueItem,
@@ -413,6 +415,7 @@ export function App({
     handleReplyToMessage,
     handleDismissPendingReply,
     handleDeleteMessage,
+    handleSaveMessageEdit,
     activeDraftText,
     activePendingReply,
     handleDraftTextChange,
@@ -421,6 +424,46 @@ export function App({
     setDraftByThreadKey,
     setPendingReplyByThreadKey,
   } = chat
+
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  const [activeSubthread, setActiveSubthread] = useState<{
+    messageId: string
+    anchorMessage: BackendMessage
+  } | null>(null)
+
+  const handleOpenSubthread = useCallback(
+    async (messageId: string) => {
+      if (activePersonaId == null) return
+      if (activeSubthread?.messageId === messageId) {
+        setActiveSubthread(null)
+        return
+      }
+      try {
+        setStatusText('Opening side chat…')
+        const data = await api<{ message?: BackendMessage }>(
+          `/api/personas/${activePersonaId}/messages/${encodeURIComponent(messageId)}`,
+        )
+        const m = data.message
+        if (!m || !m.is_from_bot) {
+          setError('Side chat requires a bot response')
+          setStatusText('Idle')
+          return
+        }
+        setActiveSubthread({ messageId, anchorMessage: m })
+        setStatusText('Side chat open')
+        setError('')
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+        setStatusText('Idle')
+      }
+    },
+    [activePersonaId, activeSubthread?.messageId, setError, setStatusText],
+  )
+
+  useEffect(() => {
+    setEditingMessageId(null)
+    setActiveSubthread(null)
+  }, [activePersonaId, activeSessionId, chatId])
 
   const [replayNotice, setReplayNotice] = useState<string>('')
   const [schedules, setSchedules] = useState<ScheduleTask[]>([])
@@ -2019,33 +2062,51 @@ export function App({
               </div>
 
               <div className="flex min-h-0 min-w-0 flex-1 flex-col px-0 pb-1 md:px-1">
-                <div className="min-h-0 min-w-0 flex-1">
-                  <ThreadPane
-                    key={runtimeKey}
-                    adapter={adapter}
-                    initialMessages={historySeed}
-                    runtimeKey={runtimeKey}
-                    isStreaming={pendingRunsForActivePersona.length > 0}
-                    historyLoading={historyLoading}
-                    historyHasMore={historyHasMore}
-                    historyLoadingMore={historyLoadingMore}
-                    onLoadMoreHistory={loadMoreHistory}
-                    draftText={activeDraftText}
-                    onDraftTextChange={handleDraftTextChange}
-                    bookmarkedMessageIds={bookmarkedMessageIds}
-                    onToggleBookmark={toggleMessageBookmark}
-                    onReplyToMessage={handleReplyToMessage}
-                    onDeleteMessage={handleDeleteMessage}
-                    pendingReply={activePendingReply}
-                    onDismissPendingReply={handleDismissPendingReply}
-                    onMobileThreadScroll={handleMobileThreadScroll}
-                    onShowShortcuts={handleShowShortcuts}
-                    uploadHint={
-                      statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
-                        ? statusText
-                        : undefined
-                    }
-                  />
+                <div className="mc-thread-with-subthread min-h-0 min-w-0 flex-1">
+                  <div className="mc-thread-main">
+                    <ThreadPane
+                      key={runtimeKey}
+                      adapter={adapter}
+                      initialMessages={historySeed}
+                      runtimeKey={runtimeKey}
+                      isStreaming={pendingRunsForActivePersona.length > 0}
+                      historyLoading={historyLoading}
+                      historyHasMore={historyHasMore}
+                      historyLoadingMore={historyLoadingMore}
+                      onLoadMoreHistory={loadMoreHistory}
+                      draftText={activeDraftText}
+                      onDraftTextChange={handleDraftTextChange}
+                      bookmarkedMessageIds={bookmarkedMessageIds}
+                      onToggleBookmark={toggleMessageBookmark}
+                      onReplyToMessage={handleReplyToMessage}
+                      onDeleteMessage={handleDeleteMessage}
+                      onSaveMessageEdit={handleSaveMessageEdit}
+                      onOpenSubthread={handleOpenSubthread}
+                      editingMessageId={editingMessageId}
+                      onEditingMessageIdChange={setEditingMessageId}
+                      activeSubthreadMessageId={activeSubthread?.messageId ?? null}
+                      pendingReply={activePendingReply}
+                      onDismissPendingReply={handleDismissPendingReply}
+                      onMobileThreadScroll={handleMobileThreadScroll}
+                      onShowShortcuts={handleShowShortcuts}
+                      uploadHint={
+                        statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
+                          ? statusText
+                          : undefined
+                      }
+                    />
+                  </div>
+                  {activeSubthread ? (
+                    <SubthreadSidePane
+                      chatId={chatId}
+                      personaId={activePersonaId}
+                      sessionId={activeSessionId}
+                      anchorMessageId={activeSubthread.messageId}
+                      anchorMessage={activeSubthread.anchorMessage}
+                      historySuffix={bulletinHistorySuffix}
+                      onClose={() => setActiveSubthread(null)}
+                    />
+                  ) : null}
                 </div>
               </div>
             </div>

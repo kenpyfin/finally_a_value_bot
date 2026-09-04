@@ -644,6 +644,7 @@ pub(crate) async fn ingest_wecom_incoming(
                     run_key: None,
                     reply_bot_instance_id: Some(crate::db::BOT_INSTANCE_WECOM_PRIMARY),
                     session_id: None,
+                    history_override: None,
                 },
                 None,
                 image_data,

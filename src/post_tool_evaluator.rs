@@ -1,7 +1,8 @@
 //! Post-Tool Evaluator (PTE): evaluates whether a task is complete after tool execution.
 //! Called after each tool iteration on the Classic / ClassicCostRouting agent loop only
 //! (Cursor and Deterministic do not use this path).
-//! Decides whether to continue the agent loop or synthesize a final response.
+//! Decides whether to continue the agent loop, ask the user, or synthesize a final response.
+//! Doubt defaults to `ask_user` (clarification), not another tool round.
 
 use crate::agent_turn_context::extract_session_goal;
 use crate::claude::{ContentBlock, Message, MessageContent, ResponseContentBlock};
@@ -41,19 +42,39 @@ pub fn pte_action_name(action: &PteAction) -> &'static str {
     }
 }
 
+/// User-visible reply when PTE chooses `ask_user`.
+pub fn format_pte_ask_user_reply(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return "I need a clarification before continuing. What should I do next?".into();
+    }
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("stalled") {
+        return format!(
+            "I paused because progress is stalled: {reason} Choose: retry now, wait, or adjust the request."
+        );
+    }
+    if reason.ends_with('?') {
+        reason.to_string()
+    } else {
+        format!("I need a clarification before continuing: {reason}")
+    }
+}
+
 /// Build the PTE system prompt with principles and memory context baked in.
 fn build_pte_system_prompt(principles_content: &str, memory_context: &str) -> String {
     let mut prompt = String::from(
         r#"You are a task-completion evaluator. Judge whether the session goal (`current_request`) is fulfilled by tool results so far.
 
-Output JSON only: {"action": "continue" | "complete", "reason": "brief rationale"}
+Output JSON only: {"action": "continue" | "complete" | "ask_user", "reason": "brief rationale or a direct question for the user"}
 
 Rules:
 - "complete" = the session goal (`current_request`) is fulfilled by tool results
-- "continue" = more steps needed, or results are partial/inconclusive for that goal
+- "continue" = a clear next tool step will make progress toward that goal
+- "ask_user" = missing critical information, blocked, ambiguous, or no clear next step without guessing. Put a direct clarification question in reason
 - Prior turns and bulletin/memory are background — judge only `current_request`
 - Consider principles as constraints only
-- If in doubt, say "continue"
+- If in doubt, say "ask_user" (do not keep calling tools)
 - Keep reason concise (one sentence)
 "#,
     );
@@ -425,9 +446,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pte_ask_user() {
+        let j = r#"{"action": "ask_user", "reason": "Which mailbox should I open?"}"#;
+        let r = parse_pte_response(j).unwrap();
+        assert_eq!(r.action, PteAction::AskUser);
+        assert_eq!(r.reason, "Which mailbox should I open?");
+    }
+
+    #[test]
+    fn test_format_pte_ask_user_reply_question() {
+        let text = format_pte_ask_user_reply("Which mailbox should I open?");
+        assert_eq!(text, "Which mailbox should I open?");
+    }
+
+    #[test]
+    fn test_format_pte_ask_user_reply_statement() {
+        let text = format_pte_ask_user_reply("The mailcode cannot be fetched with available tools");
+        assert!(text.starts_with("I need a clarification before continuing:"));
+        assert!(text.contains("mailcode"));
+    }
+
+    #[test]
+    fn test_format_pte_ask_user_reply_stalled() {
+        let text = format_pte_ask_user_reply(
+            "Repeated stalled failures detected; stop loop and ask user whether to retry or wait.",
+        );
+        assert!(text.contains("progress is stalled"));
+        assert!(text.contains("retry now"));
+    }
+
+    #[test]
     fn test_build_pte_system_prompt_empty() {
         let prompt = build_pte_system_prompt("", "");
         assert!(prompt.contains("task-completion evaluator"));
+        assert!(prompt.contains("ask_user"));
+        assert!(prompt.contains("If in doubt, say \"ask_user\""));
+        assert!(!prompt.contains("If in doubt, say \"continue\""));
         assert!(!prompt.contains("# Principles"));
         assert!(!prompt.contains("# Memory Context"));
     }

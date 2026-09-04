@@ -183,6 +183,8 @@ pub async fn prepare_agent_run(
 
     let mut messages = if context.is_background_job {
         Vec::new()
+    } else if let Some(ref override_msgs) = context.history_override {
+        override_msgs.clone()
     } else if let Some(ref sid) = context.session_id {
         let session_id = sid.clone();
         let history = call_blocking(state.db.clone(), move |db| {
@@ -233,7 +235,7 @@ pub async fn prepare_agent_run(
         }
     }
 
-    if context.session_id.is_none() {
+    if context.session_id.is_none() && context.history_override.is_none() {
         messages = trim_to_recent_balanced(messages, min_user_suffix, min_asst_suffix);
     }
 

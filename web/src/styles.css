@@ -893,6 +893,312 @@ html:not(.dark) .aui-composer-send:hover {
   color: #f87171;
 }
 
+.mc-msg-action-btn-active {
+  color: var(--mc-accent);
+  background: color-mix(in srgb, var(--mc-accent) 12%, transparent);
+  opacity: 1;
+}
+
+.mc-msg-subthread-anchor {
+  outline: 1px solid color-mix(in srgb, var(--mc-accent) 45%, transparent);
+  border-radius: 0.75rem;
+}
+
+.mc-inline-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 100%;
+  max-width: 100%;
+}
+
+.mc-inline-editor-textarea {
+  width: 100%;
+  min-height: 6rem;
+  resize: vertical;
+  border-radius: 0.65rem;
+  border: 1px solid var(--mc-border-soft);
+  background: var(--mc-bg-panel);
+  color: var(--mc-text-primary);
+  font: inherit;
+  font-size: 0.92rem;
+  line-height: 1.45;
+  padding: 0.7rem 0.8rem;
+}
+
+.mc-inline-editor-textarea:focus {
+  outline: 2px solid color-mix(in srgb, var(--mc-accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
+.mc-inline-editor-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.mc-inline-editor-btn {
+  border: 1px solid var(--mc-border-soft);
+  background: transparent;
+  color: var(--mc-text-muted);
+  border-radius: 0.45rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mc-inline-editor-btn:hover:not(:disabled) {
+  color: var(--mc-text-primary);
+  border-color: var(--mc-border-strong);
+}
+
+.mc-inline-editor-btn-primary {
+  background: color-mix(in srgb, var(--mc-accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--mc-accent) 40%, transparent);
+  color: var(--mc-text-primary);
+}
+
+.mc-inline-editor-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mc-inline-editor-error {
+  color: #f87171;
+  font-size: 0.75rem;
+}
+
+.mc-inline-editor-hint {
+  color: var(--mc-text-faint);
+  font-size: 0.7rem;
+}
+
+.mc-thread-with-subthread {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  flex: 1;
+  gap: 0;
+}
+
+.mc-thread-with-subthread > .mc-thread-main {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+
+.mc-subthread-pane {
+  display: flex;
+  flex-direction: column;
+  width: min(420px, 100%);
+  min-width: 280px;
+  border-left: 1px solid var(--mc-border-soft);
+  background: color-mix(in srgb, var(--mc-bg-panel) 88%, transparent);
+  min-height: 0;
+}
+
+.mc-subthread-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 0.85rem 0.55rem;
+  border-bottom: 1px solid var(--mc-border-soft);
+}
+
+.mc-subthread-title {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--mc-text-primary);
+}
+
+.mc-subthread-meta {
+  margin-top: 0.15rem;
+  font-size: 0.7rem;
+  color: var(--mc-text-muted);
+}
+
+.mc-subthread-close {
+  border: 0;
+  background: transparent;
+  color: var(--mc-text-muted);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.35rem;
+}
+
+.mc-subthread-close:hover {
+  color: var(--mc-text-primary);
+  background: color-mix(in srgb, var(--mc-accent) 10%, transparent);
+}
+
+.mc-subthread-anchor {
+  margin: 0.65rem 0.75rem 0.25rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 0.55rem;
+  border: 1px solid var(--mc-border-soft);
+  background: color-mix(in srgb, var(--mc-accent) 6%, transparent);
+}
+
+.mc-subthread-anchor-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--mc-text-muted);
+}
+
+.mc-subthread-anchor-snippet {
+  margin-top: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--mc-text-primary);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mc-subthread-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0.65rem 0.75rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.mc-subthread-empty {
+  margin: auto 0;
+  text-align: center;
+  color: var(--mc-text-muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  padding: 1rem;
+}
+
+.mc-subthread-bubble {
+  border: 1px solid var(--mc-border-soft);
+  border-radius: 0.65rem;
+  padding: 0.55rem 0.65rem;
+  background: var(--mc-bg-main);
+}
+
+.mc-subthread-bubble-user {
+  background: color-mix(in srgb, var(--mc-accent) 8%, var(--mc-bg-panel));
+}
+
+.mc-subthread-bubble-role {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--mc-text-muted);
+  margin-bottom: 0.25rem;
+}
+
+.mc-subthread-plain,
+.mc-subthread-markdown {
+  font-size: 0.86rem;
+  line-height: 1.45;
+  color: var(--mc-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.mc-subthread-markdown p {
+  margin: 0.35rem 0;
+}
+
+.mc-subthread-markdown p:first-child {
+  margin-top: 0;
+}
+
+.mc-subthread-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.mc-subthread-error {
+  margin: 0 0.75rem 0.35rem;
+  color: #f87171;
+  font-size: 0.75rem;
+}
+
+.mc-subthread-composer {
+  border-top: 1px solid var(--mc-border-soft);
+  padding: 0.65rem 0.75rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.mc-subthread-input {
+  width: 100%;
+  resize: none;
+  border-radius: 0.55rem;
+  border: 1px solid var(--mc-border-soft);
+  background: var(--mc-bg-main);
+  color: var(--mc-text-primary);
+  font: inherit;
+  font-size: 0.86rem;
+  line-height: 1.4;
+  padding: 0.55rem 0.65rem;
+}
+
+.mc-subthread-input:focus {
+  outline: 2px solid color-mix(in srgb, var(--mc-accent) 50%, transparent);
+  outline-offset: 1px;
+}
+
+.mc-subthread-composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.mc-subthread-status {
+  font-size: 0.7rem;
+  color: var(--mc-text-faint);
+}
+
+.mc-subthread-send {
+  border: 1px solid var(--mc-border-soft);
+  background: transparent;
+  color: var(--mc-text-muted);
+  border-radius: 0.45rem;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mc-subthread-send-primary {
+  background: color-mix(in srgb, var(--mc-accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--mc-accent) 40%, transparent);
+  color: var(--mc-text-primary);
+}
+
+.mc-subthread-send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (max-width: 767px) {
+  .mc-thread-with-subthread {
+    position: relative;
+  }
+
+  .mc-subthread-pane {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    width: 100%;
+    min-width: 0;
+    border-left: 0;
+    background: var(--mc-bg-main);
+  }
+}
+
 .mc-reply-quote-preview {
   display: flex;
   align-items: stretch;

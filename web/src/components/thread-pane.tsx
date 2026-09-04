@@ -1,6 +1,6 @@
 import React from 'react'
 import { ThreadHistorySkeleton } from './skeleton'
-import { IconCopy, IconReply, IconStar, IconTrash } from './icons'
+import { IconCopy, IconPencil, IconReply, IconSideChat, IconStar, IconTrash } from './icons'
 import {
   AssistantRuntimeProvider,
   CompositeAttachmentAdapter,
@@ -133,6 +133,11 @@ type ThreadPaneUiContextValue = {
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
   onReplyToMessage?: (messageId: string) => void | Promise<void>
   onDeleteMessage?: (messageId: string) => void | Promise<void>
+  onSaveMessageEdit?: (messageId: string, content: string) => void | Promise<void>
+  onOpenSubthread?: (messageId: string) => void | Promise<void>
+  editingMessageId?: string | null
+  onEditingMessageIdChange?: (messageId: string | null) => void
+  activeSubthreadMessageId?: string | null
   pendingReply?: PendingReplyQuote | null
   onDismissPendingReply?: () => void
   draftText: string
@@ -147,6 +152,11 @@ const ThreadPaneUiContext = React.createContext<ThreadPaneUiContextValue>({
   onToggleBookmark: undefined,
   onReplyToMessage: undefined,
   onDeleteMessage: undefined,
+  onSaveMessageEdit: undefined,
+  onOpenSubthread: undefined,
+  editingMessageId: null,
+  onEditingMessageIdChange: undefined,
+  activeSubthreadMessageId: null,
   pendingReply: null,
   onDismissPendingReply: undefined,
   draftText: '',
@@ -254,6 +264,9 @@ function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
     onToggleBookmark,
     onReplyToMessage,
     onDeleteMessage,
+    onSaveMessageEdit,
+    onOpenSubthread,
+    onEditingMessageIdChange,
     onMobileMessageTap,
   } = React.useContext(ThreadPaneUiContext)
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
@@ -278,6 +291,36 @@ function MessageMobileActionSheet({ role }: { role: 'user' | 'assistant' }) {
         >
           <IconReply />
           <span className="mc-msg-action-label">Reply</span>
+        </button>
+      ) : null}
+      {role === 'assistant' && onSaveMessageEdit && onEditingMessageIdChange ? (
+        <button
+          type="button"
+          className="mc-msg-action-btn cursor-pointer"
+          onClick={() => {
+            onEditingMessageIdChange(messageId)
+            onMobileMessageTap?.('')
+          }}
+          title="Edit message"
+          aria-label="Edit message"
+        >
+          <IconPencil />
+          <span className="mc-msg-action-label">Edit</span>
+        </button>
+      ) : null}
+      {role === 'assistant' && onOpenSubthread ? (
+        <button
+          type="button"
+          className="mc-msg-action-btn cursor-pointer"
+          onClick={() => {
+            onOpenSubthread(messageId)
+            onMobileMessageTap?.('')
+          }}
+          title="Open side chat"
+          aria-label="Open side chat"
+        >
+          <IconSideChat />
+          <span className="mc-msg-action-label">Side chat</span>
         </button>
       ) : null}
       {onToggleBookmark ? (
@@ -470,6 +513,47 @@ function MessageDeleteButton({ showLabel = false }: { showLabel?: boolean }) {
   )
 }
 
+function MessageEditButton({ showLabel = false }: { showLabel?: boolean }) {
+  const { onSaveMessageEdit, onEditingMessageIdChange, editingMessageId } =
+    React.useContext(ThreadPaneUiContext)
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  const isRunning = useMessage((m) => m.role === 'assistant' && m.status?.type === 'running')
+  if (!onSaveMessageEdit || !onEditingMessageIdChange || !messageId || isRunning) return null
+  const active = editingMessageId === messageId
+  return (
+    <button
+      type="button"
+      className="mc-msg-action-btn"
+      onClick={() => onEditingMessageIdChange(active ? null : messageId)}
+      title={active ? 'Cancel edit' : 'Edit message'}
+      aria-label={active ? 'Cancel edit' : 'Edit message'}
+      aria-pressed={active}
+    >
+      {showLabel ? (active ? 'Cancel' : 'Edit') : <IconPencil />}
+    </button>
+  )
+}
+
+function MessageSideChatButton({ showLabel = false }: { showLabel?: boolean }) {
+  const { onOpenSubthread, activeSubthreadMessageId } = React.useContext(ThreadPaneUiContext)
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  const isRunning = useMessage((m) => m.role === 'assistant' && m.status?.type === 'running')
+  if (!onOpenSubthread || !messageId || isRunning) return null
+  const active = activeSubthreadMessageId === messageId
+  return (
+    <button
+      type="button"
+      className={active ? 'mc-msg-action-btn mc-msg-action-btn-active' : 'mc-msg-action-btn'}
+      onClick={() => onOpenSubthread(messageId)}
+      title="Open side chat"
+      aria-label="Open side chat"
+      aria-pressed={active}
+    >
+      {showLabel ? 'Side chat' : <IconSideChat />}
+    </button>
+  )
+}
+
 function MessageActionBar({
   role,
   showLabels = false,
@@ -492,6 +576,8 @@ function MessageActionBar({
       <div className="mc-msg-actions mc-msg-meta-row-desktop" role="toolbar" aria-label="Message actions">
         <MessageCopyButton showLabel={showLabels} />
         <MessageReplyButton showLabel={showLabels} />
+        {role === 'assistant' ? <MessageEditButton showLabel={showLabels} /> : null}
+        {role === 'assistant' ? <MessageSideChatButton showLabel={showLabels} /> : null}
         <MessageBookmarkButton role={role} />
         <MessageDeleteButton showLabel={showLabels} />
       </div>
@@ -502,10 +588,88 @@ function MessageActionBar({
   )
 }
 
+function AssistantInlineEditor() {
+  const { editingMessageId, onEditingMessageIdChange, onSaveMessageEdit } =
+    React.useContext(ThreadPaneUiContext)
+  const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
+  const initialText = useMessage((m) => messageTextContent(m.content, '\n'))
+  const [draft, setDraft] = React.useState(initialText)
+  const [saving, setSaving] = React.useState(false)
+  const [saveError, setSaveError] = React.useState('')
+
+  React.useEffect(() => {
+    setDraft(initialText)
+    setSaveError('')
+  }, [initialText, messageId])
+
+  if (!messageId || editingMessageId !== messageId || !onSaveMessageEdit) return null
+
+  const cancel = () => {
+    onEditingMessageIdChange?.(null)
+    setDraft(initialText)
+    setSaveError('')
+  }
+
+  const save = async () => {
+    if (!draft.trim() || saving) return
+    setSaving(true)
+    setSaveError('')
+    try {
+      await onSaveMessageEdit(messageId, draft)
+      onEditingMessageIdChange?.(null)
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="mc-inline-editor">
+      <textarea
+        className="mc-inline-editor-textarea"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        rows={Math.min(16, Math.max(4, draft.split('\n').length + 1))}
+        disabled={saving}
+        aria-label="Edit assistant message"
+        onKeyDown={(e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+            e.preventDefault()
+            void save()
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault()
+            cancel()
+          }
+        }}
+      />
+      <div className="mc-inline-editor-actions">
+        <button type="button" className="mc-inline-editor-btn" onClick={cancel} disabled={saving}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="mc-inline-editor-btn mc-inline-editor-btn-primary"
+          onClick={() => void save()}
+          disabled={saving || !draft.trim() || draft.trim() === initialText.trim()}
+        >
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+      {saveError ? <div className="mc-inline-editor-error">{saveError}</div> : null}
+      <div className="mc-inline-editor-hint">Ctrl/Cmd+Enter to save · Esc to cancel</div>
+    </div>
+  )
+}
+
 function CustomAssistantMessage() {
   const messageId = useMessage((m) => (typeof m.id === 'string' ? m.id : ''))
   const mobileTap = useMobileMessageTapProps(messageId)
   const groupProps = useMessageGroupProps('assistant')
+  const { editingMessageId, activeSubthreadMessageId } = React.useContext(ThreadPaneUiContext)
+  const isEditing = Boolean(messageId && editingMessageId === messageId)
+  const isSubthreadAnchor = Boolean(messageId && activeSubthreadMessageId === messageId)
   const hasRenderableContent = useMessage((m) =>
     Array.isArray(m.content)
       ? m.content.some((part) => {
@@ -516,8 +680,21 @@ function CustomAssistantMessage() {
   )
 
   return (
-    <AssistantMessage.Root data-message-id={messageId || undefined} {...groupProps} {...mobileTap}>
-      {hasRenderableContent ? (
+    <AssistantMessage.Root
+      data-message-id={messageId || undefined}
+      data-subthread-anchor={isSubthreadAnchor ? 'true' : undefined}
+      {...groupProps}
+      {...mobileTap}
+      className={[
+        groupProps.className,
+        isSubthreadAnchor ? 'mc-msg-subthread-anchor' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+    >
+      {isEditing ? (
+        <AssistantInlineEditor />
+      ) : hasRenderableContent ? (
         <AssistantMessage.Content />
       ) : (
         <div className="mc-assistant-placeholder" aria-live="polite">
@@ -528,7 +705,7 @@ function CustomAssistantMessage() {
         </div>
       )}
       <BranchPicker />
-      <MessageActionBar role="assistant" />
+      {!isEditing ? <MessageActionBar role="assistant" /> : null}
       <MessageMobileActionSheet role="assistant" />
     </AssistantMessage.Root>
   )
@@ -605,6 +782,11 @@ export type ThreadPaneProps = {
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
   onReplyToMessage?: (messageId: string) => void | Promise<void>
   onDeleteMessage?: (messageId: string) => void | Promise<void>
+  onSaveMessageEdit?: (messageId: string, content: string) => void | Promise<void>
+  onOpenSubthread?: (messageId: string) => void | Promise<void>
+  editingMessageId?: string | null
+  onEditingMessageIdChange?: (messageId: string | null) => void
+  activeSubthreadMessageId?: string | null
   pendingReply?: PendingReplyQuote | null
   onDismissPendingReply?: () => void
   /** Mobile (max-width 767px): report scroll direction so the app shell can collapse the main header. */
@@ -673,6 +855,11 @@ export const ThreadPane = React.memo(function ThreadPane({
   onToggleBookmark,
   onReplyToMessage,
   onDeleteMessage,
+  onSaveMessageEdit,
+  onOpenSubthread,
+  editingMessageId = null,
+  onEditingMessageIdChange,
+  activeSubthreadMessageId = null,
   pendingReply,
   onDismissPendingReply,
   onMobileThreadScroll,
@@ -756,6 +943,11 @@ export const ThreadPane = React.memo(function ThreadPane({
       onToggleBookmark,
       onReplyToMessage,
       onDeleteMessage,
+      onSaveMessageEdit,
+      onOpenSubthread,
+      editingMessageId,
+      onEditingMessageIdChange,
+      activeSubthreadMessageId,
       pendingReply,
       onDismissPendingReply,
       draftText,
@@ -765,14 +957,19 @@ export const ThreadPane = React.memo(function ThreadPane({
       onMobileMessageTap,
     }),
     [
+      activeSubthreadMessageId,
       bookmarkedMessageIds,
       draftText,
+      editingMessageId,
       mobileActionMessageId,
       onMobileMessageTap,
       onDeleteMessage,
       onDismissPendingReply,
       onDraftTextChange,
+      onEditingMessageIdChange,
+      onOpenSubthread,
       onReplyToMessage,
+      onSaveMessageEdit,
       onToggleBookmark,
       pendingReply,
       uploadHint,

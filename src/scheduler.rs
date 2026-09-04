@@ -469,6 +469,7 @@ async fn run_scheduled_agent_and_finalize(
                 run_key: Some(format!("scheduled:{}:{}", task_id, started_at_str)),
                 reply_bot_instance_id: None,
                 session_id: None,
+                history_override: None,
             },
             Some(&prompt),
             None,

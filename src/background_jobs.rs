@@ -318,6 +318,7 @@ pub fn spawn_background_job(
                 run_key: Some(job_id.clone()),
                 reply_bot_instance_id: None,
                 session_id: session_id.clone(),
+                history_override: None,
             },
             Some(&prompt),
             None,

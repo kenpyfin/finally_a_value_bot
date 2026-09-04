@@ -27,6 +27,30 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-03 — PTE asks on doubt instead of continuing
+
+- **Area:** agent / PTE
+- **Summary:** Classic post-tool evaluator no longer defaults to another tool round when unsure. The prompt now emits `ask_user` with a clarification question; delivery uses that question instead of the stall “retry/wait/adjust” template (stall fast-path still uses the stall copy).
+- **Rationale:** “If in doubt, continue” kept Classic looping (e.g. WeCom `mailcode_` forwards with no fetch tool) up to `max_tool_iterations`.
+- **Key files / symbols:** `build_pte_system_prompt` / `format_pte_ask_user_reply` in `src/post_tool_evaluator.rs`; `PteAction::AskUser` in `src/channels/telegram.rs`.
+- **Follow-ups:** Rebuild/restart the gateway (`./reload.sh`). Evaluator infra failures still fail-open to `continue` so a dead PTE host does not halt every turn.
+
+### 2026-09-03 — Agent engine selection actually saves
+
+- **Area:** web UI / settings
+- **Summary:** Settings → Agent engine pills save immediately with a confirmation, Inherit + global default are back, and the preview dropdown no longer looks like the engine picker. Sidecar health no longer blocks the save; LLM/Cursor Selects no longer crash the tab.
+- **Rationale:** Operators could not tell whether an engine click persisted, and a hung sidecar health probe left the pills disabled.
+- **Key files / symbols:** `patchPersonaEngine` / `patchGlobalEngine` in `web/src/components/settings-agent-engine.tsx`.
+- **Follow-ups:** Rebuild/restart the gateway so `web/dist` is compiled in (`./reload.sh` when no Cursor turn is in flight).
+
+### 2026-09-03 — Bot response edit + ephemeral side chat
+
+- **Area:** web UI / agent context
+- **Summary:** Assistant messages can be edited in place (`PATCH /api/personas/:id/messages/:mid`) and saved to SQLite so later turns see the revised text. A Side chat action opens an ephemeral docked pane (`POST /api/subthread_stream`) seeded with the anchor reply plus the cockpit history window; side-chat turns are not written to main history.
+- **Rationale:** Operators needed to correct bot text without regenerating, and to ask focused follow-ups about one reply without polluting the main timeline.
+- **Key files / symbols:** `update_message_content` / `get_messages_up_to` in `src/db.rs`; `AgentRequestContext.history_override`; `api_persona_message_patch` / `api_subthread_stream` in `src/web.rs`; `SubthreadSidePane`; edit/side-chat actions in `web/src/components/thread-pane.tsx`.
+- **Follow-ups:** Persist side chats later if operators want reopen; optional regenerate-from-edit.
+
 ### 2026-09-03 — PTE/PDQE are Classic and Deterministic only
 
 - **Area:** agent quality gates / cursor

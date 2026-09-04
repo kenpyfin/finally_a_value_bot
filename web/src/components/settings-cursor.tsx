@@ -310,11 +310,16 @@ export function SettingsCursorPanel({ api, onError }: Props) {
         </Text>
         <Flex direction="column" gap="2">
           <Flex gap="2" wrap="wrap" align="center">
-            {!useCustomSdkModel && modelCatalog.length > 0 ? (
+            {!useCustomSdkModel &&
+            modelCatalog.length > 0 &&
+            sdkModel &&
+            modelCatalog.some((model) => model.id === sdkModel) ? (
               <Select.Root value={sdkModel} onValueChange={onSdkModelChange}>
                 <Select.Trigger placeholder="Select model" style={{ flex: 1, minWidth: 160 }} />
                 <Select.Content>
-                  {modelCatalog.map((model) => (
+                  {modelCatalog
+                    .filter((model) => Boolean(model.id))
+                    .map((model) => (
                     <Select.Item key={model.id} value={model.id}>
                       {model.display_name?.trim() ? `${model.display_name} (${model.id})` : model.id}
                     </Select.Item>
@@ -351,10 +356,12 @@ export function SettingsCursorPanel({ api, onError }: Props) {
           {selectedModelEntry?.parameters && selectedModelEntry.parameters.length > 0 ? (
             <Flex direction="column" gap="2">
               {selectedModelEntry.parameters.map((param) => {
-                const currentValue =
-                  sdkModelParams.find((item) => item.id === param.id)?.value ??
-                  param.values[0]?.value ??
-                  ''
+                const allowed = param.values.map((value) => value.value).filter(Boolean)
+                const savedValue = sdkModelParams.find((item) => item.id === param.id)?.value ?? ''
+                const currentValue = allowed.includes(savedValue)
+                  ? savedValue
+                  : (allowed[0] ?? '')
+                if (!currentValue) return null
                 return (
                   <Flex key={param.id} direction="column" gap="1">
                     <Text size="2" weight="medium">
@@ -366,7 +373,9 @@ export function SettingsCursorPanel({ api, onError }: Props) {
                     >
                       <Select.Trigger placeholder={`Select ${parameterLabel(param).toLowerCase()}`} />
                       <Select.Content>
-                        {param.values.map((value) => (
+                        {param.values
+                          .filter((value) => Boolean(value.value))
+                          .map((value) => (
                           <Select.Item key={`${param.id}:${value.value}`} value={value.value}>
                             {value.display_name?.trim() || value.value}
                           </Select.Item>

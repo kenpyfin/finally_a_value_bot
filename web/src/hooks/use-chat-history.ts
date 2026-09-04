@@ -208,6 +208,50 @@ export function useChatHistory({
     [activePersonaId, requestConfirm, setError, setPersonaBookmarks, setStatusText],
   )
 
+  const handleSaveMessageEdit = useCallback(
+    async (messageId: string, content: string) => {
+      if (activePersonaId == null) return
+      const trimmed = content.trim()
+      if (!trimmed) {
+        setError('Edited message cannot be empty')
+        return
+      }
+      try {
+        setStatusText('Saving edit…')
+        await api(`/api/personas/${activePersonaId}/messages/${encodeURIComponent(messageId)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ content: trimmed }),
+        })
+        setHistorySeed((prev) =>
+          prev.map((m) => {
+            if (m.id !== messageId) return m
+            return {
+              ...m,
+              content: [{ type: 'text' as const, text: trimmed }],
+            }
+          }),
+        )
+        setPersonaBookmarks((prev) =>
+          prev.map((b) => {
+            if (b.message_id !== messageId) return b
+            const preview =
+              Array.from(trimmed).length > 280
+                ? `${Array.from(trimmed).slice(0, 280).join('')}…`
+                : trimmed
+            return { ...b, content_preview: preview }
+          }),
+        )
+        setStatusText('Message updated')
+        setError('')
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+        setStatusText('Idle')
+        throw e
+      }
+    },
+    [activePersonaId, setError, setPersonaBookmarks, setStatusText],
+  )
+
   const activeDraftKey = `${chatId ?? 0}:${activePersonaId ?? 0}`
   const activeDraftText = draftByThreadKey[activeDraftKey] ?? ''
   const activePendingReply = pendingReplyByThreadKey[activeDraftKey] ?? null
@@ -237,6 +281,7 @@ export function useChatHistory({
     handleReplyToMessage,
     handleDismissPendingReply,
     handleDeleteMessage,
+    handleSaveMessageEdit,
     activeDraftText,
     activePendingReply,
     handleDraftTextChange,

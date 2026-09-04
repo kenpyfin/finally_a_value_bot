@@ -2022,6 +2022,34 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Update message body in place. Also refreshes bookmark preview when bookmarked.
+    pub fn update_message_content(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE messages SET content = ?1
+             WHERE chat_id = ?2 AND persona_id = ?3 AND id = ?4",
+            params![content, chat_id, persona_id, message_id],
+        )?;
+        if rows == 0 {
+            return Ok(false);
+        }
+        let preview: String = content.chars().take(280).collect();
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "UPDATE persona_message_bookmarks
+             SET content_preview = ?1, updated_at = ?2
+             WHERE chat_id = ?3 AND persona_id = ?4 AND message_id = ?5",
+            params![preview, now, chat_id, persona_id, message_id],
+        )?;
+        Ok(true)
+    }
+
     /// True when the **latest** row for this chat is a bot message with the same body as `content`
     /// and a recent timestamp. That usually means `send_message` already posted this text and the
     /// main agent is about to deliver the same final reply again.
@@ -6581,6 +6609,48 @@ impl Database {
         let messages = stmt
             .query_map(params![session_id], stored_message_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
+    /// Messages at or before `max_timestamp`, scoped to main chat or a focused session.
+    /// Used to seed ephemeral sub-thread context around an anchor message.
+    pub fn get_messages_up_to(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        max_timestamp: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<StoredMessage>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
+        let messages = if let Some(sid) = session_id {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3
+                   AND timestamp <= ?4
+                 ORDER BY timestamp ASC"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, sid, max_timestamp],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                   AND timestamp <= ?3
+                 ORDER BY timestamp ASC"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, max_timestamp],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         Ok(messages)
     }
 }

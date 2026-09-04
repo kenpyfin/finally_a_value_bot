@@ -416,6 +416,7 @@ impl EventHandler for Handler {
                         run_key: None,
                         reply_bot_instance_id: Some(discord_bot_instance_id),
                         session_id: None,
+                    history_override: None,
                     },
                     None,
                     image_data,

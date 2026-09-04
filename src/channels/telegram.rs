@@ -45,7 +45,9 @@ use crate::memory::{
     enrich_persona_memory_for_prompt, render_identity_and_tier1_for_system, render_memory_for_llm,
     render_persona_context_memory_with_options, MemoryPromptBuildOptions,
 };
-use crate::post_tool_evaluator::{evaluate_completion, pte_action_name, PteAction, PteResult};
+use crate::post_tool_evaluator::{
+    evaluate_completion, format_pte_ask_user_reply, pte_action_name, PteAction, PteResult,
+};
 use crate::safety_redaction::EnvSecretRedactor;
 use crate::skills::SkillManager;
 use crate::slash_commands::{parse as parse_slash_command, SlashCommand};
@@ -326,6 +328,10 @@ pub struct AgentRequestContext<'a> {
     pub reply_bot_instance_id: Option<i64>,
     /// When set, scopes this run to a focused session (web-UI only).
     pub session_id: Option<String>,
+    /// When set, use this conversation history instead of loading from the database.
+    /// Used by ephemeral web sub-threads. Caller is responsible for trimming and
+    /// appending the current user turn. Messages are not persisted by the agent loop.
+    pub history_override: Option<Vec<crate::claude::Message>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1684,6 +1690,7 @@ async fn handle_message(
                 run_key: None,
                 reply_bot_instance_id: Some(telegram_bot_instance_id_spawn),
                 session_id: None,
+            history_override: None,
             },
             None,
             image_data,
@@ -2193,8 +2200,11 @@ pub(crate) async fn process_classic_agent_with_events(
     );
 
     // Background-job runs are detached and do not consume foreground chat context while running.
+    // history_override (ephemeral sub-threads) supplies a pre-built conversation and skips DB load.
     let mut messages = if context.is_background_job {
         Vec::new()
+    } else if let Some(ref override_msgs) = context.history_override {
+        override_msgs.clone()
     } else if let Some(ref sid) = context.session_id {
         // Session mode: load full session history
         let session_id = sid.clone();
@@ -2250,8 +2260,8 @@ pub(crate) async fn process_classic_agent_with_events(
         }
     }
 
-    // Sessions retain full history; main chat trims to balanced suffix.
-    if context.session_id.is_none() {
+    // Sessions and history_override retain their prepared history; main chat trims to balanced suffix.
+    if context.session_id.is_none() && context.history_override.is_none() {
         messages = trim_to_recent_balanced(messages, min_user_suffix, min_asst_suffix);
     }
 
@@ -4004,10 +4014,7 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
                                 finish_turn!("pte_complete", final_text);
                             }
                             PteAction::AskUser => {
-                                let ask_text = format!(
-                            "I paused because progress is stalled: {}. Choose: retry now, wait, or adjust the request.",
-                            pte_result.reason
-                        );
+                                let ask_text = format_pte_ask_user_reply(&pte_result.reason);
                                 finish_turn!("pte_ask_user", ask_text);
                             }
                             PteAction::StopWithSummary => {
@@ -6164,7 +6171,7 @@ fn is_operational_bot_content(text: &str) -> bool {
     false
 }
 
-pub(super) fn history_to_claude_messages(
+pub(crate) fn history_to_claude_messages(
     history: &[StoredMessage],
     _bot_username: &str,
     keep_trailing_assistant: bool,

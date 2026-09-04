@@ -1,3 +1,19 @@
+### 2026-09-03 — PTE “if in doubt, continue” burned Classic turns
+
+- **Symptom:** After switching to `selling_oversea` (Classic override), forwarding a WeCom mail (`【企业微信邮件】… 邮件id：mailcode_…`) ran the Classic tool loop for a long time instead of stopping to ask.
+- **Root cause:** PTE system prompt listed only `continue`/`complete` and said “If in doubt, say continue.” `ask_user` existed in code but the evaluator was instructed not to use it. Opaque `mailcode_` tokens have no fetch tool, so “continue” meant endless discovery.
+- **Fix:** Prompt includes `ask_user`; doubt → clarification question in `reason`. User-visible `ask_user` copy is that question (stall classifier still uses the stalled retry/wait line).
+- **Prevention:** Do not tell quality gates to keep looping when the next step is a guess. Keep PTE infra fail-open (`continue` on timeout/skip) separate from task-level doubt.
+- **Files/refs:** `build_pte_system_prompt` / `format_pte_ask_user_reply` in `src/post_tool_evaluator.rs`; WeCom inbound text `【企业微信邮件】`; persona 28 `agent_engine_override=classic`.
+
+### 2026-09-03 — Agent engine settings looked unsaved
+
+- **Symptom:** Settings → Agent engine clicks did not feel like they saved (pills stuck disabled, selection snapped back to Classic, or changing the second dropdown did nothing).
+- **Root cause:** (1) Engine pills held `savingKey` until `GET /api/cursor-engine` finished (sidecar `/health` can take up to 10s). (2) A failed reload after a successful PATCH nulled `personaEngine`, so the UI showed Classic. (3) **Show settings for** used the same engine names as the real picker but never persisted. (4) Inherit was removed, so there was no way to clear a persona override or edit the global default from this tab. (5) Radix Select crashes on empty/`value=""` or unmatched items, which unmounted the whole Agent engine panel.
+- **Fix:** Optimistic persona PATCH, release the busy state before sidecar health, keep the last good selection on silent reload failure, restore Inherit + global default save, relabel the preview dropdown, isolate knob-panel crashes, and only mount Selects when the value exists in the item list.
+- **Prevention:** Do not await sidecar health on the engine-save path. Do not reuse the engine picker control for a non-saving preview. Never pass an empty string to Radix `Select.Root`/`Select.Item`.
+- **Files/refs:** `patchPersonaEngine` / `patchGlobalEngine` in `web/src/components/settings-agent-engine.tsx`; Select guards in `settings-cursor.tsx` / `settings-llm.tsx`.
+
 ### 2026-09-03 — PTE/PDQE Classic+Deterministic only (Cursor skipped)
 
 - **Symptom:** Cursor turns waited on PDQE after the sidecar reply (and previously could hang or fail-open with a user-visible notice).

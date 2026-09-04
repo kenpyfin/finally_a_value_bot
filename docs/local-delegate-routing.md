@@ -36,7 +36,7 @@ Registered only when cost routing is active. The strategy model can delegate a *
 
 ## Configuration
 
-- **Settings → Agent engine**: choose the engine for the **current persona**. Local URL/model live on the Cost routing configure panel.
+- **Settings → Agent engine**: click an engine pill to save it for the **current persona** (or Inherit default). Local URL/model live on the Cost routing settings panel.
 - DB keys remain `MULTIMODEL_*` for backward compatibility (`src/local_delegate/mod.rs`).
 
 PTE, PDQE, Learn & Optimize, and Deterministic local phases may still use the configured local endpoint independently of the Classic engine choice. **Cursor skips PTE and PDQE** (no classic tool loop; finish does not call the evaluator).
