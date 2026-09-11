@@ -1,3 +1,51 @@
+### 2026-09-09 — Load earlier messages jumped the thread
+
+- **Symptom:** Tapping “Load earlier messages” moved the visible messages instead of leaving the screen still while older rows appeared above.
+- **Root cause:** `runtime.thread.reset()` remounts the list on a later frame. Height restore ran against the *old* DOM (delta 0), then assistant-ui’s viewport MutationObserver/`scrollTo({ top: scrollHeight })` fired after paint (`autoScroll` + `isAtBottom`, or a leftover `scrollingToBottomBehaviorRef`). Side-chat jumps use `targetScrollMessageId` and must not share that restore.
+- **Fix:** On “Load earlier”, freeze a clone of the current viewport over the thread. `flushSync` remounts history underneath, then pin the same message (or apply the height delta) before paint. Lift the clone after the restored view has painted. Skip this path when a jump target is armed.
+- **Prevention:** Do not treat a successful restore on the pre-reset DOM as done. Pagination (hold still) and reveal-message (intentional jump) are mutually exclusive viewport owners. Disable CSS `overflow-anchor` on the thread scroller so the browser does not also adjust.
+- **Files/refs:** `web/src/lib/scroll-anchor.ts`; reset/restore layout effects and Viewport props in `web/src/components/thread-pane.tsx`; `revealMessageInThread` in `web/src/app/App.tsx`.
+
+### 2026-09-09 — Header session controls duplicated on desktop
+
+- **Symptom:** Main chat, + Session, and Side chats appeared twice in the header (inline next to the title and again on a second row).
+- **Root cause:** `.mc-mobile-session-subbar { display: grid }` is unlayered CSS. Tailwind `md:hidden` lives in `@layer utilities`, so the unlayered `display: grid` won at every viewport and the mobile-only sub-bar never hid.
+- **Fix:** Default the sub-bar to `display: none`; set `display: grid` only inside `@media (max-width: 767px)` so the collapse animation still works on small screens.
+- **Prevention:** Do not set `display` in unlayered CSS on an element that relies on Tailwind `hidden` / `md:hidden`. Either own show/hide in the same unlayered stylesheet (media queries) or keep `display` exclusively in Tailwind utilities.
+- **Files/refs:** `.mc-mobile-session-subbar` in `web/src/styles.css`; two `renderSessionControls` call sites in `web/src/app/AppHeader.tsx`.
+
+### 2026-09-05 — Bookmark jump landed at the bottom of the session
+
+- **Symptom:** Clicking a bookmark chip scrolled to the bottom of the current section/session instead of the specific message box.
+- **Root cause:** `revealMessageInThread` relied on `el.scrollIntoView()`, but assistant-ui's `useThreadViewportAutoScroll` schedules `scrollToBottom("instant")` on `thread.runStart` / `thread.initialize` / `threadListItem.switchedTo` and on content-resize while `isAtBottom`. Switching sessions or `runtime.thread.reset()` (from `ensureMessageVisible`) fires `thread.initialize`, and closing the cockpit resizes the viewport — both snapped to the bottom right after our scroll, so the jump was always clobbered.
+- **Fix:** Arm a `targetScrollMessageId` before any history reset; pass it to `ThreadPrimitive.Viewport` as `autoScroll={false}` + `scrollToBottomOnInitialize={false}` + `scrollToBottomOnThreadSwitch={false}` while a jump is pending. ThreadPane then centers the message with `centerMessageInViewport` (explicit `viewport.scrollTo`, which also clears `isAtBottom`) and pulses it via `flashMessageElement`, retrying across frames as history settles, then clears the target.
+- **Prevention:** Never fight assistant-ui auto-scroll with a bare `scrollIntoView`; suppress the viewport's scroll-to-bottom flags for the duration of an intentional jump. React 18 batches the cockpit-collapse and target-arm state updates in the same click, so `autoScroll` is already off before the resize observer runs.
+- **Files/refs:** `targetScrollMessageId` effect + `ThreadPrimitive.Viewport` props in `web/src/components/thread-pane.tsx`; `centerMessageInViewport` / `flashMessageElement` in `web/src/lib/reveal-message.ts`; `revealMessageInThread` / `handleTargetScrollHandled` in `web/src/app/App.tsx`; upstream `web/node_modules/@assistant-ui/react/dist/primitives/thread/useThreadViewportAutoScroll.js`.
+
+### 2026-09-05 — Mobile header auto-hide oscillated during momentum scroll
+
+- **Symptom:** On mobile the scroll-up auto-hiding header felt uneven and jittery; the header re-expanded immediately and the card/cockpit strip flickered.
+- **Root cause:** `mobileChatHeaderCollapsed` shrank the in-flow header (padding, heading font-size, icon sizes). Because the header sits directly above the scroll viewport, each collapse/expand resized the viewport mid-fling, which cancels WebKit/Blink momentum and produces a small reverse delta. The old single-frame thresholds (`delta > 14` / `delta < -12`) then re-toggled instantly, trapping an oscillation.
+- **Fix:** Keep Tier-1 header height fixed (no per-scroll sizing); only a separate collapsible Tier-2 session sub-bar animates (grid-rows). Replace single-frame deltas with accumulated-direction hysteresis (collapse after >50px down, reveal after >40px up, always reveal near top) plus a ~350ms post-toggle scroll guard so the reflow's own scroll events do not re-trigger.
+- **Prevention:** Do not resize an in-flow header on scroll when it bounds the scroll container; drive auto-hide from an accumulated delta with a post-toggle guard, and confine layout changes to a small secondary bar.
+- **Files/refs:** two-tier layout in `web/src/app/AppHeader.tsx`; accumulated-delta handler + `scrollGuardUntilRef` in `web/src/components/thread-pane.tsx`; `handleMobileThreadScroll` in `web/src/app/App.tsx`; `mc-mobile-session-subbar` in `web/src/styles.css`.
+
+### 2026-09-04 — Stuck-run recycle killed every Cursor session
+
+- **Symptom:** Sourdough’s ~8-minute “write a guide” turn dropped when the supervisor recycled the sidecar. `/health` had `runs_in_flight=3` `oldest_run_age_secs=1278`.
+- **Root cause:** `stuck_runs_in_flight` called `force_recycle_and_respawn`, which SIGKILLs Node on `:3848`. All in-flight `/run` streams die, not only the 20-minute-old ones. PZ3/videographer HTTP timeouts left ghost slots; sourdough was collateral. Later `wedged_health` recycles (2.5s `/health` miss) also killed retries.
+- **Fix:** Supervisor cancels only sessions with wall age ≥ 1200s via `POST /admin/cancel_old_runs`. Sidecar reaper uses the same cap. Do not process-kill for stuck age. `wedged_health` remains process-wide (sidecar unreachable).
+- **Prevention:** Never recycle the sidecar process to clear one hung `/run` while others are live. Cancel by `activeRuns` age. Log `cancelled old runs; younger sessions kept`.
+- **Files/refs:** `cancelRunsOlderThan` in `scripts/cursor-sdk-runner.mjs`; `request_cancel_old_runs` in `src/cursor_sdk_sidecar.rs`; log `Cursor sidecar stuck runs detected; cancelling old sessions only`.
+
+### 2026-09-04 — Cursor interrupt copy mentioned Comfy on sourdough
+
+- **Symptom:** Sourdough (`please write a guide on this`) got “Generation may already have finished on disk (the Comfy queue can be empty). Reply `check again`…” after a stream drop. No Comfy job existed.
+- **Root cause:** `cursor_stream_interrupt_notice` is shared by every Cursor persona. Copy written for PZ3 disk/queue recovery was delivered whenever the sidecar NDJSON stream died with no unfinished background jobs (`status=stream_interrupted timed_out=false tools=`). Sidecar `wedged_health` / `stuck_runs_in_flight` recycles severed the HTTP body.
+- **Fix:** Idle/timeout notices ask the user to send the request again. Background-still-running copy still says not to resend.
+- **Prevention:** Keep Cursor interrupt copy persona-agnostic. Do not advertise Comfy/`check again` on a global path. Status phrases still skip the sidecar; they are not the default drop CTA.
+- **Files/refs:** `cursor_stream_interrupt_notice` / `cursor_turn_timeout_notice` in `src/cursor_engine_config.rs`; sourdough history `20260904-185153.md`; log `Cursor SDK sidecar force recycle (wedged_health)`.
+
 ### 2026-09-03 — PTE “if in doubt, continue” burned Classic turns
 
 - **Symptom:** After switching to `selling_oversea` (Classic override), forwarding a WeCom mail (`【企业微信邮件】… 邮件id：mailcode_…`) ran the Classic tool loop for a long time instead of stopping to ask.

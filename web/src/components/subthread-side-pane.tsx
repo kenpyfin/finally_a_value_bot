@@ -2,24 +2,30 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api, makeHeaders } from '../api/client'
-import type { BackendMessage, PersonaBulletinHistorySuffix } from '../types'
+import type {
+  BackendMessage,
+  PersonaBulletinHistorySuffix,
+  SideChatTurn,
+} from '../types'
+import { ConfirmDialog } from './confirm-dialog'
 import { MarkdownTable } from './markdown-table'
 import { makeReplySnippet } from '../lib/reply-quote'
-
-type SubthreadTurn = {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  streaming?: boolean
-}
 
 export type SubthreadSidePaneProps = {
   chatId: number | null
   personaId: number | null
   sessionId: string | null
+  sideChatId: string
   anchorMessageId: string
   anchorMessage: BackendMessage
   historySuffix: PersonaBulletinHistorySuffix | null
+  turns: SideChatTurn[]
+  onTurnsChange: React.Dispatch<React.SetStateAction<SideChatTurn[]>>
+  draft: string
+  onDraftChange: (draft: string) => void
+  onDraftLocalChange?: (draft: string) => void
+  onSendComplete?: () => void | Promise<void>
+  onDelete?: () => void | Promise<boolean>
   onClose: () => void
 }
 
@@ -97,16 +103,24 @@ export function SubthreadSidePane({
   chatId,
   personaId,
   sessionId,
+  sideChatId,
   anchorMessageId,
   anchorMessage,
   historySuffix,
+  turns,
+  onTurnsChange,
+  draft,
+  onDraftChange,
+  onDraftLocalChange,
+  onSendComplete,
+  onDelete,
   onClose,
 }: SubthreadSidePaneProps) {
-  const [turns, setTurns] = useState<SubthreadTurn[]>([])
-  const [draft, setDraft] = useState('')
   const [status, setStatus] = useState('Ready')
   const [error, setError] = useState('')
   const [sending, setSending] = useState(false)
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [contextWindow, setContextWindow] = useState<{
     min_user: number
     min_assistant: number
@@ -114,6 +128,7 @@ export function SubthreadSidePane({
   const abortRef = useRef<AbortController | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const draftPersistTimer = useRef<number | null>(null)
 
   const anchorSnippet = makeReplySnippet(
     typeof anchorMessage.content === 'string' ? anchorMessage.content : '',
@@ -121,7 +136,7 @@ export function SubthreadSidePane({
 
   useEffect(() => {
     inputRef.current?.focus()
-  }, [anchorMessageId])
+  }, [sideChatId, anchorMessageId])
 
   useEffect(() => {
     const el = listRef.current
@@ -132,6 +147,9 @@ export function SubthreadSidePane({
   useEffect(() => {
     return () => {
       abortRef.current?.abort()
+      if (draftPersistTimer.current != null) {
+        window.clearTimeout(draftPersistTimer.current)
+      }
     }
   }, [])
 
@@ -145,23 +163,40 @@ export function SubthreadSidePane({
     return 'cockpit window'
   })()
 
+  const handleDraftInput = useCallback(
+    (value: string) => {
+      onDraftLocalChange?.(value)
+      if (draftPersistTimer.current != null) {
+        window.clearTimeout(draftPersistTimer.current)
+      }
+      draftPersistTimer.current = window.setTimeout(() => {
+        onDraftChange(value)
+      }, 400)
+    },
+    [onDraftChange, onDraftLocalChange],
+  )
+
   const send = useCallback(async () => {
     const text = draft.trim()
     if (!text || sending || chatId == null || personaId == null) return
 
-    const userTurn: SubthreadTurn = {
+    const userTurn: SideChatTurn = {
       id: `u-${Date.now()}`,
       role: 'user',
       content: text,
     }
     const assistantId = `a-${Date.now()}`
-    const historyPayload = turns.map((t) => ({ role: t.role, content: t.content }))
+    const historyPayload = turns.map((t) => ({
+      role: t.role === 'assistant' ? 'assistant' : 'user',
+      content: t.content,
+    }))
 
-    setDraft('')
+    onDraftLocalChange?.('')
+    onDraftChange('')
     setError('')
     setSending(true)
     setStatus('Sending…')
-    setTurns((prev) => [
+    onTurnsChange((prev) => [
       ...prev,
       userTurn,
       { id: assistantId, role: 'assistant', content: '', streaming: true },
@@ -180,6 +215,7 @@ export function SubthreadSidePane({
           chat_id: chatId,
           persona_id: personaId,
           session_id: sessionId,
+          side_chat_id: sideChatId,
           anchor_message_id: anchorMessageId,
           message: text,
           history: historyPayload,
@@ -223,7 +259,7 @@ export function SubthreadSidePane({
           const obj = parseJsonObject(evt.data)
           const delta = typeof obj?.delta === 'string' ? obj.delta : ''
           if (!delta) continue
-          setTurns((prev) =>
+          onTurnsChange((prev) =>
             prev.map((t) =>
               t.id === assistantId ? { ...t, content: `${t.content}${delta}`, streaming: true } : t,
             ),
@@ -233,7 +269,7 @@ export function SubthreadSidePane({
         if (evt.event === 'done') {
           const obj = parseJsonObject(evt.data)
           const response = typeof obj?.response === 'string' ? obj.response : ''
-          setTurns((prev) =>
+          onTurnsChange((prev) =>
             prev.map((t) =>
               t.id === assistantId
                 ? {
@@ -256,15 +292,18 @@ export function SubthreadSidePane({
       }
 
       if (!completed && !abort.signal.aborted) {
-        setTurns((prev) =>
+        onTurnsChange((prev) =>
           prev.map((t) => (t.id === assistantId ? { ...t, streaming: false } : t)),
         )
         setStatus('Idle')
       }
+      if (completed) {
+        await onSendComplete?.()
+      }
     } catch (e) {
       if (abort.signal.aborted) {
         setStatus('Cancelled')
-        setTurns((prev) =>
+        onTurnsChange((prev) =>
           prev.map((t) =>
             t.id === assistantId
               ? { ...t, content: t.content || '(cancelled)', streaming: false }
@@ -275,7 +314,7 @@ export function SubthreadSidePane({
         const msg = e instanceof Error ? e.message : String(e)
         setError(msg)
         setStatus('Error')
-        setTurns((prev) =>
+        onTurnsChange((prev) =>
           prev.map((t) =>
             t.id === assistantId
               ? { ...t, content: t.content || `Error: ${msg}`, streaming: false }
@@ -291,9 +330,14 @@ export function SubthreadSidePane({
     anchorMessageId,
     chatId,
     draft,
+    onDraftChange,
+    onDraftLocalChange,
+    onSendComplete,
+    onTurnsChange,
     personaId,
     sending,
     sessionId,
+    sideChatId,
     turns,
   ])
 
@@ -301,22 +345,47 @@ export function SubthreadSidePane({
     abortRef.current?.abort()
   }, [])
 
+  const handleConfirmDelete = useCallback(async () => {
+    if (!onDelete) return
+    setDeleting(true)
+    try {
+      const ok = await onDelete()
+      if (ok) setDeleteConfirmOpen(false)
+    } finally {
+      setDeleting(false)
+    }
+  }, [onDelete])
+
   return (
     <aside className="mc-subthread-pane" aria-label="Side chat">
       <header className="mc-subthread-header">
         <div className="mc-subthread-header-text">
           <div className="mc-subthread-title">Side chat</div>
-          <div className="mc-subthread-meta">Ephemeral · context {windowLabel}</div>
+          <div className="mc-subthread-meta">Saved · context {windowLabel}</div>
         </div>
-        <button
-          type="button"
-          className="mc-subthread-close"
-          onClick={onClose}
-          aria-label="Close side chat"
-          title="Close"
-        >
-          ×
-        </button>
+        <div className="mc-subthread-header-actions">
+          {onDelete ? (
+            <button
+              type="button"
+              className="mc-subthread-delete"
+              onClick={() => setDeleteConfirmOpen(true)}
+              aria-label="Delete side chat"
+              title="Delete side chat"
+              disabled={sending}
+            >
+              Delete
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="mc-subthread-close"
+            onClick={onClose}
+            aria-label="Close side chat"
+            title="Close"
+          >
+            ×
+          </button>
+        </div>
       </header>
 
       <div className="mc-subthread-anchor" role="note">
@@ -376,7 +445,7 @@ export function SubthreadSidePane({
           rows={3}
           placeholder="Ask about this reply…"
           disabled={sending}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => handleDraftInput(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
@@ -402,6 +471,17 @@ export function SubthreadSidePane({
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={deleteConfirmOpen}
+        onOpenChange={setDeleteConfirmOpen}
+        title="Delete side chat?"
+        description="This removes this side conversation and all of its turns. The main chat timeline is unchanged."
+        confirmLabel="Delete"
+        destructive
+        loading={deleting}
+        onConfirm={() => void handleConfirmDelete()}
+      />
     </aside>
   )
 }

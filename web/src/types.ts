@@ -497,6 +497,7 @@ export type BackendMessage = {
   is_from_bot?: boolean
   timestamp?: string
   is_bookmarked?: boolean
+  session_id?: string | null
 }
 
 export type PersonaBulletinFocus = {
@@ -543,6 +544,26 @@ export type PersonaMessageBookmark = {
   note?: string | null
   created_at?: string
   updated_at?: string
+}
+
+export type SideChatSummary = {
+  id: string
+  session_id?: string | null
+  anchor_message_id: string
+  title: string
+  anchor_snippet: string
+  draft_text?: string
+  turn_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type SideChatTurn = {
+  id: string
+  role: 'user' | 'assistant' | string
+  content: string
+  created_at?: string
+  streaming?: boolean
 }
 
 export type QueueItem = {

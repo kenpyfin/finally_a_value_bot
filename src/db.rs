@@ -541,6 +541,35 @@ pub struct PersonaMessageBookmark {
     pub updated_at: String,
 }
 
+/// Side chat (sub-thread) anchored to an assistant message; turns are not main timeline.
+#[derive(Debug, Clone)]
+pub struct SideChat {
+    pub id: String,
+    pub chat_id: i64,
+    pub persona_id: i64,
+    /// Empty string = main chat; otherwise focused session id.
+    pub session_id: String,
+    pub anchor_message_id: String,
+    pub title: String,
+    pub anchor_snippet: String,
+    pub draft_text: String,
+    pub turn_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SideChatTurn {
+    pub id: String,
+    pub side_chat_id: String,
+    pub seq: i64,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+pub const SIDE_CHAT_MAX_TURNS: usize = 40;
+
 /// Operator action item created by the agent (web Inbox); not Tier 3 memory.
 #[derive(Debug, Clone)]
 pub struct PersonaTodo {
@@ -865,6 +894,7 @@ impl Database {
         Self::migrate_cursor_agent_runs_tmux(&conn)?;
         Self::migrate_drop_project_artifacts(&conn)?;
         Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
+        Self::migrate_side_chats_schema(&conn)?;
         Self::migrate_persona_todos(&conn)?;
         Self::migrate_workflow_learning_schema(&conn)?;
         Self::migrate_background_jobs_lease_schema(&conn)?;
@@ -1897,6 +1927,39 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_persona_message_bookmarks_persona_time
                 ON persona_message_bookmarks(chat_id, persona_id, updated_at DESC);",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_side_chats_schema(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS side_chats (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                anchor_message_id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                anchor_snippet TEXT NOT NULL DEFAULT '',
+                draft_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (chat_id, persona_id, session_id, anchor_message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_side_chats_persona_time
+                ON side_chats(chat_id, persona_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS side_chat_turns (
+                id TEXT PRIMARY KEY,
+                side_chat_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (side_chat_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS idx_side_chat_turns_chat_seq
+                ON side_chat_turns(side_chat_id, seq ASC);",
         )?;
         Ok(())
     }
@@ -4601,6 +4664,468 @@ impl Database {
         Ok(items)
     }
 
+    fn normalize_side_chat_session_id(session_id: Option<&str>) -> String {
+        session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn side_chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SideChat> {
+        Ok(SideChat {
+            id: row.get(0)?,
+            chat_id: row.get(1)?,
+            persona_id: row.get(2)?,
+            session_id: row.get(3)?,
+            anchor_message_id: row.get(4)?,
+            title: row.get(5)?,
+            anchor_snippet: row.get(6)?,
+            draft_text: row.get(7)?,
+            turn_count: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    }
+
+    /// Ensure a side chat exists for the given anchor; returns the existing or newly created row.
+    pub fn ensure_side_chat(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        session_id: Option<&str>,
+        anchor_message_id: &str,
+        anchor_snippet: &str,
+    ) -> Result<SideChat, FinallyAValueBotError> {
+        let session_key = Self::normalize_side_chat_session_id(session_id);
+        let anchor_message_id = anchor_message_id.trim();
+        if anchor_message_id.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "anchor_message_id is required".into(),
+            ));
+        }
+        let snippet: String = anchor_snippet.chars().take(280).collect();
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM side_chats
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3 AND anchor_message_id = ?4",
+                params![chat_id, persona_id, session_key, anchor_message_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let id = if let Some(id) = existing {
+            id
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO side_chats (
+                    id, chat_id, persona_id, session_id, anchor_message_id,
+                    title, anchor_snippet, draft_text, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, '', ?7, ?7)",
+                params![
+                    id,
+                    chat_id,
+                    persona_id,
+                    session_key,
+                    anchor_message_id,
+                    snippet,
+                    now
+                ],
+            )?;
+            id
+        };
+        drop(conn);
+        self.get_side_chat(chat_id, persona_id, &id)?
+            .ok_or_else(|| {
+                FinallyAValueBotError::ToolExecution("side chat missing after ensure".into())
+            })
+    }
+
+    pub fn list_side_chats(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        limit: usize,
+    ) -> Result<Vec<SideChat>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sc.id, sc.chat_id, sc.persona_id, sc.session_id, sc.anchor_message_id,
+                    sc.title, sc.anchor_snippet, sc.draft_text,
+                    COALESCE((SELECT COUNT(*) FROM side_chat_turns t WHERE t.side_chat_id = sc.id), 0),
+                    sc.created_at, sc.updated_at
+             FROM side_chats sc
+             WHERE sc.chat_id = ?1 AND sc.persona_id = ?2
+             ORDER BY sc.updated_at DESC
+             LIMIT ?3",
+        )?;
+        let items = stmt
+            .query_map(
+                params![chat_id, persona_id, limit as i64],
+                Self::side_chat_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    pub fn get_side_chat(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        side_chat_id: &str,
+    ) -> Result<Option<SideChat>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT sc.id, sc.chat_id, sc.persona_id, sc.session_id, sc.anchor_message_id,
+                    sc.title, sc.anchor_snippet, sc.draft_text,
+                    COALESCE((SELECT COUNT(*) FROM side_chat_turns t WHERE t.side_chat_id = sc.id), 0),
+                    sc.created_at, sc.updated_at
+             FROM side_chats sc
+             WHERE sc.id = ?1 AND sc.chat_id = ?2 AND sc.persona_id = ?3",
+            params![side_chat_id, chat_id, persona_id],
+            Self::side_chat_from_row,
+        );
+        match result {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_side_chat_turns(
+        &self,
+        side_chat_id: &str,
+    ) -> Result<Vec<SideChatTurn>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, side_chat_id, seq, role, content, created_at
+             FROM side_chat_turns
+             WHERE side_chat_id = ?1
+             ORDER BY seq ASC",
+        )?;
+        let items = stmt
+            .query_map(params![side_chat_id], |row| {
+                Ok(SideChatTurn {
+                    id: row.get(0)?,
+                    side_chat_id: row.get(1)?,
+                    seq: row.get(2)?,
+                    role: row.get(3)?,
+                    content: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    pub fn patch_side_chat(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        side_chat_id: &str,
+        draft_text: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        if draft_text.is_none() && title.is_none() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = match (draft_text, title) {
+            (Some(draft), Some(title)) => {
+                let title_val: String = title.chars().take(120).collect();
+                conn.execute(
+                    "UPDATE side_chats SET draft_text = ?1, title = ?2, updated_at = ?3
+                     WHERE id = ?4 AND chat_id = ?5 AND persona_id = ?6",
+                    params![draft, title_val, now, side_chat_id, chat_id, persona_id],
+                )?
+            }
+            (Some(draft), None) => conn.execute(
+                "UPDATE side_chats SET draft_text = ?1, updated_at = ?2
+                 WHERE id = ?3 AND chat_id = ?4 AND persona_id = ?5",
+                params![draft, now, side_chat_id, chat_id, persona_id],
+            )?,
+            (None, Some(title)) => {
+                let title_val: String = title.chars().take(120).collect();
+                conn.execute(
+                    "UPDATE side_chats SET title = ?1, updated_at = ?2
+                     WHERE id = ?3 AND chat_id = ?4 AND persona_id = ?5",
+                    params![title_val, now, side_chat_id, chat_id, persona_id],
+                )?
+            }
+            (None, None) => 0,
+        };
+        Ok(rows > 0)
+    }
+
+    pub fn delete_side_chat(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        side_chat_id: &str,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let _ = tx.execute(
+            "DELETE FROM side_chat_turns WHERE side_chat_id = ?1",
+            params![side_chat_id],
+        )?;
+        let rows = tx.execute(
+            "DELETE FROM side_chats WHERE id = ?1 AND chat_id = ?2 AND persona_id = ?3",
+            params![side_chat_id, chat_id, persona_id],
+        )?;
+        tx.commit()?;
+        Ok(rows > 0)
+    }
+
+    /// Append a user + assistant turn pair; caps at SIDE_CHAT_MAX_TURNS (drops oldest).
+    pub fn append_side_chat_turns(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        side_chat_id: &str,
+        user_content: &str,
+        assistant_content: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        let user_content = user_content.trim();
+        let assistant_content = assistant_content.trim();
+        if user_content.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "user turn must not be empty".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let owned: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM side_chats WHERE id = ?1 AND chat_id = ?2 AND persona_id = ?3",
+            params![side_chat_id, chat_id, persona_id],
+            |row| row.get(0),
+        )?;
+        if owned == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "side chat not found".into(),
+            ));
+        }
+        let tx = conn.unchecked_transaction()?;
+        let next_seq: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM side_chat_turns WHERE side_chat_id = ?1",
+                params![side_chat_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+            + 1;
+        let now = chrono::Utc::now().to_rfc3339();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let asst_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO side_chat_turns (id, side_chat_id, seq, role, content, created_at)
+             VALUES (?1, ?2, ?3, 'user', ?4, ?5)",
+            params![user_id, side_chat_id, next_seq, user_content, now],
+        )?;
+        tx.execute(
+            "INSERT INTO side_chat_turns (id, side_chat_id, seq, role, content, created_at)
+             VALUES (?1, ?2, ?3, 'assistant', ?4, ?5)",
+            params![asst_id, side_chat_id, next_seq + 1, assistant_content, now],
+        )?;
+
+        // Cap total turns by deleting oldest seq values.
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM side_chat_turns WHERE side_chat_id = ?1",
+            params![side_chat_id],
+            |row| row.get(0),
+        )?;
+        if count > SIDE_CHAT_MAX_TURNS as i64 {
+            let drop_n = count - SIDE_CHAT_MAX_TURNS as i64;
+            tx.execute(
+                "DELETE FROM side_chat_turns WHERE id IN (
+                    SELECT id FROM side_chat_turns WHERE side_chat_id = ?1
+                    ORDER BY seq ASC LIMIT ?2
+                 )",
+                params![side_chat_id, drop_n],
+            )?;
+        }
+
+        // Title from first user turn if empty.
+        let title: String = tx
+            .query_row(
+                "SELECT title FROM side_chats WHERE id = ?1",
+                params![side_chat_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        if title.trim().is_empty() {
+            let t: String = user_content.chars().take(80).collect();
+            tx.execute(
+                "UPDATE side_chats SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![t, now, side_chat_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE side_chats SET updated_at = ?1 WHERE id = ?2",
+                params![now, side_chat_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// How many main-chat (or session) messages are at/after the given message (inclusive), newest-side window size.
+    pub fn count_messages_from_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<usize>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let target: Option<(String, Option<String>)> = match conn.query_row(
+            "SELECT timestamp, session_id FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3",
+            params![chat_id, persona_id, message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let Some((ts, msg_session)) = target else {
+            return Ok(None);
+        };
+        let count = if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3
+                   AND (timestamp > ?4 OR (timestamp = ?4 AND id >= ?5))",
+                params![chat_id, persona_id, sid, ts, message_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else if let Some(sid) = msg_session {
+            // Message is in a focused session; count within that session.
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3
+                   AND (timestamp > ?4 OR (timestamp = ?4 AND id >= ?5))",
+                params![chat_id, persona_id, sid, ts, message_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else {
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM messages
+                     WHERE chat_id = ?1 AND persona_id = ?2
+                       AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                       AND (timestamp > ?3 OR (timestamp = ?3 AND id >= ?4))"
+                ),
+                params![chat_id, persona_id, ts, message_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        Ok(Some(count as usize))
+    }
+
+    /// Window of messages around a target id (older pad + target + newer).
+    pub fn get_messages_around_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        before: usize,
+        after: usize,
+        session_id: Option<&str>,
+    ) -> Result<Option<Vec<StoredMessage>>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let target: Option<(String, Option<String>)> = match conn.query_row(
+            "SELECT timestamp, session_id FROM messages
+             WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3",
+            params![chat_id, persona_id, message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let Some((ts, msg_session)) = target else {
+            return Ok(None);
+        };
+
+        let older = if let Some(sid) = session_id
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or(msg_session.clone())
+        {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3
+                   AND (timestamp < ?4 OR (timestamp = ?4 AND id < ?5))
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?6"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, sid, ts, message_id, before as i64],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                   AND (timestamp < ?3 OR (timestamp = ?3 AND id < ?4))
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, ts, message_id, before as i64],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let newer_incl = if let Some(sid) = session_id
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or(msg_session)
+        {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3
+                   AND (timestamp > ?4 OR (timestamp = ?4 AND id >= ?5))
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?6"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, sid, ts, message_id, (after + 1) as i64],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                   AND (timestamp > ?3 OR (timestamp = ?3 AND id >= ?4))
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, ts, message_id, (after + 1) as i64],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut older = older;
+        older.reverse(); // oldest first
+        let mut out = older;
+        out.extend(newer_incl);
+        Ok(Some(out))
+    }
+
     pub fn add_persona_todo(
         &self,
         chat_id: i64,
@@ -6316,6 +6841,24 @@ impl Database {
         )?;
         let _ = tx.execute(
             "DELETE FROM persona_message_bookmarks WHERE chat_id = ?1 AND persona_id = ?2",
+            params![chat_id, persona_id],
+        )?;
+        let side_ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM side_chats WHERE chat_id = ?1 AND persona_id = ?2")?;
+            let ids = stmt
+                .query_map(params![chat_id, persona_id], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        };
+        for sid in &side_ids {
+            let _ = tx.execute(
+                "DELETE FROM side_chat_turns WHERE side_chat_id = ?1",
+                params![sid],
+            )?;
+        }
+        let _ = tx.execute(
+            "DELETE FROM side_chats WHERE chat_id = ?1 AND persona_id = ?2",
             params![chat_id, persona_id],
         )?;
         let _ = tx.execute(

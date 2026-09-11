@@ -27,6 +27,70 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-09 — Web UI npm audit: Vite 6 / Vitest 4
+
+- **Area:** web UI / deps
+- **Summary:** Patched `web/` npm advisories without `npm audit fix --force`. Transitive fixes first, then Vite `5.4` → `6.4.3` and Vitest `3.2` → `4.1.11` (`@vitest/coverage-v8` matched). `npm audit` is now clean and `vite build` succeeds.
+- **Rationale:** `reload.sh` prints the audit warning after `npm install`; it is not a failed build. `--force` would have jumped to Vite 8, which `@tailwindcss/vite` and `@vitejs/plugin-react` do not support.
+- **Key files / symbols:** `web/package.json` (`vite`, `vitest`, `@vitest/coverage-v8`); `web/package-lock.json`.
+- **Follow-ups:** Rebuild/restart gateway if you want the Vite 6 `web/dist` embedded (`./reload.sh`).
+
+### 2026-09-09 — Load-earlier keeps the thread still
+
+- **Area:** web UI / history
+- **Summary:** “Load earlier messages” freezes a clone of the current viewport on click, remounts history underneath, restores scroll, then lifts the clone after paint so there is no flash to the top. Side-chat jumps skip the freeze.
+- **Rationale:** `runtime.thread.reset()` after a prepend fired initialize-scroll-to-bottom, so height-delta restore lost the race and the viewport jumped. Jumping must keep its own path.
+- **Key files / symbols:** `captureMessageScrollAnchor` / `restoreMessageScrollAnchor` in `web/src/lib/scroll-anchor.ts`; prepend pin + `scrollToBottomOnInitialize={false}` in `web/src/components/thread-pane.tsx`.
+- **Follow-ups:** Rebuild/restart gateway so `web/dist` ships (`./reload.sh`).
+
+### 2026-09-09 — Mobile cockpit is a header button
+
+- **Area:** web UI / header
+- **Summary:** On phone widths the cockpit is a labeled header chip (with a queue/jobs badge), separated from Inbox/Settings/Ops. Session status was removed from the Operator tools sheet.
+- **Rationale:** Opening the cockpit required the ops sheet after the floating pill auto-hides; operators need a persistent, dedicated control.
+- **Key files / symbols:** `.mc-cockpit-launch` in `web/src/styles.css`; mobile launch button in `web/src/app/AppHeader.tsx`; `handleToggleCockpit` in `web/src/app/App.tsx`; `IconCockpit`.
+- **Follow-ups:** Rebuild/restart gateway so `web/dist` ships (`./reload.sh`).
+
+### 2026-09-09 — Hide duplicate session controls on desktop
+
+- **Area:** web UI / header
+- **Summary:** The mobile session sub-bar (Main chat / + Session / Side chats) no longer stays visible next to the desktop header cluster. It is `display: none` by default and `display: grid` only below 768px.
+- **Rationale:** Unlayered `.mc-mobile-session-subbar { display: grid }` beat Tailwind `md:hidden` (utilities layer), so both copies rendered on `md+`.
+- **Key files / symbols:** `.mc-mobile-session-subbar` in `web/src/styles.css`; `renderSessionControls` in `web/src/app/AppHeader.tsx`.
+- **Follow-ups:** Rebuild/restart gateway so `web/dist` ships (`./reload.sh`).
+
+### 2026-09-05 — Operator UI: header controls, cockpit float, mobile scroll, bookmark jump
+
+- **Area:** web UI / header / thread
+- **Summary:** Session and Side-chat controls are now visually separated (segmented session pill + divider + icon/badge side-chats button), with a dedicated mobile two-tier header (title/actions on top, a collapsible session sub-bar below). The floating CockpitBar pill now auto-hides when the thread is scrolled away from the top or a side chat is open, and can be opened from the header status chip or the mobile ops sheet (Session status). Mobile header height is fixed (no per-scroll resize) and collapse uses accumulated-delta hysteresis plus a post-toggle guard to stop the jitter/oscillation. Bookmark chips now reliably center the target message instead of snapping to the bottom.
+- **Rationale:** The two picker groups read as one undifferentiated button string and crowded on mobile; the floating cockpit hovered over content and the side-chat split; in-flow header resizing during momentum scroll cancelled the fling and oscillated; and assistant-ui's auto-scroll-to-bottom (on `thread.initialize` / resize) clobbered the bookmark `scrollIntoView`, so jumps landed at the bottom of the session.
+- **Key files / symbols:** `renderSessionControls` + two-tier layout in `web/src/app/AppHeader.tsx`; `mc-session-controls` / `mc-session-picker` (segmented) / `mc-side-chats-btn` / `mc-badge-counter` / `mc-mobile-session-subbar` in `web/src/styles.css`; `IconSideChat`+badge in `side-chats-picker.tsx`; `onThreadScrolledDownChange`, accumulated-delta scroll handler, and `targetScrollMessageId` centering effect + `ThreadPrimitive.Viewport` with `autoScroll`/`scrollToBottomOnInitialize`/`scrollToBottomOnThreadSwitch` in `web/src/components/thread-pane.tsx`; `centerMessageInViewport` / `flashMessageElement` in `web/src/lib/reveal-message.ts`; `threadScrolledDown` state, floating-pill visibility gate, and rewritten `revealMessageInThread` / `handleTargetScrollHandled` in `web/src/app/App.tsx`; `onOpenSessionStatus` in `ops-ui.tsx`.
+- **Follow-ups:** Rebuild/restart gateway so `web/dist` ships (`./reload.sh`).
+
+### 2026-09-04 — Persist side chats; keep history scroll; jump bookmarks
+
+- **Area:** web UI / history
+- **Summary:** Side chats are stored in SQLite (`side_chats` / `side_chat_turns`) and listed in a header registry; closing the pane no longer drops the conversation. “Load earlier messages” keeps the viewport still (scroll restore no longer re-captures after DOM growth). Bookmark chips jump to the message in the main thread instead of opening a reader dialog.
+- **Rationale:** Ephemeral side chats were lost on close; history prepend scrolled to the oldest row; bookmarks opened a separate dialog instead of in-thread navigation.
+- **Key files / symbols:** `ensure_side_chat` / `append_side_chat_turns` / `get_messages_around_id` in `src/db.rs`; `api_persona_side_chats_*` / `api_subthread_stream` / history `around_id` in `src/web.rs`; `useSideChats`, `SideChatsPicker`, `revealMessageInThread` / `ensureMessageVisible`; scroll restore in `thread-pane.tsx`.
+- **Follow-ups:** Rebuild/restart gateway so `web/dist` is compiled in (`./reload.sh`).
+
+### 2026-09-04 — Stuck Cursor runs cancel only the old session
+
+- **Area:** cursor sidecar / supervisor
+- **Summary:** When `/health` shows a `/run` older than 20 minutes, the supervisor now `POST /admin/cancel_old_runs` instead of killing the sidecar process. Younger Cursor sessions stay. The sidecar reaper uses the same wall-age cap (`CURSOR_MAX_RUN_WALL_SECS`, default 1200). Unreachable `/health` (`wedged_health`) still force-recycles because individual sessions cannot be addressed.
+- **Rationale:** Process recycle was dropping live chats (e.g. sourdough) as collateral for hung PZ3/videographer slots.
+- **Key files / symbols:** `cancelRunsOlderThan` / `handleCancelOldRuns` in `scripts/cursor-sdk-runner.mjs`; `request_cancel_old_runs` / `supervise_sidecar` in `src/cursor_sdk_sidecar.rs`.
+- **Follow-ups:** Recycle sidecar (script mtime) and rebuild/restart gateway (`./reload.sh`).
+
+### 2026-09-04 — Cursor stream-drop copy asks for a resend
+
+- **Area:** cursor engine / delivery
+- **Summary:** Idle/timeout interrupt notices no longer mention Comfy or `check again`. They ask the user to send the request again. Background-job copy is unchanged (do not resend while work is still running).
+- **Rationale:** The PZ3 Comfy status line was global, so sourdough (and any other Cursor persona) saw GPU-queue advice after a sidecar drop.
+- **Key files / symbols:** `cursor_turn_timeout_notice` / `cursor_stream_interrupt_notice` in `src/cursor_engine_config.rs`.
+- **Follow-ups:** Rebuild/restart the gateway (`./reload.sh`). `check again` still skips the sidecar as a status poll; it is just no longer advertised on every drop.
+
 ### 2026-09-03 — PTE asks on doubt instead of continuing
 
 - **Area:** agent / PTE

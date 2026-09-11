@@ -13,6 +13,7 @@
  *   CURSOR_SIDECAR_MAX_UPTIME_SECS  idle self-recycle, default 86400
  *   CURSOR_RUN_WAIT_TIMEOUT_MS      hang watchdog for run.wait() AFTER stream ends, default 120000 (not a turn budget)
  *   CURSOR_STREAM_IDLE_TIMEOUT_MS   cancel SDK stream when no events for this long, default 900000 (15 min)
+ *   CURSOR_MAX_RUN_WALL_SECS        cancel only /run sessions older than this; keep younger ones, default 1200
  *   CURSOR_RUN_INTERACTIVE_RESERVE  slots reserved for interactive chat (scheduled waits), default 1
  *   CURSOR_SDK_NODE_PREFIX          runtime dir with sdk-shim.mjs + node_modules
  *
@@ -24,7 +25,8 @@
  * `@cursor/sdk` (it calls `crypto.randomUUID()` for agent/run ids).
  * Sends pass `local.force` so a leftover run cannot block the next message.
  *
- * API: GET /health  GET /models  POST /run  POST /admin/request_recycle
+ * API: GET /health  GET /models  POST /run
+ *      POST /admin/request_recycle  POST /admin/cancel_old_runs
  */
 
 import crypto, { webcrypto } from "node:crypto";
@@ -68,6 +70,7 @@ const DEFAULT_AGENT_POOL_MAX = 16;
 const DEFAULT_SIDECAR_MAX_UPTIME_SECS = 86400;
 const DEFAULT_RUN_WAIT_TIMEOUT_MS = 120_000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900_000;
+const DEFAULT_MAX_RUN_WALL_SECS = 1200;
 const DEFAULT_RUN_INTERACTIVE_RESERVE = 1;
 const DEFAULT_REAPER_INTERVAL_SECS = 60;
 const UUID_RE =
@@ -151,6 +154,10 @@ function streamIdleTimeoutMs() {
     DEFAULT_STREAM_IDLE_TIMEOUT_MS,
     60_000,
   );
+}
+
+function maxRunWallAgeSecs() {
+  return envInt("CURSOR_MAX_RUN_WALL_SECS", DEFAULT_MAX_RUN_WALL_SECS, 60);
 }
 
 function interactiveReserve() {
@@ -877,13 +884,38 @@ async function triggerCleanShutdown(reason) {
   process.exit(0);
 }
 
+async function cancelRunsOlderThan(maxAgeSecs) {
+  const now = monotonicNow();
+  const cancelled = [];
+  for (const [id, rec] of [...activeRuns.entries()]) {
+    const wallAge = now - rec.startedMonotonic;
+    if (wallAge < maxAgeSecs) continue;
+    logErr(
+      `cancelling old run id=${id} kind=${rec.runKind} wall=${wallAge.toFixed(0)}s (younger sessions kept)`,
+    );
+    try {
+      if (rec.cancelFn) await rec.cancelFn();
+    } catch (err) {
+      logErr(`old run cancel failed id=${id}: ${err}`);
+    }
+    cancelled.push({
+      id,
+      kind: rec.runKind,
+      wall_age_secs: Math.floor(wallAge),
+    });
+    activeRuns.delete(id);
+  }
+  return cancelled;
+}
+
 async function cancelStuckRuns() {
   const now = monotonicNow();
   const idleLimitSec = streamIdleTimeoutMs() / 1000;
+  const wallLimitSec = maxRunWallAgeSecs();
   for (const [id, rec] of [...activeRuns.entries()]) {
     const idleAge = now - rec.lastEventMonotonic;
     const wallAge = now - rec.startedMonotonic;
-    if (idleAge <= idleLimitSec * 1.05 && wallAge <= idleLimitSec * 2) {
+    if (idleAge <= idleLimitSec * 1.05 && wallAge < wallLimitSec) {
       continue;
     }
     logErr(
@@ -1051,6 +1083,32 @@ async function handleRequestRecycle(req, res) {
   });
 }
 
+async function handleCancelOldRuns(req, res) {
+  if (!clientIsLoopback(req)) {
+    jsonResponse(res, 403, { ok: false, reason: "loopback_only" });
+    return;
+  }
+  let body = {};
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    body = {};
+  }
+  const requested = Number.parseInt(String(body?.max_age_secs ?? ""), 10);
+  const maxAgeSecs =
+    Number.isFinite(requested) && requested >= 60
+      ? requested
+      : maxRunWallAgeSecs();
+  const cancelled = await cancelRunsOlderThan(maxAgeSecs);
+  jsonResponse(res, 200, {
+    ok: true,
+    max_age_secs: maxAgeSecs,
+    cancelled: cancelled.length,
+    runs: cancelled,
+    runs_in_flight: runsInFlightCount(),
+  });
+}
+
 async function handleRun(req, res) {
   let body;
   try {
@@ -1083,6 +1141,13 @@ async function handleRun(req, res) {
     res,
     runId,
   };
+  const rec = activeRuns.get(runId);
+  if (rec) {
+    rec.cancelFn = async () => {
+      active.cancelRequested = true;
+      await cancelRun(active.run);
+    };
+  }
   const onClose = () => {
     if (active.cancelRequested) return;
     active.cancelRequested = true;
@@ -1255,6 +1320,10 @@ async function handleRequest(req, res) {
       await handleRequestRecycle(req, res);
       return;
     }
+    if (route === "POST /admin/cancel_old_runs") {
+      await handleCancelOldRuns(req, res);
+      return;
+    }
     jsonResponse(res, 404, { ok: false, error: "not found" });
   } catch (err) {
     logErr(`handler error ${route}: ${err}`);
@@ -1266,7 +1335,7 @@ async function handleRequest(req, res) {
   }
 }
 
-function runSelfTests() {
+async function runSelfTests() {
   if (!isEphemeralSessionScope("scheduled:17:2026-08-11T07:00:49Z")) {
     throw new Error("scheduled scope should be ephemeral");
   }
@@ -1321,6 +1390,31 @@ function runSelfTests() {
     for (const id of scheduledIds) endTrackedRun(id);
     if (interactiveId) endTrackedRun(interactiveId);
   }
+  {
+    const young = tryBeginRun({ run_kind: "interactive" });
+    const old = tryBeginRun({ run_kind: "interactive" });
+    if (!young || !old) throw new Error("cancel-old-runs self-test needs two slots");
+    const oldRec = activeRuns.get(old);
+    const youngRec = activeRuns.get(young);
+    oldRec.startedMonotonic -= 1300;
+    let oldCancelled = false;
+    let youngCancelled = false;
+    oldRec.cancelFn = async () => {
+      oldCancelled = true;
+    };
+    youngRec.cancelFn = async () => {
+      youngCancelled = true;
+    };
+    const cancelled = await cancelRunsOlderThan(1200);
+    if (cancelled.length !== 1 || cancelled[0].id !== old) {
+      throw new Error("cancel-old-runs should cancel only the 20min+ session");
+    }
+    if (!oldCancelled) throw new Error("old session cancelFn should run");
+    if (youngCancelled) throw new Error("younger session must not be cancelled");
+    if (!activeRuns.has(young)) throw new Error("younger session should remain in flight");
+    if (activeRuns.has(old)) throw new Error("old session should be dropped from tracking");
+    endTrackedRun(young);
+  }
   const sendOpts = buildSendOptions(null);
   if (!sendOpts.local?.force) {
     throw new Error("send should force-expire stuck local runs");
@@ -1330,7 +1424,10 @@ function runSelfTests() {
 
 function main() {
   if (process.argv[2] === "--self-test") {
-    runSelfTests();
+    runSelfTests().catch((err) => {
+      process.stderr.write(`cursor-sdk-runner self-test failed: ${err}\n`);
+      process.exit(1);
+    });
     return;
   }
   pruneLegacyResumeStores();

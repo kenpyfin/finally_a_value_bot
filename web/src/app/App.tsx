@@ -17,6 +17,8 @@ import { AppHeader } from './AppHeader'
 import { AppDialogs } from './AppDialogs'
 import { AuthDialog } from '../context/AuthContext'
 import { useChatHistory } from '../hooks/use-chat-history'
+import { useSideChats } from '../hooks/use-side-chats'
+import { findMessageElement } from '../lib/reveal-message'
 import { useDocumentVisible } from '../hooks/use-document-visible'
 import { useKeyboardShortcuts } from '../hooks/use-keyboard-shortcuts'
 import { useOperatorOps } from '../hooks/use-operator-ops'
@@ -293,7 +295,14 @@ type LoadHistoryFn = (
   cid?: number | null,
   personaId?: number | null,
   day?: string | null,
-  opts?: { force?: boolean; limitOverride?: number; sessionId?: string | null },
+  opts?: {
+    force?: boolean
+    limitOverride?: number
+    sessionId?: string | null
+    aroundId?: string
+    aroundBefore?: number
+    aroundAfter?: number
+  },
 ) => Promise<void>
 
 function artifactPreviewUrl(item: ArtifactItem): string {
@@ -399,7 +408,6 @@ export function App({
     denseDelivery,
     loadPersonaBulletin,
     reloadPersonaBulletin,
-    removePersonaBookmark,
     toggleMessageBookmark,
   } = ops
 
@@ -411,6 +419,7 @@ export function App({
     setHistoryLoading,
     loadHistory,
     loadMoreHistory,
+    ensureMessageVisible,
     resetHistoryPagination,
     handleReplyToMessage,
     handleDismissPendingReply,
@@ -425,44 +434,122 @@ export function App({
     setPendingReplyByThreadKey,
   } = chat
 
-  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
-  const [activeSubthread, setActiveSubthread] = useState<{
-    messageId: string
-    anchorMessage: BackendMessage
-  } | null>(null)
+  const side = useSideChats({
+    activePersonaId,
+    activeSessionId,
+    chatId,
+    setError,
+    setStatusText,
+  })
 
-  const handleOpenSubthread = useCallback(
+  const {
+    sideChats,
+    sideChatsLoading,
+    activeSideChat,
+    activeTurns,
+    setActiveTurns,
+    activeDraft,
+    setActiveDraft,
+    setActiveDraftLocal,
+    openSideChatForAnchor,
+    openSideChatById,
+    closeSideChatPane,
+    deleteSideChat,
+    refreshAfterSend,
+  } = side
+
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  // Armed message id for a bookmark/anchor jump. ThreadPane performs the centered
+  // scroll (with auto-scroll-to-bottom suppressed) once the element is mounted.
+  const [targetScrollMessageId, setTargetScrollMessageId] = useState<string | null>(null)
+
+  const handleTargetScrollHandled = useCallback(
+    (found: boolean) => {
+      setTargetScrollMessageId(null)
+      if (found) {
+        setStatusText('Jumped to message')
+      } else {
+        setError('Could not find that message in the chat window')
+        setStatusText('Idle')
+      }
+    },
+    [setError, setStatusText],
+  )
+
+  const revealMessageInThread = useCallback(
     async (messageId: string) => {
-      if (activePersonaId == null) return
-      if (activeSubthread?.messageId === messageId) {
-        setActiveSubthread(null)
+      if (!messageId) return
+      // Arm the jump first so ThreadPane suppresses auto-scroll-to-bottom before any
+      // history reset happens.
+      setTargetScrollMessageId(messageId)
+      if (findMessageElement(messageId)) {
+        // Already mounted; ThreadPane's effect will center it on the state change.
         return
       }
+      setStatusText('Loading message…')
       try {
-        setStatusText('Opening side chat…')
-        const data = await api<{ message?: BackendMessage }>(
+        const meta = await api<{
+          message?: BackendMessage
+          messages_from?: number
+        }>(
           `/api/personas/${activePersonaId}/messages/${encodeURIComponent(messageId)}`,
         )
-        const m = data.message
-        if (!m || !m.is_from_bot) {
-          setError('Side chat requires a bot response')
-          setStatusText('Idle')
+        const sessionId =
+          typeof meta.message?.session_id === 'string' && meta.message.session_id.trim()
+            ? meta.message.session_id.trim()
+            : null
+        if (sessionId !== (activeSessionId ?? null)) {
+          await handleSelectSession(sessionId)
+        }
+        if (findMessageElement(messageId)) {
+          // Mounted after session switch; ThreadPane effect (initialMessages dep) handles it.
           return
         }
-        setActiveSubthread({ messageId, anchorMessage: m })
-        setStatusText('Side chat open')
-        setError('')
+        const { ok } = await ensureMessageVisible(messageId)
+        if (!ok) {
+          setTargetScrollMessageId(null)
+          setStatusText('Idle')
+        }
+        // On success, ThreadPane centers the message and calls onTargetScrollHandled.
       } catch (e) {
+        setTargetScrollMessageId(null)
         setError(e instanceof Error ? e.message : String(e))
         setStatusText('Idle')
       }
     },
-    [activePersonaId, activeSubthread?.messageId, setError, setStatusText],
+    [
+      activePersonaId,
+      activeSessionId,
+      ensureMessageVisible,
+      handleSelectSession,
+      setError,
+      setStatusText,
+    ],
+  )
+
+  const handleOpenSubthread = useCallback(
+    async (messageId: string) => {
+      await openSideChatForAnchor(messageId)
+      void revealMessageInThread(messageId)
+    },
+    [openSideChatForAnchor, revealMessageInThread],
+  )
+
+  const handleSelectSideChat = useCallback(
+    async (sideChatId: string) => {
+      const sc = await openSideChatById(sideChatId)
+      if (!sc) return
+      const targetSession = sc.session_id ?? null
+      if (targetSession !== (activeSessionId ?? null)) {
+        await handleSelectSession(targetSession)
+      }
+      void revealMessageInThread(sc.anchor_message_id)
+    },
+    [activeSessionId, handleSelectSession, openSideChatById, revealMessageInThread],
   )
 
   useEffect(() => {
     setEditingMessageId(null)
-    setActiveSubthread(null)
   }, [activePersonaId, activeSessionId, chatId])
 
   const [replayNotice, setReplayNotice] = useState<string>('')
@@ -531,6 +618,7 @@ export function App({
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [mobileChatHeaderCollapsed, setMobileChatHeaderCollapsed] = useState(false)
+  const [threadScrolledDown, setThreadScrolledDown] = useState(false)
   const [cockpitExpanded, setCockpitExpanded] = useState(false)
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState<boolean>(readDesktopSidebarOpen)
   const [desktopSidebarWidth, setDesktopSidebarWidth] = useState<number>(readDesktopSidebarWidth)
@@ -1662,11 +1750,15 @@ export function App({
       setMobileChatHeaderCollapsed(false)
       return
     }
-    if ((opts.scrollTop ?? 0) < 28) {
+    if ((opts.scrollTop ?? 0) < 24) {
       setMobileChatHeaderCollapsed(false)
       return
     }
     setMobileChatHeaderCollapsed((prev) => (prev === opts.collapseHeader ? prev : opts.collapseHeader))
+  }, [])
+
+  const handleThreadScrolledDownChange = useCallback((scrolledDown: boolean) => {
+    setThreadScrolledDown((prev) => (prev === scrolledDown ? prev : scrolledDown))
   }, [])
 
   const handleShowShortcuts = useCallback(() => {
@@ -1706,8 +1798,8 @@ export function App({
     setAgentHistoryDialogOpen(true)
   }, [])
 
-  const handleExpandCockpit = useCallback(() => {
-    setCockpitExpanded(true)
+  const handleToggleCockpit = useCallback(() => {
+    setCockpitExpanded((v) => !v)
   }, [])
 
   const handleOpenMobileNav = useCallback(() => {
@@ -1819,6 +1911,13 @@ export function App({
       onSelectSession: handleSelectSessionStable,
       onCreateSession: handleCreateSession,
       onDeleteSession: handleDeleteSession,
+      sideChats,
+      activeSideChatId: activeSideChat?.id ?? null,
+      sideChatsLoading,
+      onSelectSideChat: (id: string) => {
+        void handleSelectSideChat(id)
+      },
+      onDeleteSideChat: deleteSideChat,
     }),
     [
       activePersonaId,
@@ -1829,6 +1928,11 @@ export function App({
       handleSelectSessionStable,
       handleCreateSession,
       handleDeleteSession,
+      sideChats,
+      activeSideChat?.id,
+      sideChatsLoading,
+      handleSelectSideChat,
+      deleteSideChat,
     ],
   )
 
@@ -1841,7 +1945,8 @@ export function App({
       backgroundActiveCount,
       installationStatus,
       statusText,
-      onExpandCockpit: handleExpandCockpit,
+      cockpitExpanded,
+      onToggleCockpit: handleToggleCockpit,
       onOpenSettings: handleOpenSettings,
       onOpenInbox: handleOpenInbox,
       inboxBadgeCount,
@@ -1859,7 +1964,8 @@ export function App({
       backgroundActiveCount,
       installationStatus,
       statusText,
-      handleExpandCockpit,
+      cockpitExpanded,
+      handleToggleCockpit,
       handleOpenSettings,
       handleOpenInbox,
       inboxBadgeCount,
@@ -1992,13 +2098,21 @@ export function App({
               }
             >
               <div
-                className={`pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2 transition-all duration-200 max-md:ease-out ${
-                  mobileChatHeaderCollapsed && !cockpitExpanded
-                    ? 'max-md:-translate-y-2 max-md:opacity-0'
-                    : 'max-md:translate-y-0 max-md:opacity-100'
+                className={`pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2 transition-all duration-200 ease-out ${
+                  !cockpitExpanded &&
+                  (threadScrolledDown || activeSideChat != null || mobileChatHeaderCollapsed)
+                    ? '-translate-y-3 scale-95 opacity-0'
+                    : 'translate-y-0 scale-100 opacity-100'
                 }`}
               >
-                <div className="pointer-events-auto w-full max-w-5xl">
+                <div
+                  className={`w-full max-w-5xl ${
+                    !cockpitExpanded &&
+                    (threadScrolledDown || activeSideChat != null || mobileChatHeaderCollapsed)
+                      ? 'pointer-events-none'
+                      : 'pointer-events-auto'
+                  }`}
+                >
                   <CockpitBar
                     appearance={appearance}
                     statusText={statusText}
@@ -2010,7 +2124,7 @@ export function App({
                     bulletinFocus={bulletinFocus}
                     bookmarks={personaBookmarks}
                     activePersonaId={activePersonaId}
-                    onRemoveBookmark={removePersonaBookmark}
+                    onJumpToBookmark={revealMessageInThread}
                     historySuffix={bulletinHistorySuffix}
                     operatorMemoServer={bulletinOperatorMemo}
                     denseDelivery={denseDelivery}
@@ -2084,10 +2198,13 @@ export function App({
                       onOpenSubthread={handleOpenSubthread}
                       editingMessageId={editingMessageId}
                       onEditingMessageIdChange={setEditingMessageId}
-                      activeSubthreadMessageId={activeSubthread?.messageId ?? null}
+                      activeSubthreadMessageId={activeSideChat?.anchorMessageId ?? null}
                       pendingReply={activePendingReply}
                       onDismissPendingReply={handleDismissPendingReply}
                       onMobileThreadScroll={handleMobileThreadScroll}
+                      onThreadScrolledDownChange={handleThreadScrolledDownChange}
+                      targetScrollMessageId={targetScrollMessageId}
+                      onTargetScrollHandled={handleTargetScrollHandled}
                       onShowShortcuts={handleShowShortcuts}
                       uploadHint={
                         statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
@@ -2096,15 +2213,24 @@ export function App({
                       }
                     />
                   </div>
-                  {activeSubthread ? (
+                  {activeSideChat ? (
                     <SubthreadSidePane
+                      key={activeSideChat.id}
                       chatId={chatId}
                       personaId={activePersonaId}
-                      sessionId={activeSessionId}
-                      anchorMessageId={activeSubthread.messageId}
-                      anchorMessage={activeSubthread.anchorMessage}
+                      sessionId={activeSideChat.sessionId ?? activeSessionId}
+                      sideChatId={activeSideChat.id}
+                      anchorMessageId={activeSideChat.anchorMessageId}
+                      anchorMessage={activeSideChat.anchorMessage}
                       historySuffix={bulletinHistorySuffix}
-                      onClose={() => setActiveSubthread(null)}
+                      turns={activeTurns}
+                      onTurnsChange={setActiveTurns}
+                      draft={activeDraft}
+                      onDraftChange={setActiveDraft}
+                      onDraftLocalChange={setActiveDraftLocal}
+                      onSendComplete={refreshAfterSend}
+                      onDelete={() => deleteSideChat(activeSideChat.id)}
+                      onClose={closeSideChatPane}
                     />
                   ) : null}
                 </div>

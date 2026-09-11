@@ -64,7 +64,14 @@ export function useChatHistory({
       cid: number | null = chatId,
       personaId?: number | null,
       day?: string | null,
-      opts?: { force?: boolean; limitOverride?: number; sessionId?: string | null },
+      opts?: {
+        force?: boolean
+        limitOverride?: number
+        sessionId?: string | null
+        aroundId?: string
+        aroundBefore?: number
+        aroundAfter?: number
+      },
     ): Promise<void> => {
       if (cid == null) return
       const pid =
@@ -82,19 +89,31 @@ export function useChatHistory({
       const query = new URLSearchParams({ chat_id: String(cid), persona_id: String(pid) })
       const sid = opts?.sessionId !== undefined ? opts.sessionId : activeSessionIdRef.current
       if (sid) query.set('session_id', sid)
-      if (day) query.set('day', day)
-      else {
+      if (opts?.aroundId) {
+        query.set('around_id', opts.aroundId)
+        query.set('around_before', String(opts.aroundBefore ?? 15))
+        query.set('around_after', String(opts.aroundAfter ?? 15))
+      } else if (day) {
+        query.set('day', day)
+      } else {
         const visibleLimit = opts?.limitOverride ?? historyVisibleLimitRef.current
         query.set('limit', String(visibleLimit + 1))
       }
       const data = await api<{ messages?: BackendMessage[] }>(`/api/history?${query.toString()}`)
       const rawMessages = Array.isArray(data.messages) ? data.messages : []
       const mapped = mapBackendHistory(rawMessages)
-      if (day) {
+      if (opts?.aroundId) {
+        setHistoryByDay({})
+        setHistoryHasMore(true)
+        setHistoryVisibleLimit(Math.max(historyVisibleLimitRef.current, mapped.length))
+        if (!historiesEqual(historySeedRef.current, mapped)) {
+          setHistorySeed(mapped)
+        }
+      } else if (day) {
         setHistoryByDay((prev) => {
           const nextByDay = { ...prev, [day]: mapped }
           const allDays = Object.keys(nextByDay).sort()
-          const combined = allDays.flatMap((d) => (nextByDay[d] ?? []))
+          const combined = allDays.flatMap((d) => nextByDay[d] ?? [])
           setHistoryHasMore(false)
           if (!historiesEqual(historySeedRef.current, combined)) {
             setHistorySeed(combined)
@@ -134,6 +153,57 @@ export function useChatHistory({
       setHistoryLoadingMore(false)
     }
   }, [activePersonaId, chatId, historyLoadingMore, loadHistory, setError])
+
+  /** Ensure a message is in the loaded history window (raise limit or around_id). */
+  const ensureMessageVisible = useCallback(
+    async (
+      messageId: string,
+    ): Promise<{ ok: boolean; sessionId: string | null }> => {
+      if (chatId == null || activePersonaId == null) {
+        return { ok: false, sessionId: null }
+      }
+      try {
+        const data = await api<{
+          message?: BackendMessage
+          messages_from?: number
+        }>(`/api/personas/${activePersonaId}/messages/${encodeURIComponent(messageId)}`)
+        const m = data.message
+        if (!m?.id) return { ok: false, sessionId: null }
+        const sessionId =
+          typeof m.session_id === 'string' && m.session_id.trim()
+            ? m.session_id.trim()
+            : null
+        const fromCount =
+          typeof data.messages_from === 'number' && data.messages_from > 0
+            ? data.messages_from
+            : null
+        const HISTORY_REVEAL_CAP = 300
+        const pad = 10
+        if (fromCount != null && fromCount + pad <= HISTORY_REVEAL_CAP) {
+          const nextLimit = Math.max(historyVisibleLimitRef.current, fromCount + pad)
+          setHistoryVisibleLimit(nextLimit)
+          await loadHistory(chatId, activePersonaId, null, {
+            force: true,
+            limitOverride: nextLimit,
+            sessionId,
+          })
+        } else {
+          await loadHistory(chatId, activePersonaId, null, {
+            force: true,
+            sessionId,
+            aroundId: messageId,
+            aroundBefore: 20,
+            aroundAfter: 20,
+          })
+        }
+        return { ok: true, sessionId }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+        return { ok: false, sessionId: null }
+      }
+    },
+    [activePersonaId, chatId, loadHistory, setError],
+  )
 
   const handleReplyToMessage = useCallback(
     async (messageId: string) => {
@@ -277,6 +347,7 @@ export function useChatHistory({
     setHistoryLoading,
     loadHistory,
     loadMoreHistory,
+    ensureMessageVisible,
     resetHistoryPagination,
     handleReplyToMessage,
     handleDismissPendingReply,

@@ -322,6 +322,15 @@ struct HistoryQuery {
     day: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    /// When set, return a window of messages around this id (ignores day/limit paging).
+    #[serde(default)]
+    around_id: Option<String>,
+    /// Older messages to include with around_id (default 15).
+    #[serde(default)]
+    around_before: Option<usize>,
+    /// Newer messages to include with around_id (default 15).
+    #[serde(default)]
+    around_after: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,6 +367,37 @@ struct SubthreadStreamRequest {
     /// Prior ephemeral turns in this side chat (not including the current message).
     #[serde(default)]
     history: Vec<SubthreadHistoryTurn>,
+    /// When set, persist the completed user+assistant turns onto this side chat.
+    #[serde(default)]
+    side_chat_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PersonaSideChatPathParams {
+    persona_id: i64,
+}
+
+#[derive(Deserialize)]
+struct PersonaSideChatIdPathParams {
+    persona_id: i64,
+    side_chat_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SideChatEnsureBody {
+    anchor_message_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    anchor_snippet: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SideChatPatchBody {
+    #[serde(default)]
+    draft_text: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -687,7 +727,21 @@ async fn api_history(
     let cid2 = chat_id;
     let pid = persona_id;
 
-    let messages = if let Some(ref sid) = query.session_id {
+    let messages = if let Some(ref around_id) = query.around_id {
+        let around_id = around_id.trim().to_string();
+        if around_id.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "around_id is required".into()));
+        }
+        let before = query.around_before.unwrap_or(15).clamp(0, 100);
+        let after = query.around_after.unwrap_or(15).clamp(0, 100);
+        let session_id = query.session_id.clone();
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_messages_around_id(cid2, pid, &around_id, before, after, session_id.as_deref())
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "message not found".into()))?
+    } else if let Some(ref sid) = query.session_id {
         let session_id = sid.clone();
         call_blocking(state.app_state.db.clone(), move |db| {
             db.get_all_messages_for_session(&session_id)
@@ -1470,8 +1524,9 @@ async fn api_send_stream(
     })))
 }
 
-/// Ephemeral side-chat stream: seeds context from the anchor bot message + cockpit window,
-/// then runs the shared agent without persisting side-chat turns into main history.
+/// Side-chat stream: seeds context from the anchor bot message + cockpit window,
+/// runs the shared agent without writing into main history, and optionally persists
+/// turns onto a `side_chats` row when `side_chat_id` is provided.
 async fn api_subthread_stream(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -1692,6 +1747,32 @@ async fn api_subthread_stream(
     let limits = state.limits.clone();
     let history_override = seeded;
     let session_id_for_run = session_for_seed;
+    let side_chat_id_for_persist = body
+        .side_chat_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let user_text_for_persist = text.clone();
+    if let Some(ref sid) = side_chat_id_for_persist {
+        let sid = sid.clone();
+        let pid_sc = persona_id;
+        let ok = match call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_side_chat(chat_id, pid_sc, &sid)
+        })
+        .await
+        {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                state.request_hub.end_with_limits(&key, &state.limits).await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        };
+        if !ok {
+            state.request_hub.end_with_limits(&key, &state.limits).await;
+            return Err((StatusCode::NOT_FOUND, "side chat not found".into()));
+        }
+    }
     let (queue_position, _) = state
         .app_state
         .chat_queue
@@ -1843,7 +1924,7 @@ async fn api_subthread_stream(
             )
             .await;
 
-            // Never persist sub-thread turns — stream result only.
+            // Persist onto side_chats when requested; never write into main timeline.
             let response = match agent_result {
                 Ok(agent_out) => ensure_visible_turn_text(&agent_out.response),
                 Err(e) => {
@@ -1858,12 +1939,42 @@ async fn api_subthread_stream(
                 }
             };
 
+            if let Some(side_chat_id) = side_chat_id_for_persist.as_ref() {
+                let side_chat_id = side_chat_id.clone();
+                let user_text = user_text_for_persist.clone();
+                let assistant_text = response.clone();
+                let pid_persist = persona_id;
+                if let Err(e) = call_blocking(state_for_task.app_state.db.clone(), move |db| {
+                    db.append_side_chat_turns(
+                        chat_id,
+                        pid_persist,
+                        &side_chat_id,
+                        &user_text,
+                        &assistant_text,
+                    )
+                })
+                .await
+                {
+                    warn!(
+                        target: "web",
+                        chat_id,
+                        persona_id,
+                        error = %e,
+                        "failed to persist side chat turns"
+                    );
+                }
+            }
+
             state_for_task
                 .run_hub
                 .publish(
                     &run_id_for_task,
                     "done",
-                    json!({ "response": response, "ephemeral": true }).to_string(),
+                    json!({
+                        "response": response,
+                        "persisted": side_chat_id_for_persist.is_some(),
+                    })
+                    .to_string(),
                     limits.run_history_limit,
                 )
                 .await;
@@ -4713,6 +4824,267 @@ async fn api_persona_bookmarks_delete(
     })))
 }
 
+fn side_chat_to_json(sc: &crate::db::SideChat) -> serde_json::Value {
+    json!({
+        "id": sc.id,
+        "session_id": if sc.session_id.is_empty() { serde_json::Value::Null } else { json!(sc.session_id) },
+        "anchor_message_id": sc.anchor_message_id,
+        "title": sc.title,
+        "anchor_snippet": sc.anchor_snippet,
+        "draft_text": sc.draft_text,
+        "turn_count": sc.turn_count,
+        "created_at": sc.created_at,
+        "updated_at": sc.updated_at,
+    })
+}
+
+async fn api_persona_side_chats_list(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaSideChatPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let pid2 = path.persona_id;
+    let items = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_side_chats(chat_id, pid2, 100)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "side_chats": items.iter().map(side_chat_to_json).collect::<Vec<_>>(),
+    })))
+}
+
+async fn api_persona_side_chats_ensure(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaSideChatPathParams>,
+    Json(body): Json<SideChatEnsureBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let anchor_message_id = body.anchor_message_id.trim().to_string();
+    if anchor_message_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "anchor_message_id is required".into(),
+        ));
+    }
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+    let pid_lookup = path.persona_id;
+    let message = call_blocking(state.app_state.db.clone(), {
+        let anchor_message_id = anchor_message_id.clone();
+        move |db| db.get_message_for_persona(chat_id, pid_lookup, &anchor_message_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(message) = message else {
+        return Err((StatusCode::NOT_FOUND, "anchor message not found".into()));
+    };
+    if !message.is_from_bot {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "anchor must be a bot response".into(),
+        ));
+    }
+    let snippet = body
+        .anchor_snippet
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| truncate_chars(message.content.trim(), 280));
+    let session_id = body
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| message.session_id.clone());
+    let pid_ensure = path.persona_id;
+    let sc = call_blocking(state.app_state.db.clone(), move |db| {
+        db.ensure_side_chat(
+            chat_id,
+            pid_ensure,
+            session_id.as_deref(),
+            &anchor_message_id,
+            &snippet,
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let turns = call_blocking(state.app_state.db.clone(), {
+        let id = sc.id.clone();
+        move |db| db.list_side_chat_turns(&id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let turns_json: Vec<serde_json::Value> = turns
+        .into_iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "role": t.role,
+                "content": t.content,
+                "created_at": t.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "side_chat": side_chat_to_json(&sc),
+        "turns": turns_json,
+    })))
+}
+
+async fn api_persona_side_chat_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaSideChatIdPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let side_chat_id = path.side_chat_id.trim().to_string();
+    if side_chat_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "side_chat_id is required".into()));
+    }
+    let pid = path.persona_id;
+    let sc = call_blocking(state.app_state.db.clone(), {
+        let side_chat_id = side_chat_id.clone();
+        move |db| db.get_side_chat(chat_id, pid, &side_chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "side chat not found".into()))?;
+    let turns = call_blocking(state.app_state.db.clone(), {
+        let id = sc.id.clone();
+        move |db| db.list_side_chat_turns(&id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let turns_json: Vec<serde_json::Value> = turns
+        .into_iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "role": t.role,
+                "content": t.content,
+                "created_at": t.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "side_chat": side_chat_to_json(&sc),
+        "turns": turns_json,
+    })))
+}
+
+async fn api_persona_side_chat_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaSideChatIdPathParams>,
+    Json(body): Json<SideChatPatchBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let side_chat_id = path.side_chat_id.trim().to_string();
+    if side_chat_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "side_chat_id is required".into()));
+    }
+    let draft = body.draft_text.as_deref();
+    let title = body.title.as_deref();
+    if draft.is_none() && title.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "draft_text or title is required".into(),
+        ));
+    }
+    let pid = path.persona_id;
+    let updated = call_blocking(state.app_state.db.clone(), {
+        let side_chat_id = side_chat_id.clone();
+        let draft = draft.map(str::to_string);
+        let title = title.map(str::to_string);
+        move |db| {
+            db.patch_side_chat(
+                chat_id,
+                pid,
+                &side_chat_id,
+                draft.as_deref(),
+                title.as_deref(),
+            )
+        }
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "side chat not found".into()));
+    }
+    let sc = call_blocking(state.app_state.db.clone(), {
+        let side_chat_id = side_chat_id.clone();
+        move |db| db.get_side_chat(chat_id, pid, &side_chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "side chat not found".into()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "side_chat": side_chat_to_json(&sc),
+    })))
+}
+
+async fn api_persona_side_chat_delete(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaSideChatIdPathParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let side_chat_id = path.side_chat_id.trim().to_string();
+    if side_chat_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "side_chat_id is required".into()));
+    }
+    let pid = path.persona_id;
+    let deleted = call_blocking(state.app_state.db.clone(), move |db| {
+        db.delete_side_chat(chat_id, pid, &side_chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "deleted": deleted,
+    })))
+}
+
 /// Full text of one message in the persona thread (used by web bookmark reader; bookmarks only store a short preview).
 async fn api_persona_message_get(
     headers: HeaderMap,
@@ -4751,6 +5123,17 @@ async fn api_persona_message_get(
         return Err((StatusCode::NOT_FOUND, "message not found".into()));
     };
 
+    let pid_count = path.persona_id;
+    let mid = m.id.clone();
+    let messages_from = call_blocking(state.app_state.db.clone(), {
+        let mid = mid.clone();
+        let sid = m.session_id.clone();
+        move |db| db.count_messages_from_id(cid, pid_count, &mid, sid.as_deref())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .unwrap_or(0);
+
     Ok(Json(json!({
         "ok": true,
         "persona_id": path.persona_id,
@@ -4760,7 +5143,9 @@ async fn api_persona_message_get(
             "content": m.content,
             "is_from_bot": m.is_from_bot,
             "timestamp": m.timestamp,
-        }
+            "session_id": m.session_id,
+        },
+        "messages_from": messages_from,
     })))
 }
 
@@ -8217,6 +8602,16 @@ fn build_router(web_state: WebState) -> Router {
         .route(
             "/api/personas/:persona_id/bookmarks/:message_id",
             delete(api_persona_bookmarks_delete),
+        )
+        .route(
+            "/api/personas/:persona_id/side_chats",
+            get(api_persona_side_chats_list).post(api_persona_side_chats_ensure),
+        )
+        .route(
+            "/api/personas/:persona_id/side_chats/:side_chat_id",
+            get(api_persona_side_chat_get)
+                .patch(api_persona_side_chat_patch)
+                .delete(api_persona_side_chat_delete),
         )
         .route(
             "/api/personas/:persona_id/messages/:message_id",

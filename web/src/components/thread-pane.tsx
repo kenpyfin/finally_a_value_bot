@@ -1,4 +1,5 @@
 import React from 'react'
+import { flushSync } from 'react-dom'
 import { ThreadHistorySkeleton } from './skeleton'
 import { IconCopy, IconPencil, IconReply, IconSideChat, IconStar, IconTrash } from './icons'
 import {
@@ -6,6 +7,7 @@ import {
   CompositeAttachmentAdapter,
   ComposerPrimitive,
   MessagePrimitive,
+  ThreadPrimitive,
   SimpleImageAttachmentAdapter,
   SimpleTextAttachmentAdapter,
   useAui,
@@ -32,6 +34,17 @@ import {
 } from '@assistant-ui/react-ui'
 import remarkGfm from 'remark-gfm'
 import { historiesEqual, isHistoryPrepend } from '../lib/history-sync'
+import {
+  applyHeightScrollAnchor,
+  captureHeightScrollAnchor,
+  coverViewport,
+  installViewportScrollFreeze,
+  setViewportHoldScroll,
+  uncoverViewportAfterPaint,
+  withAllowedScrollWrite,
+  type HeightScrollAnchor,
+} from '../lib/scroll-anchor'
+import { centerMessageInViewport, flashMessageElement } from '../lib/reveal-message'
 import { messageTextForClipboard, parseReplyForDisplay, type DisplayReplyQuote, type PendingReplyQuote } from '../lib/reply-quote'
 import { MarkdownTable } from './markdown-table'
 import { copyTextToClipboard } from '../lib/copy-to-clipboard'
@@ -73,12 +86,6 @@ function formatUnknown(value: unknown): string {
   } catch {
     return String(value)
   }
-}
-
-type ScrollAnchor = { scrollTop: number; scrollHeight: number }
-
-function captureScrollAnchor(el: HTMLElement): ScrollAnchor {
-  return { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight }
 }
 
 function ToolCallCard(props: ToolCallMessagePartProps) {
@@ -795,9 +802,71 @@ export type ThreadPaneProps = {
     source: 'scroll' | 'reset' | 'focus' | 'media-change'
     scrollTop?: number
   }) => void
+  /** All widths: report whether the thread is scrolled away from the top (for the floating cockpit pill). */
+  onThreadScrolledDownChange?: (scrolledDown: boolean) => void
+  /** When set, the thread centers this message and suppresses auto-scroll-to-bottom (bookmark jump). */
+  targetScrollMessageId?: string | null
+  /** Called once the target message has been centered (true) or could not be found (false). */
+  onTargetScrollHandled?: (found: boolean) => void
   /** Shown under the composer during multipart uploads (e.g. "Uploading photo.png (10.2 MB)…"). */
   uploadHint?: string
   onShowShortcuts?: () => void
+}
+
+/**
+ * Runs inside the runtime so its layout effect fires in the same commit as
+ * the remounted messages — before paint — and can correct scrollTop.
+ */
+function PrependScrollLock({
+  viewportRef,
+  pendingAnchorRef,
+  jumpingRef,
+  scrollGuardUntilRef,
+  lastViewportScrollTopRef,
+  uncoverRef,
+}: {
+  viewportRef: React.RefObject<HTMLDivElement | null>
+  pendingAnchorRef: React.MutableRefObject<HeightScrollAnchor | null>
+  jumpingRef: React.MutableRefObject<string | null>
+  scrollGuardUntilRef: React.MutableRefObject<number>
+  lastViewportScrollTopRef: React.MutableRefObject<number>
+  uncoverRef: React.MutableRefObject<(() => void) | null>
+}) {
+  const headKey = useAuiState(({ thread }) => {
+    const n = thread.messages.length
+    const first = n > 0 ? thread.messages[0]?.id ?? '' : ''
+    return `${n}:${first}`
+  })
+
+  React.useLayoutEffect(() => {
+    if (jumpingRef.current) return
+    const el = viewportRef.current
+    const anchor = pendingAnchorRef.current
+    if (!el || !anchor) return
+    withAllowedScrollWrite(el, () => {
+      applyHeightScrollAnchor(el, anchor)
+    })
+    scrollGuardUntilRef.current = Date.now() + 700
+    lastViewportScrollTopRef.current = el.scrollTop
+    uncoverViewportAfterPaint(() => {
+      uncoverRef.current?.()
+      uncoverRef.current = null
+      if (pendingAnchorRef.current === anchor) {
+        pendingAnchorRef.current = null
+        setViewportHoldScroll(el, false)
+      }
+    })
+  }, [
+    headKey,
+    jumpingRef,
+    lastViewportScrollTopRef,
+    pendingAnchorRef,
+    scrollGuardUntilRef,
+    uncoverRef,
+    viewportRef,
+  ])
+
+  return null
 }
 
 function DraftAwareComposer() {
@@ -863,6 +932,9 @@ export const ThreadPane = React.memo(function ThreadPane({
   pendingReply,
   onDismissPendingReply,
   onMobileThreadScroll,
+  onThreadScrolledDownChange,
+  targetScrollMessageId = null,
+  onTargetScrollHandled,
   uploadHint,
   onShowShortcuts,
 }: ThreadPaneProps) {
@@ -883,7 +955,18 @@ export const ThreadPane = React.memo(function ThreadPane({
   const viewportScrollCleanupRef = React.useRef<(() => void) | null>(null)
   const lastViewportScrollTopRef = React.useRef(0)
   const scrollGuardUntilRef = React.useRef(0)
-  const pendingScrollRestoreRef = React.useRef<ScrollAnchor | null>(null)
+  const pendingScrollRestoreRef = React.useRef<HeightScrollAnchor | null>(null)
+  const uncoverViewportRef = React.useRef<(() => void) | null>(null)
+  const targetScrollMessageIdRef = React.useRef(targetScrollMessageId)
+  targetScrollMessageIdRef.current = targetScrollMessageId
+  const lastScrolledDownRef = React.useRef(false)
+  const scrollAccumRef = React.useRef(0)
+  const runtimeKeyChangedThisRender = lastRuntimeKeyRef.current !== runtimeKey
+  const holdStillForPrepend =
+    !targetScrollMessageId &&
+    !runtimeKeyChangedThisRender &&
+    (pendingScrollRestoreRef.current != null ||
+      isHistoryPrepend(lastInitialMessagesRef.current, initialMessages))
   React.useLayoutEffect(() => {
     const runtimeKeyChanged = lastRuntimeKeyRef.current !== runtimeKey
     if (!runtimeKeyChanged && isStreaming) return
@@ -896,47 +979,101 @@ export const ThreadPane = React.memo(function ThreadPane({
     const prev = lastInitialMessagesRef.current
     const prepend =
       !runtimeKeyChanged && isHistoryPrepend(prev, initialMessages)
-    if (prepend && viewportRef.current) {
-      pendingScrollRestoreRef.current = captureScrollAnchor(viewportRef.current)
-    } else {
+    const jumping = targetScrollMessageIdRef.current != null
+    const vp = viewportRef.current
+    if (
+      prepend &&
+      !jumping &&
+      vp &&
+      pendingScrollRestoreRef.current == null
+    ) {
+      pendingScrollRestoreRef.current = captureHeightScrollAnchor(vp)
+      setViewportHoldScroll(vp, true)
+      if (!uncoverViewportRef.current) {
+        uncoverViewportRef.current = coverViewport(vp)
+      }
+    } else if (!prepend || jumping) {
       pendingScrollRestoreRef.current = null
+      uncoverViewportRef.current?.()
+      uncoverViewportRef.current = null
+      if (vp) setViewportHoldScroll(vp, false)
     }
-    runtime.thread.reset(initialMessages)
+    // Flush the runtime store so new message nodes exist before paint, then
+    // correct scrollTop in this same layout turn (avoids flash-to-top).
+    flushSync(() => {
+      runtime.thread.reset(initialMessages)
+    })
+    if (pendingScrollRestoreRef.current && vp && !jumping) {
+      withAllowedScrollWrite(vp, () => {
+        applyHeightScrollAnchor(vp, pendingScrollRestoreRef.current as HeightScrollAnchor)
+      })
+      scrollGuardUntilRef.current = Date.now() + 700
+      lastViewportScrollTopRef.current = vp.scrollTop
+      uncoverViewportAfterPaint(() => {
+        uncoverViewportRef.current?.()
+        uncoverViewportRef.current = null
+        pendingScrollRestoreRef.current = null
+        setViewportHoldScroll(vp, false)
+      })
+    }
     lastInitialMessagesRef.current = initialMessages
     lastRuntimeKeyRef.current = runtimeKey
+    if (runtimeKeyChanged && !jumping) {
+      requestAnimationFrame(() => {
+        const el = viewportRef.current
+        if (!el || targetScrollMessageIdRef.current) return
+        el.scrollTop = el.scrollHeight
+        lastViewportScrollTopRef.current = el.scrollTop
+      })
+    }
   }, [initialMessages, runtime, runtimeKey, isStreaming])
 
   React.useLayoutEffect(() => {
-    const anchor = pendingScrollRestoreRef.current
-    const el = viewportRef.current
-    if (!anchor || !el) return
-    const apply = () => {
-      const heightDelta = el.scrollHeight - anchor.scrollHeight
-      if (heightDelta <= 0) return false
-      el.scrollTop = anchor.scrollTop + heightDelta
+    if (targetScrollMessageId) {
+      const vp = viewportRef.current
       pendingScrollRestoreRef.current = null
-      scrollGuardUntilRef.current = Date.now() + 700
-      lastViewportScrollTopRef.current = el.scrollTop
-      return true
+      uncoverViewportRef.current?.()
+      uncoverViewportRef.current = null
+      if (vp) setViewportHoldScroll(vp, false)
     }
-    if (apply()) return
-    requestAnimationFrame(() => {
-      if (apply()) return
-      requestAnimationFrame(apply)
-    })
-  }, [initialMessages])
+  }, [targetScrollMessageId])
 
+  // Bookmark / jump: center the target message once it is mounted, retrying across a few
+  // frames while history settles. Auto-scroll-to-bottom is disabled (see Thread.Viewport
+  // props below) so this scroll is not clobbered by assistant-ui.
   React.useEffect(() => {
-    const anchor = pendingScrollRestoreRef.current
-    const el = viewportRef.current
-    if (!anchor || !el) return
-    const heightDelta = el.scrollHeight - anchor.scrollHeight
-    if (heightDelta <= 0) return
-    el.scrollTop = anchor.scrollTop + heightDelta
-    pendingScrollRestoreRef.current = null
-    scrollGuardUntilRef.current = Date.now() + 700
-    lastViewportScrollTopRef.current = el.scrollTop
-  }, [initialMessages, historyLoadingMore])
+    if (!targetScrollMessageId) return
+    let cancelled = false
+    let attempts = 0
+    const tryScroll = () => {
+      if (cancelled) return
+      const vp = viewportRef.current
+      const msgEl = vp?.querySelector(
+        `[data-message-id="${CSS.escape(targetScrollMessageId)}"]`,
+      )
+      if (vp && msgEl instanceof HTMLElement) {
+        centerMessageInViewport(vp, msgEl)
+        flashMessageElement(msgEl)
+        // Guard the scroll-direction detector so the programmatic jump does not
+        // toggle the mobile header, and record the new position.
+        scrollGuardUntilRef.current = Date.now() + 700
+        lastViewportScrollTopRef.current = vp.scrollTop
+        onTargetScrollHandled?.(true)
+        return
+      }
+      attempts += 1
+      if (attempts < 40) {
+        requestAnimationFrame(tryScroll)
+      } else {
+        onTargetScrollHandled?.(false)
+      }
+    }
+    const raf = requestAnimationFrame(tryScroll)
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(raf)
+    }
+  }, [targetScrollMessageId, initialMessages, onTargetScrollHandled])
   const uiContextValue = React.useMemo<ThreadPaneUiContextValue>(
     () => ({
       bookmarkedMessageIds,
@@ -981,37 +1118,75 @@ export const ThreadPane = React.memo(function ThreadPane({
       viewportRef.current = el
       viewportScrollCleanupRef.current?.()
       viewportScrollCleanupRef.current = null
-      if (!el || !onMobileThreadScroll) return
+      if (!el) return
+      installViewportScrollFreeze(el)
+      if (!onMobileThreadScroll && !onThreadScrolledDownChange) return
 
       const mq = window.matchMedia('(max-width: 767px)')
       lastViewportScrollTopRef.current = el.scrollTop
       scrollGuardUntilRef.current = Date.now() + 550
+      lastScrolledDownRef.current = el.scrollTop > 24
+      onThreadScrolledDownChange?.(lastScrolledDownRef.current)
+
+      const reportScrolledDown = (st: number) => {
+        const scrolledDown = st > 24
+        if (scrolledDown !== lastScrolledDownRef.current) {
+          lastScrolledDownRef.current = scrolledDown
+          onThreadScrolledDownChange?.(scrolledDown)
+        }
+      }
 
       const onScroll = () => {
-        if (!mq.matches) {
-          onMobileThreadScroll({ collapseHeader: false, source: 'media-change', scrollTop: el.scrollTop })
-          return
-        }
-        if (Date.now() < scrollGuardUntilRef.current) {
-          return
-        }
         const st = el.scrollTop
+        // General scrolled-away-from-top signal (all widths) for the floating cockpit pill.
+        reportScrolledDown(st)
+
+        if (!onMobileThreadScroll) {
+          lastViewportScrollTopRef.current = st
+          return
+        }
+        if (!mq.matches) {
+          onMobileThreadScroll({ collapseHeader: false, source: 'media-change', scrollTop: st })
+          lastViewportScrollTopRef.current = st
+          return
+        }
+        // Post-toggle guard: ignore the reflow scroll events triggered by our own
+        // header height change so we do not oscillate.
+        if (Date.now() < scrollGuardUntilRef.current) {
+          lastViewportScrollTopRef.current = st
+          return
+        }
         const delta = st - lastViewportScrollTopRef.current
         lastViewportScrollTopRef.current = st
-        if (st < 28) {
+        // Always reveal near the top.
+        if (st < 24) {
+          scrollAccumRef.current = 0
           onMobileThreadScroll({ collapseHeader: false, source: 'scroll', scrollTop: st })
           return
         }
-        if (delta > 14) {
+        // Accumulate distance in the current direction; reset when direction flips
+        // (hysteresis prevents flicker from small momentum jitters).
+        if (
+          (delta > 0 && scrollAccumRef.current < 0) ||
+          (delta < 0 && scrollAccumRef.current > 0)
+        ) {
+          scrollAccumRef.current = 0
+        }
+        scrollAccumRef.current += delta
+        if (scrollAccumRef.current > 50) {
+          scrollAccumRef.current = 0
+          scrollGuardUntilRef.current = Date.now() + 350
           onMobileThreadScroll({ collapseHeader: true, source: 'scroll', scrollTop: st })
-        } else if (delta < -12) {
+        } else if (scrollAccumRef.current < -40) {
+          scrollAccumRef.current = 0
+          scrollGuardUntilRef.current = Date.now() + 350
           onMobileThreadScroll({ collapseHeader: false, source: 'scroll', scrollTop: st })
         }
       }
 
       const onMqChange = () => {
         if (!mq.matches) {
-          onMobileThreadScroll({ collapseHeader: false, source: 'media-change', scrollTop: el.scrollTop })
+          onMobileThreadScroll?.({ collapseHeader: false, source: 'media-change', scrollTop: el.scrollTop })
         }
       }
 
@@ -1022,7 +1197,7 @@ export const ThreadPane = React.memo(function ThreadPane({
         mq.removeEventListener('change', onMqChange)
       }
     },
-    [onMobileThreadScroll],
+    [onMobileThreadScroll, onThreadScrolledDownChange],
   )
 
   React.useEffect(() => {
@@ -1034,9 +1209,25 @@ export const ThreadPane = React.memo(function ThreadPane({
     () => () => {
       viewportScrollCleanupRef.current?.()
       viewportScrollCleanupRef.current = null
+      uncoverViewportRef.current?.()
+      uncoverViewportRef.current = null
     },
     [],
   )
+
+  const handleLoadMoreHistory = React.useCallback(() => {
+    const vp = viewportRef.current
+    if (vp && targetScrollMessageIdRef.current == null) {
+      if (pendingScrollRestoreRef.current == null) {
+        pendingScrollRestoreRef.current = captureHeightScrollAnchor(vp)
+      }
+      setViewportHoldScroll(vp, true)
+      if (!uncoverViewportRef.current) {
+        uncoverViewportRef.current = coverViewport(vp)
+      }
+    }
+    void onLoadMoreHistory?.()
+  }, [onLoadMoreHistory])
 
   return (
     <ThreadPaneUiContext.Provider value={uiContextValue}>
@@ -1073,11 +1264,26 @@ export const ThreadPane = React.memo(function ThreadPane({
             {historyLoading ? (
               <ThreadHistorySkeleton />
             ) : (
-            <Thread.Viewport ref={bindThreadViewport} className="aui-thread-viewport mc-thread-viewport">
+            <ThreadPrimitive.Viewport
+              ref={bindThreadViewport}
+              className="aui-thread-viewport mc-thread-viewport"
+              autoScroll={targetScrollMessageId || holdStillForPrepend ? false : undefined}
+              scrollToBottomOnInitialize={false}
+              scrollToBottomOnRunStart={targetScrollMessageId || holdStillForPrepend ? false : undefined}
+              scrollToBottomOnThreadSwitch={targetScrollMessageId == null}
+            >
+              <PrependScrollLock
+                viewportRef={viewportRef}
+                pendingAnchorRef={pendingScrollRestoreRef}
+                jumpingRef={targetScrollMessageIdRef}
+                scrollGuardUntilRef={scrollGuardUntilRef}
+                lastViewportScrollTopRef={lastViewportScrollTopRef}
+                uncoverRef={uncoverViewportRef}
+              />
               {historyHasMore && onLoadMoreHistory ? (
                 <LoadEarlierMessages
                   loading={historyLoadingMore}
-                  onLoadMore={() => void onLoadMoreHistory()}
+                  onLoadMore={handleLoadMoreHistory}
                 />
               ) : null}
               <ThreadWelcomeHints onShowShortcuts={onShowShortcuts} />
@@ -1088,7 +1294,7 @@ export const ThreadPane = React.memo(function ThreadPane({
                 }}
               />
               <Thread.FollowupSuggestions />
-            </Thread.Viewport>
+            </ThreadPrimitive.Viewport>
             )}
             <div className="mc-thread-composer-stack">
               {!historyLoading ? (

@@ -347,8 +347,7 @@ pub fn cursor_turn_timeout_secs(
 pub fn cursor_turn_timeout_notice(timeout_secs: u64) -> String {
     format!(
         "This Cursor turn stopped after {timeout_secs}s without a final reply. \
-Generation may already have finished on disk (the Comfy queue can be empty). \
-Reply `check again` to summarize existing files only — that does not start a new job."
+Please send your request again."
     )
 }
 
@@ -373,8 +372,7 @@ You'll get another message when it finishes. Do not send the same request again 
         cursor_turn_timeout_notice(timeout_secs)
     } else {
         "The live Cursor stream dropped before a final reply was ready. \
-Generation may already have finished on disk (the Comfy queue can be empty). \
-Reply `check again` to summarize existing files only — that does not start a new job."
+Please send your request again."
             .to_string()
     }
 }
@@ -646,14 +644,17 @@ mod tests {
 
         let timeout_only = cursor_stream_interrupt_notice(900, true, false);
         assert!(timeout_only.contains("stopped after 900s"));
-        assert!(timeout_only.contains("check again"));
+        assert!(timeout_only.contains("Please send your request again"));
         assert!(!timeout_only.contains("background work"));
+        assert!(!timeout_only.to_lowercase().contains("comfy"));
+        assert!(!timeout_only.to_lowercase().contains("check again"));
         assert!(!timeout_only.to_lowercase().contains("narrower request"));
 
         let decode_idle = cursor_stream_interrupt_notice(900, false, false);
         assert!(decode_idle.contains("stream dropped"));
-        assert!(decode_idle.contains("check again"));
-        assert!(decode_idle.contains("does not start a new job"));
+        assert!(decode_idle.contains("Please send your request again"));
+        assert!(!decode_idle.to_lowercase().contains("comfy"));
+        assert!(!decode_idle.to_lowercase().contains("check again"));
         assert!(is_cursor_interrupt_notice(&decode_idle));
     }
 }

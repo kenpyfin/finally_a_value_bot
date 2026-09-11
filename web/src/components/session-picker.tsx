@@ -86,7 +86,6 @@ export function SessionPicker({
   return (
     <Flex
       align="center"
-      gap="2"
       className="mc-session-picker"
       data-compact={compact ? 'true' : 'false'}
       style={{ minWidth: 0 }}

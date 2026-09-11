@@ -1,9 +1,10 @@
 import React from 'react'
 import { Button, Flex, Heading, IconButton } from '@radix-ui/themes'
 import { SessionPicker } from '../components/session-picker'
+import { SideChatsPicker } from '../components/side-chats-picker'
 import { CockpitStatusChip } from '../components/ops-ui'
-import { IconInbox, IconOps, IconSettings } from '../components/icons'
-import type { ChatSession, InstallationStatus, QueueLane } from '../types'
+import { IconCockpit, IconInbox, IconOps, IconSettings } from '../components/icons'
+import type { ChatSession, InstallationStatus, QueueLane, SideChatSummary } from '../types'
 
 type Appearance = 'dark' | 'light'
 
@@ -23,6 +24,11 @@ export type AppHeaderSessionProps = {
   onSelectSession: (sessionId: string | null) => void
   onCreateSession: (intent: string, mirrorMainChat: boolean) => Promise<void>
   onDeleteSession: (sessionId: string) => Promise<void>
+  sideChats: SideChatSummary[]
+  activeSideChatId: string | null
+  sideChatsLoading?: boolean
+  onSelectSideChat: (sideChatId: string) => void
+  onDeleteSideChat: (sideChatId: string) => Promise<boolean>
 }
 
 export type AppHeaderToolbarProps = {
@@ -30,7 +36,8 @@ export type AppHeaderToolbarProps = {
   backgroundActiveCount: number
   installationStatus: InstallationStatus | null
   statusText: string
-  onExpandCockpit: () => void
+  cockpitExpanded?: boolean
+  onToggleCockpit: () => void
   onOpenSettings: () => void
   onOpenInbox: () => void
   inboxBadgeCount?: number
@@ -78,13 +85,19 @@ export const AppHeader = React.memo(function AppHeader({
     onSelectSession,
     onCreateSession,
     onDeleteSession,
+    sideChats,
+    activeSideChatId,
+    sideChatsLoading,
+    onSelectSideChat,
+    onDeleteSideChat,
   } = session
   const {
     queueLane,
     backgroundActiveCount,
     installationStatus,
     statusText,
-    onExpandCockpit,
+    cockpitExpanded = false,
+    onToggleCockpit,
     onOpenSettings,
     onOpenInbox,
     inboxBadgeCount = 0,
@@ -98,6 +111,35 @@ export const AppHeader = React.memo(function AppHeader({
     agentHistoryDisabled = false,
   } = toolbar
 
+  const cockpitBusyCount = (queueLane?.pending ?? 0) + backgroundActiveCount
+
+  const renderSessionControls = (className?: string) =>
+    activePersonaId == null ? null : (
+      <Flex
+        align="center"
+        className={`mc-session-controls min-w-0 ${className ?? ''}`}
+      >
+        <SessionPicker
+          compact
+          sessions={chatSessions}
+          activeSessionId={activeSessionId}
+          onSelectSession={onSelectSession}
+          onCreateSession={onCreateSession}
+          onDeleteSession={onDeleteSession}
+          loading={historyLoading}
+        />
+        <span className="mc-toolbar-divider" aria-hidden />
+        <SideChatsPicker
+          sideChats={sideChats}
+          sessions={chatSessions}
+          activeSideChatId={activeSideChatId}
+          loading={sideChatsLoading}
+          onSelect={onSelectSideChat}
+          onDelete={onDeleteSideChat}
+        />
+      </Flex>
+    )
+
   return (
     <header
       className={
@@ -106,11 +148,7 @@ export const AppHeader = React.memo(function AppHeader({
           : 'sticky top-0 z-30 border-b border-[color:var(--mc-border-soft)] bg-[color:var(--mc-surface-elevated)]/92 backdrop-blur-sm md:top-0'
       }
     >
-      <div
-        className={`mc-app-header-bar px-3 transition-[padding] duration-200 max-md:ease-out md:px-4 md:py-3 ${
-          mobileChatHeaderCollapsed ? 'max-md:py-1.5' : 'max-md:py-2'
-        }`}
-      >
+      <div className="mc-app-header-bar px-3 max-md:py-2 md:px-4 md:py-3">
         <Flex
           justify="between"
           align="center"
@@ -121,13 +159,13 @@ export const AppHeader = React.memo(function AppHeader({
           <Flex
             align="center"
             gap="2"
-            className={`min-w-0 w-full md:flex-1 ${mobileChatHeaderCollapsed ? 'min-h-[40px]' : 'min-h-[44px]'}`}
+            className="min-w-0 w-full min-h-[44px] md:flex-1"
           >
             <IconButton
               size="3"
               variant="soft"
               color="gray"
-              className={`shrink-0 md:!hidden ${mobileChatHeaderCollapsed ? 'min-h-9 min-w-9' : 'min-h-10 min-w-10'}`}
+              className="shrink-0 min-h-10 min-w-10 md:!hidden"
               type="button"
               aria-expanded={mobileNavOpen}
               aria-haspopup="dialog"
@@ -166,29 +204,36 @@ export const AppHeader = React.memo(function AppHeader({
             </IconButton>
             <Heading
               size="6"
-              className={`min-w-0 shrink truncate transition-[font-size] duration-200 max-md:ease-out ${
-                mobileChatHeaderCollapsed ? 'max-md:[font-size:1rem]' : 'max-md:[font-size:1.125rem]'
-              }`}
+              className="min-w-0 shrink truncate max-md:[font-size:1.125rem]"
             >
               {activePersonaName ?? 'Chat'}
             </Heading>
-            {activePersonaId != null ? (
-              <SessionPicker
-                compact
-                sessions={chatSessions}
-                activeSessionId={activeSessionId}
-                onSelectSession={onSelectSession}
-                onCreateSession={onCreateSession}
-                onDeleteSession={onDeleteSession}
-                loading={historyLoading}
-              />
-            ) : null}
+            {renderSessionControls('max-md:!hidden')}
             <div className="ml-auto flex shrink-0 items-center gap-1 md:hidden">
               <button
                 type="button"
-                className={`mc-inbox-launch mc-inbox-launch--icon cursor-pointer ${
-                  mobileChatHeaderCollapsed ? 'min-h-9 min-w-9' : 'min-h-10 min-w-10'
-                }`}
+                className="mc-cockpit-launch cursor-pointer"
+                data-active={cockpitExpanded ? 'true' : 'false'}
+                data-busy={cockpitBusyCount > 0 ? 'true' : 'false'}
+                aria-pressed={cockpitExpanded}
+                aria-label={
+                  cockpitBusyCount > 0 ? `Cockpit, ${cockpitBusyCount} active` : 'Cockpit'
+                }
+                title="Cockpit"
+                onClick={onToggleCockpit}
+              >
+                <IconCockpit className="size-4 shrink-0" />
+                <span className="mc-cockpit-launch-label">Cockpit</span>
+                {cockpitBusyCount > 0 ? (
+                  <span className="mc-badge-counter" aria-hidden>
+                    {cockpitBusyCount > 99 ? '99+' : cockpitBusyCount}
+                  </span>
+                ) : null}
+              </button>
+              <span className="mc-toolbar-divider" aria-hidden />
+              <button
+                type="button"
+                className="mc-inbox-launch mc-inbox-launch--icon cursor-pointer min-h-10 min-w-10"
                 data-has-items={inboxBadgeCount > 0 ? 'true' : 'false'}
                 aria-label={
                   inboxBadgeCount > 0 ? `Inbox, ${inboxBadgeCount} items` : 'Inbox'
@@ -208,7 +253,7 @@ export const AppHeader = React.memo(function AppHeader({
                 variant="soft"
                 color="gray"
                 type="button"
-                className={`cursor-pointer ${mobileChatHeaderCollapsed ? 'min-h-9 min-w-9' : 'min-h-10 min-w-10'}`}
+                className="cursor-pointer min-h-10 min-w-10"
                 aria-label="Settings"
                 title="Settings"
                 onClick={onOpenMobileSettings}
@@ -220,7 +265,7 @@ export const AppHeader = React.memo(function AppHeader({
                 variant="soft"
                 color="gray"
                 type="button"
-                className={`cursor-pointer ${mobileChatHeaderCollapsed ? 'min-h-9 min-w-9' : 'min-h-10 min-w-10'}`}
+                className="cursor-pointer min-h-10 min-w-10"
                 aria-label="Operator tools"
                 title="Operator tools"
                 onClick={onOpenMobileOps}
@@ -229,13 +274,25 @@ export const AppHeader = React.memo(function AppHeader({
               </IconButton>
             </div>
           </Flex>
+          {activePersonaId != null ? (
+            <div
+              className={`mc-mobile-session-subbar w-full ${
+                mobileChatHeaderCollapsed ? 'mc-mobile-session-subbar--collapsed' : ''
+              }`}
+              aria-hidden={mobileChatHeaderCollapsed}
+            >
+              <div className="mc-mobile-session-subbar-inner">
+                {renderSessionControls('w-full justify-start')}
+              </div>
+            </div>
+          ) : null}
           <Flex align="center" gap="2" wrap="wrap" justify="end" className="w-full max-md:!hidden md:!flex">
             <CockpitStatusChip
               queueLane={queueLane}
               backgroundActiveCount={backgroundActiveCount}
               installationStatus={installationStatus}
               statusText={statusText}
-              onClick={onExpandCockpit}
+              onClick={onToggleCockpit}
             />
             <button
               type="button"

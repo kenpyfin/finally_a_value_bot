@@ -1,13 +1,9 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { EmptyState } from './empty-state'
-import { MarkdownTable } from './markdown-table'
-import { Button, Dialog, Flex, Select, Switch, Text, TextArea } from '@radix-ui/themes'
-import remarkGfm from 'remark-gfm'
-import ReactMarkdown from 'react-markdown'
+import { Button, Flex, Select, Switch, Text, TextArea } from '@radix-ui/themes'
 import { api } from '../api/client'
 import {
   OPERATOR_MEMO_MAX_CHARS,
-  type BackendMessage,
   type InstallationStatus,
   type PersonaBulletinFocus,
   type PersonaBulletinHistorySuffix,
@@ -65,10 +61,10 @@ export type CockpitBarProps = {
   onQueueClick: () => void
   bulletinFocus: PersonaBulletinFocus | null
   bookmarks: PersonaMessageBookmark[]
-  /** Used to load full message text for the bookmark reader. */
+  /** Used when jumping to a bookmarked message. */
   activePersonaId: number | null
-  /** Persisted removal via DELETE bookmark; return true when the bookmark was removed. */
-  onRemoveBookmark?: (messageId: string) => Promise<boolean>
+  /** Jump to message in the main thread (replaces bookmark reader dialog). */
+  onJumpToBookmark?: (messageId: string) => void | Promise<void>
   /** GET bulletin `history_suffix`; null when unavailable. */
   historySuffix: PersonaBulletinHistorySuffix | null
   /** Server-stored operator memo (may be null). */
@@ -99,7 +95,7 @@ export const CockpitBar = React.memo(function CockpitBar({
   bulletinFocus,
   bookmarks,
   activePersonaId,
-  onRemoveBookmark,
+  onJumpToBookmark,
   historySuffix,
   operatorMemoServer,
   denseDelivery,
@@ -118,12 +114,6 @@ export const CockpitBar = React.memo(function CockpitBar({
     },
     [expandedControlled, onExpandedChange],
   )
-  const [selectedBookmark, setSelectedBookmark] = useState<PersonaMessageBookmark | null>(null)
-  const [bookmarkMessage, setBookmarkMessage] = useState<BackendMessage | null>(null)
-  const [bookmarkMessageLoading, setBookmarkMessageLoading] = useState(false)
-  const [bookmarkMessageError, setBookmarkMessageError] = useState('')
-  const [removeBookmarkBusy, setRemoveBookmarkBusy] = useState(false)
-  const [removeBookmarkError, setRemoveBookmarkError] = useState('')
   const [depthBusy, setDepthBusy] = useState(false)
   const [depthError, setDepthError] = useState('')
   const [memoDraft, setMemoDraft] = useState('')
@@ -258,50 +248,6 @@ export const CockpitBar = React.memo(function CockpitBar({
       installationStatus.requires_restart_to_apply_runtime_settings) === true
 
   useEffect(() => {
-    if (selectedBookmark == null) {
-      setBookmarkMessage(null)
-      setBookmarkMessageError('')
-      setBookmarkMessageLoading(false)
-      setRemoveBookmarkBusy(false)
-      setRemoveBookmarkError('')
-      return
-    }
-    if (activePersonaId == null) {
-      setBookmarkMessage(null)
-      setBookmarkMessageError('No active persona')
-      setBookmarkMessageLoading(false)
-      return
-    }
-    let cancelled = false
-    const mid = selectedBookmark.message_id
-    setBookmarkMessage(null)
-    setBookmarkMessageError('')
-    setBookmarkMessageLoading(true)
-    void (async () => {
-      try {
-        const res = await api<{ message?: BackendMessage }>(
-          `/api/personas/${activePersonaId}/messages/${encodeURIComponent(mid)}`,
-        )
-        if (cancelled) return
-        const m = res.message
-        if (m && typeof m.content === 'string') {
-          setBookmarkMessage(m)
-        } else {
-          setBookmarkMessageError('Message not found')
-        }
-      } catch (e) {
-        if (cancelled) return
-        setBookmarkMessageError(e instanceof Error ? e.message : String(e))
-      } finally {
-        if (!cancelled) setBookmarkMessageLoading(false)
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [selectedBookmark, activePersonaId])
-
-  useEffect(() => {
     if (expandedControlled !== undefined && expandedControlled !== expandedInternal) {
       setExpandedInternal(expandedControlled)
     }
@@ -310,7 +256,6 @@ export const CockpitBar = React.memo(function CockpitBar({
   useEffect(() => {
     if (!expanded) return
     const onPointerDown = (event: PointerEvent) => {
-      if (selectedBookmark != null) return
       const target = event.target as Node | null
       if (!target) return
       if (expandedRootRef.current?.contains(target)) return
@@ -321,7 +266,7 @@ export const CockpitBar = React.memo(function CockpitBar({
     return () => {
       window.removeEventListener('pointerdown', onPointerDown)
     }
-  }, [expanded, selectedBookmark])
+  }, [expanded, setExpanded])
 
   const stripClass = floating
     ? 'rounded-xl border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/90 backdrop-blur'
@@ -664,13 +609,10 @@ export const CockpitBar = React.memo(function CockpitBar({
                       type="button"
                       className="mc-cockpit-bookmark-btn rounded border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-left text-xs text-[color:var(--mc-text-primary)] hover:bg-[color:var(--mc-surface-main)]"
                       onClick={() => {
-                        setBookmarkMessage(null)
-                        setBookmarkMessageError('')
-                        setBookmarkMessageLoading(true)
-                        setRemoveBookmarkError('')
-                        setSelectedBookmark(b)
+                        setExpanded(false)
+                        void onJumpToBookmark?.(b.message_id)
                       }}
-                      title="Open bookmark details"
+                      title="Jump to message in chat"
                     >
                       [{b.role}] {b.content_preview}
                     </button>
@@ -679,7 +621,7 @@ export const CockpitBar = React.memo(function CockpitBar({
               ) : (
                 <EmptyState
                   title="No bookmarks yet"
-                  description="Bookmark messages from the thread to revisit them here."
+                  description="Bookmark messages from the thread to jump back to them here."
                   className="mt-2"
                 />
               )}
@@ -687,106 +629,6 @@ export const CockpitBar = React.memo(function CockpitBar({
           </div>
         </div>
       ) : null}
-      <Dialog.Root open={selectedBookmark != null} onOpenChange={(open) => !open && setSelectedBookmark(null)}>
-        <Dialog.Content
-          maxWidth="42rem"
-          className="max-h-[min(85vh,720px)] max-md:!max-w-[calc(100vw-1.25rem)] flex flex-col gap-3"
-        >
-          <Dialog.Title>Bookmarked message</Dialog.Title>
-          {selectedBookmark ? (
-            <>
-              <Text size="1" color="gray" className="shrink-0">
-                {bookmarkMessage && typeof bookmarkMessage.is_from_bot === 'boolean'
-                  ? bookmarkMessage.is_from_bot
-                    ? 'ASSISTANT'
-                    : 'USER'
-                  : String(selectedBookmark.role).toUpperCase()}
-                {(() => {
-                  const ts =
-                    (bookmarkMessage?.timestamp && bookmarkMessage.timestamp.trim()) ||
-                    selectedBookmark.updated_at ||
-                    selectedBookmark.created_at
-                  if (!ts) return ''
-                  const d = Date.parse(ts)
-                  return Number.isFinite(d) ? ` · ${new Date(d).toLocaleString()}` : ''
-                })()}
-                {bookmarkMessage?.sender_name ? ` · ${bookmarkMessage.sender_name}` : ''}
-              </Text>
-              <div className="min-h-0 flex-1 overflow-y-auto rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] p-3 text-sm leading-relaxed">
-                {bookmarkMessageLoading ? (
-                  <Text size="2" color="gray">
-                    Loading full message…
-                  </Text>
-                ) : (
-                  <div className="aui-md-root">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        table: MarkdownTable,
-                      }}
-                    >
-                      {(() => {
-                        if (bookmarkMessage) {
-                          const c = bookmarkMessage.content ?? ''
-                          return c.trim() ? c : '_Empty message._'
-                        }
-                        if (bookmarkMessageError) {
-                          return `*Could not load full message (${bookmarkMessageError}). Showing saved preview:*\n\n${selectedBookmark.content_preview || '_No preview stored._'}`
-                        }
-                        return selectedBookmark.content_preview || '_Empty message._'
-                      })()}
-                    </ReactMarkdown>
-                  </div>
-                )}
-              </div>
-              {selectedBookmark.note ? (
-                <Text as="p" size="1" color="gray" className="shrink-0">
-                  Note: {selectedBookmark.note}
-                </Text>
-              ) : null}
-              {removeBookmarkError ? (
-                <Text size="1" color="red" className="shrink-0">
-                  {removeBookmarkError}
-                </Text>
-              ) : null}
-              <Flex justify="between" gap="2" align="center" wrap="wrap" className="shrink-0">
-                {onRemoveBookmark && activePersonaId != null ? (
-                  <Button
-                    type="button"
-                    size="2"
-                    variant="solid"
-                    color="red"
-                    disabled={removeBookmarkBusy}
-                    onClick={() => {
-                      if (!selectedBookmark) return
-                      setRemoveBookmarkError('')
-                      setRemoveBookmarkBusy(true)
-                      void (async () => {
-                        try {
-                          const ok = await onRemoveBookmark(selectedBookmark.message_id)
-                          if (ok) setSelectedBookmark(null)
-                          else setRemoveBookmarkError('Could not remove bookmark.')
-                        } finally {
-                          setRemoveBookmarkBusy(false)
-                        }
-                      })()
-                    }}
-                  >
-                    {removeBookmarkBusy ? 'Removing…' : 'Remove bookmark'}
-                  </Button>
-                ) : (
-                  <span />
-                )}
-                <Dialog.Close>
-                  <Button type="button" size="2" variant="soft">
-                    Close
-                  </Button>
-                </Dialog.Close>
-              </Flex>
-            </>
-          ) : null}
-        </Dialog.Content>
-      </Dialog.Root>
       </div>
     </>
   )

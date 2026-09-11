@@ -178,6 +178,26 @@ export function IconMoreVertical({ className }: { className?: string }) {
   )
 }
 
+export function IconCockpit({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className ?? 'size-5 shrink-0'}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M5.5 16.5a7.5 7.5 0 1 1 13 0" />
+      <path d="M12 14V9.5" />
+      <path d="m12 14 3.2-2.4" />
+      <path d="M4 19h16" />
+    </svg>
+  )
+}
+
 export function IconOps({ className }: { className?: string }) {
   return (
     <svg
