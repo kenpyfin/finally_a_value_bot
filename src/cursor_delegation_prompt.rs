@@ -3,7 +3,7 @@
 //! Every message is a new Cursor session (FullSlim). Resume-delta helpers remain
 //! for tests/compat but are not selected by the engine.
 //!
-//! Does not alter `prepare_agent_run` / `build_system_prompt`; Classic and Deterministic
+//! Does not alter `prepare_agent_run` / `build_system_prompt`; Classic and Gemini ADK
 //! engines are unaffected.
 
 use crate::agent_turn_context::{

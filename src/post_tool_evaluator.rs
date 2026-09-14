@@ -1,6 +1,6 @@
 //! Post-Tool Evaluator (PTE): evaluates whether a task is complete after tool execution.
 //! Called after each tool iteration on the Classic / ClassicCostRouting agent loop only
-//! (Cursor and Deterministic do not use this path).
+//! (Cursor and Gemini ADK do not use this path).
 //! Decides whether to continue the agent loop, ask the user, or synthesize a final response.
 //! Doubt defaults to `ask_user` (clarification), not another tool round.
 

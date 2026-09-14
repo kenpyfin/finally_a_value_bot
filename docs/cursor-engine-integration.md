@@ -218,13 +218,13 @@ Agent history records a synthetic iteration with tool rows when MCP tools ran (`
 
 ## Context (Cursor-only)
 
-Classic and Deterministic engines still receive the full `build_system_prompt` output unchanged. Only the **sidecar delegation prompt** is shaped in [`src/cursor_delegation_prompt.rs`](../src/cursor_delegation_prompt.rs) inside `run_cursor_engine`.
+Classic and Gemini ADK engines still receive the full `build_system_prompt` output unchanged. Only the **sidecar delegation prompt** is shaped in [`src/cursor_delegation_prompt.rs`](../src/cursor_delegation_prompt.rs) inside `run_cursor_engine`.
 
 Every interactive and scheduled Cursor turn uses **Full slim**: slim system prompt (tool catalog stripped when MCP on) + full `hook_messages` flatten. The gateway already sends persona + bounded chat history each message; the sidecar does **not** resume a prior Cursor agent or keep a Jsonl checkpoint store.
 
 FullSlim additionally inserts `[continuation_context]` immediately before `[current_request]`: a user `[quoted_message]` block if present, otherwise the last interactive user/assistant pair (scheduler and background-shell notices are skipped). If the flattened prompt exceeds 120k characters, oldest `prior_turn` messages are dropped first; the live `[current_request]` is not chopped off the end.
 
-**Finish path:** `prep.system_prompt` (full) still feeds `pipeline_finish_turn` and agent history. **PTE and PDQE run only on Classic and Deterministic** — Cursor skips both.
+**Finish path:** `prep.system_prompt` (full) still feeds `pipeline_finish_turn` and agent history. **PTE runs only on Classic.** **PDQE runs on Classic and Gemini ADK** — Cursor skips both.
 
 **Slim prompt** (`delegation_slim_prompt`, default on): when MCP is live, replaces the `## Tool groups` prose block with a short MCP delegation section pointing at `finally-a-value-bot`. Shortens the `# Agent Skills` intro but keeps `<available_skills>` metadata for routing.
 
@@ -238,11 +238,11 @@ Pipeline stage telemetry includes `delegation=full_slim`, `fresh_session=true`, 
 
 | Surface | Keys / behavior |
 | --- | --- |
-| Settings → Agent engine | Click an engine pill to save for the **current persona** (`personas.agent_engine_override`). **Inherit default** clears the override. **Inherit default** dropdown PATCHes global `AGENT_ENGINE` for personas without an override. The **Show settings for** dropdown only previews knobs and does not save. |
-| Settings → Agent engine (Cursor panel) | Model, sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt** |
-| DB app_settings | `CURSOR_MCP_TOOLS_ENABLED`, `CURSOR_MCP_EXPOSE_SEND_MESSAGE`, `CURSOR_DELEGATION_SLIM_PROMPT` |
+| Settings → Agent engine | Click an engine pill to save for the **current persona** (`personas.agent_engine_override`). That choice also reveals that engine's settings panel. Every persona stores an explicit engine (no inherit); empty/invalid override resolves to Classic. |
+| Settings → Agent engine (Cursor panel) | **SDK model + parameters are per-persona** (`personas.cursor_sdk_model` / `cursor_sdk_model_params`). Sidecar URL, MCP, and timeouts stay global. Also: sidecar health, **Expose bot tools (MCP)**, optional **send_message**, **slim sidecar prompt** |
+| DB app_settings | Global Cursor sidecar/MCP/timeouts: `CURSOR_MCP_TOOLS_ENABLED`, `CURSOR_MCP_EXPOSE_SEND_MESSAGE`, `CURSOR_DELEGATION_SLIM_PROMPT`, etc. Model defaults remain in app_settings when a persona has no override. |
+| API | `GET/PATCH /api/cursor-engine?persona_id=` overlays/saves persona model+params; response includes `persona_id`, `model_scope` (`global` \| `persona`), `mcp_endpoint_url`, `mcp_bridge_ready` |
 | Doctor | `cursor_engine.mcp_bridge` when engine is Cursor |
-| API | `GET/PATCH /api/cursor-engine` includes `mcp_endpoint_url`, `mcp_bridge_ready` |
 
 ## What is intentionally not synced
 

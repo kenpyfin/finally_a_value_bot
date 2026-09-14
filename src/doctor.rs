@@ -142,8 +142,87 @@ fn build_report() -> DoctorReport {
     check_node_and_browser(&mut report);
     check_mcp_dependencies(&mut report);
     check_cursor_mcp_bridge(&mut report);
+    check_gemini_adk(&mut report);
 
     report
+}
+
+fn check_gemini_adk(report: &mut DoctorReport) {
+    let Ok(config) = Config::load() else {
+        return;
+    };
+    let runtime_dir_str = config.runtime_data_dir();
+    let engine = crate::db::Database::new(&runtime_dir_str)
+        .ok()
+        .and_then(|db| {
+            crate::runtime_toggles::RuntimeToggles::agent_engine_from_app_settings(&db).ok()
+        })
+        .flatten()
+        .unwrap_or_else(|| {
+            crate::runtime_toggles::AgentEngine::parse(
+                &std::env::var("AGENT_ENGINE").unwrap_or_default(),
+            )
+        });
+    if engine != crate::runtime_toggles::AgentEngine::GeminiAdk {
+        return;
+    }
+    let api_key_ok = crate::gemini_adk::GeminiAdkSettings::api_key_configured(&config);
+    if !api_key_ok {
+        report.push(
+            "gemini_adk.api_key",
+            "Gemini ADK API key",
+            CheckStatus::Warn,
+            "AGENT_ENGINE=gemini_adk but GEMINI_API_KEY/GOOGLE_API_KEY is missing".to_string(),
+            Some("Add GEMINI_API_KEY (or GOOGLE_API_KEY) to .env.".to_string()),
+        );
+    } else {
+        report.push(
+            "gemini_adk.api_key",
+            "Gemini ADK API key",
+            CheckStatus::Pass,
+            "Gemini API key configured for native ADK engine".to_string(),
+            None,
+        );
+    }
+    if let Ok(db) = crate::db::Database::new(&runtime_dir_str) {
+        match crate::gemini_adk::profile::load_from_db(&db) {
+            Ok(profile) => {
+                if let Err(e) = profile.validate() {
+                    report.push(
+                        "gemini_adk.topology",
+                        "Gemini ADK topology",
+                        CheckStatus::Warn,
+                        format!("Invalid topology: {e}"),
+                        Some(
+                            "Fix or reset topology in Settings → Agent engine → Gemini ADK."
+                                .to_string(),
+                        ),
+                    );
+                } else {
+                    report.push(
+                        "gemini_adk.topology",
+                        "Gemini ADK topology",
+                        CheckStatus::Pass,
+                        format!(
+                            "Topology ok ({} agents, root={})",
+                            profile.agents.len(),
+                            profile.root_agent_id
+                        ),
+                        None,
+                    );
+                }
+            }
+            Err(e) => {
+                report.push(
+                    "gemini_adk.topology",
+                    "Gemini ADK topology",
+                    CheckStatus::Warn,
+                    format!("Failed to load topology: {e}"),
+                    None,
+                );
+            }
+        }
+    }
 }
 
 fn check_cursor_mcp_bridge(report: &mut DoctorReport) {

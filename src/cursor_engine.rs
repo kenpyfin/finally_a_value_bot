@@ -1269,11 +1269,29 @@ pub async fn run_cursor_engine(
     cancel: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<AgentProcessResult> {
     let run_start = Instant::now();
-    let settings = state
+    let global_settings = state
         .cursor_settings
         .read()
         .map_err(|e| anyhow::anyhow!("cursor settings lock poisoned: {e}"))?
         .clone();
+    let chat_id = context.chat_id;
+    let persona_id = context.persona_id;
+    let persona_cursor = call_blocking(state.db.clone(), move |db| {
+        Ok(db
+            .get_persona(persona_id)?
+            .filter(|p| p.chat_id == chat_id)
+            .map(|p| (p.cursor_sdk_model, p.cursor_sdk_model_params)))
+    })
+    .await
+    .unwrap_or(None);
+    let settings = match persona_cursor {
+        Some((model, params)) => crate::cursor_engine_config::apply_persona_cursor_model_override(
+            global_settings,
+            model.as_deref(),
+            params.as_deref(),
+        ),
+        None => global_settings,
+    };
     let base_url = settings.sdk_runner_url.trim();
 
     if base_url.is_empty() {
@@ -1283,8 +1301,6 @@ pub async fn run_cursor_engine(
         ));
     }
 
-    let chat_id = context.chat_id;
-    let persona_id = context.persona_id;
     let session_scope = cursor_session_scope(&context);
 
     let before_turn = run_before_turn_hooks(state, &context, &prep.run_key, event_tx).await?;

@@ -8,7 +8,7 @@ Classic agent runs can use a **local OpenAI-compatible** endpoint for read-only 
 |-----------------|----------|
 | **Single turn** (`classic`) | Always uses Settings → LLM for every iteration. Default, best reasoning continuity. |
 | **Classic · Cost routing** (`classic_cost_routing`) | Same tool loop; after a read-only tool chain, the next iteration may route to the local model. Mutations always stay on strategy. |
-| **Deterministic** | Unchanged — per-phase model picks in the Deterministic pipeline settings tab. |
+| **Gemini ADK** (`gemini_adk`) | Native multi-agent Gemini loop; see [`gemini-adk-engine.md`](gemini-adk-engine.md). Does not use Classic cost routing. |
 | **Cursor** | Full turn via Cursor SDK sidecar; bot tools/skills/hooks per [`cursor-engine-integration.md`](cursor-engine-integration.md). |
 
 Cost routing is active only when:
@@ -36,10 +36,10 @@ Registered only when cost routing is active. The strategy model can delegate a *
 
 ## Configuration
 
-- **Settings → Agent engine**: click an engine pill to save it for the **current persona** (or Inherit default). Local URL/model live on the Cost routing settings panel.
+- **Settings → Agent engine**: click an engine pill to save it for the **current persona** (explicit engine only; no inherit). Local URL/model live on the Cost routing settings panel.
 - DB keys remain `MULTIMODEL_*` for backward compatibility (`src/local_delegate/mod.rs`).
 
-PTE, PDQE, Learn & Optimize, and Deterministic local phases may still use the configured local endpoint independently of the Classic engine choice. **Cursor skips PTE and PDQE** (no classic tool loop; finish does not call the evaluator).
+PTE, PDQE, and Learn & Optimize may still use the configured local endpoint independently of the Classic engine choice. **Cursor skips PTE and PDQE**. **Gemini ADK skips PTE** but still runs PDQE on delivery.
 
 ## API
 

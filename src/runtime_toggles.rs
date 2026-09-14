@@ -13,9 +13,10 @@ pub const APP_SETTING_RESPONSE_QUALITY_EVALUATOR_ENABLED: &str =
 pub const APP_SETTING_AGENT_ENGINE: &str = "AGENT_ENGINE";
 
 const AGENT_ENGINE_CLASSIC: u8 = 0;
-const AGENT_ENGINE_DETERMINISTIC: u8 = 1;
+// Formerly AGENT_ENGINE_DETERMINISTIC = 1; freed. Legacy stored u8 maps to Classic via from_u8.
 const AGENT_ENGINE_CURSOR: u8 = 2;
 const AGENT_ENGINE_CLASSIC_COST_ROUTING: u8 = 3;
+const AGENT_ENGINE_GEMINI_ADK: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentEngine {
@@ -23,7 +24,8 @@ pub enum AgentEngine {
     Classic,
     /// Classic tool loop with inverse local cost routing when local delegate is verified.
     ClassicCostRouting,
-    Deterministic,
+    /// Native in-process Gemini multi-agent (ADK-style) engine.
+    GeminiAdk,
     Cursor,
 }
 
@@ -32,14 +34,16 @@ impl AgentEngine {
         match self {
             Self::Classic => "classic",
             Self::ClassicCostRouting => "classic_cost_routing",
-            Self::Deterministic => "deterministic",
+            Self::GeminiAdk => "gemini_adk",
             Self::Cursor => "cursor",
         }
     }
 
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "deterministic" | "pipeline" => Self::Deterministic,
+            // Legacy deterministic pipeline → Classic (safe fallback; DB migration also rewrites).
+            "deterministic" | "pipeline" => Self::Classic,
+            "gemini_adk" | "adk" | "gemini-adk" => Self::GeminiAdk,
             "cursor" | "cursor_sdk" | "cursor-sdk" => Self::Cursor,
             "classic_cost_routing" | "classic_routed" | "cost_routing" => Self::ClassicCostRouting,
             _ => Self::Classic,
@@ -55,7 +59,9 @@ impl AgentEngine {
             "classic_cost_routing" | "classic_routed" | "cost_routing" => {
                 Some(Self::ClassicCostRouting)
             }
-            "deterministic" | "pipeline" => Some(Self::Deterministic),
+            // Legacy deterministic → Classic so stored overrides stay valid.
+            "deterministic" | "pipeline" => Some(Self::Classic),
+            "gemini_adk" | "adk" | "gemini-adk" => Some(Self::GeminiAdk),
             "cursor" | "cursor_sdk" | "cursor-sdk" => Some(Self::Cursor),
             _ => None,
         }
@@ -63,9 +69,10 @@ impl AgentEngine {
 
     fn from_u8(v: u8) -> Self {
         match v {
-            AGENT_ENGINE_DETERMINISTIC => Self::Deterministic,
             AGENT_ENGINE_CURSOR => Self::Cursor,
             AGENT_ENGINE_CLASSIC_COST_ROUTING => Self::ClassicCostRouting,
+            AGENT_ENGINE_GEMINI_ADK => Self::GeminiAdk,
+            // 0 (Classic) and former Deterministic (1) both map to Classic.
             _ => Self::Classic,
         }
     }
@@ -73,9 +80,9 @@ impl AgentEngine {
     fn to_u8(self) -> u8 {
         match self {
             Self::Classic => AGENT_ENGINE_CLASSIC,
-            Self::Deterministic => AGENT_ENGINE_DETERMINISTIC,
             Self::Cursor => AGENT_ENGINE_CURSOR,
             Self::ClassicCostRouting => AGENT_ENGINE_CLASSIC_COST_ROUTING,
+            Self::GeminiAdk => AGENT_ENGINE_GEMINI_ADK,
         }
     }
 
@@ -288,23 +295,25 @@ fn persist_bool(db: &Database, key: &str, enabled: bool) -> Result<(), FinallyAV
     db.set_app_setting(key, if enabled { "true" } else { "false" })
 }
 
-/// Resolve the engine for a single run. `NULL`/empty/invalid override inherits `global`.
+/// Resolve the engine for a single run.
+/// Empty/invalid override falls back to Classic (personas are expected to store an explicit engine).
 pub fn resolve_run_agent_engine(
     persona_override: Option<&str>,
     global: AgentEngine,
 ) -> AgentEngine {
     let Some(raw) = persona_override.map(str::trim).filter(|s| !s.is_empty()) else {
-        return global;
+        // Prefer Classic when unset; global remains a last-resort for legacy rows mid-migration.
+        let _ = global;
+        return AgentEngine::Classic;
     };
     match AgentEngine::parse_override(raw) {
         Some(engine) => engine,
         None => {
             tracing::warn!(
                 override_value = raw,
-                "invalid persona agent_engine_override; inheriting global {}",
-                global.as_str()
+                "invalid persona agent_engine_override; using classic"
             );
-            global
+            AgentEngine::Classic
         }
     }
 }
@@ -331,10 +340,10 @@ mod tests {
 
     #[test]
     fn agent_engine_from_str() {
-        assert_eq!(
-            AgentEngine::parse("deterministic"),
-            AgentEngine::Deterministic
-        );
+        assert_eq!(AgentEngine::parse("deterministic"), AgentEngine::Classic);
+        assert_eq!(AgentEngine::parse("pipeline"), AgentEngine::Classic);
+        assert_eq!(AgentEngine::parse("gemini_adk"), AgentEngine::GeminiAdk);
+        assert_eq!(AgentEngine::parse("adk"), AgentEngine::GeminiAdk);
         assert_eq!(AgentEngine::parse("cursor"), AgentEngine::Cursor);
         assert_eq!(AgentEngine::parse("classic"), AgentEngine::Classic);
         assert_eq!(
@@ -345,24 +354,24 @@ mod tests {
     }
 
     #[test]
-    fn persona_override_null_inherits_global() {
+    fn persona_override_empty_defaults_to_classic() {
         assert_eq!(
             resolve_run_agent_engine(None, AgentEngine::Classic),
             AgentEngine::Classic
         );
         assert_eq!(
             resolve_run_agent_engine(Some(""), AgentEngine::Cursor),
-            AgentEngine::Cursor
+            AgentEngine::Classic
         );
         assert_eq!(
             resolve_run_agent_engine(Some("cursor"), AgentEngine::Classic),
             AgentEngine::Cursor
         );
         assert_eq!(
-            resolve_run_agent_engine(Some("not-an-engine"), AgentEngine::Cursor),
-            AgentEngine::Cursor
+            resolve_run_agent_engine(Some("gemini_adk"), AgentEngine::Classic),
+            AgentEngine::GeminiAdk
         );
-        assert_ne!(
+        assert_eq!(
             resolve_run_agent_engine(Some("not-an-engine"), AgentEngine::Cursor),
             AgentEngine::Classic
         );

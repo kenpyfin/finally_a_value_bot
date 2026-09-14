@@ -119,7 +119,10 @@ export type CursorEngineConfigResponse = {
   sidecar_reachable?: boolean
   api_key_configured?: boolean
   engine_ready?: boolean
-  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  agent_engine?: 'classic' | 'classic_cost_routing' | 'gemini_adk' | 'cursor'
+  persona_id?: number | null
+  /** `persona` when model/params come from the persona; otherwise `global`. */
+  model_scope?: 'global' | 'persona'
   cli_path?: string
   cli_model?: string
   cli_runner_url?: string
@@ -144,7 +147,7 @@ export type RuntimeConfigResponse = {
   tool_output_debug?: boolean
   post_tool_evaluator_enabled?: boolean
   response_quality_evaluator_enabled?: boolean
-  agent_engine?: 'classic' | 'classic_cost_routing' | 'deterministic' | 'cursor'
+  agent_engine?: 'classic' | 'classic_cost_routing' | 'gemini_adk' | 'cursor'
   local_delegate_configured?: boolean
   local_delegate_tools_ok?: boolean
   local_delegate_ready?: boolean
@@ -191,119 +194,48 @@ export type SkillCatalogEntry = {
   allowed_for_persona?: boolean
 }
 
-export type PipelinePhaseKind =
-  | 'intent_classify'
-  | 'plan_generate'
-  | 'execute_plan'
-  | 'synthesize_delivery'
+export type AdkAgentKind = 'llm' | 'sequential' | 'parallel' | 'loop'
 
-export type PipelineModelRoute =
-  | 'inherit_global'
-  | 'strategy'
-  | 'local'
-
-export type PipelineTransitionCondition =
-  | 'always'
-  | 'intent_category_conversational'
-  | 'intent_category_question'
-  | 'intent_category_task'
-  | 'intent_needs_clarification'
-  | 'intent_needs_clarification_proceed'
-  | 'plan_empty'
-  | 'execute_any_failed'
-  | 'execute_all_succeeded'
-  | 'channel_web'
-  | 'is_scheduled'
-
-export type PipelineTransitionTarget =
-  | { direct_answer: true }
-  | { clarify: true }
-  | { finish: true }
-  | { phase: string }
-
-export type PipelineTransitionRule = {
-  when: PipelineTransitionCondition
-  goto:
-    | 'direct_answer'
-    | 'clarify'
-    | 'finish'
-    | { phase: string }
-}
-
-export type PipelineOperationalConfig = {
-  timeout_secs: number
-  max_iterations: number
-  max_iterations_local: number
-  max_plan_steps: number
-  llm_round_timeout_secs: number
-  tool_execution_timeout_secs: number
-  iteration_breaker_min_chars: number
-  compact_system_max_chars: number
-  collapsed_session_turns: number
-  sop_reference_max_chars: number
-  min_polish_only_summary_chars: number
-  max_polish_only_combined_chars: number
-}
-
-export type PipelinePolicyConfig = {
-  heuristic_intent_enabled: boolean
-  merged_classify_and_plan_enabled: boolean
-  skip_consolidate_when_good: boolean
-  clarify_on_web_proceed: boolean
-  clarify_on_scheduler_proceed: boolean
-  image_input_force_task: boolean
-  retry_failed_steps: boolean
-  escalate_to_strategy_on_skill_failure: boolean
-  use_local_for_json_stages: boolean
-  bind_persona_sops_in_plan: boolean
-}
-
-export type PriorStepFeedMode = 'full' | 'summary'
-
-export type PhaseContextIncludes = {
-  include_system_prompt: boolean
-  include_agent_system_prompt: boolean
-  include_skills_catalog: boolean
-  include_session_excerpt: boolean
-  include_persona_memory: boolean
-  include_workspace_paths: boolean
-  include_sop_reference: boolean
-  include_current_request: boolean
-  include_prior_step_summaries: boolean
-  prior_step_feed_mode: PriorStepFeedMode
-  prior_step_summary_prompt: string
-  prior_step_full_output_max_chars: number
-  include_step_contract: boolean
-  include_execution_summary: boolean
-}
-
-export type PipelinePhase = {
+export type AdkAgent = {
   id: string
   label: string
   enabled: boolean
-  kind: PipelinePhaseKind
-  model_route: PipelineModelRoute
-  system_prompt: string
-  preamble?: string | null
-  context_includes: PhaseContextIncludes
-  transitions: PipelineTransitionRule[]
+  kind: AdkAgentKind
+  model: string
+  instruction: string
+  allowed_tools?: string[] | null
+  sub_agents: string[]
+  output_key?: string | null
+  max_iterations?: number | null
 }
 
-export type PipelineProfile = {
+export type AdkTopologyProfile = {
   version: number
-  entry_phase_id: string
-  phases: PipelinePhase[]
-  operational: PipelineOperationalConfig
-  policies: PipelinePolicyConfig
+  root_agent_id: string
+  agents: AdkAgent[]
+  default_model: string
 }
 
-export type DeterministicPipelineResponse = {
+export type GeminiAdkConfigResponse = {
   ok?: boolean
+  default_model?: string
+  max_iterations?: number
+  api_key_configured?: boolean
+  engine_ready?: boolean
+  agent_engine?: 'classic' | 'classic_cost_routing' | 'gemini_adk' | 'cursor'
   schema_version?: number
-  profile?: PipelineProfile
-  defaults?: PipelineProfile
-  builtin_prompts?: Record<string, string>
-  agent_engine?: 'classic' | 'deterministic' | 'cursor'
+  message?: string
+}
+
+export type GeminiAdkTopologyResponse = {
+  ok?: boolean
+  scope?: 'global' | 'persona'
+  persona_id?: number
+  uses_default?: boolean
+  profile?: AdkTopologyProfile
+  defaults?: AdkTopologyProfile
+  global?: AdkTopologyProfile
+  schema_version?: number
   message?: string
 }
 

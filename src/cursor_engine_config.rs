@@ -272,6 +272,32 @@ pub fn load_from_db(
     Ok(cfg)
 }
 
+/// Overlay per-persona Cursor SDK model / params onto global settings.
+pub fn apply_persona_cursor_model_override(
+    mut settings: CursorEngineSettings,
+    cursor_sdk_model: Option<&str>,
+    cursor_sdk_model_params_json: Option<&str>,
+) -> CursorEngineSettings {
+    if let Some(model) = cursor_sdk_model.map(str::trim).filter(|s| !s.is_empty()) {
+        settings.sdk_model = model.to_string();
+    }
+    if let Some(raw) = cursor_sdk_model_params_json
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(parsed) = serde_json::from_str::<Vec<CursorModelParam>>(raw) {
+            settings.sdk_model_params = parsed
+                .into_iter()
+                .filter(|p| !p.id.trim().is_empty())
+                .collect();
+        }
+    }
+    if settings.sdk_model.trim().is_empty() {
+        settings.sdk_model = crate::config::default_cursor_sdk_model();
+    }
+    settings
+}
+
 pub fn persist_to_db(
     db: &Database,
     cfg: &CursorEngineSettings,
@@ -560,6 +586,9 @@ pub fn cli_on_path(cli_path: &str) -> bool {
 
 #[derive(Debug, Deserialize)]
 pub struct CursorEnginePatchRequest {
+    /// When set, `sdk_model` / `sdk_model_params` are stored on this persona.
+    #[serde(default)]
+    pub persona_id: Option<i64>,
     #[serde(default)]
     pub sdk_runner_url: Option<String>,
     #[serde(default)]

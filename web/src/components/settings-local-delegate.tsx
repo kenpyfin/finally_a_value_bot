@@ -229,8 +229,8 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
 
       <Text size="1" color="gray">
         Configure a local OpenAI-compatible server for Classic · Cost routing (read-only discovery
-        and delegated sub-jobs), PTE/PDQE sidecars, and Deterministic local phases. Enable cost
-        routing from Settings → Agent engine (per persona, or the global inherit default).
+        and delegated sub-jobs) and PTE/PDQE sidecars. Enable cost routing from Settings → Agent
+        engine (per persona, or the global inherit default).
       </Text>
 
       {!localToolsOk ? (

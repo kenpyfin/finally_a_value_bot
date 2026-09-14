@@ -4619,15 +4619,19 @@ async fn api_persona_bulletin_patch(
     if let Some(v) = body.agent_engine_override {
         patch_engine = true;
         engine_ov = match v {
-            None => None,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "agent_engine_override cannot be null; set classic, classic_cost_routing, cursor, or gemini_adk".into(),
+                ));
+            }
             Some(s) => {
                 let t = s.trim();
-                if t.is_empty() {
-                    None
-                } else if crate::runtime_toggles::AgentEngine::parse_override(t).is_none() {
+                if t.is_empty() || crate::runtime_toggles::AgentEngine::parse_override(t).is_none()
+                {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        "agent_engine_override must be classic, classic_cost_routing, cursor, deterministic, or null".into(),
+                        "agent_engine_override must be classic, classic_cost_routing, cursor, or gemini_adk".into(),
                     ));
                 } else {
                     Some(t.to_string())
@@ -6463,8 +6467,8 @@ async fn api_runtime_patch(
         }
 
         messages.push(match engine {
-            crate::runtime_toggles::AgentEngine::Deterministic => {
-                "Agent engine set to deterministic pipeline."
+            crate::runtime_toggles::AgentEngine::GeminiAdk => {
+                "Agent engine set to Gemini ADK (native multi-agent)."
             }
             crate::runtime_toggles::AgentEngine::Cursor => {
                 "Agent engine set to Cursor SDK (local sidecar)."
@@ -6518,99 +6522,299 @@ async fn api_runtime_patch(
     })))
 }
 
-async fn api_deterministic_pipeline_get(
+async fn api_gemini_adk_get(
     headers: HeaderMap,
     State(state): State<WebState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let profile = state
+    let settings = state
         .app_state
-        .pipeline_profile
+        .gemini_adk_settings
         .read()
         .map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "pipeline profile lock poisoned".into(),
+                "gemini_adk_settings lock poisoned".into(),
             )
         })?
         .clone();
-    let defaults = crate::agent_pipeline::profile::PipelineProfile::default_profile();
-    let builtin_prompts: serde_json::Map<String, serde_json::Value> =
-        crate::agent_pipeline::profile::PhaseKind::all()
-            .iter()
-            .map(|kind| {
-                (
-                    kind.label().to_string(),
-                    serde_json::Value::String(
-                        crate::agent_pipeline::profile::builtin_prompt_for_kind(*kind).to_string(),
-                    ),
-                )
-            })
-            .collect();
+    let api_key_configured =
+        crate::gemini_adk::GeminiAdkSettings::api_key_configured(&state.app_state.config);
+    let engine_ready = settings.engine_ready(&state.app_state.config);
     Ok(Json(json!({
         "ok": true,
-        "schema_version": crate::agent_pipeline::profile::SCHEMA_VERSION,
-        "profile": profile,
-        "defaults": defaults,
-        "builtin_prompts": builtin_prompts,
+        "default_model": settings.default_model,
+        "max_iterations": settings.max_iterations,
+        "api_key_configured": api_key_configured,
+        "engine_ready": engine_ready,
         "agent_engine": state.app_state.runtime_toggles.agent_engine().as_str(),
+        "schema_version": crate::gemini_adk::profile::SCHEMA_VERSION,
     })))
 }
 
 #[derive(Debug, Deserialize)]
-struct DeterministicPipelinePatchRequest {
+struct GeminiAdkPatchRequest {
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    max_iterations: Option<usize>,
+}
+
+async fn api_gemini_adk_patch(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<GeminiAdkPatchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    if body.default_model.is_none() && body.max_iterations.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide default_model and/or max_iterations".into(),
+        ));
+    }
+    let mut settings = state
+        .app_state
+        .gemini_adk_settings
+        .read()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gemini_adk_settings lock poisoned".into(),
+            )
+        })?
+        .clone();
+    if let Some(ref model) = body.default_model {
+        let m = model.trim();
+        if m.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "default_model must not be empty".into(),
+            ));
+        }
+        call_blocking(state.app_state.db.clone(), {
+            let m = m.to_string();
+            move |db| crate::gemini_adk::config::persist_default_model(db, &m)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        settings.default_model = m.to_string();
+    }
+    if let Some(max) = body.max_iterations {
+        if max == 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "max_iterations must be >= 1".into(),
+            ));
+        }
+        call_blocking(state.app_state.db.clone(), move |db| {
+            crate::gemini_adk::config::persist_max_iterations(db, max)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        settings.max_iterations = max.min(200);
+    }
+    {
+        let mut guard = state.app_state.gemini_adk_settings.write().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gemini_adk_settings lock poisoned".into(),
+            )
+        })?;
+        *guard = settings.clone();
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "default_model": settings.default_model,
+        "max_iterations": settings.max_iterations,
+        "api_key_configured": crate::gemini_adk::GeminiAdkSettings::api_key_configured(&state.app_state.config),
+        "engine_ready": settings.engine_ready(&state.app_state.config),
+        "message": "Gemini ADK settings saved.",
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiAdkTopologyQuery {
+    #[serde(default)]
+    persona_id: Option<i64>,
+}
+
+async fn api_gemini_adk_topology_get(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<GeminiAdkTopologyQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    let global = state
+        .app_state
+        .gemini_adk_profile
+        .read()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gemini_adk_profile lock poisoned".into(),
+            )
+        })?
+        .clone();
+    let defaults = crate::gemini_adk::AdkTopologyProfile::default_profile();
+
+    if let Some(pid) = query.persona_id {
+        let persona = call_blocking(state.app_state.db.clone(), move |db| db.get_persona(pid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let Some(persona) = persona.filter(|p| p.chat_id == chat_id) else {
+            return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+        };
+        let uses_default = persona
+            .gemini_adk_topology
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none();
+        let profile = if uses_default {
+            global.clone()
+        } else {
+            crate::gemini_adk::profile::parse_topology_json(
+                persona.gemini_adk_topology.as_deref().unwrap_or(""),
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+        };
+        return Ok(Json(json!({
+            "ok": true,
+            "scope": "persona",
+            "persona_id": pid,
+            "uses_default": uses_default,
+            "profile": profile,
+            "defaults": defaults,
+            "global": global,
+            "schema_version": crate::gemini_adk::profile::SCHEMA_VERSION,
+        })));
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "scope": "global",
+        "uses_default": false,
+        "profile": global,
+        "defaults": defaults,
+        "schema_version": crate::gemini_adk::profile::SCHEMA_VERSION,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiAdkTopologyPatchRequest {
+    #[serde(default)]
+    persona_id: Option<i64>,
     #[serde(default)]
     reset_defaults: bool,
     #[serde(default)]
-    profile: Option<crate::agent_pipeline::profile::PipelineProfile>,
+    clear_persona_override: bool,
+    #[serde(default)]
+    profile: Option<crate::gemini_adk::AdkTopologyProfile>,
 }
 
-async fn api_deterministic_pipeline_patch(
+async fn api_gemini_adk_topology_patch(
     headers: HeaderMap,
     State(state): State<WebState>,
-    Json(body): Json<DeterministicPipelinePatchRequest>,
+    Json(body): Json<GeminiAdkTopologyPatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+
+    if let Some(pid) = body.persona_id {
+        if body.clear_persona_override {
+            call_blocking(state.app_state.db.clone(), move |db| {
+                db.set_persona_gemini_adk_topology(chat_id, pid, None)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let global = state
+                .app_state
+                .gemini_adk_profile
+                .read()
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "gemini_adk_profile lock poisoned".into(),
+                    )
+                })?
+                .clone();
+            return Ok(Json(json!({
+                "ok": true,
+                "scope": "persona",
+                "persona_id": pid,
+                "uses_default": true,
+                "profile": global,
+                "message": "Persona Gemini ADK topology cleared; using global default.",
+            })));
+        }
+        let new_profile = if body.reset_defaults {
+            crate::gemini_adk::AdkTopologyProfile::default_profile()
+        } else if let Some(p) = body.profile {
+            p.migrate()
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Provide profile, reset_defaults=true, or clear_persona_override=true".into(),
+            ));
+        };
+        if let Err(e) = new_profile.validate() {
+            return Err((StatusCode::BAD_REQUEST, e));
+        }
+        let json = serde_json::to_string(&new_profile)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        call_blocking(state.app_state.db.clone(), {
+            let json = json.clone();
+            move |db| db.set_persona_gemini_adk_topology(chat_id, pid, Some(&json))
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(Json(json!({
+            "ok": true,
+            "scope": "persona",
+            "persona_id": pid,
+            "uses_default": false,
+            "profile": new_profile,
+            "message": "Persona Gemini ADK topology saved.",
+        })));
+    }
+
     let new_profile = if body.reset_defaults {
-        crate::agent_pipeline::profile::PipelineProfile::default_profile()
+        crate::gemini_adk::AdkTopologyProfile::default_profile()
     } else if let Some(p) = body.profile {
-        p
+        p.migrate()
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
             "Provide profile or reset_defaults=true".into(),
         ));
     };
-    let new_profile = new_profile.migrate();
-    if let Err(errs) = new_profile.validate() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            serde_json::to_string(&json!({ "ok": false, "errors": errs }))
-                .unwrap_or_else(|_| "validation failed".into()),
-        ));
+    if let Err(e) = new_profile.validate() {
+        return Err((StatusCode::BAD_REQUEST, e));
     }
     call_blocking(state.app_state.db.clone(), {
         let profile_db = new_profile.clone();
-        move |db| crate::agent_pipeline::profile::persist_to_db(db, &profile_db)
+        move |db| crate::gemini_adk::profile::persist_to_db(db, &profile_db)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     {
-        let mut guard = state.app_state.pipeline_profile.write().map_err(|_| {
+        let mut guard = state.app_state.gemini_adk_profile.write().map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "pipeline profile lock poisoned".into(),
+                "gemini_adk_profile lock poisoned".into(),
             )
         })?;
         *guard = new_profile.clone();
     }
     Ok(Json(json!({
         "ok": true,
+        "scope": "global",
         "profile": new_profile,
         "message": if body.reset_defaults {
-            "Deterministic pipeline profile reset to defaults."
+            "Global Gemini ADK topology reset to defaults."
         } else {
-            "Deterministic pipeline profile saved."
+            "Global Gemini ADK topology saved."
         },
     })))
 }
@@ -7003,7 +7207,7 @@ async fn api_multimodel_get(
         "tier2_tools_ok": cfg.tier2_tools_ok,
         "strategy_provider": strategy_provider,
         "strategy_model": strategy_model,
-        "description": "Local OpenAI-compatible endpoint for cost routing, PTE/PDQE, and deterministic local phases.",
+        "description": "Local OpenAI-compatible endpoint for cost routing, PTE/PDQE, and local tool phases.",
     })))
 }
 
@@ -7161,6 +7365,8 @@ fn cursor_engine_json(
     sidecar_managed: bool,
     web_port: u16,
     web_enabled: bool,
+    persona_id: Option<i64>,
+    model_scope: &str,
 ) -> serde_json::Value {
     json!({
         "ok": true,
@@ -7173,6 +7379,8 @@ fn cursor_engine_json(
         "engine_ready": cfg.engine_ready(health),
         "sidecar_managed": sidecar_managed,
         "agent_engine": agent_engine,
+        "persona_id": persona_id,
+        "model_scope": model_scope,
         "cli_path": cfg.cli_path,
         "cli_model": cfg.cli_model,
         "cli_runner_url": cfg.cli_runner_url,
@@ -7196,26 +7404,83 @@ fn cursor_engine_json(
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct CursorEngineQuery {
+    #[serde(default)]
+    persona_id: Option<i64>,
+}
+
 async fn api_cursor_engine_get(
     headers: HeaderMap,
     State(state): State<WebState>,
+    Query(query): Query<CursorEngineQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let cfg = state
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    let mut cfg = state
         .app_state
         .cursor_settings
         .read()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .clone();
+    let mut model_scope = "global";
+    let mut persona_id_out = None;
+    if let Some(pid) = query.persona_id {
+        let persona = call_blocking(state.app_state.db.clone(), move |db| db.get_persona(pid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let Some(persona) = persona.filter(|p| p.chat_id == chat_id) else {
+            return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+        };
+        let had_persona_model = persona
+            .cursor_sdk_model
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+            || persona
+                .cursor_sdk_model_params
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+        cfg = crate::cursor_engine_config::apply_persona_cursor_model_override(
+            cfg,
+            persona.cursor_sdk_model.as_deref(),
+            persona.cursor_sdk_model_params.as_deref(),
+        );
+        persona_id_out = Some(pid);
+        if had_persona_model {
+            model_scope = "persona";
+        }
+    }
     let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
-    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    let global_engine = state.app_state.runtime_toggles.agent_engine();
+    let agent_engine = if let Some(pid) = persona_id_out {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            Ok(
+                crate::runtime_toggles::resolve_run_agent_engine_from_persona(
+                    db,
+                    chat_id,
+                    pid,
+                    global_engine,
+                )
+                .as_str()
+                .to_string(),
+            )
+        })
+        .await
+        .unwrap_or_else(|_| global_engine.as_str().to_string())
+    } else {
+        global_engine.as_str().to_string()
+    };
     Ok(Json(cursor_engine_json(
         &cfg,
         &health,
-        agent_engine,
+        &agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
         state.app_state.config.web_port,
         state.app_state.config.web_enabled,
+        persona_id_out,
+        model_scope,
     )))
 }
 
@@ -7225,6 +7490,7 @@ async fn api_cursor_engine_patch(
     Json(body): Json<crate::cursor_engine_config::CursorEnginePatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
     let mut cfg = state
         .app_state
         .cursor_settings
@@ -7243,14 +7509,19 @@ async fn api_cursor_engine_patch(
         }
         cfg.sdk_runner_url = trimmed;
     }
-    if let Some(ref model) = body.sdk_model {
-        cfg.sdk_model = model.trim().to_string();
-    }
-    if let Some(params) = body.sdk_model_params {
-        cfg.sdk_model_params = params
-            .into_iter()
-            .filter(|p| !p.id.trim().is_empty() && !p.value.trim().is_empty())
-            .collect();
+    let persona_model_patch = body.persona_id.is_some();
+    let persona_sdk_model = body.sdk_model.clone();
+    let persona_sdk_params = body.sdk_model_params.clone();
+    if !persona_model_patch {
+        if let Some(ref model) = body.sdk_model {
+            cfg.sdk_model = model.trim().to_string();
+        }
+        if let Some(params) = body.sdk_model_params.clone() {
+            cfg.sdk_model_params = params
+                .into_iter()
+                .filter(|p| !p.id.trim().is_empty() && !p.value.trim().is_empty())
+                .collect();
+        }
     }
     if let Some(ref path) = body.cli_path {
         cfg.cli_path = path.trim().to_string();
@@ -7286,7 +7557,7 @@ async fn api_cursor_engine_patch(
     }
     cfg.delegation_resume_delta = false;
 
-    if cfg.sdk_model.trim().is_empty() {
+    if !persona_model_patch && cfg.sdk_model.trim().is_empty() {
         cfg.sdk_model = crate::config::default_cursor_sdk_model();
     }
     if cfg.cli_path.trim().is_empty() {
@@ -7309,20 +7580,114 @@ async fn api_cursor_engine_patch(
         *guard = cfg.clone();
     }
 
+    let mut model_scope = "global";
+    let mut persona_id_out = None;
+    if let Some(pid) = body.persona_id {
+        let existing = call_blocking(state.app_state.db.clone(), move |db| db.get_persona(pid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .filter(|p| p.chat_id == chat_id);
+        // Explicit empty string / empty params clears persona override (falls back to global).
+        // Omitted fields keep the existing persona values.
+        let model_for_db = match persona_sdk_model.as_ref() {
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            }
+            None => existing
+                .as_ref()
+                .and_then(|p| p.cursor_sdk_model.clone())
+                .filter(|s| !s.trim().is_empty()),
+        };
+        let params_json = match persona_sdk_params.as_ref() {
+            Some(params) => {
+                let filtered: Vec<_> = params
+                    .iter()
+                    .filter(|p| !p.id.trim().is_empty() && !p.value.trim().is_empty())
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".into()))
+                }
+            }
+            None => existing
+                .as_ref()
+                .and_then(|p| p.cursor_sdk_model_params.clone())
+                .filter(|s| !s.trim().is_empty()),
+        };
+        call_blocking(state.app_state.db.clone(), {
+            let model = model_for_db.clone();
+            let params_json = params_json.clone();
+            move |db| {
+                db.set_persona_cursor_sdk_model(
+                    chat_id,
+                    pid,
+                    model.as_deref(),
+                    params_json.as_deref(),
+                )
+            }
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        cfg = crate::cursor_engine_config::apply_persona_cursor_model_override(
+            cfg,
+            model_for_db.as_deref(),
+            params_json.as_deref(),
+        );
+        if model_for_db.is_some() || params_json.is_some() {
+            model_scope = "persona";
+        }
+        persona_id_out = Some(pid);
+    }
+
     let health = crate::cursor_engine_config::probe_sidecar_health(&cfg.sdk_runner_url).await;
-    let agent_engine = state.app_state.runtime_toggles.agent_engine().as_str();
+    let global_engine = state.app_state.runtime_toggles.agent_engine();
+    let agent_engine = if let Some(pid) = persona_id_out {
+        call_blocking(state.app_state.db.clone(), move |db| {
+            Ok(
+                crate::runtime_toggles::resolve_run_agent_engine_from_persona(
+                    db,
+                    chat_id,
+                    pid,
+                    global_engine,
+                )
+                .as_str()
+                .to_string(),
+            )
+        })
+        .await
+        .unwrap_or_else(|_| global_engine.as_str().to_string())
+    } else {
+        global_engine.as_str().to_string()
+    };
     let mut out = cursor_engine_json(
         &cfg,
         &health,
-        agent_engine,
+        &agent_engine,
         state.app_state.cursor_sidecar.managed_locally,
         state.app_state.config.web_port,
         state.app_state.config.web_enabled,
+        persona_id_out,
+        model_scope,
     );
     if let serde_json::Value::Object(ref mut map) = out {
         map.insert(
             "message".into(),
-            serde_json::Value::String("Cursor settings saved.".into()),
+            serde_json::Value::String(
+                if persona_id_out.is_some() {
+                    "Cursor settings saved (model/params for this persona)."
+                } else {
+                    "Cursor settings saved."
+                }
+                .into(),
+            ),
         );
     }
     Ok(Json(out))
@@ -7374,6 +7739,8 @@ async fn api_cursor_engine_health_post(
         state.app_state.cursor_sidecar.managed_locally,
         state.app_state.config.web_port,
         state.app_state.config.web_enabled,
+        None,
+        "global",
     );
     if let serde_json::Value::Object(ref mut map) = out {
         map.insert("message".into(), serde_json::Value::String(message));
@@ -8513,8 +8880,12 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/terminal/sessions", post(api_terminal_sessions_post))
         .route("/api/terminal/ws", get(api_terminal_ws))
         .route(
-            "/api/deterministic-pipeline",
-            get(api_deterministic_pipeline_get).patch(api_deterministic_pipeline_patch),
+            "/api/gemini-adk",
+            get(api_gemini_adk_get).patch(api_gemini_adk_patch),
+        )
+        .route(
+            "/api/gemini-adk/topology",
+            get(api_gemini_adk_topology_get).patch(api_gemini_adk_topology_patch),
         )
         .route("/api/restart", post(api_restart_post))
         .route(
@@ -9011,8 +9382,11 @@ mod tests {
         let cursor_settings = Arc::new(std::sync::RwLock::new(
             crate::cursor_engine_config::CursorEngineSettings::from_env(&cfg),
         ));
-        let pipeline_profile = Arc::new(std::sync::RwLock::new(
-            crate::agent_pipeline::profile::PipelineProfile::default_profile(),
+        let gemini_adk_settings = Arc::new(std::sync::RwLock::new(
+            crate::gemini_adk::GeminiAdkSettings::from_env(&cfg),
+        ));
+        let gemini_adk_profile = Arc::new(std::sync::RwLock::new(
+            crate::gemini_adk::AdkTopologyProfile::default_profile(),
         ));
         let cursor_sidecar = crate::cursor_sdk_sidecar::SidecarHandle::inactive();
         let steel_browser = crate::steel_browser_sidecar::SteelBrowserHandle::inactive();
@@ -9021,7 +9395,8 @@ mod tests {
             env_redactor: env_redactor.clone(),
             runtime_toggles: runtime_toggles.clone(),
             cursor_settings,
-            pipeline_profile,
+            gemini_adk_settings,
+            gemini_adk_profile,
             cursor_sidecar,
             steel_browser,
             telegram_bots: Arc::new(telegram_bots),

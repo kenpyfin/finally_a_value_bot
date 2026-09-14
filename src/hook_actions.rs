@@ -47,7 +47,7 @@ pub fn extract_terminal_pz_post_ids(
     extract_pz_post_ids(&combined)
 }
 
-pub fn apply_deterministic_persona_memory_hygiene(
+pub fn apply_persona_memory_hygiene(
     memory: &MemoryManager,
     chat_id: i64,
     persona_id: i64,
@@ -70,7 +70,7 @@ pub fn apply_deterministic_persona_memory_hygiene(
 
     if changed {
         if let Err(e) = memory.write_persona_memory_state(chat_id, persona_id, memory_state) {
-            warn!("Deterministic focus hygiene write failed: {e}");
+            warn!("Persona focus hygiene write failed: {e}");
         }
     }
 }
@@ -86,13 +86,7 @@ pub fn apply_hook_memory_effects(
         return;
     }
     let terminal_post_ids: HashSet<String> = effects.terminal_pz_post_ids.iter().cloned().collect();
-    apply_deterministic_persona_memory_hygiene(
-        memory,
-        chat_id,
-        persona_id,
-        &terminal_post_ids,
-        false,
-    );
+    apply_persona_memory_hygiene(memory, chat_id, persona_id, &terminal_post_ids, false);
 }
 
 #[cfg(test)]

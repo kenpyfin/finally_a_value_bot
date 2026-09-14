@@ -1104,6 +1104,9 @@ mod tests {
             dense_delivery_web_max_chars: None,
             dense_delivery_summary_chars: None,
             agent_engine_override: None,
+            gemini_adk_topology: None,
+            cursor_sdk_model: None,
+            cursor_sdk_model_params: None,
         }
     }
 

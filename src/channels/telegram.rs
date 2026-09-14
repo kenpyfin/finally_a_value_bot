@@ -37,7 +37,7 @@ use crate::config::Config;
 use crate::db::{
     call_blocking, Database, PersonaBulletinFocus, PersonaMessageBookmark, StoredMessage,
 };
-use crate::hook_actions::{apply_deterministic_persona_memory_hygiene, apply_hook_memory_effects};
+use crate::hook_actions::{apply_hook_memory_effects, apply_persona_memory_hygiene};
 use crate::hook_runtime::{run_hooks_for_event_async, HookEventName, HookRunInput};
 use crate::llm::{LlmProvider, LlmSendOptions};
 use crate::memory::MemoryManager;
@@ -283,7 +283,8 @@ pub struct AppState {
     pub env_redactor: Arc<EnvSecretRedactor>,
     pub runtime_toggles: Arc<crate::runtime_toggles::RuntimeToggles>,
     pub cursor_settings: Arc<std::sync::RwLock<crate::cursor_engine_config::CursorEngineSettings>>,
-    pub pipeline_profile: Arc<std::sync::RwLock<crate::agent_pipeline::PipelineProfile>>,
+    pub gemini_adk_settings: Arc<std::sync::RwLock<crate::gemini_adk::GeminiAdkSettings>>,
+    pub gemini_adk_profile: Arc<std::sync::RwLock<crate::gemini_adk::AdkTopologyProfile>>,
     pub cursor_sidecar: Arc<crate::cursor_sdk_sidecar::SidecarHandle>,
     pub steel_browser: Arc<crate::steel_browser_sidecar::SteelBrowserHandle>,
     /// Telegram bots keyed by `channel_bot_instances.id`.
@@ -521,10 +522,16 @@ pub async fn run_bot(
             crate::cursor_engine_config::CursorEngineSettings::from_env(&config)
         }),
     ));
-    let pipeline_profile = Arc::new(std::sync::RwLock::new(
-        crate::agent_pipeline::profile::load_from_db(&db).unwrap_or_else(|e| {
-            warn!("Failed to load pipeline profile from DB: {e}");
-            crate::agent_pipeline::profile::PipelineProfile::default_profile()
+    let gemini_adk_settings = Arc::new(std::sync::RwLock::new(
+        crate::gemini_adk::config::load_from_db(&db, &config).unwrap_or_else(|e| {
+            warn!("Failed to load Gemini ADK settings from DB: {e}");
+            crate::gemini_adk::GeminiAdkSettings::from_env(&config)
+        }),
+    ));
+    let gemini_adk_profile = Arc::new(std::sync::RwLock::new(
+        crate::gemini_adk::profile::load_from_db(&db).unwrap_or_else(|e| {
+            warn!("Failed to load Gemini ADK topology from DB: {e}");
+            crate::gemini_adk::AdkTopologyProfile::default_profile()
         }),
     ));
     let cursor_sidecar =
@@ -622,7 +629,8 @@ pub async fn run_bot(
         env_redactor,
         runtime_toggles,
         cursor_settings,
-        pipeline_profile,
+        gemini_adk_settings,
+        gemini_adk_profile,
         cursor_sidecar,
         steel_browser,
         telegram_bots: Arc::new(telegram_bots_map),
@@ -1885,12 +1893,10 @@ pub async fn process_with_agent_with_events(
     .await
     .unwrap_or(global_engine);
 
-    if run_engine == crate::runtime_toggles::AgentEngine::Deterministic {
+    if run_engine == crate::runtime_toggles::AgentEngine::GeminiAdk {
         let prep = prepare_agent_run(state, &context, override_prompt, image_data.clone()).await?;
-        return crate::agent_pipeline::run_deterministic_pipeline(
-            state, context, prep, event_tx, cancel,
-        )
-        .await;
+        return crate::gemini_adk::run_gemini_adk_engine(state, context, prep, event_tx, cancel)
+            .await;
     }
 
     if run_engine == crate::runtime_toggles::AgentEngine::Cursor {
@@ -3805,7 +3811,7 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
             }
 
             // Post-Tool Evaluator (Classic / ClassicCostRouting only — Cursor and
-            // Deterministic do not enter this tool loop).
+            // Gemini ADK / Cursor do not enter this tool loop).
             if !iteration_timed_out {
                 if state.runtime_toggles.post_tool_evaluator_enabled() {
                     info!(
@@ -4466,7 +4472,7 @@ async fn finish_turn_with_quality_gate(
         runtime_data_dir: state.config.runtime_data_dir(),
     };
 
-    // PTE/PDQE are Classic + Deterministic only. Cursor has no classic tool loop (no PTE)
+    // PTE/PDQE are Classic + Gemini ADK only. Cursor has no classic tool loop (no PTE)
     // and must not wait on local/evaluator PDQE after the sidecar reply.
     let cursor_engine = pipeline_extras
         .map(|ex| ex.agent_engine.as_str())
@@ -4732,7 +4738,7 @@ async fn finish_turn_with_quality_gate(
                 ex.pipeline_stages.clone(),
                 ex.cloud_calls,
                 if ex.agent_engine.is_empty() {
-                    "deterministic".to_string()
+                    "classic".to_string()
                 } else {
                     ex.agent_engine.clone()
                 },
@@ -6996,13 +7002,7 @@ async fn run_persona_focus_sync_after_delivery(
         return;
     }
 
-    apply_deterministic_persona_memory_hygiene(
-        &state.memory,
-        chat_id,
-        persona_id,
-        &HashSet::new(),
-        true,
-    );
+    apply_persona_memory_hygiene(&state.memory, chat_id, persona_id, &HashSet::new(), true);
 
     if !should_run_focus_sync_llm(false, messages, response_len, had_tool_calls) {
         info!(chat_id, persona_id, "focus_sync_skipped reason=gate");

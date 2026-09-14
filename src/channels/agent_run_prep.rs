@@ -1,4 +1,4 @@
-//! Shared agent run bootstrap for classic and deterministic engines.
+//! Shared agent run bootstrap for classic, Gemini ADK, and Cursor engines.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -22,7 +22,7 @@ use super::{
     workspace_data_path_display, AgentRequestContext, AppState,
 };
 
-/// Bootstrap output shared by classic and deterministic agent engines.
+/// Bootstrap output shared by classic, Gemini ADK, and Cursor agent engines.
 pub struct AgentRunPrep {
     pub principles_content: String,
     pub pte_memory_prose: String,

@@ -257,7 +257,8 @@ export function formatEngineBadgeLabel(engine: string): string {
   if (trimmed === 'cursor') return 'Cursor'
   if (trimmed === 'classic') return 'Classic'
   if (trimmed.startsWith('classic')) return trimmed
-  if (trimmed === 'deterministic') return 'Deterministic'
+  if (trimmed === 'gemini_adk' || trimmed === 'adk') return 'Gemini ADK'
+  if (trimmed === 'deterministic') return 'Classic' // legacy label
   return trimmed
 }
 

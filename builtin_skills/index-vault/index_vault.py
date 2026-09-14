@@ -104,10 +104,24 @@ def index_vault() -> int:
 
     print(f"Prepared {len(docs)} chunks. Starting upsert...")
     try:
-        collection.upsert(documents=docs, metadatas=metas, ids=ids)
-        print(f"Successfully indexed {len(docs)} chunks from {vault}")
+        try:
+            max_batch = int(client.get_max_batch_size())
+        except Exception:
+            max_batch = 5461
+        # Stay under ChromaDB's hard limit (and leave headroom for embedding batches).
+        batch_size = max(1, min(max_batch, 5000))
+        total = len(docs)
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            print(f"Upserting batch {start + 1}-{end} of {total}...")
+            collection.upsert(
+                documents=docs[start:end],
+                metadatas=metas[start:end],
+                ids=ids[start:end],
+            )
+        print(f"Successfully indexed {total} chunks from {vault}")
     except Exception as e:
-        print(f"Upsert failed: {e}", file=sys.stderr)
+        print(f"Upsert failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
     return 0
 

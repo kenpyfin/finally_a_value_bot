@@ -11,6 +11,7 @@ import type {
 type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
   onError: (message: string) => void
+  activePersonaId?: number | null
 }
 
 function statusColor(ok: boolean | undefined): 'green' | 'orange' | 'gray' {
@@ -76,7 +77,7 @@ function parseModelCatalog(
     .filter((model) => Boolean(model.id))
 }
 
-export function SettingsCursorPanel({ api, onError }: Props) {
+export function SettingsCursorPanel({ api, onError, activePersonaId = null }: Props) {
   const [config, setConfig] = useState<CursorEngineConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -103,7 +104,11 @@ export function SettingsCursorPanel({ api, onError }: Props) {
     setLoading(true)
     setSaveNotice(null)
     try {
-      const data = await api<CursorEngineConfigResponse>('/api/cursor-engine')
+      const path =
+        activePersonaId != null
+          ? `/api/cursor-engine?persona_id=${activePersonaId}`
+          : '/api/cursor-engine'
+      const data = await api<CursorEngineConfigResponse>(path)
       setConfig(data)
       setSdkModel(data.sdk_model ?? '')
       setSdkModelParams(data.sdk_model_params ?? [])
@@ -122,7 +127,7 @@ export function SettingsCursorPanel({ api, onError }: Props) {
     } finally {
       setLoading(false)
     }
-  }, [api, onError])
+  }, [activePersonaId, api, onError])
 
   useEffect(() => {
     void load()
@@ -240,6 +245,7 @@ export function SettingsCursorPanel({ api, onError }: Props) {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          ...(activePersonaId != null ? { persona_id: activePersonaId } : {}),
           sdk_model: sdkModel,
           sdk_model_params: sdkModelParams,
           cli_path: cliPath,
@@ -302,7 +308,8 @@ export function SettingsCursorPanel({ api, onError }: Props) {
           Cursor SDK engine
         </Text>
         <Text size="1" color="gray" className="mb-2 block">
-          The sidecar starts automatically when the bot starts. The bot installs{' '}
+          SDK model and parameters are saved for this persona. Sidecar URL, MCP, and timeouts stay
+          shared. The sidecar starts automatically when the bot starts. The bot installs{' '}
           <code>@cursor/sdk</code> into a runtime Node prefix on first boot (no{' '}
           <code>cursor-sdk-bridge</code> subprocess). The only required setup is{' '}
           <code>CURSOR_API_KEY</code> in repo-root <code>.env</code> (never commit the value).

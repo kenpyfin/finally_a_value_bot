@@ -78,7 +78,7 @@ const MAIN_CHAT_MESSAGE_VISIBILITY: &str = "(
     )
 )";
 
-const PERSONA_SELECT_COLS: &str = "id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo, dense_delivery_enabled, dense_delivery_messaging_max_chars, dense_delivery_web_max_chars, dense_delivery_summary_chars, agent_engine_override";
+const PERSONA_SELECT_COLS: &str = "id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo, dense_delivery_enabled, dense_delivery_messaging_max_chars, dense_delivery_web_max_chars, dense_delivery_summary_chars, agent_engine_override, gemini_adk_topology, cursor_sdk_model, cursor_sdk_model_params";
 
 fn persona_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Persona> {
     Ok(Persona {
@@ -94,6 +94,9 @@ fn persona_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Persona> {
         dense_delivery_web_max_chars: row.get(9)?,
         dense_delivery_summary_chars: row.get(10)?,
         agent_engine_override: row.get(11)?,
+        gemini_adk_topology: row.get(12)?,
+        cursor_sdk_model: row.get(13)?,
+        cursor_sdk_model_params: row.get(14)?,
     })
 }
 
@@ -154,9 +157,15 @@ pub struct Persona {
     pub dense_delivery_web_max_chars: Option<i64>,
     /// Summary excerpt cap override (NULL → 800).
     pub dense_delivery_summary_chars: Option<i64>,
-    /// Per-persona agent engine (`classic` / `classic_cost_routing` / `cursor` / `deterministic`).
-    /// NULL/empty inherits the global `AGENT_ENGINE` setting.
+    /// Per-persona agent engine (`classic` / `classic_cost_routing` / `cursor` / `gemini_adk`).
+    /// New personas default to `classic`. NULL/empty falls back to Classic (no inherit UI).
     pub agent_engine_override: Option<String>,
+    /// Optional per-persona Gemini ADK topology JSON. NULL inherits global `GEMINI_ADK_TOPOLOGY_CONFIG`.
+    pub gemini_adk_topology: Option<String>,
+    /// Per-persona Cursor SDK model id. NULL falls back to global `CURSOR_SDK_MODEL`.
+    pub cursor_sdk_model: Option<String>,
+    /// Per-persona Cursor SDK model params JSON array. NULL falls back to global params.
+    pub cursor_sdk_model_params: Option<String>,
 }
 
 /// Maximum `operator_memo` length (characters) for storage and prompt injection.
@@ -902,6 +911,8 @@ impl Database {
         Self::migrate_background_jobs_session_schema(&conn)?;
         Self::migrate_personas_prompt_context(&conn)?;
         Self::migrate_personas_dense_delivery_and_engine(&conn)?;
+        Self::migrate_gemini_adk_and_retire_deterministic(&conn)?;
+        Self::migrate_persona_explicit_engine_and_cursor_model(&conn)?;
         Self::migrate_hook_policy_schema(&conn)?;
         Self::ensure_builtin_hook_definitions(&conn)?;
         Self::migrate_chat_sessions_schema(&conn)?;
@@ -1671,6 +1682,58 @@ impl Database {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// Retire Deterministic pipeline storage; add Gemini ADK per-persona topology column.
+    fn migrate_gemini_adk_and_retire_deterministic(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "personas", "gemini_adk_topology")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN gemini_adk_topology TEXT",
+                [],
+            )?;
+        }
+        // Legacy engine ids → classic (Single turn).
+        conn.execute(
+            "UPDATE personas SET agent_engine_override = 'classic'
+             WHERE lower(trim(agent_engine_override)) IN ('deterministic', 'pipeline')",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE app_settings SET value = 'classic', updated_at = ?1
+             WHERE lower(trim(key)) = 'agent_engine'
+               AND lower(trim(value)) IN ('deterministic', 'pipeline')",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        let _ = conn.execute(
+            "DELETE FROM app_settings WHERE lower(trim(key)) = 'deterministic_pipeline_config'",
+            [],
+        );
+        Ok(())
+    }
+
+    /// Backfill NULL engines to classic; add per-persona Cursor SDK model columns.
+    fn migrate_persona_explicit_engine_and_cursor_model(
+        conn: &Connection,
+    ) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "personas", "cursor_sdk_model")? {
+            conn.execute("ALTER TABLE personas ADD COLUMN cursor_sdk_model TEXT", [])?;
+        }
+        if !Self::column_exists(conn, "personas", "cursor_sdk_model_params")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN cursor_sdk_model_params TEXT",
+                [],
+            )?;
+        }
+        // Personas without an override become Single turn (no inherit UI).
+        conn.execute(
+            "UPDATE personas SET agent_engine_override = 'classic'
+             WHERE agent_engine_override IS NULL
+                OR trim(agent_engine_override) = ''",
+            [],
+        )?;
         Ok(())
     }
 
@@ -6637,7 +6700,7 @@ impl Database {
             }
         }
         conn.execute(
-            "INSERT OR IGNORE INTO personas (chat_id, name, model_override) VALUES (?1, 'default', NULL)",
+            "INSERT OR IGNORE INTO personas (chat_id, name, model_override, agent_engine_override) VALUES (?1, 'default', NULL, 'classic')",
             params![chat_id],
         )?;
         let persona_id: i64 = conn.query_row(
@@ -6766,7 +6829,7 @@ impl Database {
     ) -> Result<i64, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO personas (chat_id, name, model_override) VALUES (?1, ?2, ?3)",
+            "INSERT INTO personas (chat_id, name, model_override, agent_engine_override) VALUES (?1, ?2, ?3, 'classic')",
             params![chat_id, name, model_override],
         )?;
         Ok(conn.last_insert_rowid())
@@ -6960,6 +7023,40 @@ impl Database {
         )?;
         Ok(rows > 0)
     }
+
+    pub fn set_persona_gemini_adk_topology(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        topology_json: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let value = topology_json.map(str::trim).filter(|s| !s.is_empty());
+        let rows = conn.execute(
+            "UPDATE personas SET gemini_adk_topology = ?1 WHERE id = ?2 AND chat_id = ?3",
+            params![value, persona_id, chat_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn set_persona_cursor_sdk_model(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        model: Option<&str>,
+        model_params_json: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let model_v = model.map(str::trim).filter(|s| !s.is_empty());
+        let params_v = model_params_json.map(str::trim).filter(|s| !s.is_empty());
+        let rows = conn.execute(
+            "UPDATE personas SET cursor_sdk_model = ?1, cursor_sdk_model_params = ?2
+             WHERE id = ?3 AND chat_id = ?4",
+            params![model_v, params_v, persona_id, chat_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Returns messages ranked by relevance (FTS5 rank).
     pub fn search_messages(
         &self,

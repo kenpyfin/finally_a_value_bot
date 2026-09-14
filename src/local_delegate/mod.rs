@@ -53,7 +53,7 @@ impl RouteTarget {
     }
 }
 
-/// Deterministic pipeline compat alias.
+/// Compat alias for older call sites.
 pub type ModelTier = RouteTarget;
 
 impl RouteTarget {
@@ -215,7 +215,7 @@ impl LocalDelegateConfig {
         self.routing_enabled
     }
 
-    /// Legacy name used by Deterministic execute path.
+    /// Legacy alias for [`Self::local_routable`].
     pub fn ready_for_routing(&self) -> bool {
         self.routing_enabled && self.local_routable()
     }

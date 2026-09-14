@@ -1,5 +1,5 @@
 //! Pre-delivery Quality Evaluator (PDQE): synchronous QC before the user receives a reply.
-//! Runs for Classic and Deterministic engines only — Cursor finish skips PDQE.
+//! Runs for Classic and Gemini ADK engines — Cursor finish skips PDQE.
 
 use std::sync::Arc;
 use std::time::Duration;

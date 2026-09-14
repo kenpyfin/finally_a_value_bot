@@ -1,12 +1,13 @@
 import { Component, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { Callout, Flex, Select, Text } from '@radix-ui/themes'
+import { Callout, Flex, Text } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import { SettingsLlmPanel } from './settings-llm'
 import { SettingsLocalDelegatePanel } from './settings-local-delegate'
 import { SettingsCursorPanel } from './settings-cursor'
-import { SettingsDeterministicPipelinePanel } from './settings-deterministic-pipeline'
+import { SettingsGeminiAdkPanel } from './settings-gemini-adk'
 import type {
   CursorEngineConfigResponse,
+  GeminiAdkConfigResponse,
   Persona,
   PersonaAgentEngineInfo,
   RuntimeConfigResponse,
@@ -19,8 +20,7 @@ type Props = {
   personas: Persona[]
 }
 
-type EngineId = 'classic' | 'classic_cost_routing' | 'deterministic' | 'cursor'
-type PersonaEngineChoice = 'inherit' | EngineId
+type EngineId = 'classic' | 'classic_cost_routing' | 'gemini_adk' | 'cursor'
 
 const ENGINE_OPTIONS: { id: EngineId; label: string; subtitle: string }[] = [
   { id: 'classic', label: 'Single turn', subtitle: 'One cloud model — best reasoning continuity' },
@@ -29,16 +29,23 @@ const ENGINE_OPTIONS: { id: EngineId; label: string; subtitle: string }[] = [
     label: 'Classic · Cost routing',
     subtitle: 'Local read-only discovery + delegate sub-jobs',
   },
-  { id: 'deterministic', label: 'Deterministic pipeline', subtitle: 'Intent → plan → execute → consolidate' },
+  {
+    id: 'gemini_adk',
+    label: 'Gemini ADK',
+    subtitle: 'Native multi-agent (coordinator + specialists)',
+  },
   { id: 'cursor', label: 'Cursor (SDK)', subtitle: 'Full turn via Cursor sidecar' },
 ]
 
 function asEngineId(raw: string | undefined | null): EngineId {
   switch (raw) {
     case 'classic_cost_routing':
-    case 'deterministic':
+    case 'gemini_adk':
     case 'cursor':
       return raw
+    case 'deterministic':
+    case 'pipeline':
+      return 'classic'
     default:
       return 'classic'
   }
@@ -73,25 +80,37 @@ class ConfigPanelErrorBoundary extends Component<{ children: ReactNode }, { mess
 export function SettingsAgentEnginePanel({ api, onError, activePersonaId, personas }: Props) {
   const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null)
   const [cursorStatus, setCursorStatus] = useState<CursorEngineConfigResponse | null>(null)
+  const [geminiStatus, setGeminiStatus] = useState<GeminiAdkConfigResponse | null>(null)
   const [personaEngine, setPersonaEngine] = useState<PersonaAgentEngineInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
-  const [configureEngine, setConfigureEngine] = useState<EngineId>('classic')
-  const [followPersona, setFollowPersona] = useState(true)
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
-  const followPersonaRef = useRef(true)
-  followPersonaRef.current = followPersona
   const loadOnceRef = useRef(false)
 
   const activePersona = personas.find((p) => p.id === activePersonaId) ?? null
   const personaName = activePersona?.name?.trim() || (activePersonaId != null ? `#${activePersonaId}` : '')
 
   const refreshCursorStatus = useCallback(async () => {
+    if (activePersonaId == null) {
+      setCursorStatus(null)
+      return
+    }
     try {
-      const cursor = await api<CursorEngineConfigResponse>('/api/cursor-engine')
+      const cursor = await api<CursorEngineConfigResponse>(
+        `/api/cursor-engine?persona_id=${activePersonaId}`,
+      )
       setCursorStatus(cursor)
     } catch {
       setCursorStatus(null)
+    }
+  }, [activePersonaId, api])
+
+  const refreshGeminiStatus = useCallback(async () => {
+    try {
+      const gemini = await api<GeminiAdkConfigResponse>('/api/gemini-adk')
+      setGeminiStatus(gemini)
+    } catch {
+      setGeminiStatus(null)
     }
   }, [api])
 
@@ -117,37 +136,40 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
                   override: bulletin.agent_engine_override ?? null,
                   global: bulletin.agent_engine_global ?? data.agent_engine ?? 'classic',
                   effective:
+                    bulletin.agent_engine_override ??
                     bulletin.agent_engine_effective ??
-                    bulletin.agent_engine_global ??
-                    data.agent_engine ??
                     'classic',
-                  uses_default: !bulletin.agent_engine_override,
+                  uses_default: false,
                 }
           setPersonaEngine(info)
-          effective = asEngineId(info.effective)
+          effective = asEngineId(info.override ?? info.effective)
         } else {
           setPersonaEngine(null)
         }
-
-        setConfigureEngine((prev) => (followPersonaRef.current ? effective : prev))
 
         if (effective === 'cursor') {
           void refreshCursorStatus()
         } else {
           setCursorStatus(null)
         }
+        if (effective === 'gemini_adk') {
+          void refreshGeminiStatus()
+        } else {
+          setGeminiStatus(null)
+        }
       } catch (e) {
         onError(e instanceof Error ? e.message : String(e))
         if (!opts?.silent) {
           setRuntime(null)
           setCursorStatus(null)
+          setGeminiStatus(null)
           setPersonaEngine(null)
         }
       } finally {
         setLoading(false)
       }
     },
-    [activePersonaId, api, onError, refreshCursorStatus],
+    [activePersonaId, api, onError, refreshCursorStatus, refreshGeminiStatus],
   )
 
   useEffect(() => {
@@ -156,64 +178,30 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
     void load({ silent })
   }, [load])
 
-  async function patchPersonaEngine(choice: PersonaEngineChoice) {
+  async function patchPersonaEngine(engine: EngineId) {
     if (activePersonaId == null) {
       onError('Select a persona in the sidebar to set its agent engine.')
       return
     }
-    const global = asEngineId(runtime?.agent_engine)
-    const nextEngine: EngineId = choice === 'inherit' ? global : choice
     const previous = personaEngine
     setSavingKey('agent_engine')
     setSaveNotice(null)
     setPersonaEngine({
-      override: choice === 'inherit' ? null : choice,
-      global,
-      effective: nextEngine,
-      uses_default: choice === 'inherit',
+      override: engine,
+      global: asEngineId(runtime?.agent_engine),
+      effective: engine,
+      uses_default: false,
     })
-    setFollowPersona(true)
-    setConfigureEngine(nextEngine)
     try {
       await api(`/api/personas/${activePersonaId}/bulletin`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          agent_engine_override: choice === 'inherit' ? null : choice,
-        }),
+        body: JSON.stringify({ agent_engine_override: engine }),
       })
-      setSaveNotice(
-        choice === 'inherit'
-          ? `Saved. ${personaName || 'This persona'} inherits the default (${engineLabel(global)}).`
-          : `Saved. ${personaName || 'This persona'} uses ${engineLabel(choice)}.`,
-      )
+      setSaveNotice(`Saved. ${personaName || 'This persona'} uses ${engineLabel(engine)}.`)
       void load({ silent: true })
     } catch (e) {
       setPersonaEngine(previous)
-      onError(e instanceof Error ? e.message : String(e))
-      await load({ silent: true })
-    } finally {
-      setSavingKey(null)
-    }
-  }
-
-  async function patchGlobalEngine(engine: EngineId) {
-    setSavingKey('global_engine')
-    setSaveNotice(null)
-    try {
-      const res = await api<RuntimeConfigResponse>('/api/runtime', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent_engine: engine }),
-      })
-      setRuntime(res)
-      if (res.warnings?.length) {
-        onError(res.warnings.join(' '))
-      }
-      setSaveNotice(`Saved default engine: ${engineLabel(engine)} (personas that inherit this default).`)
-      setFollowPersona(true)
-      await load({ silent: true })
-    } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
       await load({ silent: true })
     } finally {
@@ -225,17 +213,13 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
     return <SettingsPanelSkeleton />
   }
 
-  const globalEngine = asEngineId(runtime?.agent_engine)
-  const usesDefault = personaEngine?.uses_default !== false && !personaEngine?.override
-  const selectedChoice: PersonaEngineChoice = usesDefault
-    ? 'inherit'
-    : asEngineId(personaEngine?.override ?? personaEngine?.effective ?? runtime?.agent_engine)
-  const selectedEngine = asEngineId(personaEngine?.effective ?? runtime?.agent_engine)
+  const selectedEngine = asEngineId(
+    personaEngine?.override ?? personaEngine?.effective ?? runtime?.agent_engine,
+  )
   const costRoutingSelected = selectedEngine === 'classic_cost_routing'
-  const localReady = runtime?.local_delegate_ready === true
   const localConfigured = runtime?.local_delegate_configured === true
   const toolsOk = runtime?.local_delegate_tools_ok === true
-  const panelEngine = followPersona ? selectedEngine : configureEngine
+  const localReady = runtime?.local_delegate_ready === true
   const busy = savingKey != null
 
   return (
@@ -246,40 +230,23 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
         </Text>
         {activePersonaId == null ? (
           <Text size="1" color="gray">
-            Select a persona in the sidebar to set its engine. Clicks save immediately.
+            Select a persona in the sidebar to set its engine. Choosing an engine saves it and shows
+            its settings below.
           </Text>
         ) : (
           <Text size="1" color="gray">
-            Click an engine to save it for{' '}
-            <span className="font-medium">{personaName}</span>
-            . Inherit uses the default below. Single turn uses one cloud model for the full Classic
-            loop. Cost routing keeps the same loop but routes read-only tool chains to a verified
-            local model. Deterministic runs a structured pipeline. Cursor delegates the turn to a
-            local SDK sidecar.
+            Engine for <span className="font-medium">{personaName}</span>. Click to save —
+            settings for that engine appear below. New personas default to Single turn.
           </Text>
         )}
         <Flex gap="2" wrap="wrap">
-          <button
-            key="inherit"
-            type="button"
-            disabled={busy || activePersonaId == null}
-            className={
-              selectedChoice === 'inherit'
-                ? 'mc-engine-option mc-engine-option--active'
-                : 'mc-engine-option'
-            }
-            title={`Inherit default (${engineLabel(globalEngine)})`}
-            onClick={() => void patchPersonaEngine('inherit')}
-          >
-            Inherit default
-          </button>
           {ENGINE_OPTIONS.map((opt) => (
             <button
               key={opt.id}
               type="button"
               disabled={busy || activePersonaId == null}
               className={
-                selectedChoice === opt.id
+                selectedEngine === opt.id
                   ? 'mc-engine-option mc-engine-option--active'
                   : 'mc-engine-option'
               }
@@ -290,11 +257,6 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
             </button>
           ))}
         </Flex>
-        {usesDefault && activePersonaId != null ? (
-          <Text size="1" color="gray">
-            Running as {engineLabel(selectedEngine)} via the inherit default.
-          </Text>
-        ) : null}
 
         {saveNotice ? (
           <Callout.Root color="green" size="1" variant="soft">
@@ -324,69 +286,39 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
             </Callout.Text>
           </Callout.Root>
         ) : null}
+
+        {selectedEngine === 'gemini_adk' && geminiStatus && !geminiStatus.engine_ready ? (
+          <Callout.Root color="orange" size="1" variant="soft">
+            <Callout.Text>
+              Gemini ADK is active but not ready (API key{' '}
+              {geminiStatus.api_key_configured ? 'ok' : 'missing'}). Set GEMINI_API_KEY in .env and
+              finish setup in the Gemini ADK panel below.
+            </Callout.Text>
+          </Callout.Root>
+        ) : null}
       </Flex>
 
-      <Flex direction="column" gap="2">
-        <Text size="2" weight="medium">
-          Inherit default
-        </Text>
-        <Text size="1" color="gray">
-          Used when a persona is set to Inherit default. Does not change personas that already have
-          their own engine.
-        </Text>
-        <Select.Root
-          value={globalEngine}
-          disabled={busy}
-          onValueChange={(v) => void patchGlobalEngine(asEngineId(v))}
-        >
-          <Select.Trigger className="w-full md:max-w-sm" />
-          <Select.Content position="popper">
-            {ENGINE_OPTIONS.map((opt) => (
-              <Select.Item key={opt.id} value={opt.id}>
-                {opt.label}
-              </Select.Item>
-            ))}
-          </Select.Content>
-        </Select.Root>
-      </Flex>
-
-      <Flex direction="column" gap="2">
-        <Text size="2" weight="medium">
-          Show settings for
-        </Text>
-        <Text size="1" color="gray">
-          Preview knobs for another engine without changing this persona&apos;s saved engine (for
-          example Cursor settings while this persona is Classic). This dropdown does not save.
-        </Text>
-        <Select.Root
-          value={panelEngine}
-          onValueChange={(v) => {
-            setFollowPersona(false)
-            setConfigureEngine(asEngineId(v))
-          }}
-        >
-          <Select.Trigger className="w-full md:max-w-sm" />
-          <Select.Content position="popper">
-            {ENGINE_OPTIONS.map((opt) => (
-              <Select.Item key={opt.id} value={opt.id}>
-                {opt.label}
-              </Select.Item>
-            ))}
-          </Select.Content>
-        </Select.Root>
-      </Flex>
-
-      <ConfigPanelErrorBoundary key={panelEngine}>
-        {panelEngine === 'classic' ? <SettingsLlmPanel api={api} onError={onError} /> : null}
-        {panelEngine === 'classic_cost_routing' ? (
+      <ConfigPanelErrorBoundary key={selectedEngine}>
+        {selectedEngine === 'classic' ? <SettingsLlmPanel api={api} onError={onError} /> : null}
+        {selectedEngine === 'classic_cost_routing' ? (
           <Flex direction="column" gap="4">
             <SettingsLlmPanel api={api} onError={onError} />
             <SettingsLocalDelegatePanel api={api} onError={onError} />
           </Flex>
         ) : null}
-        {panelEngine === 'cursor' ? <SettingsCursorPanel api={api} onError={onError} /> : null}
-        {panelEngine === 'deterministic' ? (
-          <SettingsDeterministicPipelinePanel api={api} onError={onError} />
+        {selectedEngine === 'cursor' ? (
+          <SettingsCursorPanel
+            api={api}
+            onError={onError}
+            activePersonaId={activePersonaId}
+          />
+        ) : null}
+        {selectedEngine === 'gemini_adk' ? (
+          <SettingsGeminiAdkPanel
+            api={api}
+            onError={onError}
+            activePersonaId={activePersonaId}
+          />
         ) : null}
       </ConfigPanelErrorBoundary>
     </Flex>

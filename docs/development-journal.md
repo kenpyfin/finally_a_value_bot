@@ -27,6 +27,22 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-12 — Persona-explicit agent engine; Cursor model per persona
+
+- **Area:** agent / settings / web
+- **Summary:** Removed “Inherit default” from Agent engine settings. Every persona stores an explicit engine (NULL/empty backfilled to Classic). Cursor SDK model and model parameters are stored on the persona and overlaid at run time / in settings when `persona_id` is passed.
+- **Rationale:** Operators should see and edit what this persona actually uses, not a global inherit indirection. Model choice is persona-scoped; sidecar/MCP/timeouts stay shared.
+- **Key files / symbols:** `migrate_persona_explicit_engine_and_cursor_model`, `set_persona_cursor_sdk_model`, `apply_persona_cursor_model_override`, `resolve_run_agent_engine`, `GET/PATCH /api/cursor-engine?persona_id=`, `settings-agent-engine.tsx`, `settings-cursor.tsx`.
+- **Follow-ups:** Optional UI to clear persona model back to global default without typing empty.
+
+### 2026-09-11 — Gemini ADK engine replaces Deterministic pipeline
+
+- **Area:** agent / settings / web
+- **Summary:** Removed the Deterministic pipeline (`src/agent_pipeline/`). Added a native in-process Gemini ADK multi-agent engine (`src/gemini_adk/`) with per-persona topology editor. Agent engine settings UI now reveals settings for the selected engine (no preview dropdown). New personas default to Single turn (`classic`).
+- **Rationale:** User wanted ADK-style multi-agent orchestration integrated into the bot (no sidecar/Python), and a simpler settings page where choosing an engine is choosing its settings.
+- **Key files / symbols:** `AgentEngine::GeminiAdk`, `run_gemini_adk_engine`, `AdkTopologyProfile`, `/api/gemini-adk`, `/api/gemini-adk/topology`, `settings-agent-engine.tsx`, `settings-gemini-adk.tsx`, `create_persona` default override.
+- **Follow-ups:** Optional parallel child execution with isolated tool scratch; richer allowed_tools UI picker.
+
 ### 2026-09-09 — Web UI npm audit: Vite 6 / Vitest 4
 
 - **Area:** web UI / deps

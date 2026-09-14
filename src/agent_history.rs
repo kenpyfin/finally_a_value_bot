@@ -305,12 +305,12 @@ pub struct PipelineStageRecord {
     pub duration_ms: u128,
 }
 
-/// Optional metadata for deterministic pipeline runs passed into delivery/history.
+/// Optional metadata for multi-agent / staged runs passed into delivery/history.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineFinishExtras {
     pub pipeline_stages: Vec<PipelineStageRecord>,
     pub cloud_calls: u32,
-    /// `classic` | `deterministic` | `cursor`
+    /// `classic` | `gemini_adk` | `cursor`
     pub agent_engine: String,
 }
 
@@ -326,7 +326,7 @@ pub struct AgentRunRecord {
     /// JSON (pretty) of `system_prompt`, `tool_names_first_turn`, and `messages` as sent on the first LLM call.
     pub initial_llm_snapshot: Option<String>,
     pub multimodel_summary: LocalDelegateRunSummary,
-    /// Deterministic pipeline stage timeline (empty for classic runs).
+    /// Staged agent timeline (Gemini ADK / Cursor extras; empty for classic runs).
     pub pipeline_stages: Vec<PipelineStageRecord>,
     pub cloud_calls: u32,
     pub agent_engine: String,
@@ -367,7 +367,7 @@ impl AgentRunRecord {
 
         if !self.pipeline_stages.is_empty() {
             md.push_str(&format!(
-                "\n## Deterministic pipeline (engine: {} | cloud calls: {})\n",
+                "\n## Agent stages (engine: {} | cloud calls: {})\n",
                 self.agent_engine, self.cloud_calls
             ));
             for stage in &self.pipeline_stages {

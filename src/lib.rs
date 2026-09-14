@@ -1,6 +1,5 @@
 pub mod agent_history;
 pub mod agent_path_discipline;
-pub mod agent_pipeline;
 pub mod agent_turn_context;
 pub mod background_jobs;
 pub mod background_shell;
@@ -25,6 +24,7 @@ pub mod error;
 pub mod final_delivery_dedupe;
 pub mod final_delivery_media;
 pub mod gateway;
+pub mod gemini_adk;
 pub mod hook_actions;
 pub mod hook_executor;
 pub mod hook_runtime;
