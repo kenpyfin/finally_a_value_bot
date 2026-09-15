@@ -8,12 +8,16 @@ use crate::runtime_toggles::RuntimeToggles;
 
 use crate::claude::ToolDefinition;
 use crate::safety_redaction::EnvSecretRedactor;
-use crate::tools::command_runner::{build_command_with_env, shell_command};
+use crate::tools::command_runner::{
+    build_command_with_env, run_managed_command, shell_command, ManagedCommandOutcome,
+};
 
 use super::bash_safety::{
-    check_bash_safety, check_expensive_shell_search, check_self_repo_git,
-    is_expensive_shell_search, parse_confirmation_prefix, EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS,
+    check_bash_safety, check_expensive_shell_search_scoped, check_self_repo_git,
+    is_expensive_shell_search_scoped, parse_confirmation_prefix,
+    EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS,
 };
+use super::tool_cancel::current_tool_cancel;
 use super::{schema_object, Tool, ToolResult};
 
 fn maybe_rewrite_leading_tool_path(
@@ -88,7 +92,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "bash",
-            "Execute a bash command and return the output. Use for running shell commands, scripts, or system operations. Do not use recursive `grep -r` or unbounded `find` over large trees — use the `glob` and `grep` tools instead (shell recursive search is blocked unless you prefix CONFIRM_EXECUTE).",
+            "Execute a bash command and return the output. Use for running shell commands, scripts, or system operations. Do not use recursive `grep -r` or unbounded `find` over large trees — use `locate_file`, `glob`, and `grep` instead (shell recursive search is blocked unless you prefix CONFIRM_EXECUTE). On a locate miss, ask the user.",
             schema_object(
                 json!({
                     "command": {
@@ -112,14 +116,27 @@ impl Tool for BashTool {
         };
         let (confirmed, command) = parse_confirmation_prefix(raw_command.trim());
 
+        let auth = super::auth_context_from_input(&input);
+        let memory = super::locate::load_memory_for_auth(
+            &self.working_dir,
+            &self.working_dir.join("runtime"),
+            auth.as_ref(),
+        );
+        let registry =
+            super::locate::build_registry(&self.working_dir, auth.as_ref(), memory.as_ref());
+        let allowed_roots = super::locate::allowed_search_root_paths(&registry);
+        let root_hints: Vec<String> = super::locate::directory_roots(&registry)
+            .iter()
+            .map(|r| format!("{} (`{}`)", r.label, r.path.display()))
+            .collect();
+
         let mut timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(3600);
-        if is_expensive_shell_search(&command) {
+        if is_expensive_shell_search_scoped(&command, &allowed_roots) {
             timeout_secs = timeout_secs.min(EXPENSIVE_SHELL_SEARCH_TIMEOUT_SECS);
         }
-        let auth = super::auth_context_from_input(&input);
         let working_dir =
             super::resolve_tool_working_dir_for_auth(&self.working_dir, auth.as_ref());
         if let Err(e) = tokio::fs::create_dir_all(&working_dir).await {
@@ -138,7 +155,9 @@ impl Tool for BashTool {
             return blocked;
         }
 
-        if let Some(blocked) = check_expensive_shell_search(&command, confirmed) {
+        if let Some(blocked) =
+            check_expensive_shell_search_scoped(&command, confirmed, &allowed_roots, &root_hints)
+        {
             return blocked;
         }
         if let Some(blocked) = check_self_repo_git(&command, &self.working_dir) {
@@ -150,20 +169,17 @@ impl Tool for BashTool {
         info!("Executing bash: {}", self.env_redactor.redact(&command));
 
         let spec = shell_command(&command);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            build_command_with_env(
-                &spec,
-                Some(&working_dir),
-                self.runtime_toggles.tool_output_debug(),
-                Some(self.working_dir.as_path()),
-            )
-            .output(),
-        )
-        .await;
+        let cmd = build_command_with_env(
+            &spec,
+            Some(&working_dir),
+            self.runtime_toggles.tool_output_debug(),
+            Some(self.working_dir.as_path()),
+        );
+        let cancel = current_tool_cancel();
+        let outcome = run_managed_command(cmd, timeout_secs, cancel.as_ref()).await;
 
-        match result {
-            Ok(Ok(output)) => {
+        match outcome {
+            ManagedCommandOutcome::Completed(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let exit_code = output.status.code().unwrap_or(-1);
@@ -197,10 +213,18 @@ impl Tool for BashTool {
                         .with_error_type("process_exit")
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Failed to execute command: {e}"))
-                .with_error_type("spawn_error"),
-            Err(_) => ToolResult::error(format!("Command timed out after {timeout_secs} seconds"))
-                .with_error_type("timeout"),
+            ManagedCommandOutcome::SpawnError(e) => {
+                ToolResult::error(format!("Failed to execute command: {e}"))
+                    .with_error_type("spawn_error")
+            }
+            ManagedCommandOutcome::TimedOut => {
+                ToolResult::error(format!("Command timed out after {timeout_secs} seconds"))
+                    .with_error_type("timeout")
+            }
+            ManagedCommandOutcome::Cancelled => {
+                ToolResult::error("Command cancelled because the Cursor run ended".into())
+                    .with_error_type("run_cancelled")
+            }
         }
     }
 }

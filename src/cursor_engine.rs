@@ -939,6 +939,7 @@ impl McpTokenGuard {
 impl Drop for McpTokenGuard {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
+            // Sets cancel so in-flight bash trees get process-group SIGKILL.
             self.registry.revoke_run(&token);
         }
     }

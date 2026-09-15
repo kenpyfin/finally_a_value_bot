@@ -101,6 +101,15 @@ impl Tool for ReadFileTool {
                         "Failed to read file: {msg}. This path is likely a binary/image file — use a markdown image link with the absolute path in your final message instead of read_file."
                     ));
                 }
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return ToolResult::error(format!(
+                        "Not found: '{path}' resolved to '{}' but the file does not exist under declared roots. \
+                         Call locate_file with this path, or ask the user for the correct location — \
+                         do not run find over large trees.",
+                        resolved_path.display()
+                    ))
+                    .with_error_type("not_found");
+                }
                 return ToolResult::error(format!("Failed to read file: {msg}"));
             }
         };

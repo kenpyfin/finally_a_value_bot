@@ -27,6 +27,22 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-15 — Context-first file locator (declared roots before walk)
+
+- **Area:** tools / path resolution / agent prompt
+- **Summary:** Added a declared-root registry and `locate_file` tool so agents resolve against persona ORIGIN, shared ORIGIN, skills, runtime, Tier-1 `Repo:` paths, and SOP pointers before any filesystem walk. Fixed persona-vs-shared `ORIGIN/` resolution and “permission denied” for missing in-scope files. Blocked name-filtered `find` outside declared roots and pointed the model at `locate_file` + ask-user instead of widening.
+- **Rationale:** Uninformed `find` over `/home/ken/big_storage` hung chat after a false permission error; locations were already in memory/config.
+- **Key files / symbols:** `src/tools/locate.rs` (`build_registry`, `locate_in_registry`, `LocateFileTool`); `resolve_prefixed_path` / `absolutize_for_compare` / `assert_persona_tool_path_allowed_with_memory` in `src/tools/mod.rs`; `is_expensive_shell_search_scoped` in `src/tools/bash_safety.rs`; locate roots section in `build_system_prompt`.
+- **Follow-ups:** Optionally index vault paths for content search; migrate persona ORIGIN trees into shared ORIGIN when desired.
+
+### 2026-09-14 — Kill Cursor MCP tool process trees on cancel/timeout
+
+- **Area:** cursor / tools / safety
+- **Summary:** Cursor run cancel and bash timeouts now terminate the full subprocess tree (process group / Job Object). MCP runs expose a cancel flag to in-flight `tools/call`s; broad `find $HOME -name …` is blocked without `CONFIRM_EXECUTE`.
+- **Rationale:** Sidecar reapers cancelled SDK sessions while gateway-owned `find`/`sleep` children kept running, so the engine looked dead and load stayed high.
+- **Key files / symbols:** `run_managed_command`, `KillOnDropGroup`, `CursorMcpRegistry::cancel_and_drain`, `scope_tool_cancel`, `find_targets_broad_root`.
+- **Follow-ups:** Rebuild/restart gateway (`./reload.sh`). Optionally kill any leftover pre-fix `find /home/...` orphans once.
+
 ### 2026-09-12 — Persona-explicit agent engine; Cursor model per persona
 
 - **Area:** agent / settings / web

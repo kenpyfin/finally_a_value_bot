@@ -26,6 +26,7 @@ unnecessary_cast = "allow"
 [dependencies]
 teloxide = { version = "0.17", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
+process-wrap = { version = "10", features = ["tokio1"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "stream", "multipart"] }
 rusqlite = { version = "0.32", features = ["bundled-full"] }
 serde = { version = "1", features = ["derive"] }

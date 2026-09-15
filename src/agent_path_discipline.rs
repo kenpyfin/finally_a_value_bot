@@ -10,9 +10,10 @@ pub fn strict_path_discipline_section(
         r##"
 ## Path discipline (strict)
 
-Follow these rules on **every** turn for `read_file`, `write_file`, `edit_file`, `apply_search_replace`, `symbol_edit`, `glob`, `grep`, **`bash`**, **`run_skill_script`**, and **`cursor_agent`** / **`build_skill`**.
+Follow these rules on **every** turn for `read_file`, `write_file`, `edit_file`, `apply_search_replace`, `symbol_edit`, `glob`, `grep`, **`locate_file`**, **`bash`**, **`run_skill_script`**, and **`cursor_agent`** / **`build_skill`**.
 
 **Tool cwd:** `{tool_cwd}` (persona-scoped under `{workspace_data_root_display}/shared/personas/...` when auth is present). Relative tool paths resolve from here—not from the configuration root and not by prefixing `WORKSPACE_DIR` as `workspace/...`.
+**Locate first:** Prefer `locate_file` or a known `ORIGIN/…` / Tier-1 `Repo:` path before any filesystem walk. On a miss, ask the user — do not run `find`/`grep -r` over large trees.
 
 ### Allowed patterns (use these)
 
@@ -86,6 +87,8 @@ mod tests {
         assert!(s.contains("../../../../skills"));
         assert!(s.contains("Self-repo"));
         assert!(s.contains("Tier-1"));
+        assert!(s.contains("locate_file"));
+        assert!(s.contains("ask the user"));
     }
 
     #[test]

@@ -9,7 +9,8 @@ use crate::db::Database;
 use crate::runtime_toggles::RuntimeToggles;
 use crate::skills::SkillManager;
 
-use super::command_runner::build_command_with_env;
+use super::command_runner::{build_command_with_env, run_managed_command, ManagedCommandOutcome};
+use super::tool_cancel::current_tool_cancel;
 use super::{auth_context_from_input, schema_object, Tool, ToolResult};
 
 pub struct RunSkillScriptTool {
@@ -477,7 +478,7 @@ impl Tool for RunSkillScriptTool {
             interpreter, skill_name, script, args
         );
 
-        let mut cmd = build_command_with_env(
+        let cmd = build_command_with_env(
             &super::command_runner::CommandSpec {
                 program: interpreter.clone(),
                 args: {
@@ -491,11 +492,11 @@ impl Tool for RunSkillScriptTool {
             None,
         );
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
+        let cancel = current_tool_cancel();
+        let outcome = run_managed_command(cmd, timeout_secs, cancel.as_ref()).await;
 
-        match result {
-            Ok(Ok(output)) => {
+        match outcome {
+            ManagedCommandOutcome::Completed(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let exit_code = output.status.code().unwrap_or(-1);
@@ -509,10 +510,18 @@ impl Tool for RunSkillScriptTool {
                         .with_error_type("process_exit")
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Failed to execute script: {e}"))
-                .with_error_type("spawn_error"),
-            Err(_) => ToolResult::error(format!("Script timed out after {timeout_secs} seconds"))
-                .with_error_type("timeout"),
+            ManagedCommandOutcome::SpawnError(e) => {
+                ToolResult::error(format!("Failed to execute script: {e}"))
+                    .with_error_type("spawn_error")
+            }
+            ManagedCommandOutcome::TimedOut => {
+                ToolResult::error(format!("Script timed out after {timeout_secs} seconds"))
+                    .with_error_type("timeout")
+            }
+            ManagedCommandOutcome::Cancelled => {
+                ToolResult::error("Script cancelled because the Cursor run ended".into())
+                    .with_error_type("run_cancelled")
+            }
         }
     }
 }

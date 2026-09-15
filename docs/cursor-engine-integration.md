@@ -131,13 +131,17 @@ These tools are **not** exposed to Cursor MCP (avoid recursion and duplicate del
 - Endpoint accepts **loopback clients only** (`127.0.0.1` / `::1`).
 - Requires valid run-scoped Bearer token; revoked when the turn finishes.
 - Tool args are redacted via `EnvSecretRedactor` in logs.
+- **Run cancel contract:** each MCP run owns an `AtomicBool` cancel flag. `revoke_run` / `McpTokenGuard` drop / `finish_run` set it. In-flight `tools/call` handlers race on that flag and install it as a task-local for process tools. `bash` / `run_skill_script` run under a process group (Unix) or Job Object (Windows) via `process-wrap` and **SIGKILL the whole tree** on timeout, cancel, or future drop — so a Cursor reaper/HTTP timeout cannot leave `find`/`sleep` descendants attached to the gateway.
+- Broad foreground shell searches (`find /home/$USER …`, `find ~ …`, recursive `grep -r`) remain blocked unless prefixed with `CONFIRM_EXECUTE` (see `bash_safety`). Prefer `glob` / `grep` tools.
 - **Self-repo ban:** Cursor/agent shells get `GIT_CEILING_DIRECTORIES=<WORKSPACE_DIR>` so git does not bind the bot's own checkout from persona cwd. Explicit git/`cd` into the finally-a-value-bot source tree is blocked in `bash` / background shell. **Persona Tier-1 target repos** (`Repo: /absolute/path` in identity/memory) remain fully allowed — `cd` there and run git normally. Override detection with `FINALLY_A_VALUE_BOT_SELF_REPO`. See `src/self_repo.rs`.
 
 ### Key files
 
 | File | Role |
 | --- | --- |
-| [`src/cursor_mcp_bridge.rs`](../src/cursor_mcp_bridge.rs) | Registry, JSON-RPC handler, `tools/list` / `tools/call` |
+| [`src/cursor_mcp_bridge.rs`](../src/cursor_mcp_bridge.rs) | Registry, JSON-RPC handler, `tools/list` / `tools/call`, run cancel + active-call drain |
+| [`src/tools/command_runner.rs`](../src/tools/command_runner.rs) | Process-group / Job Object managed command runner |
+| [`src/tools/tool_cancel.rs`](../src/tools/tool_cancel.rs) | Task-local cancel flag for tool executions |
 | [`src/tool_hook_dispatch.rs`](../src/tool_hook_dispatch.rs) | Shared PreToolUse / PostToolUse / PostToolBatch for MCP (and future Classic reuse) |
 | [`src/cursor_engine.rs`](../src/cursor_engine.rs) | Turn orchestration, MCP registration, finish path |
 | [`scripts/cursor-sdk-runner.mjs`](../scripts/cursor-sdk-runner.mjs) | Passes `mcpServers`, streams tool events (`scripts/cursor-sdk-runner.py` is rollback) |

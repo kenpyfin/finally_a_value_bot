@@ -1,3 +1,19 @@
+### 2026-09-15 — Permission-denied for missing ORIGIN files drove uninformed finds
+
+- **Symptom:** Agent hung / timed out on `find /home/ken/big_storage … -name Sourdough-Journal-Post-Pipeline.md` after `read_file ORIGIN/…` returned “Permission denied”.
+- **Root cause:** (1) `resolve_tool_path` always mapped `ORIGIN/` to `shared/ORIGIN`, ignoring persona-local `shared/personas/{chat}/{persona}/ORIGIN` where the SOP lived. (2) `is_under` canonicalized existing roots to absolute paths but left missing relative paths relative, so in-scope missing files failed `starts_with` and looked like permission errors — the model then searched the whole disk.
+- **Fix:** Persona-local ORIGIN wins when present; path allow checks absolutize without requiring existence; `locate_file` resolves against a declared root registry (persona cwd, ORIGIN trees, skills, runtime, Tier-1 `Repo:`, SOP pointers) and on miss tells the agent to ask the user. Name-filtered `find` outside declared roots is blocked (redirect to `locate_file`).
+- **Prevention:** Never report permission-denied for a path that is structurally under an allowed root but absent. Never exempt `find -name` over unregistered absolute trees. Prefer declared roots / `locate_file` over filesystem walks.
+- **Files/refs:** `resolve_prefixed_path` / `build_registry` / `locate_file` in `src/tools/locate.rs`; `absolutize_for_compare` in `src/tools/mod.rs`; `is_expensive_shell_search_scoped` in `src/tools/bash_safety.rs`.
+
+### 2026-09-14 — Cursor cancel no longer leaves bash orphans
+
+- **Symptom:** After Cursor runs timed out (~20 min) or were reaped, `find /home/ken …` (and similar) kept running under the gateway for an hour+. UI showed “Run cancelled” while the engine looked wedged.
+- **Root cause:** (1) `bash` used `tokio::time::timeout` around `Command::output()` without killing the process tree on expiry — only the await was cancelled. (2) Cursor MCP revoke/reaper cancelled the SDK run but did not signal in-flight MCP tools. (3) `bash_safety` treated any `find … -name` as cheap, including `find /home/$USER`.
+- **Fix:** Managed runner (`process-wrap` process group / Job Object) kills the whole tree on timeout, cancel, or drop. MCP runs carry a cancel flag; `tools/call` scopes it and `finish_run`/`revoke_run` assert it. Broad home-root finds require `CONFIRM_EXECUTE`.
+- **Prevention:** Never await a shell with timeout without process-group kill. Propagate run cancel into MCP tools. Do not exempt `-name` finds over `/`, `/home`, or `$HOME`.
+- **Files/refs:** `run_managed_command` in `src/tools/command_runner.rs`; `tool_cancel`; `cancel_and_drain` in `src/cursor_mcp_bridge.rs`; `find_targets_broad_root` in `src/tools/bash_safety.rs`; log `reaper cancelling stuck run` / `Run cancelled`.
+
 ### 2026-09-09 — Load earlier messages jumped the thread
 
 - **Symptom:** Tapping “Load earlier messages” moved the visible messages instead of leaving the screen still while older rows appeared above.

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,8 @@ use crate::tool_hook_dispatch::{
     dispatch_tool_with_hooks, run_post_tool_batch_hooks, ToolHookDispatchContext,
     ToolHookDispatchOutcome,
 };
-use crate::tools::ToolAuthContext;
+use crate::tools::tool_cancel::{request_cancel, scope_tool_cancel};
+use crate::tools::{ToolAuthContext, ToolResult};
 
 pub const MCP_SERVER_NAME: &str = "finally-a-value-bot";
 const AUTH_CONTEXT_KEY: &str = "__finally_a_value_bot_auth";
@@ -79,6 +81,8 @@ pub struct CursorMcpRegisterParams {
 struct CursorMcpRunState {
     params: CursorMcpRegisterParams,
     expires_at: Instant,
+    cancel: Arc<AtomicBool>,
+    active_calls: Arc<AtomicUsize>,
     schedule_skill_activated: bool,
     modify_skill_activated: bool,
     discovery_streak_count: usize,
@@ -125,6 +129,8 @@ impl CursorMcpRegistry {
         let state = CursorMcpRunState {
             params,
             expires_at,
+            cancel: Arc::new(AtomicBool::new(false)),
+            active_calls: Arc::new(AtomicUsize::new(0)),
             schedule_skill_activated: false,
             modify_skill_activated: false,
             discovery_streak_count: 0,
@@ -143,9 +149,45 @@ impl CursorMcpRegistry {
     }
 
     pub fn revoke_run(&self, token: &str) {
-        if let Ok(mut guard) = self.runs.write() {
-            guard.remove(token);
+        let removed = if let Ok(mut guard) = self.runs.write() {
+            guard.remove(token)
+        } else {
+            None
+        };
+        if let Some(arc) = removed {
+            if let Ok(run) = arc.lock() {
+                request_cancel(&run.cancel);
+            }
         }
+    }
+
+    /// Signal cancel and briefly wait for in-flight `tools/call` handlers to drain.
+    pub async fn cancel_and_drain(&self, token: &str, max_wait: Duration) {
+        let (cancel, active_calls) = {
+            let Ok(guard) = self.runs.read() else {
+                return;
+            };
+            let Some(arc) = guard.get(token).cloned() else {
+                return;
+            };
+            let Ok(run) = arc.lock() else {
+                return;
+            };
+            request_cancel(&run.cancel);
+            (run.cancel.clone(), run.active_calls.clone())
+        };
+        let deadline = Instant::now() + max_wait;
+        while active_calls.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if active_calls.load(Ordering::SeqCst) > 0 {
+            warn!(
+                remaining = active_calls.load(Ordering::SeqCst),
+                "Cursor MCP tool calls still active after cancel drain"
+            );
+        }
+        // Keep cancel asserted until revoke; flag already set.
+        let _ = cancel;
     }
 
     pub fn active_run_count(&self) -> usize {
@@ -172,6 +214,9 @@ impl CursorMcpRegistry {
         token: &str,
         event_tx: Option<&UnboundedSender<AgentEvent>>,
     ) -> Option<CursorMcpFinishSummary> {
+        // Stop in-flight tools (bash trees, etc.) before PostToolBatch / revoke.
+        self.cancel_and_drain(token, Duration::from_secs(2)).await;
+
         let arc = self.runs.read().ok()?.get(token).cloned()?;
         let (
             discovery_streak_count,
@@ -518,13 +563,26 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let (run_key, caller_channel, chat_id, persona_id, is_scheduled_task, tool_auth, event_tx) = {
+    let (
+        run_key,
+        caller_channel,
+        chat_id,
+        persona_id,
+        is_scheduled_task,
+        tool_auth,
+        event_tx,
+        cancel,
+        active_calls,
+    ) = {
         let run = match run_arc.lock() {
             Ok(g) => g,
             Err(_) => return json_rpc_error(id, -32000, "Run lock poisoned"),
         };
         if !state.cursor_mcp.tool_allowed(&run, &tool_name) {
             return json_rpc_error(id, -32002, format!("Tool not allowed: {tool_name}"));
+        }
+        if run.cancel.load(Ordering::SeqCst) {
+            return cancelled_tool_response(id, &tool_name);
         }
         (
             run.params.run_key.clone(),
@@ -534,6 +592,8 @@ async fn handle_tools_call(
             run.params.is_scheduled_task,
             run.params.tool_auth.clone(),
             run.event_tx.clone(),
+            run.cancel.clone(),
+            run.active_calls.clone(),
         )
     };
 
@@ -588,7 +648,43 @@ async fn handle_tools_call(
         });
     }
 
-    let outcome = dispatch_tool_with_hooks(&mut dispatch_ctx, &tool_name, arguments).await;
+    active_calls.fetch_add(1, Ordering::SeqCst);
+    struct ActiveCallGuard(Arc<AtomicUsize>);
+    impl Drop for ActiveCallGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let _call_guard = ActiveCallGuard(active_calls.clone());
+
+    let outcome = scope_tool_cancel(Some(cancel.clone()), async {
+        // Race the tool against run cancel so non-process tools also stop promptly.
+        // Process tools also see `cancel` via task-local and kill their process group.
+        tokio::select! {
+            biased;
+            _ = wait_flag_cancelled(&cancel) => {
+                ToolHookDispatchOutcome {
+                    result: ToolResult::error(
+                        "Tool cancelled because the Cursor run ended".into(),
+                    )
+                    .with_error_type("run_cancelled"),
+                    blocked: false,
+                    record: ToolCallRecord {
+                        name: tool_name.clone(),
+                        input_preview: String::new(),
+                        result_preview: "run_cancelled".into(),
+                        duration_ms: 0,
+                        is_error: true,
+                    },
+                }
+            }
+            outcome = dispatch_tool_with_hooks(&mut dispatch_ctx, &tool_name, arguments) => {
+                outcome
+            }
+        }
+    })
+    .await;
+    drop(_call_guard);
 
     if let Some(tx) = event_tx.as_ref() {
         let _ = tx.send(AgentEvent::ToolResult {
@@ -639,6 +735,26 @@ async fn handle_tools_call(
             "isError": result.is_error
         }),
     )
+}
+
+fn cancelled_tool_response(id: Option<serde_json::Value>, tool_name: &str) -> Response {
+    info!(tool = %tool_name, "Cursor MCP tool call rejected: run cancelled");
+    json_rpc_result(
+        id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "Tool cancelled because the Cursor run ended"
+            }],
+            "isError": true
+        }),
+    )
+}
+
+async fn wait_flag_cancelled(flag: &Arc<AtomicBool>) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 pub async fn probe_mcp_health(web_port: u16) -> bool {

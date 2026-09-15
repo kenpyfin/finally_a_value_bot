@@ -2187,6 +2187,20 @@ pub(crate) async fn process_classic_agent_with_events(
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
     let (sops_caps_line, sops_body) = sops_prompt_sections();
+    let locate_auth = crate::tools::ToolAuthContext {
+        caller_channel: "system".into(),
+        caller_chat_id: chat_id,
+        caller_persona_id: persona_id,
+        control_chat_ids: state.config.control_chat_ids.clone(),
+        is_scheduled_task: context.is_scheduled_task,
+        session_id: context.session_id.clone(),
+    };
+    let locate_registry = crate::tools::locate::build_registry(
+        &state.config.workspace_root_absolute(),
+        Some(&locate_auth),
+        persona_memory_state.as_ref(),
+    );
+    let locate_roots_section = crate::tools::locate::format_registry_for_prompt(&locate_registry);
     let system_prompt = build_system_prompt(
         &state.config.bot_username,
         &principles_content,
@@ -2203,6 +2217,7 @@ pub(crate) async fn process_classic_agent_with_events(
         identity_tier1_system.as_str(),
         &sops_caps_line,
         &sops_body,
+        &locate_roots_section,
     );
 
     // Background-job runs are detached and do not consume foreground chat context while running.
@@ -5907,18 +5922,24 @@ pub(super) fn build_system_prompt(
     identity_tier1_memory: &str,
     sops_caps_line: &str,
     sops_body: &str,
+    locate_roots_section: &str,
 ) -> String {
     let caps = format!(
         r#"## Tool groups (names only; use tool schemas for parameters)
 - **Shell:** bash — follow **Path discipline (strict)**; never use `workspace/` prefixes or `workspace/skills/` in shell paths (tool cwd is persona-scoped under `shared/personas/{chat_id}/{persona_id}/`)
 - **Browser:** `steel-browser` skill (`activate_skill` + `run_skill_script`; human-in-the-loop via session viewer)
-- **Files / repo:** read_file, write_file, edit_file, apply_search_replace, read_repo_map, symbol_edit (when enabled), glob, grep
+- **Files / repo:** read_file, write_file, edit_file, apply_search_replace, read_repo_map, symbol_edit (when enabled), glob, grep, **locate_file** (declared-root resolution; prefer before find)
 - **Web:** web_search, web_fetch
 - **Scheduling:** schedule_task, update_scheduled_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history (runtime enforces `schedule-job` activation before create/update)
 - **History / export:** export_chat, search_chat_history
 - **Media:** user images arrive as image blocks
 - **Cursor CLI:** cursor_agent, cursor_agent_send, list_cursor_agent_runs (use detach: true for long work)
-- **Skills:** `activate_skill` loads full `SKILL.md`; **`run_skill_script`** runs bundled skill scripts (prefer over bash); **new** skills → activate `create-skill` then **`build_skill`**; **existing** skill changes are runtime-gated to require **`modify-skill`** activation in the same turn
+- **Skills:** `activate_skill` loads full `SKILL.md`; **`run_skill_script`** runs bundled skill scripts (prefer over bash,
+            "",
+            "",
+            "",
+            ""
+        ); **new** skills → activate `create-skill` then **`build_skill`**; **existing** skill changes are runtime-gated to require **`modify-skill`** activation in the same turn
 {sops_caps_line}- **Background:** `spawn_background_command` for long shell/code (tmux; separate completion message). **`register_tracked_job`** records an external id (e.g. ComfyUI `prompt_id`) so it appears in the same queue as shell jobs without blocking another background slot. Agent re-runs after timeout use background-handoff + handoff sentinel (web/scheduler). `list_background_jobs` is available via ops APIs; check cockpit/queue for active jobs.
 - **Memory / cockpit:** read_tiered_memory, write_tiered_memory, read_memory_state, validate_memory_state, write_memory_state, patch_memory_state, write_memory (chat_daily), update_bulletin_focus, add_todo, list_todos, complete_todo, read_agent_history
 
@@ -5940,7 +5961,8 @@ pub(super) fn build_system_prompt(
 
 ## Task scope (read first)
 - **Primary goal:** The `[current_request]` message at the end of the conversation is your task for this turn. Answer it directly.
-- **SOP first:** If `[persona_context]` includes Tier 2 SOPs (`**id** → vault path`) or this section names a vault SOP for the task, `read_file` that `ORIGIN/…` path and **follow it step-by-step** before improvising tools or bash.
+- **SOP first:** If `[persona_context]` includes Tier 2 SOPs (`**id** → vault path`) or this section names a vault SOP for the task, `read_file` that `ORIGIN/…` path and **follow it step-by-step** before improvising tools or bash. If `read_file` misses, call `locate_file` — do not run `find`.
+- **Locate before search:** Prefer `locate_file` / known `ORIGIN/…` / Tier-1 `Repo:` paths. On a locate miss, **ask the user**; never escalate to `find`/`grep -r` over `/home` or large trees.
 - **Background context:** `[persona_context]`, Tier 1 identity/facts in this system prompt, and `# Principles` (AGENTS.md) are reference material and constraints — not implicit todos.
 - **Recall tools:** Use `search_chat_history` or `search_vault` only when `[current_request]` requires historical context.
 
@@ -6016,7 +6038,8 @@ User messages from prior turns are wrapped in XML tags like <user_message contex
 - **Where to put secrets:** Prefer skill-specific credentials in `skills/<skill-name>/.env`. Put bot-wide keys (e.g. `TELEGRAM_BOT_TOKEN`, `LLM_*`, `WORKSPACE_DIR`, `VAULT_ORIGIN_VAULT_REPO`, other `VAULT_*` consumed by the Rust binary) in the configuration `.env` at the configuration root.
 - **Skill scripts and `.env`:** Many bundled skill scripts call `load_dotenv` on the skill folder’s `.env` to fill in variables that are **not** already set in the process environment. Values already exported by the bot (for example after loading the configuration `.env`) **take precedence**—the skill file does not override them by default. If a required variable is still missing, use the skill’s documented default or fix the env and tell the user clearly what is missing.
 
-The workspace (your working directory for file/bash/search tools) is persistent across sessions. Your workspace path is: {workspace_path}. Relative paths in read_file, write_file, edit_file, apply_search_replace, symbol_edit, glob, and grep are resolved from this directory.
+The workspace (your working directory for file/bash/search tools) is persistent across sessions. Your workspace path is: {workspace_path}. Relative paths in read_file, write_file, edit_file, apply_search_replace, symbol_edit, glob, grep, and locate_file are resolved from this directory (locate_file also searches declared roots below).
+{locate_roots}
 {path_discipline}
 
 Be concise and helpful. When executing commands or tools, show the relevant results to the user.
@@ -6028,6 +6051,11 @@ Be concise and helpful. When executing commands or tools, show the relevant resu
         timezone = timezone,
         workspace_data_root_display = workspace_data_root_display,
         config_env_summary = config_env_summary,
+        locate_roots = if locate_roots_section.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{locate_roots_section}\n")
+        },
         path_discipline = {
             let mut section = crate::agent_path_discipline::strict_path_discipline_section(
                 workspace_path,
@@ -7653,6 +7681,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("12345"));
         assert!(prompt.contains("**Shell:** bash"));
@@ -7680,6 +7709,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
             "",
             "",
             "",
@@ -7765,6 +7795,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("# Principles"));
         assert!(!prompt.contains("# Operator memo"));
@@ -7789,6 +7820,8 @@ mod tests {
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
             tier1,
+            "",
+            "",
             "",
             "",
         );
@@ -7816,6 +7849,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("# Agent Skills"));
         assert!(prompt.contains("activate_skill"));
@@ -7837,6 +7871,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
             "",
             "",
             "",
@@ -7862,6 +7897,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("Your workspace path is: /home/user/tmp/shared"));
     }
@@ -7884,6 +7920,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("## Path discipline (strict)"));
         assert!(prompt.contains("workspace/skills/"));
@@ -7891,6 +7928,34 @@ mod tests {
         assert!(prompt.contains("/home/user/finally_a_value_bot.data/skills"));
         assert!(prompt.contains("build_skill"));
         assert!(prompt.contains("modify-skill"));
+        assert!(prompt.contains("locate_file"));
+        assert!(prompt.contains("ask the user"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_includes_locate_roots_section() {
+        let roots = "## Declared file roots (locate first)\n- **persona ORIGIN:** `/tmp/ORIGIN`\n";
+        let prompt = build_system_prompt(
+            "testbot",
+            "",
+            "finally_a_value_bot.data/AGENTS.md",
+            42,
+            1,
+            "",
+            "/home/user/tmp/shared",
+            "/home/user/finally_a_value_bot.data/skills",
+            None,
+            "UTC",
+            "/home/user/tmp",
+            "/home/user — bot loads `/home/user/.env`",
+            "",
+            "",
+            "",
+            roots,
+        );
+        assert!(prompt.contains("## Declared file roots (locate first)"));
+        assert!(prompt.contains("persona ORIGIN"));
+        assert!(prompt.contains("Locate before search"));
     }
 
     #[test]
@@ -7908,6 +7973,7 @@ mod tests {
             "UTC",
             "/abs/workspace_data_root",
             "/abs — bot loads `/abs/.env`",
+            "",
             "",
             "",
             "",
@@ -7935,6 +8001,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("Your workspace path is: ./workspace/shared"));
         assert!(prompt.contains("./workspace/skills"));
@@ -7955,6 +8022,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
             "",
             "",
             "",
@@ -8310,6 +8378,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("## Task scope (read first)"));
         assert!(prompt.contains("[current_request]"));
@@ -8331,6 +8400,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
             "",
             "",
             "",
@@ -8544,6 +8614,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("# Principles"));
         assert!(prompt.contains("Test"));
@@ -8571,6 +8642,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("read_tiered_memory"));
         assert!(prompt.contains("write_tiered_memory"));
@@ -8591,6 +8663,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
             "",
             "",
             "",
@@ -8616,6 +8689,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("schedule_task"));
         assert!(prompt.contains("6-field cron"));
@@ -8636,6 +8710,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp — bot loads `./tmp/.env`",
+            "",
             "",
             "",
             "",
@@ -8664,6 +8739,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(prompt.contains("Time and timezone"));
         assert!(prompt.contains("US/Eastern"));
@@ -8684,6 +8760,7 @@ mod tests {
             "UTC",
             "./tmp/workspace",
             "./tmp/.env",
+            "",
             "",
             "",
             "",

@@ -163,6 +163,20 @@ pub async fn prepare_agent_run(
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
     let (sops_caps_line, sops_body) = sops_prompt_sections();
+    let locate_auth = ToolAuthContext {
+        caller_channel: context.caller_channel.to_string(),
+        caller_chat_id: chat_id,
+        caller_persona_id: persona_id,
+        control_chat_ids: state.config.control_chat_ids.clone(),
+        is_scheduled_task: context.is_scheduled_task,
+        session_id: context.session_id.clone(),
+    };
+    let locate_registry = crate::tools::locate::build_registry(
+        &state.config.workspace_root_absolute(),
+        Some(&locate_auth),
+        persona_memory_state.as_ref(),
+    );
+    let locate_roots_section = crate::tools::locate::format_registry_for_prompt(&locate_registry);
     let system_prompt = build_system_prompt(
         &state.config.bot_username,
         &principles_content,
@@ -179,6 +193,7 @@ pub async fn prepare_agent_run(
         identity_tier1_system.as_str(),
         &sops_caps_line,
         &sops_body,
+        &locate_roots_section,
     );
 
     let mut messages = if context.is_background_job {

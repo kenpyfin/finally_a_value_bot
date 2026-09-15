@@ -11,6 +11,7 @@ pub mod edit_file;
 pub mod export_chat;
 pub mod glob;
 pub mod grep;
+pub mod locate;
 pub mod mcp;
 pub mod memory;
 pub mod memory_state;
@@ -30,6 +31,7 @@ pub mod spawn_background_command;
 pub mod symbol_edit;
 pub mod sync_skills;
 pub mod tiered_memory;
+pub mod tool_cancel;
 pub mod vault_add;
 pub mod web_fetch;
 pub mod web_html;
@@ -341,10 +343,32 @@ fn has_persona_scope(auth: Option<&ToolAuthContext>) -> bool {
     auth.is_some_and(|a| a.caller_chat_id > 0 && a.caller_persona_id > 0)
 }
 
+/// Absolutize a path for prefix checks without requiring the path to exist.
+///
+/// `canonicalize` fails for missing files and leaves relative paths relative, which
+/// falsely fails `starts_with` against a canonicalized (absolute) allowed root and
+/// surfaces as "Permission denied" instead of not-found.
+pub fn absolutize_for_compare(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// True when `path` is under `root` (both sides absolutized; existence not required).
+pub fn path_under_root(path: &Path, root: &Path) -> bool {
+    let resolved_path = absolutize_for_compare(path);
+    let resolved_root = absolutize_for_compare(root);
+    resolved_path.starts_with(&resolved_root)
+}
+
 fn is_under(path: &Path, root: &Path) -> bool {
-    let resolved_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    resolved_path.starts_with(resolved_root)
+    path_under_root(path, root)
 }
 
 /// Strip redundant prefixes when tool cwd is under `.../shared`.
@@ -451,7 +475,8 @@ pub fn resolve_tool_path(workspace_root: &Path, tool_working_dir: &Path, path: &
         })
         .unwrap_or_default();
     if shared_global_prefixes().contains(&first) {
-        return shared_root.join(&normalized);
+        // Persona-local ORIGIN (etc.) wins when present; otherwise shared.
+        return locate::resolve_prefixed_path(workspace_root, tool_working_dir, &normalized);
     }
 
     if resolves_under_workspace_data_root(tool_working_dir, &normalized) {
@@ -491,6 +516,27 @@ pub fn assert_persona_tool_path_allowed(
     auth: Option<&ToolAuthContext>,
     is_write: bool,
 ) -> Result<(), String> {
+    let memory = auth.and_then(|a| {
+        locate::load_memory_for_auth(workspace_root, &workspace_root.join("runtime"), Some(a))
+    });
+    assert_persona_tool_path_allowed_with_memory(
+        workspace_root,
+        resolved_path,
+        auth,
+        is_write,
+        memory.as_ref(),
+    )
+}
+
+/// Like [`assert_persona_tool_path_allowed`], but accepts preloaded persona memory so Tier-1
+/// `Repo:` paths and SOP pointers expand the allowlist.
+pub fn assert_persona_tool_path_allowed_with_memory(
+    workspace_root: &Path,
+    resolved_path: &Path,
+    auth: Option<&ToolAuthContext>,
+    is_write: bool,
+    memory: Option<&crate::memory::PersonaMemoryState>,
+) -> Result<(), String> {
     if is_write && crate::self_repo::is_self_repo_source_path(workspace_root, resolved_path) {
         return Err(format!(
             "Write blocked: '{}' is inside the bot's own source checkout. \
@@ -504,31 +550,6 @@ pub fn assert_persona_tool_path_allowed(
     }
     let auth = auth.expect("checked above");
     let shared_root = workspace_shared_root(workspace_root);
-    let persona_root =
-        persona_shared_dir(workspace_root, auth.caller_chat_id, auth.caller_persona_id);
-
-    if is_under(resolved_path, &persona_root)
-        || is_under(resolved_path, &workspace_root.join("runtime"))
-        || is_under(resolved_path, &workspace_root.join("skills"))
-        || is_under(resolved_path, &shared_root.join("skills"))
-    {
-        return Ok(());
-    }
-
-    for prefix in shared_global_prefixes() {
-        if is_under(resolved_path, &shared_root.join(prefix)) {
-            return Ok(());
-        }
-    }
-
-    if auth.is_control_chat() {
-        let chat_personas_root = shared_root
-            .join("personas")
-            .join(auth.caller_chat_id.to_string());
-        if is_under(resolved_path, &chat_personas_root) {
-            return Ok(());
-        }
-    }
 
     if is_write
         && (is_under(resolved_path, &shared_root.join("scripts"))
@@ -542,10 +563,49 @@ pub fn assert_persona_tool_path_allowed(
         );
     }
 
+    let registry = locate::build_registry(workspace_root, Some(auth), memory);
+    let mut allowed_labels: Vec<String> = locate::directory_roots(&registry)
+        .iter()
+        .map(|r| format!("{} (`{}`)", r.label, r.path.display()))
+        .collect();
+
+    for root in locate::directory_roots(&registry) {
+        if is_under(resolved_path, &root.path) {
+            return Ok(());
+        }
+    }
+
+    // Exact SOP file pointers.
+    for root in registry.iter().filter(|r| r.exact_file) {
+        if absolutize_for_compare(resolved_path) == absolutize_for_compare(&root.path) {
+            return Ok(());
+        }
+    }
+
+    if auth.is_control_chat() {
+        let chat_personas_root = shared_root
+            .join("personas")
+            .join(auth.caller_chat_id.to_string());
+        allowed_labels.push(format!(
+            "control-chat personas (`{}`)",
+            chat_personas_root.display()
+        ));
+        if is_under(resolved_path, &chat_personas_root) {
+            return Ok(());
+        }
+    }
+
+    // Path is outside every declared root.
     Err(format!(
-        "Permission denied: path '{}' is outside the allowed persona scope. Allowed roots: \
-persona folder, shared ORIGIN/vault paths, workspace runtime/skills, and shared/skills.",
-        resolved_path.display()
+        "Permission denied: path '{}' is outside the allowed persona scope. Allowed roots: {}. \
+         Use locate_file to resolve declared paths, or ask the user — do not run find over large trees.",
+        resolved_path.display(),
+        if allowed_labels.is_empty() {
+            "persona folder, shared ORIGIN/vault paths, workspace runtime/skills, and shared/skills"
+                .to_string()
+        } else {
+            allowed_labels.join("; ")
+        }
     ))
 }
 
@@ -619,6 +679,10 @@ impl ToolRegistry {
             )),
             Box::new(glob::GlobTool::new(config.working_dir())),
             Box::new(grep::GrepTool::new(config.working_dir())),
+            Box::new(locate::LocateFileTool::new(
+                config.working_dir(),
+                &config.runtime_data_dir(),
+            )),
             Box::new(memory::ReadMemoryTool::new(
                 &config.runtime_data_dir(),
                 config.working_dir(),
@@ -802,6 +866,7 @@ impl ToolRegistry {
                         | "read_repo_map"
                         | "glob"
                         | "grep"
+                        | "locate_file"
                         | "read_memory"
                         | "read_memory_state"
                         | "validate_memory_state"
@@ -1118,6 +1183,73 @@ mod tests {
         std::fs::write(&flat, "x").unwrap();
         let err = assert_persona_tool_path_allowed(&root, &flat, Some(&auth), true).unwrap_err();
         assert!(err.contains("flat shared paths"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_resolve_tool_path_prefers_persona_origin() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_origin_res_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let persona = persona_shared_dir(&root, 10, 2);
+        let persona_file = persona.join("ORIGIN").join("ops").join("sop.md");
+        let shared_file = root
+            .join("shared")
+            .join("ORIGIN")
+            .join("ops")
+            .join("sop.md");
+        std::fs::create_dir_all(persona_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(shared_file.parent().unwrap()).unwrap();
+        std::fs::write(&persona_file, "persona").unwrap();
+        std::fs::write(&shared_file, "shared").unwrap();
+        let resolved = resolve_tool_path(&root, &persona, "ORIGIN/ops/sop.md");
+        assert_eq!(resolved, persona_file);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_assert_persona_allows_missing_file_under_allowed_root() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_missing_scope_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth = ToolAuthContext {
+            caller_channel: "web".to_string(),
+            caller_chat_id: 10,
+            caller_persona_id: 2,
+            control_chat_ids: vec![],
+            is_scheduled_task: false,
+            session_id: None,
+        };
+        let persona = persona_shared_dir(&root, 10, 2);
+        std::fs::create_dir_all(persona.join("ORIGIN")).unwrap();
+        // Missing file under persona ORIGIN must NOT be permission-denied.
+        let missing = persona.join("ORIGIN").join("no-such-sop.md");
+        assert!(
+            assert_persona_tool_path_allowed(&root, &missing, Some(&auth), false).is_ok(),
+            "missing in-scope path should be allowed (not-found is for read_file)"
+        );
+        let outside = root.join("elsewhere").join("x.md");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        let err =
+            assert_persona_tool_path_allowed(&root, &outside, Some(&auth), false).unwrap_err();
+        assert!(err.contains("Permission denied"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_path_under_root_handles_nonexistent_relative() {
+        let root = std::env::temp_dir().join(format!(
+            "finally_a_value_bot_under_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("shared").join("ORIGIN")).unwrap();
+        let missing = root.join("shared").join("ORIGIN").join("missing.md");
+        assert!(path_under_root(
+            &missing,
+            &root.join("shared").join("ORIGIN")
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
