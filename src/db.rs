@@ -78,7 +78,7 @@ const MAIN_CHAT_MESSAGE_VISIBILITY: &str = "(
     )
 )";
 
-const PERSONA_SELECT_COLS: &str = "id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo, dense_delivery_enabled, dense_delivery_messaging_max_chars, dense_delivery_web_max_chars, dense_delivery_summary_chars, agent_engine_override, gemini_adk_topology, cursor_sdk_model, cursor_sdk_model_params";
+const PERSONA_SELECT_COLS: &str = "id, chat_id, name, model_override, recent_history_min_user, recent_history_min_assistant, operator_memo, dense_delivery_enabled, dense_delivery_messaging_max_chars, dense_delivery_web_max_chars, dense_delivery_summary_chars, agent_engine_override, gemini_adk_topology, cursor_sdk_model, cursor_sdk_model_params, llm_provider_override, llm_base_url_override";
 
 fn persona_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Persona> {
     Ok(Persona {
@@ -97,6 +97,8 @@ fn persona_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Persona> {
         gemini_adk_topology: row.get(12)?,
         cursor_sdk_model: row.get(13)?,
         cursor_sdk_model_params: row.get(14)?,
+        llm_provider_override: row.get(15)?,
+        llm_base_url_override: row.get(16)?,
     })
 }
 
@@ -166,6 +168,10 @@ pub struct Persona {
     pub cursor_sdk_model: Option<String>,
     /// Per-persona Cursor SDK model params JSON array. NULL falls back to global params.
     pub cursor_sdk_model_params: Option<String>,
+    /// Per-persona classic strategy LLM provider id. NULL falls back to global `LLM_PROVIDER`.
+    pub llm_provider_override: Option<String>,
+    /// Per-persona local OpenAI-compatible base URL. NULL falls back to global `LLM_BASE_URL`.
+    pub llm_base_url_override: Option<String>,
 }
 
 /// Maximum `operator_memo` length (characters) for storage and prompt injection.
@@ -913,6 +919,7 @@ impl Database {
         Self::migrate_personas_dense_delivery_and_engine(&conn)?;
         Self::migrate_gemini_adk_and_retire_deterministic(&conn)?;
         Self::migrate_persona_explicit_engine_and_cursor_model(&conn)?;
+        Self::migrate_persona_llm_selection(&conn)?;
         Self::migrate_hook_policy_schema(&conn)?;
         Self::ensure_builtin_hook_definitions(&conn)?;
         Self::migrate_chat_sessions_schema(&conn)?;
@@ -1734,6 +1741,23 @@ impl Database {
                 OR trim(agent_engine_override) = ''",
             [],
         )?;
+        Ok(())
+    }
+
+    /// Per-persona classic strategy LLM provider / local base URL (model uses existing `model_override`).
+    fn migrate_persona_llm_selection(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        if !Self::column_exists(conn, "personas", "llm_provider_override")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN llm_provider_override TEXT",
+                [],
+            )?;
+        }
+        if !Self::column_exists(conn, "personas", "llm_base_url_override")? {
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN llm_base_url_override TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -6950,6 +6974,27 @@ impl Database {
         let rows = conn.execute(
             "UPDATE personas SET model_override = ?1 WHERE id = ?2 AND chat_id = ?3",
             params![model_override, persona_id, chat_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Sets classic strategy LLM selection for a persona. Empty strings clear to NULL (inherit global).
+    pub fn set_persona_llm_selection(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        provider_override: Option<&str>,
+        model_override: Option<&str>,
+        base_url_override: Option<&str>,
+    ) -> Result<bool, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let provider_v = provider_override.map(str::trim).filter(|s| !s.is_empty());
+        let model_v = model_override.map(str::trim).filter(|s| !s.is_empty());
+        let base_v = base_url_override.map(str::trim).filter(|s| !s.is_empty());
+        let rows = conn.execute(
+            "UPDATE personas SET llm_provider_override = ?1, model_override = ?2, llm_base_url_override = ?3
+             WHERE id = ?4 AND chat_id = ?5",
+            params![provider_v, model_v, base_v, persona_id, chat_id],
         )?;
         Ok(rows > 0)
     }

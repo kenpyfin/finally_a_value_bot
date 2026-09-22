@@ -27,6 +27,14 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-15 — Classic strategy LLM is per-persona
+
+- **Area:** settings / agent / llm
+- **Summary:** Settings → Agent engine → LLM now loads and saves provider/model (and local base URL) for the **current persona**. Classic runs resolve an ephemeral strategy client from persona overrides so concurrent personas do not stomp the global `LlmHandle`. Thinking toggles and cost-routing local URL/model stay shared.
+- **Rationale:** Agent engine and Cursor SDK model were already persona-scoped; classic LLM looked persona-scoped in the UI but wrote global `app_settings`. `personas.model_override` existed but was unused at runtime.
+- **Key files / symbols:** `personas.llm_provider_override` / `llm_base_url_override` + `model_override`; `Database::set_persona_llm_selection`; `LlmHandle::resolve_strategy_selection` / `send_message_for_tier_with_strategy`; `GET|PATCH /api/llm` `persona_id`; `SettingsLlmPanel` `activePersonaId`.
+- **Follow-ups:** Optional clear-to-inherit control in the UI; per-persona cost-routing local models if needed.
+
 ### 2026-09-15 — Context-first file locator (declared roots before walk)
 
 - **Area:** tools / path resolution / agent prompt

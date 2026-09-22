@@ -299,10 +299,12 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
       </Flex>
 
       <ConfigPanelErrorBoundary key={selectedEngine}>
-        {selectedEngine === 'classic' ? <SettingsLlmPanel api={api} onError={onError} /> : null}
+        {selectedEngine === 'classic' ? (
+          <SettingsLlmPanel api={api} onError={onError} activePersonaId={activePersonaId} />
+        ) : null}
         {selectedEngine === 'classic_cost_routing' ? (
           <Flex direction="column" gap="4">
-            <SettingsLlmPanel api={api} onError={onError} />
+            <SettingsLlmPanel api={api} onError={onError} activePersonaId={activePersonaId} />
             <SettingsLocalDelegatePanel api={api} onError={onError} />
           </Flex>
         ) : null}

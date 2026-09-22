@@ -368,6 +368,18 @@ pub struct LlmHandle {
     local_delegate_runtime: std::sync::RwLock<Option<crate::local_delegate::LocalDelegateRuntime>>,
 }
 
+/// Resolved classic strategy provider for one agent run (persona override or global default).
+#[derive(Clone)]
+pub struct StrategyLlmSelection {
+    pub provider_id: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub endpoint: String,
+    pub client: Arc<dyn LlmProvider>,
+    /// True when any persona LLM override field contributed to this selection.
+    pub from_persona: bool,
+}
+
 impl LlmHandle {
     pub fn new(config: &Config) -> Arc<Self> {
         Self::from_provider(config, Arc::from(create_provider(config)))
@@ -485,6 +497,30 @@ impl LlmHandle {
             .await
     }
 
+    /// Strategy-tier calls use `strategy`; local tiers keep using the shared local-delegate runtime.
+    pub async fn send_message_for_tier_with_strategy(
+        &self,
+        tier: crate::local_delegate::RouteTarget,
+        strategy: &StrategyLlmSelection,
+        system: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<MessagesResponse, FinallyAValueBotError> {
+        if tier.is_local() {
+            return self
+                .send_message_for_target(tier, system, messages, tools)
+                .await;
+        }
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+        let options = LlmSendOptions {
+            tool_choice: crate::local_delegate::tool_choice_for_target(tier, has_tools),
+        };
+        strategy
+            .client
+            .send_message_with_options(system, messages, tools, options)
+            .await
+    }
+
     pub fn current_model(&self) -> String {
         self.model
             .read()
@@ -520,22 +556,22 @@ impl LlmHandle {
             .unwrap_or(false)
     }
 
-    fn strategy_endpoint(&self) -> String {
-        if let Some(url) = self.current_base_url() {
-            let t = url.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
+    fn strategy_endpoint_for(provider: &str, base_url: Option<&str>) -> String {
+        if let Some(url) = base_url.map(str::trim).filter(|u| !u.is_empty()) {
+            return url.to_string();
         }
-        let provider = self.current_provider();
-        crate::llm_catalog::default_base_url_for_provider(&provider)
+        crate::llm_catalog::default_base_url_for_provider(provider)
             .map(|s| s.to_string())
-            .unwrap_or_else(|| match provider.as_str() {
+            .unwrap_or_else(|| match provider {
                 "anthropic" => "https://api.anthropic.com/v1/messages".to_string(),
                 "google" => "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
                 "xai" => "https://api.x.ai/v1".to_string(),
                 _ => "https://api.openai.com/v1".to_string(),
             })
+    }
+
+    fn strategy_endpoint(&self) -> String {
+        Self::strategy_endpoint_for(&self.current_provider(), self.current_base_url().as_deref())
     }
 
     fn strategy_tier_snapshot(&self) -> crate::local_delegate::RouteEndpointSnapshot {
@@ -547,13 +583,162 @@ impl LlmHandle {
         }
     }
 
+    pub fn strategy_tier_snapshot_for(
+        &self,
+        strategy: &StrategyLlmSelection,
+    ) -> crate::local_delegate::RouteEndpointSnapshot {
+        crate::local_delegate::RouteEndpointSnapshot {
+            target: crate::local_delegate::RouteTarget::Strategy,
+            provider: strategy.provider_id.clone(),
+            model: strategy.model.clone(),
+            endpoint: strategy.endpoint.clone(),
+        }
+    }
+
+    /// Validate provider/model/base_url without mutating the global handle.
+    pub fn validate_selection(
+        &self,
+        provider: String,
+        model: String,
+        local_base_url: Option<String>,
+    ) -> Result<(String, String, Option<String>), String> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err("model cannot be empty".into());
+        }
+        if model.len() > 256 {
+            return Err("model id is too long".into());
+        }
+        let provider_id = crate::llm_catalog::resolve_catalog_provider_id(&provider);
+        if provider_id.is_empty() {
+            return Err("provider cannot be empty".into());
+        }
+        if crate::llm_catalog::find_provider(&provider_id).is_none() {
+            return Err(format!("Unknown provider {provider_id:?}"));
+        }
+        if !crate::llm_catalog::is_local_provider(&provider_id)
+            && crate::llm_catalog::resolve_api_key_for_provider(&provider_id).is_empty()
+        {
+            let hints = crate::llm_catalog::provider_api_key_env_hints(&provider_id).join(", ");
+            return Err(format!(
+                "No API key in environment for provider {provider_id}. Set one of: {hints}"
+            ));
+        }
+        let base_url = if crate::llm_catalog::is_local_provider(&provider_id) {
+            let raw = local_base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    "base_url is required when provider is Ollama or llama.cpp (configure in Settings → LLM)."
+                        .to_string()
+                })?;
+            Some(crate::llm_catalog::normalize_local_base_url(
+                raw,
+                &provider_id,
+            ))
+        } else {
+            None
+        };
+        Ok((provider_id, model, base_url))
+    }
+
+    /// Resolve classic strategy LLM for a persona (NULL overrides inherit the global handle).
+    pub fn resolve_strategy_selection(
+        &self,
+        persona: Option<&crate::db::Persona>,
+    ) -> Result<StrategyLlmSelection, String> {
+        let global_provider = self.current_provider();
+        let global_model = self.current_model();
+        let global_base = self.current_base_url();
+
+        let provider_ov = persona
+            .and_then(|p| p.llm_provider_override.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let model_ov = persona
+            .and_then(|p| p.model_override.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let base_ov = persona
+            .and_then(|p| p.llm_base_url_override.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let from_persona = provider_ov.is_some() || model_ov.is_some() || base_ov.is_some();
+
+        if !from_persona {
+            let client = self
+                .provider
+                .read()
+                .map_err(|_| "LLM provider lock poisoned".to_string())?
+                .clone();
+            return Ok(StrategyLlmSelection {
+                provider_id: global_provider,
+                model: global_model,
+                base_url: global_base,
+                endpoint: self.strategy_endpoint(),
+                client,
+                from_persona: false,
+            });
+        }
+
+        let provider_id = crate::llm_catalog::resolve_catalog_provider_id(
+            provider_ov.unwrap_or(global_provider.as_str()),
+        );
+        let model = model_ov.unwrap_or(global_model.as_str()).to_string();
+        let local_base = if crate::llm_catalog::is_local_provider(&provider_id) {
+            Some(
+                base_ov
+                    .map(str::to_string)
+                    .or_else(|| global_base.clone())
+                    .filter(|u| !u.trim().is_empty())
+                    .ok_or_else(|| {
+                        "base_url is required when provider is Ollama or llama.cpp (configure in Settings → LLM)."
+                            .to_string()
+                    })?,
+            )
+        } else {
+            None
+        };
+        let (provider_id, model, base_url) =
+            self.validate_selection(provider_id, model, local_base)?;
+
+        let mut cfg = self
+            .base_config
+            .read()
+            .map_err(|_| "config lock poisoned".to_string())?
+            .clone();
+        cfg.apply_llm_provider_switch(&provider_id, &model, base_url.as_deref());
+        let client = Arc::from(create_provider(&cfg));
+        let endpoint = Self::strategy_endpoint_for(&provider_id, base_url.as_deref());
+        Ok(StrategyLlmSelection {
+            provider_id,
+            model,
+            base_url,
+            endpoint,
+            client,
+            from_persona: true,
+        })
+    }
+
     /// Resolved provider/model/endpoint for a route target (for agent history and debugging).
     pub fn tier_endpoint_snapshot(
         &self,
         target: crate::local_delegate::RouteTarget,
     ) -> crate::local_delegate::RouteEndpointSnapshot {
+        self.tier_endpoint_snapshot_with_strategy(target, None)
+    }
+
+    pub fn tier_endpoint_snapshot_with_strategy(
+        &self,
+        target: crate::local_delegate::RouteTarget,
+        strategy: Option<&StrategyLlmSelection>,
+    ) -> crate::local_delegate::RouteEndpointSnapshot {
         if !target.is_local() {
-            return self.strategy_tier_snapshot();
+            return match strategy {
+                Some(s) => self.strategy_tier_snapshot_for(s),
+                None => self.strategy_tier_snapshot(),
+            };
         }
         let mm_cfg = self.local_delegate_config();
         crate::local_delegate::RouteEndpointSnapshot {
@@ -569,13 +754,24 @@ impl LlmHandle {
         &self,
         cost_routing_active: bool,
     ) -> crate::local_delegate::LocalDelegateRunSummary {
+        self.local_delegate_run_summary_with_strategy(cost_routing_active, None)
+    }
+
+    pub fn local_delegate_run_summary_with_strategy(
+        &self,
+        cost_routing_active: bool,
+        strategy: Option<&StrategyLlmSelection>,
+    ) -> crate::local_delegate::LocalDelegateRunSummary {
         let mm_cfg = self.local_delegate_config();
-        let strategy = self.strategy_tier_snapshot();
+        let strategy_snap = match strategy {
+            Some(s) => self.strategy_tier_snapshot_for(s),
+            None => self.strategy_tier_snapshot(),
+        };
         crate::local_delegate::LocalDelegateRunSummary {
             cost_routing_active,
-            strategy_provider: strategy.provider,
-            strategy_model: strategy.model,
-            strategy_endpoint: strategy.endpoint,
+            strategy_provider: strategy_snap.provider,
+            strategy_model: strategy_snap.model,
+            strategy_endpoint: strategy_snap.endpoint,
             local_model: mm_cfg.local_model.clone(),
             local_endpoint: mm_cfg.local_base_url.clone(),
         }
@@ -621,39 +817,14 @@ impl LlmHandle {
         model: String,
         local_base_url: Option<String>,
     ) -> Result<(String, String), String> {
-        let model = model.trim().to_string();
-        if model.is_empty() {
-            return Err("model cannot be empty".into());
-        }
-        let provider_id = crate::llm_catalog::resolve_catalog_provider_id(&provider);
-        if provider_id.is_empty() {
-            return Err("provider cannot be empty".into());
-        }
-        if !crate::llm_catalog::is_local_provider(&provider_id)
-            && crate::llm_catalog::resolve_api_key_for_provider(&provider_id).is_empty()
-        {
-            let hints = crate::llm_catalog::provider_api_key_env_hints(&provider_id).join(", ");
-            return Err(format!(
-                "No API key in environment for provider {provider_id}. Set one of: {hints}"
-            ));
-        }
-        if crate::llm_catalog::is_local_provider(&provider_id)
-            && local_base_url
-                .as_deref()
-                .map(str::trim)
-                .is_none_or(str::is_empty)
-        {
-            return Err(
-                "base_url is required when provider is Ollama or llama.cpp (configure in Settings → LLM)."
-                    .into(),
-            );
-        }
+        let (provider_id, model, base_url) =
+            self.validate_selection(provider, model, local_base_url)?;
         let mut cfg = self
             .base_config
             .read()
             .map_err(|_| "config lock poisoned".to_string())?
             .clone();
-        cfg.apply_llm_provider_switch(&provider_id, &model, local_base_url.as_deref());
+        cfg.apply_llm_provider_switch(&provider_id, &model, base_url.as_deref());
         let new_provider = Arc::from(create_provider(&cfg));
         *self
             .model

@@ -6,8 +6,8 @@ Classic agent runs can use a **local OpenAI-compatible** endpoint for read-only 
 
 | Runtime setting | Behavior |
 |-----------------|----------|
-| **Single turn** (`classic`) | Always uses Settings → LLM for every iteration. Default, best reasoning continuity. |
-| **Classic · Cost routing** (`classic_cost_routing`) | Same tool loop; after a read-only tool chain, the next iteration may route to the local model. Mutations always stay on strategy. |
+| **Single turn** (`classic`) | Always uses the persona’s strategy LLM (Settings → Agent engine → LLM; falls back to global) for every iteration. Default, best reasoning continuity. |
+| **Classic · Cost routing** (`classic_cost_routing`) | Same tool loop; after a read-only tool chain, the next iteration may route to the local model. Mutations always stay on the persona’s strategy LLM. |
 | **Gemini ADK** (`gemini_adk`) | Native multi-agent Gemini loop; see [`gemini-adk-engine.md`](gemini-adk-engine.md). Does not use Classic cost routing. |
 | **Cursor** | Full turn via Cursor SDK sidecar; bot tools/skills/hooks per [`cursor-engine-integration.md`](cursor-engine-integration.md). |
 
@@ -36,7 +36,7 @@ Registered only when cost routing is active. The strategy model can delegate a *
 
 ## Configuration
 
-- **Settings → Agent engine**: click an engine pill to save it for the **current persona** (explicit engine only; no inherit). Local URL/model live on the Cost routing settings panel.
+- **Settings → Agent engine**: click an engine pill to save it for the **current persona** (explicit engine only; no inherit). Classic strategy **provider/model** are also saved per persona (NULL fields inherit global `LLM_*` app settings). Local URL/model for cost routing stay on the Cost routing settings panel (shared).
 - DB keys remain `MULTIMODEL_*` for backward compatibility (`src/local_delegate/mod.rs`).
 
 PTE, PDQE, and Learn & Optimize may still use the configured local endpoint independently of the Classic engine choice. **Cursor skips PTE and PDQE**. **Gemini ADK skips PTE** but still runs PDQE on delivery.

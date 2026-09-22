@@ -6324,6 +6324,15 @@ struct LlmModelPatchRequest {
     thinking_enabled: Option<bool>,
     #[serde(default)]
     show_thinking: Option<bool>,
+    /// When set, save classic strategy LLM onto this persona (does not change global app_settings).
+    #[serde(default)]
+    persona_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmGetQuery {
+    #[serde(default)]
+    persona_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6822,58 +6831,144 @@ async fn api_gemini_adk_topology_patch(
 async fn api_llm_get(
     headers: HeaderMap,
     State(state): State<WebState>,
+    Query(query): Query<LlmGetQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_auth(&headers, state.auth_token.as_deref())?;
-    let provider_id =
-        crate::llm_catalog::resolve_catalog_provider_id(&state.app_state.llm.current_provider());
-    let preset = crate::llm_catalog::find_provider(&provider_id);
-    let current_model = state.app_state.llm.current_model();
-    let (model_source, provider_source, base_url_source, thinking_source, show_thinking_source) =
-        call_blocking(state.app_state.db.clone(), |db| {
-            let settings = db.list_app_settings()?;
-            let model_source = settings.iter().any(|s| {
-                s.key
-                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
-                    && !s.value.trim().is_empty()
-            });
-            let provider_source = settings.iter().any(|s| {
-                s.key
-                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
-                    && !s.value.trim().is_empty()
-            });
-            let base_url_source = settings.iter().any(|s| {
-                s.key
-                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_BASE_URL)
-                    && !s.value.trim().is_empty()
-            });
-            let thinking_source = settings.iter().any(|s| {
-                s.key
-                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED)
-                    && !s.value.trim().is_empty()
-            });
-            let show_thinking_source = settings.iter().any(|s| {
-                s.key
-                    .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_SHOW_THINKING)
-                    && !s.value.trim().is_empty()
-            });
-            Ok((
-                model_source,
-                provider_source,
-                base_url_source,
-                thinking_source,
-                show_thinking_source,
-            ))
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    let mut persona_id_out: Option<i64> = None;
+    let mut model_scope = "global";
 
+    let (
+        settings_model,
+        settings_provider,
+        settings_base_url,
+        thinking_source,
+        show_thinking_source,
+    ) = call_blocking(state.app_state.db.clone(), |db| {
+        let settings = db.list_app_settings()?;
+        let model_source = settings.iter().any(|s| {
+            s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_MODEL)
+                && !s.value.trim().is_empty()
+        });
+        let provider_source = settings.iter().any(|s| {
+            s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_PROVIDER)
+                && !s.value.trim().is_empty()
+        });
+        let base_url_source = settings.iter().any(|s| {
+            s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_BASE_URL)
+                && !s.value.trim().is_empty()
+        });
+        let thinking_source = settings.iter().any(|s| {
+            s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED)
+                && !s.value.trim().is_empty()
+        });
+        let show_thinking_source = settings.iter().any(|s| {
+            s.key
+                .eq_ignore_ascii_case(crate::llm_catalog::APP_SETTING_SHOW_THINKING)
+                && !s.value.trim().is_empty()
+        });
+        Ok((
+            model_source,
+            provider_source,
+            base_url_source,
+            thinking_source,
+            show_thinking_source,
+        ))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let source_from_settings = |has: bool| -> &'static str {
+        if has {
+            "app_settings"
+        } else {
+            "default"
+        }
+    };
+
+    let (strategy, provider_source, model_source, base_url_source) =
+        if let Some(pid) = query.persona_id {
+            let persona = call_blocking(state.app_state.db.clone(), move |db| db.get_persona(pid))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let Some(persona) = persona.filter(|p| p.chat_id == chat_id) else {
+                return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+            };
+            let strategy = state
+                .app_state
+                .llm
+                .resolve_strategy_selection(Some(&persona))
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            persona_id_out = Some(pid);
+            let (provider_source, model_source, base_url_source) = if strategy.from_persona {
+                model_scope = "persona";
+                let provider_source = if persona
+                    .llm_provider_override
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    "persona"
+                } else {
+                    source_from_settings(settings_provider)
+                };
+                let model_source = if persona
+                    .model_override
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    "persona"
+                } else {
+                    source_from_settings(settings_model)
+                };
+                let base_url_source = if persona
+                    .llm_base_url_override
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    "persona"
+                } else {
+                    source_from_settings(settings_base_url)
+                };
+                (provider_source, model_source, base_url_source)
+            } else {
+                (
+                    source_from_settings(settings_provider),
+                    source_from_settings(settings_model),
+                    source_from_settings(settings_base_url),
+                )
+            };
+            (strategy, provider_source, model_source, base_url_source)
+        } else {
+            let strategy = state
+                .app_state
+                .llm
+                .resolve_strategy_selection(None)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            (
+                strategy,
+                source_from_settings(settings_provider),
+                source_from_settings(settings_model),
+                source_from_settings(settings_base_url),
+            )
+        };
+
+    let provider_id = strategy.provider_id.clone();
+    let current_model = strategy.model.clone();
+    let preset = crate::llm_catalog::find_provider(&provider_id);
     let is_local = crate::llm_catalog::is_local_provider(&provider_id);
     let default_base_url = if is_local {
         crate::llm_catalog::default_base_url_for_provider(&provider_id).map(|s| s.to_string())
     } else {
         None
     };
-    let base_url = state.app_state.llm.current_base_url();
+    let base_url = strategy.base_url.clone();
 
     let catalog_models = crate::llm_catalog::catalog_models_json(&provider_id, &current_model);
     let catalog: Vec<serde_json::Value> = catalog_models
@@ -6897,16 +6992,18 @@ async fn api_llm_get(
             "id": provider_id,
             "label": preset.map(|p| p.label).unwrap_or("Unknown provider"),
         },
-        "provider_source": if provider_source { "app_settings" } else { "default" },
+        "provider_source": provider_source,
         "api_key_configured": crate::llm_catalog::is_api_key_configured_for_provider(&provider_id),
         "model": current_model,
         "model_in_catalog": in_catalog,
-        "model_source": if model_source { "app_settings" } else { "default" },
+        "model_source": model_source,
+        "model_scope": model_scope,
+        "persona_id": persona_id_out,
         "is_local_provider": is_local,
         "base_url": base_url,
         "default_base_url": default_base_url,
         "base_url_source": if is_local {
-            if base_url_source { "app_settings" } else { "default" }
+            base_url_source
         } else {
             "n/a"
         },
@@ -7044,30 +7141,113 @@ async fn api_llm_patch(
         .map(crate::llm_catalog::resolve_catalog_provider_id)
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| state.app_state.llm.current_provider());
-    // Live catalog ids are not in the static curated list; custom=true is not required.
+    let local_base_url = if crate::llm_catalog::is_local_provider(&provider_id) {
+        Some(
+            body.base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "base_url is required for Ollama and llama.cpp providers".into(),
+                ))?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    let thinking_enabled = body
+        .thinking_enabled
+        .unwrap_or_else(|| state.app_state.llm.thinking_enabled());
+    let show_thinking = body
+        .show_thinking
+        .unwrap_or_else(|| state.app_state.llm.show_thinking());
+
+    // Thinking toggles remain global even when model selection is persona-scoped.
+    if body.thinking_enabled.is_some() || body.show_thinking.is_some() {
+        state
+            .app_state
+            .llm
+            .apply_thinking_settings(thinking_enabled, show_thinking)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        call_blocking(state.app_state.db.clone(), move |db| {
+            db.set_app_setting(
+                crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED,
+                if thinking_enabled { "true" } else { "false" },
+            )?;
+            db.set_app_setting(
+                crate::llm_catalog::APP_SETTING_SHOW_THINKING,
+                if show_thinking { "true" } else { "false" },
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    if let Some(pid) = body.persona_id {
+        let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+        let (provider_saved, model_saved, base_url_db) = state
+            .app_state
+            .llm
+            .validate_selection(provider_id.clone(), model.clone(), local_base_url)
+            .map_err(|e| {
+                if e.contains("No API key") || e.contains("base_url") || e.contains("Unknown") {
+                    (StatusCode::BAD_REQUEST, e)
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, e)
+                }
+            })?;
+
+        let provider_db = provider_saved.clone();
+        let model_db = model_saved.clone();
+        let base_for_db = base_url_db.clone();
+        let ok = call_blocking(state.app_state.db.clone(), move |db| {
+            let persona = db.get_persona(pid)?;
+            if persona.as_ref().is_none_or(|p| p.chat_id != chat_id) {
+                return Ok(false);
+            }
+            db.set_persona_llm_selection(
+                chat_id,
+                pid,
+                Some(&provider_db),
+                Some(&model_db),
+                base_for_db.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !ok {
+            return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+        }
+
+        return Ok(Json(json!({
+            "ok": true,
+            "provider": {
+                "id": provider_saved,
+            },
+            "model": model_saved,
+            "base_url": base_url_db,
+            "thinking_enabled": thinking_enabled,
+            "show_thinking": show_thinking,
+            "provider_source": "persona",
+            "model_source": "persona",
+            "model_scope": "persona",
+            "persona_id": pid,
+            "base_url_source": if base_url_db.is_some() {
+                "persona"
+            } else {
+                "n/a"
+            },
+            "message": "Provider and model saved for this persona. New agent runs for this persona use this selection immediately.",
+        })));
+    }
 
     let (provider_saved, model_saved) = state
         .app_state
         .llm
-        .apply_selection(
-            provider_id.clone(),
-            model.clone(),
-            if crate::llm_catalog::is_local_provider(&provider_id) {
-                Some(
-                    body.base_url
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|u| !u.is_empty())
-                        .ok_or((
-                            StatusCode::BAD_REQUEST,
-                            "base_url is required for Ollama and llama.cpp providers".into(),
-                        ))?
-                        .to_string(),
-                )
-            } else {
-                None
-            },
-        )
+        .apply_selection(provider_id.clone(), model.clone(), local_base_url)
         .map_err(|e| {
             if e.contains("No API key") || e.contains("base_url") {
                 (StatusCode::BAD_REQUEST, e)
@@ -7088,12 +7268,6 @@ async fn api_llm_patch(
         None
     };
     let base_url_response = base_url_db.clone();
-    let thinking_enabled = body
-        .thinking_enabled
-        .unwrap_or_else(|| state.app_state.llm.thinking_enabled());
-    let show_thinking = body
-        .show_thinking
-        .unwrap_or_else(|| state.app_state.llm.show_thinking());
     call_blocking(state.app_state.db.clone(), move |db| {
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_PROVIDER, &provider_db)?;
         db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_MODEL, &model_db)?;
@@ -7102,24 +7276,10 @@ async fn api_llm_patch(
         } else {
             db.set_app_setting(crate::llm_catalog::APP_SETTING_LLM_BASE_URL, "")?;
         }
-        db.set_app_setting(
-            crate::llm_catalog::APP_SETTING_LLM_THINKING_ENABLED,
-            if thinking_enabled { "true" } else { "false" },
-        )?;
-        db.set_app_setting(
-            crate::llm_catalog::APP_SETTING_SHOW_THINKING,
-            if show_thinking { "true" } else { "false" },
-        )?;
         Ok(())
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    state
-        .app_state
-        .llm
-        .apply_thinking_settings(thinking_enabled, show_thinking)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({
         "ok": true,
@@ -7132,6 +7292,7 @@ async fn api_llm_patch(
         "show_thinking": show_thinking,
         "provider_source": "app_settings",
         "model_source": "app_settings",
+        "model_scope": "global",
         "base_url_source": if base_url_response.is_some() {
             "app_settings"
         } else {

@@ -1941,6 +1941,17 @@ pub(crate) async fn process_classic_agent_with_events(
         .await?
         .filter(|p| p.chat_id == chat_id);
 
+    let strategy_llm = state
+        .llm
+        .resolve_strategy_selection(persona_row.as_ref())
+        .map_err(|e| anyhow::anyhow!("persona strategy LLM: {e}"))?;
+    if strategy_llm.from_persona {
+        info!(
+            "Classic strategy LLM from persona override: chat_id={}, persona_id={}, provider={}, model={}",
+            chat_id, persona_id, strategy_llm.provider_id, strategy_llm.model
+        );
+    }
+
     // Build system prompt: principles from AGENTS.md; identity + Tier 1 in system; Tier 2+ in [persona_context].
     let principles_content = state.memory.read_groups_root_memory().unwrap_or_default();
     let memory_prompt_opts = MemoryPromptBuildOptions::from_env();
@@ -2476,9 +2487,13 @@ pub(crate) async fn process_classic_agent_with_events(
     const DISCOVERY_STREAK_STALL_THRESHOLD: usize = 20;
 
     let tool_names_list: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
-    let local_delegate_run_summary = state.llm.local_delegate_run_summary(cost_routing);
+    let local_delegate_run_summary = state
+        .llm
+        .local_delegate_run_summary_with_strategy(cost_routing, Some(&strategy_llm));
     let iter0_tier = crate::local_delegate::RouteTarget::Strategy;
-    let iter0_tier_snap = state.llm.tier_endpoint_snapshot(iter0_tier);
+    let iter0_tier_snap = state
+        .llm
+        .tier_endpoint_snapshot_with_strategy(iter0_tier, Some(&strategy_llm));
     let routing_v1 = local_delegate_run_summary.routing_v1_json(&iter0_tier_snap);
     let initial_llm_snapshot_json = format_initial_llm_snapshot_json(
         &system_prompt,
@@ -2669,7 +2684,9 @@ pub(crate) async fn process_classic_agent_with_events(
                 local_error_streak: local_tier_error_streak,
             },
         );
-        let tier_snap = state.llm.tier_endpoint_snapshot(model_tier);
+        let tier_snap = state
+            .llm
+            .tier_endpoint_snapshot_with_strategy(model_tier, Some(&strategy_llm));
         let (tier_label, tier_provider, tier_model, tier_endpoint) =
             IterationRecord::tier_fields_from_snapshot(&tier_snap);
 
@@ -2705,8 +2722,9 @@ pub(crate) async fn process_classic_agent_with_events(
             match await_with_cancel(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                    state.llm.send_message_for_tier(
+                    state.llm.send_message_for_tier_with_strategy(
                         model_tier,
+                        &strategy_llm,
                         &effective_system,
                         llm_messages,
                         tool_defs,
@@ -2889,8 +2907,9 @@ pub(crate) async fn process_classic_agent_with_events(
             match await_with_cancel(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                    state.llm.send_message_for_tier(
+                    state.llm.send_message_for_tier_with_strategy(
                         crate::local_delegate::ModelTier::Strategy,
+                        &strategy_llm,
                         &system_prompt,
                         llm_messages,
                         fallback_tools,
@@ -2909,7 +2928,9 @@ pub(crate) async fn process_classic_agent_with_events(
                         "tier_tool_fallback incremented local_error_streak={}",
                         local_tier_error_streak
                     );
-                    let fallback_snap = state.llm.tier_endpoint_snapshot(model_tier);
+                    let fallback_snap = state
+                        .llm
+                        .tier_endpoint_snapshot_with_strategy(model_tier, Some(&strategy_llm));
                     (tier_label, tier_provider, tier_model, tier_endpoint) =
                         IterationRecord::tier_fields_from_snapshot(&fallback_snap);
                     assistant_text = response
@@ -3878,8 +3899,9 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
                                 let final_response = match await_with_cancel(
                                     tokio::time::timeout(
                                         std::time::Duration::from_secs(LLM_ROUND_TIMEOUT_SECS),
-                                        state.llm.send_message_for_tier(
+                                        state.llm.send_message_for_tier_with_strategy(
                                             crate::local_delegate::ModelTier::Strategy,
+                                            &strategy_llm,
                                             &system_prompt,
                                             messages.clone(),
                                             None,
@@ -3998,8 +4020,9 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
                             text.len()
                         );
 
-                                let pte_snap = state.llm.tier_endpoint_snapshot(
+                                let pte_snap = state.llm.tier_endpoint_snapshot_with_strategy(
                                     crate::local_delegate::ModelTier::Strategy,
+                                    Some(&strategy_llm),
                                 );
                                 if let Some(last) = history_iterations.last_mut() {
                                     last.hook_events.push(format!(

@@ -1107,6 +1107,8 @@ mod tests {
             gemini_adk_topology: None,
             cursor_sdk_model: None,
             cursor_sdk_model_params: None,
+            llm_provider_override: None,
+            llm_base_url_override: None,
         }
     }
 

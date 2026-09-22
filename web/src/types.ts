@@ -259,15 +259,17 @@ export type LlmProviderOption = {
 export type LlmConfigResponse = {
   ok?: boolean
   provider?: { id: string; label: string }
-  provider_source?: 'app_settings' | 'default'
+  provider_source?: 'app_settings' | 'default' | 'persona'
   api_key_configured?: boolean
   model?: string
   model_in_catalog?: boolean
-  model_source?: 'app_settings' | 'default'
+  model_source?: 'app_settings' | 'default' | 'persona'
+  model_scope?: 'global' | 'persona'
+  persona_id?: number | null
   is_local_provider?: boolean
   base_url?: string | null
   default_base_url?: string | null
-  base_url_source?: 'app_settings' | 'default' | 'n/a'
+  base_url_source?: 'app_settings' | 'default' | 'persona' | 'n/a'
   catalog?: LlmCatalogModel[]
   providers?: LlmProviderOption[]
   catalog_source?: 'static_curated' | 'live' | 'static_fallback'

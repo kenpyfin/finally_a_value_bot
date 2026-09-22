@@ -7,9 +7,11 @@ type Props = {
   api: <T>(path: string, init?: RequestInit) => Promise<T>
   onError: (message: string) => void
   onSaved?: (model: string) => void
+  /** When set, load/save classic strategy LLM for this persona. */
+  activePersonaId?: number | null
 }
 
-export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
+export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null }: Props) {
   const [llm, setLlm] = useState<LlmConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [selectedProvider, setSelectedProvider] = useState('')
@@ -35,7 +37,11 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
       setSaveNotice(null)
     }
     try {
-      const data = await api<LlmConfigResponse>('/api/llm')
+      const qs =
+        activePersonaId != null && activePersonaId > 0
+          ? `?persona_id=${activePersonaId}`
+          : ''
+      const data = await api<LlmConfigResponse>(`/api/llm${qs}`)
       setLlm(data)
       const available = data.providers ?? []
       const activeId = data.provider?.id ?? ''
@@ -81,7 +87,7 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
     } finally {
       setLoading(false)
     }
-  }, [api, onError])
+  }, [activePersonaId, api, onError])
 
   useEffect(() => {
     void load()
@@ -244,6 +250,9 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
           thinking_enabled: thinkingEnabled,
           show_thinking: showThinking,
           ...(isLocalProvider ? { base_url: serverUrl.trim() } : {}),
+          ...(activePersonaId != null && activePersonaId > 0
+            ? { persona_id: activePersonaId }
+            : {}),
         }),
       })
       setSaveNotice(res.message ?? 'Saved.')
@@ -278,9 +287,17 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
     <Flex direction="column" gap="3">
       <Text size="1" color="gray">
         Put API keys in repo-root <code className="text-xs">.env</code> only (never in this UI).
-        Provider and model are configured here and saved in the app database - not in{' '}
-        <code className="text-xs">.env</code>. Model lists load live from the provider API; curated
-        cost hints are shown when the id matches.
+        Provider and model are saved for{' '}
+        {activePersonaId != null && activePersonaId > 0 ? (
+          <>
+            this persona
+            {llm.model_scope === 'persona' ? ' (persona override active)' : ' (inherits global until saved)'}
+          </>
+        ) : (
+          <>all personas that have not set an override</>
+        )}
+        . Model lists load live from the provider API; curated cost hints are shown when the id
+        matches. Thinking toggles stay shared across personas.
       </Text>
 
       <Flex direction="column" gap="2">
@@ -488,9 +505,11 @@ export function SettingsLlmPanel({ api, onError, onSaved }: Props) {
             {llm.provider?.label ?? llm.provider?.id} / {llm.model}
             {llm.is_local_provider && llm.base_url ? ` @ ${llm.base_url}` : ''}
           </span>
-          {llm.provider_source === 'app_settings' && llm.model_source === 'app_settings'
-            ? ' (saved in app)'
-            : ' (auto-selected - save to confirm)'}
+          {llm.model_scope === 'persona' || llm.provider_source === 'persona'
+            ? ' (saved for this persona)'
+            : llm.provider_source === 'app_settings' && llm.model_source === 'app_settings'
+              ? ' (saved in app)'
+              : ' (auto-selected - save to confirm)'}
         </Text>
       </Flex>
 
