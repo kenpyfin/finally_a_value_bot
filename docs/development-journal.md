@@ -27,6 +27,14 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-21 — Promote side-chat assistant reply to main timeline
+
+- **Area:** web UI / side chat
+- **Summary:** Side-pane assistant turns can be deposited into the main timeline as a new bot message (no agent run) via **Add to main chat**; UI refreshes history and scrolls to the inserted message.
+- **Rationale:** Side chats stay out of the main record by design; operators needed a deliberate way to keep a useful side-chat answer in the session timeline.
+- **Key files / symbols:** `Database::get_side_chat_turn`; `POST /api/personas/:persona_id/side_chats/:side_chat_id/promote_turn` (`api_persona_side_chat_promote_turn`); `SubthreadSidePane` `onAddToMainChat`; `App.handleAddSideChatTurnToMain`.
+- **Follow-ups:** None.
+
 ### 2026-09-15 — Classic strategy LLM is per-persona
 
 - **Area:** settings / agent / llm

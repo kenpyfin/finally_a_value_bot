@@ -548,6 +548,31 @@ export function App({
     [activeSessionId, handleSelectSession, openSideChatById, revealMessageInThread],
   )
 
+  const handleAddSideChatTurnToMain = useCallback(
+    async (turnId: string) => {
+      if (activePersonaId == null || !activeSideChat) {
+        throw new Error('No active side chat')
+      }
+      const data = await api<{ message_id?: string }>(
+        `/api/personas/${activePersonaId}/side_chats/${encodeURIComponent(activeSideChat.id)}/promote_turn`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ turn_id: turnId }),
+        },
+      )
+      const messageId = typeof data.message_id === 'string' ? data.message_id.trim() : ''
+      if (!messageId) {
+        throw new Error('Promote succeeded but no message_id returned')
+      }
+      await loadHistory(chatId, activePersonaId, null, {
+        force: true,
+        limitOverride: HISTORY_PAGE_SIZE,
+      })
+      await revealMessageInThread(messageId)
+    },
+    [activePersonaId, activeSideChat, chatId, loadHistory, revealMessageInThread],
+  )
+
   useEffect(() => {
     setEditingMessageId(null)
   }, [activePersonaId, activeSessionId, chatId])
@@ -2229,6 +2254,7 @@ export function App({
                       onDraftChange={setActiveDraft}
                       onDraftLocalChange={setActiveDraftLocal}
                       onSendComplete={refreshAfterSend}
+                      onAddToMainChat={handleAddSideChatTurnToMain}
                       onDelete={() => deleteSideChat(activeSideChat.id)}
                       onClose={closeSideChatPane}
                     />

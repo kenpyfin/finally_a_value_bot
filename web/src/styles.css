@@ -1183,6 +1183,23 @@ html:not(.dark) .aui-composer-send:hover {
   margin-bottom: 0.25rem;
 }
 
+.mc-subthread-bubble-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.4rem;
+  gap: 0.35rem;
+}
+
+.mc-subthread-promote {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.45rem;
+  opacity: 0.85;
+}
+
+.mc-subthread-promote:hover:not(:disabled) {
+  opacity: 1;
+}
+
 .mc-subthread-plain,
 .mc-subthread-markdown {
   font-size: 0.86rem;

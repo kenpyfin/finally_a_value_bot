@@ -4906,6 +4906,35 @@ impl Database {
         Ok(items)
     }
 
+    pub fn get_side_chat_turn(
+        &self,
+        side_chat_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<SideChatTurn>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, side_chat_id, seq, role, content, created_at
+             FROM side_chat_turns
+             WHERE side_chat_id = ?1 AND id = ?2
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![side_chat_id, turn_id], |row| {
+            Ok(SideChatTurn {
+                id: row.get(0)?,
+                side_chat_id: row.get(1)?,
+                seq: row.get(2)?,
+                role: row.get(3)?,
+                content: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(turn)) => Ok(Some(turn)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     pub fn patch_side_chat(
         &self,
         chat_id: i64,

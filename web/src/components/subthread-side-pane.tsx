@@ -25,6 +25,7 @@ export type SubthreadSidePaneProps = {
   onDraftChange: (draft: string) => void
   onDraftLocalChange?: (draft: string) => void
   onSendComplete?: () => void | Promise<void>
+  onAddToMainChat?: (turnId: string) => void | Promise<void>
   onDelete?: () => void | Promise<boolean>
   onClose: () => void
 }
@@ -99,6 +100,11 @@ function parseJsonObject(raw: string): Record<string, unknown> | null {
   }
 }
 
+/** Optimistic send() ids are `a-${Date.now()}` / `u-${Date.now()}`; DB turns use UUIDs. */
+function isPersistedTurnId(id: string): boolean {
+  return !id.startsWith('a-') && !id.startsWith('u-')
+}
+
 export function SubthreadSidePane({
   chatId,
   personaId,
@@ -113,12 +119,14 @@ export function SubthreadSidePane({
   onDraftChange,
   onDraftLocalChange,
   onSendComplete,
+  onAddToMainChat,
   onDelete,
   onClose,
 }: SubthreadSidePaneProps) {
   const [status, setStatus] = useState('Ready')
   const [error, setError] = useState('')
   const [sending, setSending] = useState(false)
+  const [promotingTurnId, setPromotingTurnId] = useState<string | null>(null)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [contextWindow, setContextWindow] = useState<{
@@ -356,6 +364,26 @@ export function SubthreadSidePane({
     }
   }, [onDelete])
 
+  const handleAddToMainChat = useCallback(
+    async (turnId: string) => {
+      if (!onAddToMainChat || promotingTurnId || sending) return
+      setError('')
+      setPromotingTurnId(turnId)
+      setStatus('Adding to main chat…')
+      try {
+        await onAddToMainChat(turnId)
+        setStatus('Added to main chat')
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        setError(msg)
+        setStatus('Error')
+      } finally {
+        setPromotingTurnId(null)
+      }
+    },
+    [onAddToMainChat, promotingTurnId, sending],
+  )
+
   return (
     <aside className="mc-subthread-pane" aria-label="Side chat">
       <header className="mc-subthread-header">
@@ -399,39 +427,62 @@ export function SubthreadSidePane({
             Ask a follow-up about this reply. Side-chat turns stay out of the main timeline.
           </div>
         ) : (
-          turns.map((turn) => (
-            <div
-              key={turn.id}
-              className={
-                turn.role === 'user' ? 'mc-subthread-bubble mc-subthread-bubble-user' : 'mc-subthread-bubble'
-              }
-            >
-              <div className="mc-subthread-bubble-role">
-                {turn.role === 'user' ? 'You' : 'Assistant'}
-                {turn.streaming ? ' · streaming' : ''}
-              </div>
-              {turn.role === 'assistant' ? (
-                <div className="mc-subthread-markdown">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    components={{
-                      table: MarkdownTable,
-                      a: (props) => {
-                        const mergedRel = [props.rel, 'noopener', 'noreferrer']
-                          .filter(Boolean)
-                          .join(' ')
-                        return <a {...props} target="_blank" rel={mergedRel} />
-                      },
-                    }}
-                  >
-                    {turn.content || (turn.streaming ? '…' : '')}
-                  </ReactMarkdown>
+          turns.map((turn) => {
+            const canPromote =
+              turn.role === 'assistant' &&
+              !turn.streaming &&
+              !!turn.content.trim() &&
+              isPersistedTurnId(turn.id) &&
+              !!onAddToMainChat
+            const promoting = promotingTurnId === turn.id
+            return (
+              <div
+                key={turn.id}
+                className={
+                  turn.role === 'user' ? 'mc-subthread-bubble mc-subthread-bubble-user' : 'mc-subthread-bubble'
+                }
+              >
+                <div className="mc-subthread-bubble-role">
+                  {turn.role === 'user' ? 'You' : 'Assistant'}
+                  {turn.streaming ? ' · streaming' : ''}
                 </div>
-              ) : (
-                <div className="mc-subthread-plain">{turn.content}</div>
-              )}
-            </div>
-          ))
+                {turn.role === 'assistant' ? (
+                  <div className="mc-subthread-markdown">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        table: MarkdownTable,
+                        a: (props) => {
+                          const mergedRel = [props.rel, 'noopener', 'noreferrer']
+                            .filter(Boolean)
+                            .join(' ')
+                          return <a {...props} target="_blank" rel={mergedRel} />
+                        },
+                      }}
+                    >
+                      {turn.content || (turn.streaming ? '…' : '')}
+                    </ReactMarkdown>
+                  </div>
+                ) : (
+                  <div className="mc-subthread-plain">{turn.content}</div>
+                )}
+                {canPromote ? (
+                  <div className="mc-subthread-bubble-actions">
+                    <button
+                      type="button"
+                      className="mc-msg-action-btn mc-subthread-promote"
+                      onClick={() => void handleAddToMainChat(turn.id)}
+                      disabled={promoting || sending || promotingTurnId != null}
+                      title="Add this reply to the main chat"
+                      aria-label="Add to main chat"
+                    >
+                      {promoting ? 'Adding…' : 'Add to main chat'}
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            )
+          })
         )}
       </div>
 

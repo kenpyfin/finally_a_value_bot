@@ -401,6 +401,11 @@ struct SideChatPatchBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct SideChatPromoteTurnBody {
+    turn_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SendAttachmentRequest {
     filename: Option<String>,
     media_type: Option<String>,
@@ -5089,6 +5094,112 @@ async fn api_persona_side_chat_delete(
     })))
 }
 
+/// Deposit one side-chat assistant turn into the main timeline (no agent run).
+async fn api_persona_side_chat_promote_turn(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(path): Path<PersonaSideChatIdPathParams>,
+    Json(body): Json<SideChatPromoteTurnBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+
+    let side_chat_id = path.side_chat_id.trim().to_string();
+    if side_chat_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "side_chat_id is required".into()));
+    }
+    let turn_id = body.turn_id.trim().to_string();
+    if turn_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "turn_id is required".into()));
+    }
+
+    let pid = path.persona_id;
+    let exists = call_blocking(state.app_state.db.clone(), move |db| {
+        db.persona_exists(chat_id, pid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "persona not found".into()));
+    }
+
+    let sc = call_blocking(state.app_state.db.clone(), {
+        let side_chat_id = side_chat_id.clone();
+        move |db| db.get_side_chat(chat_id, pid, &side_chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "side chat not found".into()))?;
+
+    let turn = call_blocking(state.app_state.db.clone(), {
+        let side_chat_id = sc.id.clone();
+        let turn_id = turn_id.clone();
+        move |db| db.get_side_chat_turn(&side_chat_id, &turn_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "turn not found".into()))?;
+
+    if !turn.role.eq_ignore_ascii_case("assistant") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only assistant turns can be added to the main chat".into(),
+        ));
+    }
+    let content = turn.content.trim().to_string();
+    if content.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "turn content is empty".into()));
+    }
+    if content.chars().count() > 100_000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "content exceeds 100000 character limit".into(),
+        ));
+    }
+
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let session_id = if sc.session_id.trim().is_empty() {
+        None
+    } else {
+        Some(sc.session_id.clone())
+    };
+    let sender_name = state.app_state.config.bot_username.clone();
+    let stored = crate::db::StoredMessage {
+        id: message_id.clone(),
+        chat_id,
+        persona_id: path.persona_id,
+        session_id: session_id.clone(),
+        sender_name: sender_name.clone(),
+        content: content.clone(),
+        is_from_bot: true,
+        timestamp: timestamp.clone(),
+        origin: crate::db::message_origin_interactive(),
+    };
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.store_message(&stored)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": path.persona_id,
+        "side_chat_id": sc.id,
+        "turn_id": turn.id,
+        "message_id": message_id,
+        "message": {
+            "id": message_id,
+            "sender_name": sender_name,
+            "content": content,
+            "is_from_bot": true,
+            "timestamp": timestamp,
+            "session_id": session_id,
+        },
+    })))
+}
+
 /// Full text of one message in the persona thread (used by web bookmark reader; bookmarks only store a short preview).
 async fn api_persona_message_get(
     headers: HeaderMap,
@@ -9144,6 +9255,10 @@ fn build_router(web_state: WebState) -> Router {
             get(api_persona_side_chat_get)
                 .patch(api_persona_side_chat_patch)
                 .delete(api_persona_side_chat_delete),
+        )
+        .route(
+            "/api/personas/:persona_id/side_chats/:side_chat_id/promote_turn",
+            post(api_persona_side_chat_promote_turn),
         )
         .route(
             "/api/personas/:persona_id/messages/:message_id",
