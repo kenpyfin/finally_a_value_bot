@@ -326,21 +326,37 @@ export function usePersonaSession({
     ],
   )
 
-  const onCreatePersona = useCallback(async () => {
-    if (chatId == null) return
-    const name = window.prompt('New persona name?')
-    if (!name?.trim()) return
-    try {
+  const onCreatePersona = useCallback(
+    async (name: string) => {
+      if (chatId == null) return
+      const trimmed = name.trim()
+      if (!trimmed) throw new Error('Persona name cannot be empty')
       await api('/api/personas/create', {
         method: 'POST',
-        body: JSON.stringify({ chat_id: chatId, name: name.trim() }),
+        body: JSON.stringify({ chat_id: chatId, name: trimmed }),
       })
       await loadPersonas(chatId)
-      setStatusText(`Persona "${name.trim()}" created`)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [chatId, loadPersonas, setError, setStatusText])
+      setStatusText(`Persona "${trimmed}" created`)
+      setError('')
+    },
+    [chatId, loadPersonas, setError, setStatusText],
+  )
+
+  const onRenamePersona = useCallback(
+    async (personaId: number, name: string) => {
+      if (chatId == null) return
+      const trimmed = name.trim()
+      if (!trimmed) throw new Error('Persona name cannot be empty')
+      await api('/api/personas/rename', {
+        method: 'POST',
+        body: JSON.stringify({ chat_id: chatId, persona_id: personaId, name: trimmed }),
+      })
+      await loadPersonas(chatId)
+      setStatusText(`Persona renamed to "${trimmed}"`)
+      setError('')
+    },
+    [chatId, loadPersonas, setError, setStatusText],
+  )
 
   const onDeletePersona = useCallback(
     (personaId: number) => {
@@ -408,6 +424,7 @@ export function usePersonaSession({
     handleCreateSession,
     handleDeleteSession,
     onCreatePersona,
+    onRenamePersona,
     onDeletePersona,
     newSchedulePersonaId,
     setNewSchedulePersonaId,

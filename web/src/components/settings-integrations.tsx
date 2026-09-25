@@ -1,6 +1,10 @@
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from '@/components/ui/select'
+import { Tooltip } from '@/components/ui/tooltip'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Callout, Flex, IconButton, Select, Text, TextField, Tooltip } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
+import { useConfirmDialog } from './confirm-dialog'
 import type { BotInstanceRow, ChannelIntegrationSettings } from '../types'
 
 type Platform = 'telegram' | 'discord' | 'whatsapp' | 'wecom'
@@ -95,9 +99,9 @@ function defaultLabel(platform: Platform): string {
 
 function FieldLabel({ children }: { children: string }) {
   return (
-    <Text size="1" color="gray" className="mb-1 block">
+    <span className="mb-1 block">
       {children}
-    </Text>
+    </span>
   )
 }
 
@@ -127,21 +131,21 @@ function WecomExtraFields({
     <>
       <div>
         <FieldLabel>Connection</FieldLabel>
-        <Select.Root
+        <Select
           value={values.mode}
           onValueChange={(value) => onChange({ mode: value === 'callback' ? 'callback' : 'aibot' })}
         >
-          <Select.Trigger className="w-full" />
-          <Select.Content>
-            <Select.Item value="aibot">AI Bot long connection (no callback URL)</Select.Item>
-            <Select.Item value="callback">Self-built app callback</Select.Item>
-          </Select.Content>
-        </Select.Root>
+          <SelectTrigger className="w-full" ><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="aibot">AI Bot long connection (no callback URL)</SelectItem>
+            <SelectItem value="callback">Self-built app callback</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
       {values.mode === 'aibot' ? (
         <div>
           <FieldLabel>Bot ID</FieldLabel>
-          <TextField.Root
+          <Input
             placeholder="AI Bot ID from WeCom admin"
             value={values.aibotId}
             onChange={(e) => onChange({ aibotId: e.target.value })}
@@ -151,7 +155,7 @@ function WecomExtraFields({
         <>
           <div>
             <FieldLabel>Corp ID</FieldLabel>
-            <TextField.Root
+            <Input
               placeholder="wwxxxxxxxx"
               value={values.corpId}
               onChange={(e) => onChange({ corpId: e.target.value })}
@@ -159,7 +163,7 @@ function WecomExtraFields({
           </div>
           <div>
             <FieldLabel>Agent ID</FieldLabel>
-            <TextField.Root
+            <Input
               placeholder="1000002"
               value={values.agentId}
               onChange={(e) => onChange({ agentId: e.target.value })}
@@ -167,7 +171,7 @@ function WecomExtraFields({
           </div>
           <div>
             <FieldLabel>Callback token</FieldLabel>
-            <TextField.Root
+            <Input
               type="password"
               placeholder={callbackTokenPlaceholder}
               value={values.callbackToken}
@@ -177,7 +181,7 @@ function WecomExtraFields({
           </div>
           <div>
             <FieldLabel>EncodingAESKey</FieldLabel>
-            <TextField.Root
+            <Input
               type="password"
               placeholder={encodingAesKeyPlaceholder}
               value={values.encodingAesKey}
@@ -187,7 +191,7 @@ function WecomExtraFields({
           </div>
           <div>
             <FieldLabel>Callback port</FieldLabel>
-            <TextField.Root
+            <Input
               placeholder="8081"
               value={values.webhookPort}
               onChange={(e) => onChange({ webhookPort: e.target.value })}
@@ -197,7 +201,7 @@ function WecomExtraFields({
       )}
       <div>
         <FieldLabel>Allowed chat IDs (WeCom chatid or userid, not the group name)</FieldLabel>
-        <TextField.Root
+        <Input
           placeholder="Comma-separated; empty = all; applies on save"
           value={values.allowedChats}
           onChange={(e) => onChange({ allowedChats: e.target.value })}
@@ -246,6 +250,7 @@ export function SettingsIntegrationsPanel({
 }: Props) {
   const [loading, setLoading] = useState(true)
   const [busyId, setBusyId] = useState<number | 'new' | 'shared' | null>(null)
+  const { requestConfirm, confirmDialog } = useConfirmDialog()
   const [notice, setNotice] = useState<string | null>(null)
   const [cfg, setCfg] = useState<ChannelIntegrationSettings | null>(null)
   const [instances, setInstances] = useState<BotInstanceRow[]>([])
@@ -458,22 +463,27 @@ export function SettingsIntegrationsPanel({
     }
   }
 
-  async function removeBotInstance(row: BotInstanceRow): Promise<void> {
-    if (!window.confirm(`Delete ${row.label || platformLabel(row.platform)}? Related channel bindings will be removed.`)) {
-      return
-    }
-    setBusyId(row.id)
-    onError('')
-    try {
-      await api(`/api/channel_bot_instances/${row.id}`, { method: 'DELETE' })
-      setNotice('Bot instance removed. Restart the gateway to stop its dispatcher.')
-      await load()
-      onSaved?.()
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusyId(null)
-    }
+  function removeBotInstance(row: BotInstanceRow): void {
+    requestConfirm({
+      title: 'Delete bot instance',
+      description: `Delete ${row.label || platformLabel(row.platform)}? Related channel bindings will be removed.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+      onConfirm: async () => {
+        setBusyId(row.id)
+        onError('')
+        try {
+          await api(`/api/channel_bot_instances/${row.id}`, { method: 'DELETE' })
+          setNotice('Bot instance removed. Restart the gateway to stop its dispatcher.')
+          await load()
+          onSaved?.()
+        } catch (e) {
+          onError(e instanceof Error ? e.message : String(e))
+        } finally {
+          setBusyId(null)
+        }
+      },
+    })
   }
 
   if (loading || !cfg) {
@@ -483,23 +493,19 @@ export function SettingsIntegrationsPanel({
   return (
     <div className="space-y-3">
       {notice ? (
-        <Callout.Root color="green" size="1" variant="soft">
-          <Callout.Text>{notice}</Callout.Text>
-        </Callout.Root>
+        <div role="status" className="rounded-lg border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-900 dark:text-green-100">{notice}</div>
       ) : null}
 
-      <Callout.Root color="blue" size="1" variant="soft">
-        <Callout.Text>
+      <div role="status" className="rounded-lg border border-border bg-muted/50 p-3 text-sm">
           Integrations are bot credentials and platform access controls. Persona routing for a
           contact lives on the Channels tab.
-        </Callout.Text>
-      </Callout.Root>
+        </div>
 
       {instances.length === 0 ? (
         <div className="rounded-md border p-3" style={panelStyle}>
-          <Text size="2" color="gray">
+          <span>
             No bot instances configured yet.
-          </Text>
+          </span>
         </div>
       ) : null}
 
@@ -508,22 +514,22 @@ export function SettingsIntegrationsPanel({
         const tokenLabel = row.token_set ? `Current token: ${row.token_redacted}` : 'No token set'
         return (
           <div key={row.id} className="rounded-md border p-3" style={panelStyle}>
-            <Flex justify="between" gap="2" wrap="wrap" align="start" className="mb-2">
+            <div className="flex justify-between gap-2 flex-wrap items-start mb-2">
               <div>
-                <Text size="2" weight="bold" className="block">
+                <span className="font-semibold block">
                   {platformLabel(row.platform)} #{row.id}
                   {row.is_primary ? ' · primary' : ''}
-                </Text>
-                <Text size="1" color="gray">
+                </span>
+                <span>
                   {integrationDescription(row)}
-                </Text>
+                </span>
               </div>
-              <Text size="1" color={row.token_set ? 'green' : 'orange'}>
+              <span>
                 {tokenLabel}
-              </Text>
-            </Flex>
-            <Flex direction="column" gap="2">
-              <TextField.Root
+              </span>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Input
                 placeholder="Label"
                 value={draft.label}
                 onChange={(e) => updateDraft(row.id, { label: e.target.value })}
@@ -536,7 +542,7 @@ export function SettingsIntegrationsPanel({
                       : 'AI Bot secret'
                     : 'Token'}
                 </FieldLabel>
-                <TextField.Root
+                <Input
                   type="password"
                   placeholder={
                     row.platform === 'wecom'
@@ -558,7 +564,7 @@ export function SettingsIntegrationsPanel({
                 <>
                   <div>
                     <FieldLabel>Bot username for @mentions (without @)</FieldLabel>
-                    <TextField.Root
+                    <Input
                       placeholder="example_bot"
                       value={draft.botUsername}
                       onChange={(e) => updateDraft(row.id, { botUsername: e.target.value })}
@@ -566,7 +572,7 @@ export function SettingsIntegrationsPanel({
                   </div>
                   <div>
                     <FieldLabel>Allowed Telegram group IDs (numeric; empty = all)</FieldLabel>
-                    <TextField.Root
+                    <Input
                       placeholder="-1001234567890, -1009876543210"
                       value={draft.allowedGroups}
                       onChange={(e) => updateDraft(row.id, { allowedGroups: e.target.value })}
@@ -575,7 +581,7 @@ export function SettingsIntegrationsPanel({
                 </>
               ) : null}
               {row.platform === 'discord' ? (
-                <TextField.Root
+                <Input
                   placeholder="Allowed Discord channel IDs (comma-separated; empty = all)"
                   value={draft.discordAllowedChannels}
                   onChange={(e) => updateDraft(row.id, { discordAllowedChannels: e.target.value })}
@@ -583,12 +589,12 @@ export function SettingsIntegrationsPanel({
               ) : null}
               {row.platform === 'whatsapp' ? (
                 <>
-                  <TextField.Root
+                  <Input
                     placeholder="Phone number ID"
                     value={draft.whatsappPhoneNumberId}
                     onChange={(e) => updateDraft(row.id, { whatsappPhoneNumberId: e.target.value })}
                   />
-                  <TextField.Root
+                  <Input
                     type="password"
                     placeholder={
                       row.whatsapp_verify_token_set
@@ -599,7 +605,7 @@ export function SettingsIntegrationsPanel({
                     onChange={(e) => updateDraft(row.id, { whatsappVerifyToken: e.target.value })}
                     autoComplete="off"
                   />
-                  <TextField.Root
+                  <Input
                     placeholder="Webhook port"
                     value={draft.whatsappWebhookPort}
                     onChange={(e) => updateDraft(row.id, { whatsappWebhookPort: e.target.value })}
@@ -642,38 +648,37 @@ export function SettingsIntegrationsPanel({
                   }
                 />
               ) : null}
-            </Flex>
-            <Flex gap="2" mt="3" wrap="wrap">
-              <Button size="1" disabled={busyId === row.id} onClick={() => void saveInstance(row)}>
+            </div>
+            <div className="flex gap-2 mt-3 flex-wrap">
+              <Button size="sm" disabled={busyId === row.id} onClick={() => void saveInstance(row)}>
                 {busyId === row.id ? 'Saving…' : 'Save'}
               </Button>
               <Button
-                size="1"
-                color="red"
-                variant="soft"
+                size="sm"
+                variant="destructive"
                 disabled={busyId === row.id}
-                onClick={() => void removeBotInstance(row)}
+                onClick={() => removeBotInstance(row)}
               >
                 Delete
               </Button>
-            </Flex>
+            </div>
           </div>
         )
       })}
 
       <div className="rounded-md border p-3" style={panelStyle}>
-        <Text size="2" weight="bold" className="mb-1 block">
+        <span className="font-semibold mb-1 block">
           Add Bot Instance
-        </Text>
-        <Text size="1" color="gray" className="mb-2 block">
+        </span>
+        <span className="mb-2 block">
           Telegram and Discord can have multiple bot instances. WhatsApp and WeCom support one
           app/number in this gateway.
-        </Text>
-        <Flex direction="column" gap="2">
-          <Flex gap="2" wrap="wrap" align="end">
+        </span>
+        <div className="flex flex-col gap-2">
+          <div className="flex gap-2 flex-wrap items-end">
             <div>
               <FieldLabel>Platform</FieldLabel>
-              <Select.Root
+              <Select
                 value={newPlatform}
                 onValueChange={(value) =>
                   setNewPlatform(
@@ -687,22 +692,22 @@ export function SettingsIntegrationsPanel({
                   )
                 }
               >
-                <Select.Trigger className="w-[150px]" />
-                <Select.Content>
-                  <Select.Item value="telegram">telegram</Select.Item>
-                  <Select.Item value="discord">discord</Select.Item>
-                  <Select.Item value="whatsapp" disabled={whatsappExists}>
+                <SelectTrigger className="w-[150px]" ><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="telegram">telegram</SelectItem>
+                  <SelectItem value="discord">discord</SelectItem>
+                  <SelectItem value="whatsapp" disabled={whatsappExists}>
                     whatsapp
-                  </Select.Item>
-                  <Select.Item value="wecom" disabled={wecomExists}>
+                  </SelectItem>
+                  <SelectItem value="wecom" disabled={wecomExists}>
                     wecom
-                  </Select.Item>
-                </Select.Content>
-              </Select.Root>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <div className="min-w-[160px] flex-1">
               <FieldLabel>Label</FieldLabel>
-              <TextField.Root
+              <Input
                 placeholder={defaultLabel(newPlatform)}
                 value={newLabel}
                 onChange={(e) => setNewLabel(e.target.value)}
@@ -718,7 +723,7 @@ export function SettingsIntegrationsPanel({
                     ? 'Access token'
                     : 'Bot token'}
               </FieldLabel>
-              <TextField.Root
+              <Input
                 type="password"
                 placeholder={
                   newPlatform === 'wecom'
@@ -735,18 +740,18 @@ export function SettingsIntegrationsPanel({
               />
             </div>
             {newPlatform !== 'wecom' ? (
-              <Button size="1" disabled={busyId === 'new'} onClick={() => void addBotInstance()}>
+              <Button size="sm" disabled={busyId === 'new'} onClick={() => void addBotInstance()}>
                 {busyId === 'new' ? 'Adding…' : 'Add'}
               </Button>
             ) : null}
-          </Flex>
+          </div>
           {newPlatform === 'wecom' ? (
             <>
-              <Text size="1" color="gray">
+              <span>
                 {newWecom.mode === 'aibot'
                   ? 'Create a 智能机器人 in WeCom, enable API mode → 长连接, then paste Bot ID and Secret. No HTTPS callback is required.'
                   : 'Receive-server URL after restart: https://your-host/callback (HTTPS). Token and EncodingAESKey must match WeCom admin.'}
-              </Text>
+              </span>
               <WecomExtraFields
                 values={newWecom}
                 callbackTokenPlaceholder="Receive-server Token"
@@ -754,20 +759,20 @@ export function SettingsIntegrationsPanel({
                 onChange={(patch) => setNewWecom((current) => ({ ...current, ...patch }))}
               />
               <div>
-                <Button size="1" disabled={busyId === 'new'} onClick={() => void addBotInstance()}>
+                <Button size="sm" disabled={busyId === 'new'} onClick={() => void addBotInstance()}>
                   {busyId === 'new' ? 'Adding…' : 'Add'}
                 </Button>
               </div>
             </>
           ) : null}
-        </Flex>
+        </div>
       </div>
 
       <div className="rounded-md border p-3" style={panelStyle}>
-        <Flex align="center" gap="1" className="mb-1">
-          <Text size="2" weight="bold">
+        <div className="flex items-center gap-1 mb-1">
+          <span className="font-semibold">
             Shared Access
-          </Text>
+          </span>
           <Tooltip
             maxWidth="320px"
             side="top"
@@ -782,10 +787,9 @@ export function SettingsIntegrationsPanel({
               </>
             }
           >
-            <IconButton
-              size="1"
-              variant="ghost"
-              color="gray"
+            <Button
+              size="sm"
+              variant="outline"
               type="button"
               aria-label="About shared access"
             >
@@ -803,27 +807,28 @@ export function SettingsIntegrationsPanel({
                 <path d="M12 16v-4" />
                 <path d="M12 8h.01" />
               </svg>
-            </IconButton>
+            </Button>
           </Tooltip>
-        </Flex>
-        <Text size="1" color="gray" className="mb-2 block">
+        </div>
+        <span className="mb-2 block">
           Privileged chat IDs for cross-chat tools. This is global, not platform-specific.
-        </Text>
-        <Flex gap="2" wrap="wrap" align="center">
-          <TextField.Root
+        </span>
+        <div className="flex gap-2 flex-wrap items-center">
+          <Input
             className="min-w-[260px] flex-1"
             placeholder="Control chat IDs"
             value={controlChatIds}
             onChange={(e) => setControlChatIds(e.target.value)}
           />
-          <Button size="1" disabled={busyId === 'shared'} onClick={() => void saveShared()}>
+          <Button size="sm" disabled={busyId === 'shared'} onClick={() => void saveShared()}>
             {busyId === 'shared' ? 'Saving…' : 'Save Shared Access'}
           </Button>
-          <Button size="1" variant="soft" disabled={restartBusy} onClick={() => void requestRestart()}>
+          <Button size="sm" variant="secondary" disabled={restartBusy} onClick={() => void requestRestart()}>
             {restartBusy ? 'Restarting…' : 'Restart Gateway'}
           </Button>
-        </Flex>
+        </div>
       </div>
+      {confirmDialog}
     </div>
   )
 }

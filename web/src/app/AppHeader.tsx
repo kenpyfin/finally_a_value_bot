@@ -1,9 +1,8 @@
+import { Button } from '@/components/ui/button'
 import React from 'react'
-import { Button, Flex, Heading, IconButton } from '@radix-ui/themes'
 import { SessionPicker } from '../components/session-picker'
 import { SideChatsPicker } from '../components/side-chats-picker'
-import { CockpitStatusChip } from '../components/ops-ui'
-import { IconCockpit, IconInbox, IconOps, IconSettings } from '../components/icons'
+import { IconCockpit, IconInbox, IconOps, IconSettings, IconSidebar } from '../components/icons'
 import type { ChatSession, InstallationStatus, QueueLane, SideChatSummary } from '../types'
 
 type Appearance = 'dark' | 'light'
@@ -94,8 +93,6 @@ export const AppHeader = React.memo(function AppHeader({
   const {
     queueLane,
     backgroundActiveCount,
-    installationStatus,
-    statusText,
     cockpitExpanded = false,
     onToggleCockpit,
     onOpenSettings,
@@ -115,10 +112,7 @@ export const AppHeader = React.memo(function AppHeader({
 
   const renderSessionControls = (className?: string) =>
     activePersonaId == null ? null : (
-      <Flex
-        align="center"
-        className={`mc-session-controls min-w-0 ${className ?? ''}`}
-      >
+      <div className={`flex items-center mc-session-controls min-w-0 ${className ?? ''}`}>
         <SessionPicker
           compact
           sessions={chatSessions}
@@ -137,7 +131,7 @@ export const AppHeader = React.memo(function AppHeader({
           onSelect={onSelectSideChat}
           onDelete={onDeleteSideChat}
         />
-      </Flex>
+      </div>
     )
 
   return (
@@ -149,22 +143,11 @@ export const AppHeader = React.memo(function AppHeader({
       }
     >
       <div className="mc-app-header-bar px-3 max-md:py-2 md:px-4 md:py-3">
-        <Flex
-          justify="between"
-          align="center"
-          gap="2"
-          wrap="wrap"
-          className="w-full flex-col md:flex-row md:flex-wrap"
-        >
-          <Flex
-            align="center"
-            gap="2"
-            className="min-w-0 w-full min-h-[44px] md:flex-1"
-          >
-            <IconButton
-              size="3"
-              variant="soft"
-              color="gray"
+        <div className="flex justify-between items-center gap-2 flex-wrap w-full flex-col md:flex-row md:flex-wrap">
+          <div className="flex items-center gap-2 min-w-0 w-full min-h-[44px] md:flex-1">
+            <Button
+              size="icon-lg"
+              variant="outline"
               className="shrink-0 min-h-10 min-w-10 md:!hidden"
               type="button"
               aria-expanded={mobileNavOpen}
@@ -186,11 +169,10 @@ export const AppHeader = React.memo(function AppHeader({
               >
                 <path d="M4 6h16M4 12h16M4 18h16" />
               </svg>
-            </IconButton>
-            <IconButton
-              size="3"
-              variant="soft"
-              color="gray"
+            </Button>
+            <Button
+              size="icon-lg"
+              variant="outline"
               className="!hidden shrink-0 md:!inline-flex"
               type="button"
               aria-expanded={desktopSidebarOpen}
@@ -198,16 +180,15 @@ export const AppHeader = React.memo(function AppHeader({
               title={desktopSidebarOpen ? 'Hide personas' : 'Show personas'}
               onClick={onToggleDesktopSidebar}
             >
-              <span aria-hidden className="text-base leading-none">
-                {desktopSidebarOpen ? '⟨' : '⟩'}
-              </span>
-            </IconButton>
-            <Heading
-              size="6"
-              className="min-w-0 shrink truncate max-md:[font-size:1.125rem]"
-            >
+              <IconSidebar
+                className={`size-5 shrink-0 transition-transform duration-150 ${
+                  desktopSidebarOpen ? '' : 'rotate-180'
+                }`}
+              />
+            </Button>
+            <h1 className="font-semibold text-2xl min-w-0 shrink truncate max-md:[font-size:1.125rem]">
               {activePersonaName ?? 'Chat'}
-            </Heading>
+            </h1>
             {renderSessionControls('max-md:!hidden')}
             <div className="ml-auto flex shrink-0 items-center gap-1 md:hidden">
               <button
@@ -248,10 +229,9 @@ export const AppHeader = React.memo(function AppHeader({
                   </span>
                 ) : null}
               </button>
-              <IconButton
-                size="2"
-                variant="soft"
-                color="gray"
+              <Button
+                size="icon"
+                variant="outline"
                 type="button"
                 className="cursor-pointer min-h-10 min-w-10"
                 aria-label="Settings"
@@ -259,11 +239,10 @@ export const AppHeader = React.memo(function AppHeader({
                 onClick={onOpenMobileSettings}
               >
                 <IconSettings />
-              </IconButton>
-              <IconButton
-                size="2"
-                variant="soft"
-                color="gray"
+              </Button>
+              <Button
+                size="icon"
+                variant="outline"
                 type="button"
                 className="cursor-pointer min-h-10 min-w-10"
                 aria-label="Operator tools"
@@ -271,9 +250,9 @@ export const AppHeader = React.memo(function AppHeader({
                 onClick={onOpenMobileOps}
               >
                 <IconOps />
-              </IconButton>
+              </Button>
             </div>
-          </Flex>
+          </div>
           {activePersonaId != null ? (
             <div
               className={`mc-mobile-session-subbar w-full ${
@@ -286,14 +265,27 @@ export const AppHeader = React.memo(function AppHeader({
               </div>
             </div>
           ) : null}
-          <Flex align="center" gap="2" wrap="wrap" justify="end" className="w-full max-md:!hidden md:!flex">
-            <CockpitStatusChip
-              queueLane={queueLane}
-              backgroundActiveCount={backgroundActiveCount}
-              installationStatus={installationStatus}
-              statusText={statusText}
+          <div className="flex items-center gap-2 flex-wrap justify-end w-full max-md:!hidden md:!flex">
+            <button
+              type="button"
+              className="mc-cockpit-launch cursor-pointer"
+              data-active={cockpitExpanded ? 'true' : 'false'}
+              data-busy={cockpitBusyCount > 0 ? 'true' : 'false'}
+              aria-pressed={cockpitExpanded}
+              aria-label={
+                cockpitBusyCount > 0 ? `Cockpit, ${cockpitBusyCount} active` : 'Cockpit'
+              }
+              title="Cockpit"
               onClick={onToggleCockpit}
-            />
+            >
+              <IconCockpit className="size-4 shrink-0" />
+              <span className="mc-cockpit-launch-label">Cockpit</span>
+              {cockpitBusyCount > 0 ? (
+                <span className="mc-badge-counter" aria-hidden>
+                  {cockpitBusyCount > 99 ? '99+' : cockpitBusyCount}
+                </span>
+              ) : null}
+            </button>
             <button
               type="button"
               className="mc-inbox-launch !hidden md:!inline-flex"
@@ -312,37 +304,37 @@ export const AppHeader = React.memo(function AppHeader({
               ) : null}
             </button>
             <span className="mc-toolbar-divider !hidden md:!inline-block" aria-hidden />
-            <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenSettings}>
+            <Button size="sm" variant="secondary" className="!hidden md:!inline-flex" onClick={onOpenSettings}>
               Settings
             </Button>
-            <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenSchedules}>
+            <Button size="sm" variant="secondary" className="!hidden md:!inline-flex" onClick={onOpenSchedules}>
               Schedules
             </Button>
-            <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenPrinciples}>
+            <Button size="sm" variant="secondary" className="!hidden md:!inline-flex" onClick={onOpenPrinciples}>
               Principles
             </Button>
-            <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenArtifacts}>
+            <Button size="sm" variant="secondary" className="!hidden md:!inline-flex" onClick={onOpenArtifacts}>
               Artifacts
             </Button>
             {terminalAvailable && onOpenTerminal ? (
-              <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenTerminal}>
+              <Button size="sm" variant="secondary" className="!hidden md:!inline-flex" onClick={onOpenTerminal}>
                 Terminal
               </Button>
             ) : null}
-            <Button size="1" variant="soft" className="!hidden md:!inline-flex" onClick={onOpenMemory}>
+            <Button size="sm" variant="secondary" className="!hidden md:!inline-flex" onClick={onOpenMemory}>
               Memory
             </Button>
             <Button
-              size="1"
-              variant="soft"
+              size="sm"
+              variant="secondary"
               className="!hidden md:!inline-flex"
               disabled={agentHistoryDisabled}
               onClick={onOpenAgentHistory}
             >
               Last agent run
             </Button>
-          </Flex>
-        </Flex>
+          </div>
+        </div>
       </div>
     </header>
   )

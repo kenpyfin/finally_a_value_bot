@@ -1,5 +1,8 @@
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from '@/components/ui/select'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Callout, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import type {
   CursorEngineConfigResponse,
@@ -275,66 +278,64 @@ export function SettingsCursorPanel({ api, onError, activePersonaId = null }: Pr
 
   if (!config?.ok) {
     return (
-      <Text size="2" color="gray">
+      <span>
         Could not load Cursor configuration.
-      </Text>
+      </span>
     )
   }
 
   return (
-    <Flex direction="column" gap="3">
-      <Callout.Root color={engineReady ? 'green' : 'orange'} size="1" variant="soft">
-        <Callout.Text>{readinessSummary}</Callout.Text>
-      </Callout.Root>
+    <div className="flex flex-col gap-3">
+      <div role="status" className="rounded-lg border border-border bg-muted/50 p-3 text-sm">{readinessSummary}</div>
 
-      <Flex gap="2" wrap="wrap" align="center">
-        <Text size="1" color={statusColor(config.sidecar_reachable)}>
+      <div className="flex gap-2 flex-wrap items-center">
+        <span>
           Sidecar: {config.sidecar_reachable ? 'reachable' : 'down'}
-        </Text>
-        <Text size="1" color={statusColor(config.api_key_configured)}>
+        </span>
+        <span>
           CURSOR_API_KEY: {config.api_key_configured ? 'set' : 'missing in .env'}
-        </Text>
-        <Text size="1" color="gray">
+        </span>
+        <span>
           Runner: {config.sdk_runner_url ?? '—'}
           {sidecarManaged ? ' (managed by bot)' : ''}
-        </Text>
-        <Text size="1" color={statusColor(config.mcp_bridge_ready)}>
+        </span>
+        <span>
           MCP bridge: {config.mcp_bridge_ready ? 'ready' : 'off or web disabled'}
-        </Text>
-      </Flex>
+        </span>
+      </div>
 
       <div className="rounded-md border p-3" style={{ borderColor: 'var(--gray-6)' }}>
-        <Text size="2" weight="bold" className="mb-1 block">
+        <span className="font-semibold mb-1 block">
           Cursor SDK engine
-        </Text>
-        <Text size="1" color="gray" className="mb-2 block">
+        </span>
+        <span className="mb-2 block">
           SDK model and parameters are saved for this persona. Sidecar URL, MCP, and timeouts stay
           shared. The sidecar starts automatically when the bot starts. The bot installs{' '}
           <code>@cursor/sdk</code> into a runtime Node prefix on first boot (no{' '}
           <code>cursor-sdk-bridge</code> subprocess). The only required setup is{' '}
           <code>CURSOR_API_KEY</code> in repo-root <code>.env</code> (never commit the value).
           Node 20+ and npm must be on PATH.
-        </Text>
-        <Flex direction="column" gap="2">
-          <Flex gap="2" wrap="wrap" align="center">
+        </span>
+        <div className="flex flex-col gap-2">
+          <div className="flex gap-2 flex-wrap items-center">
             {!useCustomSdkModel &&
             modelCatalog.length > 0 &&
             sdkModel &&
             modelCatalog.some((model) => model.id === sdkModel) ? (
-              <Select.Root value={sdkModel} onValueChange={onSdkModelChange}>
-                <Select.Trigger placeholder="Select model" style={{ flex: 1, minWidth: 160 }} />
-                <Select.Content>
+              <Select value={sdkModel} onValueChange={onSdkModelChange}>
+                <SelectTrigger placeholder="Select model" style={{ flex: 1, minWidth: 160 }} ><SelectValue /></SelectTrigger>
+                <SelectContent>
                   {modelCatalog
                     .filter((model) => Boolean(model.id))
                     .map((model) => (
-                    <Select.Item key={model.id} value={model.id}>
+                    <SelectItem key={model.id} value={model.id}>
                       {model.display_name?.trim() ? `${model.display_name} (${model.id})` : model.id}
-                    </Select.Item>
+                    </SelectItem>
                   ))}
-                </Select.Content>
-              </Select.Root>
+                </SelectContent>
+              </Select>
             ) : (
-              <TextField.Root
+              <Input
                 placeholder="composer-2.5"
                 value={sdkModel}
                 onChange={(e) => setSdkModel(e.target.value)}
@@ -342,17 +343,17 @@ export function SettingsCursorPanel({ api, onError, activePersonaId = null }: Pr
               />
             )}
             <Button
-              size="1"
+              size="sm"
               variant="outline"
               disabled={loadingModels || !canLoadModels}
               onClick={() => void loadModels()}
             >
               {loadingModels ? 'Loading…' : 'Refresh models'}
             </Button>
-          </Flex>
+          </div>
           {modelCatalog.length > 0 ? (
             <Button
-              size="1"
+              size="sm"
               variant="ghost"
               type="button"
               onClick={() => setUseCustomSdkModel((value) => !value)}
@@ -361,7 +362,7 @@ export function SettingsCursorPanel({ api, onError, activePersonaId = null }: Pr
             </Button>
           ) : null}
           {selectedModelEntry?.parameters && selectedModelEntry.parameters.length > 0 ? (
-            <Flex direction="column" gap="2">
+            <div className="flex flex-col gap-2">
               {selectedModelEntry.parameters.map((param) => {
                 const allowed = param.values.map((value) => value.value).filter(Boolean)
                 const savedValue = sdkModelParams.find((item) => item.id === param.id)?.value ?? ''
@@ -370,143 +371,141 @@ export function SettingsCursorPanel({ api, onError, activePersonaId = null }: Pr
                   : (allowed[0] ?? '')
                 if (!currentValue) return null
                 return (
-                  <Flex key={param.id} direction="column" gap="1">
-                    <Text size="2" weight="medium">
+                  <div className="flex flex-col gap-1" key={param.id}>
+                    <span className="font-medium">
                       {parameterLabel(param)}
-                    </Text>
-                    <Select.Root
+                    </span>
+                    <Select
                       value={currentValue}
                       onValueChange={(value) => onModelParamChange(param.id, value)}
                     >
-                      <Select.Trigger placeholder={`Select ${parameterLabel(param).toLowerCase()}`} />
-                      <Select.Content>
+                      <SelectTrigger placeholder={`Select ${parameterLabel(param).toLowerCase()}`} ><SelectValue /></SelectTrigger>
+                      <SelectContent>
                         {param.values
                           .filter((value) => Boolean(value.value))
                           .map((value) => (
-                          <Select.Item key={`${param.id}:${value.value}`} value={value.value}>
+                          <SelectItem key={`${param.id}:${value.value}`} value={value.value}>
                             {value.display_name?.trim() || value.value}
-                          </Select.Item>
+                          </SelectItem>
                         ))}
-                      </Select.Content>
-                    </Select.Root>
-                  </Flex>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 )
               })}
-            </Flex>
+            </div>
           ) : sdkModel.trim() && canLoadModels ? (
-            <Text size="1" color="gray">
+            <span>
               Refresh models to load thinking effort and context window options for the selected model.
-            </Text>
+            </span>
           ) : null}
           {!canLoadModels ? (
-            <Text size="1" color="orange">
+            <span>
               Model list requires a reachable sidecar and <code>CURSOR_API_KEY</code> in{' '}
               <code>.env</code>. Without the key, the sidecar returns HTTP 503.
-            </Text>
+            </span>
           ) : modelsNotice ? (
-            <Text size="1" color="gray" role="status">
+            <span role="status">
               {modelsNotice}
-            </Text>
+            </span>
           ) : null}
-        </Flex>
+        </div>
       </div>
 
       <div className="rounded-md border p-3" style={{ borderColor: 'var(--gray-6)' }}>
-        <Text size="2" weight="bold" className="mb-1 block">
+        <span className="font-semibold mb-1 block">
           Bot tools (MCP)
-        </Text>
-        <Text size="1" color="gray" className="mb-2 block">
+        </span>
+        <span className="mb-2 block">
           Exposes the bot ToolRegistry to the Cursor SDK agent via loopback MCP at{' '}
           <code>{config.mcp_endpoint_url ?? '/internal/cursor-mcp'}</code>. Requires Web UI
           enabled. Recursive <code>cursor_agent</code> tools are always denied.
-        </Text>
-        <Flex direction="column" gap="2">
-          <Flex align="center" justify="between" gap="3">
-            <Text size="2">Expose bot tools to Cursor (MCP)</Text>
+        </span>
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-3">
+            <span>Expose bot tools to Cursor (MCP)</span>
             <Switch
-              size="2"
+              size="default"
               checked={mcpToolsEnabled}
               onCheckedChange={setMcpToolsEnabled}
             />
-          </Flex>
-          <Flex align="center" justify="between" gap="3">
-            <Text size="2">Allow send_message via MCP</Text>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span>Allow send_message via MCP</span>
             <Switch
-              size="2"
+              size="default"
               checked={mcpExposeSendMessage}
               disabled={!mcpToolsEnabled}
               onCheckedChange={setMcpExposeSendMessage}
             />
-          </Flex>
-          <Flex align="center" justify="between" gap="3">
-            <Text size="2">Slim sidecar prompt (strip tool catalog when MCP on)</Text>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span>Slim sidecar prompt (strip tool catalog when MCP on)</span>
             <Switch
-              size="2"
+              size="default"
               checked={delegationSlimPrompt}
               disabled={!mcpToolsEnabled}
               onCheckedChange={setDelegationSlimPrompt}
             />
-          </Flex>
-          <Text size="1" color="gray">
+          </div>
+          <span>
             Interactive chat turns use the shorter timeout below; scheduled/background jobs use the
             CLI timeout field.
-          </Text>
-          <Text size="2">Interactive turn timeout (seconds)</Text>
-          <TextField.Root
+          </span>
+          <span>Interactive turn timeout (seconds)</span>
+          <Input
             placeholder="900"
             value={interactiveTimeoutSecs}
             onChange={(e) => setInteractiveTimeoutSecs(e.target.value)}
           />
-        </Flex>
+        </div>
       </div>
 
       <div className="rounded-md border p-3" style={{ borderColor: 'var(--gray-6)' }}>
-        <Text size="2" weight="bold" className="mb-1 block">
+        <span className="font-semibold mb-1 block">
           cursor_agent CLI tool
-        </Text>
-        <Text size="1" color="gray" className="mb-2 block">
+        </span>
+        <span className="mb-2 block">
           Optional settings for the <code>cursor_agent</code> tool (separate from the Cursor engine).
           CLI on PATH: {config.cli_on_path ? 'yes' : 'no'}.
-        </Text>
-        <Flex direction="column" gap="2">
-          <TextField.Root
+        </span>
+        <div className="flex flex-col gap-2">
+          <Input
             placeholder="cursor-agent"
             value={cliPath}
             onChange={(e) => setCliPath(e.target.value)}
           />
-          <TextField.Root
+          <Input
             placeholder="Model override (optional)"
             value={cliModel}
             onChange={(e) => setCliModel(e.target.value)}
           />
-          <TextField.Root
+          <Input
             placeholder="CLI runner URL (Docker host, optional)"
             value={cliRunnerUrl}
             onChange={(e) => setCliRunnerUrl(e.target.value)}
           />
-          <TextField.Root
+          <Input
             placeholder="3600"
             value={timeoutSecs}
             onChange={(e) => setTimeoutSecs(e.target.value)}
           />
-          <Flex align="center" justify="between" gap="3">
-            <Text size="2">Tmux detach mode</Text>
-            <Switch size="2" checked={tmuxEnabled} onCheckedChange={setTmuxEnabled} />
-          </Flex>
-        </Flex>
+          <div className="flex items-center justify-between gap-3">
+            <span>Tmux detach mode</span>
+            <Switch size="default" checked={tmuxEnabled} onCheckedChange={setTmuxEnabled} />
+          </div>
+        </div>
       </div>
 
-      <Flex gap="2" align="center" wrap="wrap">
-        <Button size="2" className="cursor-pointer" disabled={saving} onClick={() => void save()}>
+      <div className="flex gap-2 items-center flex-wrap">
+        <Button size="default" className="cursor-pointer" disabled={saving} onClick={() => void save()}>
           {saving ? 'Saving…' : 'Save Cursor settings'}
         </Button>
-      </Flex>
+      </div>
 
       {saveNotice ? (
-        <Callout.Root color="green" size="1" variant="soft">
-          <Callout.Text role="status">{saveNotice}</Callout.Text>
-        </Callout.Root>
+        <div role="status" className="rounded-lg border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-900 dark:text-green-100">{saveNotice}</div>
       ) : null}
-    </Flex>
+    </div>
   )
 }

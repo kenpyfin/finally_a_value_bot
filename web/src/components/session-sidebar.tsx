@@ -1,5 +1,9 @@
+import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
+import { Badge } from '@/components/ui/badge'
+import { Separator } from '@/components/ui/separator'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { Badge, Button, Flex, ScrollArea, Separator, Text } from '@radix-ui/themes'
 import type { Persona } from '../types'
 
 const PRIMARY_THEME_KEYS = new Set(['green', 'slate', 'blue'])
@@ -32,14 +36,6 @@ function IconMoon({ className }: { className?: string }) {
   )
 }
 
-function IconTrash({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
-    </svg>
-  )
-}
-
 const iconBtnClass =
   'inline-flex h-8 w-8 items-center justify-center rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] text-[color:var(--mc-text-muted)] hover:text-[color:var(--mc-text-primary)] hover:brightness-110'
 
@@ -54,7 +50,6 @@ type SessionSidebarProps = {
   selectedPersonaId: number | null
   onPersonaSelect: (personaName: string) => void
   onCreatePersona: () => void
-  onDeletePersona: (personaId: number) => void
   onCloseRequest?: () => void
 }
 
@@ -106,7 +101,6 @@ export const SessionSidebar = React.memo(function SessionSidebar({
   selectedPersonaId,
   onPersonaSelect,
   onCreatePersona,
-  onDeletePersona,
   onCloseRequest,
 }: SessionSidebarProps) {
   const isDark = appearance === 'dark'
@@ -148,14 +142,14 @@ export const SessionSidebar = React.memo(function SessionSidebar({
     <aside
       className="flex h-full min-h-0 flex-col border-r border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] p-4"
     >
-      <Flex justify="between" align="center" className="mb-4">
+      <div className="flex justify-between items-center mb-4">
         <div className="min-w-0">
-          <Text size="5" weight="bold" className="tracking-tight">
+          <span className="text-xl font-semibold tracking-tight">
             FinallyAValueBot
-          </Text>
-          <Text size="1" color="gray" className="mt-0.5 block">
+          </span>
+          <span className="mt-0.5 block">
             Personas & sessions
-          </Text>
+          </span>
         </div>
         <div className="relative flex items-center gap-2">
           {onCloseRequest ? (
@@ -201,7 +195,7 @@ export const SessionSidebar = React.memo(function SessionSidebar({
               ref={themeMenuRef}
               className="absolute right-0 top-10 z-50 w-56 rounded-lg border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-sidebar)] p-2"
             >
-              <Text size="1" color="gray">Theme</Text>
+              <span>Theme</span>
               <div className="mt-2 grid grid-cols-2 gap-1">
                 {primaryThemes.map((theme) => (
                   <ThemeSwatchButton
@@ -247,23 +241,23 @@ export const SessionSidebar = React.memo(function SessionSidebar({
             </div>
           ) : null}
         </div>
-      </Flex>
+      </div>
 
-      <Flex justify="between" align="center" className="mb-2">
-        <Text size="2" weight="medium" color="gray">
+      <div className="flex justify-between items-center mb-2">
+        <span className="font-medium">
           Persona
-        </Text>
-        <Button size="1" variant="soft" onClick={onCreatePersona} title="New persona">
+        </span>
+        <Button size="sm" variant="secondary" onClick={onCreatePersona} title="New persona">
           + New
         </Button>
-      </Flex>
+      </div>
 
-      <Separator size="4" className="my-2" />
+      <Separator className="my-2" />
 
-      <ScrollArea type="auto" className="min-h-0 flex-1">
-        <div className="flex flex-col pr-1">
+      <ScrollArea className="mc-persona-list min-h-0 flex-1">
+        <div className="flex min-w-0 flex-col pr-1">
           {personas.length === 0 ? (
-            <Text size="1" color="gray">Loading…</Text>
+            <span>Loading…</span>
           ) : (
             personas.map((p, index) => (
               <div
@@ -277,43 +271,37 @@ export const SessionSidebar = React.memo(function SessionSidebar({
                 <div
                   className={
                     selectedPersonaId === p.id
-                      ? 'flex w-full items-center justify-between gap-1 border-l-2 border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2'
-                      : 'flex w-full items-center justify-between gap-1 border-l-2 border-transparent px-3 py-2 text-[color:var(--mc-text-muted)] hover:bg-[color:var(--mc-bg-panel)]/60'
+                      ? 'group mc-persona-row flex w-full items-center justify-between gap-1 border-l-2 border-[color:var(--mc-accent)] bg-[color:var(--mc-bg-panel)] px-3 py-2'
+                      : 'group mc-persona-row flex w-full items-center justify-between gap-1 border-l-2 border-transparent px-3 py-2 text-[color:var(--mc-text-muted)] hover:bg-[color:var(--mc-bg-panel)]/60'
                   }
                 >
                   <button
                     type="button"
-                    className="min-w-0 flex-1 text-left text-sm font-medium text-[color:var(--mc-text-primary)]"
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left text-sm font-medium text-[color:var(--mc-text-primary)]"
+                    title={p.name}
                     onClick={() => {
                       onPersonaSelect(p.name)
                       onCloseRequest?.()
                     }}
                   >
-                    <span className="inline-flex items-center gap-2">
-                      <span className="truncate">{p.name}</span>
-                      {personaHasNew?.[p.id] ? (
-                        <span
-                          className="h-2 w-2 rounded-full bg-[color:var(--mc-accent)]"
-                          aria-label="New messages"
-                          title="New messages"
-                        />
-                      ) : null}
-                    </span>
+                    <span className="min-w-0 truncate">{p.name}</span>
+                    {personaHasNew?.[p.id] ? (
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full bg-[color:var(--mc-accent)]"
+                        aria-label="New messages"
+                        title="New messages"
+                      />
+                    ) : null}
                   </button>
-                  {p.is_active ? <Badge size="1" variant="soft">active</Badge> : null}
-                  {p.name !== 'default' ? (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        onDeletePersona(p.id)
-                      }}
-                      title={`Delete persona "${p.name}"`}
-                      className="rounded p-1 text-[color:var(--mc-text-muted)] hover:bg-red-900/20 hover:text-red-400"
-                      aria-label={`Delete ${p.name}`}
+                  {p.is_active ? (
+                    <Badge
+                      size="sm"
+                      variant="secondary"
+                      className="shrink-0"
+                      title="Channel messages (Telegram, Discord, etc.) route to this persona"
                     >
-                      <IconTrash className="size-3.5" />
-                    </button>
+                      active
+                    </Badge>
                   ) : null}
                 </div>
               </div>

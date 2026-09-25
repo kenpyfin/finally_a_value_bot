@@ -1,5 +1,9 @@
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import { Switch } from '@/components/ui/switch'
+import { Select } from '@/components/ui/select'
 import { useCallback, useEffect, useState } from 'react'
-import { Button, Callout, Flex, Switch, Text, TextArea, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import type {
   AdkAgent,
@@ -142,71 +146,67 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
   }
 
   if (!profile) {
-    return <Text size="2" color="gray">Could not load Gemini ADK topology.</Text>
+    return <span>Could not load Gemini ADK topology.</span>
   }
 
   const agentIds = profile.agents.map((a) => a.id)
 
   return (
-    <Flex direction="column" gap="4">
+    <div className="flex flex-col gap-4">
       {engine && !engine.api_key_configured ? (
-        <Callout.Root color="orange" size="1" variant="soft">
-          <Callout.Text>
+        <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
             GEMINI_API_KEY / GOOGLE_API_KEY is not set in .env. The Gemini ADK engine cannot run
             until a key is configured.
-          </Callout.Text>
-        </Callout.Root>
+          </div>
       ) : null}
 
       {saveNotice ? (
-        <Callout.Root color="green" size="1" variant="soft">
-          <Callout.Text>{saveNotice}</Callout.Text>
-        </Callout.Root>
+        <div role="status" className="rounded-lg border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-900 dark:text-green-100">{saveNotice}</div>
       ) : null}
 
       <section className="mc-pipeline-section">
-        <Text size="2" weight="bold" className="mb-2 block">
+        <span className="font-semibold mb-2 block">
           Engine
-        </Text>
-        <Flex gap="2" wrap="wrap" align="end">
+        </span>
+        <div className="flex gap-2 flex-wrap items-end">
           <label className="mc-pipeline-field">
-            <Text size="1" color="gray">Default Gemini model</Text>
-            <TextField.Root
-              size="2"
+            <span>Default Gemini model</span>
+            <Input
+              size="default"
               value={defaultModelDraft}
               onChange={(e) => setDefaultModelDraft(e.target.value)}
               placeholder="gemini-2.5-flash"
             />
           </label>
-          <Button size="2" disabled={saving} onClick={() => void saveEngineSettings()}>
+          <Button size="default" disabled={saving} onClick={() => void saveEngineSettings()}>
             Save model
           </Button>
-        </Flex>
-        <Text size="1" color="gray" className="mt-2 block">
+        </div>
+        <span className="mt-2 block">
           Max agent iterations (engine): {engine?.max_iterations ?? '—'} · Schema v
           {engine?.schema_version ?? profile.version}
-        </Text>
+        </span>
       </section>
 
       <section className="mc-pipeline-section">
-        <Text size="2" weight="bold" className="mb-2 block">
+        <span className="font-semibold mb-2 block">
           Topology {activePersonaId != null ? '(this persona)' : '(global default)'}
-        </Text>
-        <Text size="1" color="gray" className="mb-3 block">
+        </span>
+        <span className="mb-3 block">
           {activePersonaId == null
             ? 'Select a persona to edit a per-persona topology. Saving without a persona updates the global default.'
             : usesDefault
               ? 'This persona inherits the global topology. Saving creates a persona override.'
               : 'This persona has a custom topology override.'}
-        </Text>
+        </span>
 
-        <Flex gap="2" wrap="wrap" className="mb-3">
-          <Button size="2" disabled={saving} onClick={() => void saveTopology()}>
+        <div className="flex gap-2 flex-wrap mb-3">
+          <Button size="default" disabled={saving} onClick={() => void saveTopology()}>
             {saving ? 'Saving…' : 'Save topology'}
           </Button>
           <Button
-            size="2"
-            variant="soft"
+            size="default"
+            variant="secondary"
             disabled={saving}
             onClick={() => void saveTopology({ resetDefaults: true })}
           >
@@ -214,8 +214,8 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
           </Button>
           {activePersonaId != null && !usesDefault ? (
             <Button
-              size="2"
-              variant="soft"
+              size="default"
+              variant="secondary"
               disabled={saving}
               onClick={() => void saveTopology({ clearPersonaOverride: true })}
             >
@@ -223,7 +223,7 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
             </Button>
           ) : null}
           <Button
-            size="2"
+            size="default"
             variant="ghost"
             disabled={saving}
             onClick={() => {
@@ -237,10 +237,10 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
           >
             Add agent
           </Button>
-        </Flex>
+        </div>
 
         <label className="mc-pipeline-field mb-3">
-          <Text size="1" color="gray">Root agent</Text>
+          <span>Root agent</span>
           <select
             className="mc-pipeline-select"
             value={profile.root_agent_id}
@@ -255,9 +255,9 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
         </label>
 
         <label className="mc-pipeline-field mb-3">
-          <Text size="1" color="gray">Topology default model</Text>
-          <TextField.Root
-            size="1"
+          <span>Topology default model</span>
+          <Input
+            size="sm"
             value={profile.default_model}
             onChange={(e) =>
               updateProfile((p) => ({ ...p, default_model: e.target.value }))
@@ -265,26 +265,26 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
           />
         </label>
 
-        <Flex direction="column" gap="3">
+        <div className="flex flex-col gap-3">
           {profile.agents.map((agent, index) => (
             <div key={agent.id} className="mc-pipeline-phase-card">
-              <Flex align="center" justify="between" gap="2" wrap="wrap">
-                <Flex align="center" gap="2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
                   <Switch
-                    size="1"
+                    size="sm"
                     checked={agent.enabled}
                     onCheckedChange={(checked) => updateAgent(index, { enabled: checked })}
                   />
-                  <Text size="2" weight="medium">
+                  <span className="font-medium">
                     {agent.label || agent.id}
-                  </Text>
-                  <Text size="1" color="gray">
+                  </span>
+                  <span>
                     ({agent.kind})
-                  </Text>
-                </Flex>
-                <Flex gap="2">
+                  </span>
+                </div>
+                <div className="flex gap-2">
                   <Button
-                    size="1"
+                    size="sm"
                     variant="ghost"
                     onClick={() =>
                       setExpandedAgent((cur) => (cur === agent.id ? null : agent.id))
@@ -293,9 +293,8 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
                     {expandedAgent === agent.id ? 'Collapse' : 'Expand'}
                   </Button>
                   <Button
-                    size="1"
-                    variant="ghost"
-                    color="red"
+                    size="sm"
+                    variant="destructive"
                     disabled={profile.agents.length <= 1}
                     onClick={() =>
                       updateProfile((p) => {
@@ -309,30 +308,30 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
                   >
                     Remove
                   </Button>
-                </Flex>
-              </Flex>
+                </div>
+              </div>
 
               {expandedAgent === agent.id ? (
-                <Flex direction="column" gap="2" mt="3">
-                  <Flex gap="2" wrap="wrap">
+                <div className="flex flex-col gap-2 mt-3">
+                  <div className="flex gap-2 flex-wrap">
                     <label className="mc-pipeline-field">
-                      <Text size="1" color="gray">Id</Text>
-                      <TextField.Root
-                        size="1"
+                      <span>Id</span>
+                      <Input
+                        size="sm"
                         value={agent.id}
                         onChange={(e) => updateAgent(index, { id: e.target.value })}
                       />
                     </label>
                     <label className="mc-pipeline-field">
-                      <Text size="1" color="gray">Label</Text>
-                      <TextField.Root
-                        size="1"
+                      <span>Label</span>
+                      <Input
+                        size="sm"
                         value={agent.label}
                         onChange={(e) => updateAgent(index, { label: e.target.value })}
                       />
                     </label>
                     <label className="mc-pipeline-field">
-                      <Text size="1" color="gray">Kind</Text>
+                      <span>Kind</span>
                       <select
                         className="mc-pipeline-select"
                         value={agent.kind}
@@ -348,17 +347,17 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
                       </select>
                     </label>
                     <label className="mc-pipeline-field">
-                      <Text size="1" color="gray">Model (empty = topology default)</Text>
-                      <TextField.Root
-                        size="1"
+                      <span>Model (empty = topology default)</span>
+                      <Input
+                        size="sm"
                         value={agent.model}
                         onChange={(e) => updateAgent(index, { model: e.target.value })}
                       />
                     </label>
                     <label className="mc-pipeline-field">
-                      <Text size="1" color="gray">Max iterations</Text>
-                      <TextField.Root
-                        size="1"
+                      <span>Max iterations</span>
+                      <Input
+                        size="sm"
                         type="number"
                         value={String(agent.max_iterations ?? '')}
                         onChange={(e) =>
@@ -371,9 +370,9 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
                       />
                     </label>
                     <label className="mc-pipeline-field">
-                      <Text size="1" color="gray">Output key</Text>
-                      <TextField.Root
-                        size="1"
+                      <span>Output key</span>
+                      <Input
+                        size="sm"
                         value={agent.output_key ?? ''}
                         onChange={(e) =>
                           updateAgent(index, {
@@ -382,13 +381,13 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
                         }
                       />
                     </label>
-                  </Flex>
+                  </div>
                   <label className="mc-pipeline-field">
-                    <Text size="1" color="gray">
+                    <span>
                       Sub-agents (comma-separated ids)
-                    </Text>
-                    <TextField.Root
-                      size="1"
+                    </span>
+                    <Input
+                      size="sm"
                       value={agent.sub_agents.join(', ')}
                       onChange={(e) =>
                         updateAgent(index, {
@@ -401,26 +400,25 @@ export function SettingsGeminiAdkPanel({ api, onError, activePersonaId }: Props)
                     />
                   </label>
                   <label className="mc-pipeline-field">
-                    <Text size="1" color="gray">Instruction</Text>
-                    <TextArea
-                      size="1"
+                    <span>Instruction</span>
+                    <Textarea
                       rows={4}
                       value={agent.instruction}
                       onChange={(e) => updateAgent(index, { instruction: e.target.value })}
                     />
                   </label>
-                </Flex>
+                </div>
               ) : null}
             </div>
           ))}
-        </Flex>
+        </div>
       </section>
 
       {defaults ? (
-        <Text size="1" color="gray">
+        <span>
           Defaults available via Reset to defaults. Schema version {profile.version}.
-        </Text>
+        </span>
       ) : null}
-    </Flex>
+    </div>
   )
 }

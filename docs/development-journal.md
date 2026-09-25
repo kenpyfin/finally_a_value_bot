@@ -27,6 +27,94 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-25 — Fix queue dialog blank page after shadcn migration
+
+- **Area:** web UI / queue / dialogs
+- **Summary:** Queue dialog crashed into a blank page when opened. Fixed by always mounting shadcn `DialogContent` (controlled `open` only), removing the broken TanStack `DataTable`/`getRowId` path from the queue view (plain HTML tables for runs + background jobs), and applying the same DialogContent mount fix to other dialogs that used `{open ? <DialogContent/> : null}`.
+- **Rationale:** Conditional `DialogContent` under the new Radix Dialog portal left an empty/broken surface; `DataTable` also unwrapped `row.original` incorrectly for TanStack’s `getRowId`, which could throw when rows were present.
+- **Key files / symbols:** `web/src/app/dialogs/queue-dialog.tsx`; other `app/dialogs/*-dialog.tsx`; `web/src/components/data-table.tsx` (`getRowId` corrected for future use).
+- **Follow-ups:** Reintroduce DataTable for queue once typed against TanStack Table v9 legacy APIs and covered by a smoke test.
+
+### 2026-09-25 — Web UI overhaul follow-ups (CSS prune, props, Streamdown lazy)
+
+- **Area:** web UI / styles / settings / markdown
+- **Summary:** Removed leftover Radix Themes `.rt-*` CSS, unused history-loading / persona-delete / sheet-close rules, and obsolete `.mc-sheet.rt-DialogContent` selectors. Fixed invalid migration props (`Separator size`, `Badge size/color`, `Textarea size`, `Button color`). Streamdown loads via `React.lazy` with a plain-text Suspense fallback; mermaid controls disabled.
+- **Rationale:** Finish overhaul follow-ups: dead CSS from Themes era, DOM props that only worked on Radix Themes components, and defer the ~370KB Streamdown chunk until a message renders.
+- **Key files / symbols:** `web/src/styles.css`; `settings-hooks-skills.tsx` (`StatusBadge`); `session-sidebar.tsx`; `agent-history-dialog.tsx`; `settings-gemini-adk.tsx`; `markdown-stream.tsx`.
+- **Follow-ups:** Further `.mc-*` prune as screens move fully to Tailwind utilities; optional `@streamdown/code` if syntax highlighting is desired later.
+
+### 2026-09-24 — Web UI design overhaul (phased, complete)
+
+- **Area:** web UI / design system / shell / thread / settings / ops
+- **Summary:** Full phased overhaul: shadcn/ui + token bridge (`--mc-*` ↔ shadcn), Geist/JetBrains Mono, Lucide icons, ⌘K palette, Sonner toasts, resizable thread/subthread, Streamdown + agent blocks, split `app/dialogs/`, DataTable queue, token-driven xterm, removal of `@radix-ui/themes` and `@assistant-ui/react-ui` (local `aui-thread.tsx`). See also same-day entries below for migration slices. Design rules: [`design-system.md`](design-system.md).
+- **Rationale:** Operator cockpit needed a maintainable design system without Radix Themes’ locked look and huge CSS chunk.
+- **Key files / symbols:** `docs/design-system.md`; `web/src/styles.css`; `web/src/components/ui/*`; `command-palette.tsx`; `aui-thread.tsx`; `markdown-stream.tsx`; `agent-blocks.tsx`; `app/dialogs/*`; `lib/xterm-theme.ts`; `lib/thread-ui-mode.ts`.
+- **Follow-ups:** Done 2026-09-25 (CSS prune, invalid props, Streamdown lazy-load).
+
+### 2026-09-23 — Web UI: drop `@assistant-ui/react-ui` (local thread primitives)
+
+- **Area:** web UI / thread
+- **Summary:** Replaced `@assistant-ui/react-ui` (`Thread`, `Composer`, messages, `makeMarkdownText`, `BranchPicker`) with `web/src/components/aui-thread.tsx` built on `@assistant-ui/react` + `@assistant-ui/react-markdown` / Streamdown. Layout CSS vendored into `web/src/aui-layout.css`; removed react-ui stylesheet import from `App.tsx`. Uninstalled `@assistant-ui/react-ui` and `@radix-ui/themes`.
+- **Rationale:** Remove unused Radix Themes peer and shrink vendor CSS while preserving `.aui-*` hooks, scroll anchoring, and `finally-a-value-bot_thread_ui` legacy vs next markdown paths.
+- **Key files / symbols:** `components/aui-thread.tsx`, `components/thread-pane.tsx`, `aui-layout.css`, `vite.config.ts` (`vendor-streamdown` chunk).
+- **Follow-ups:** None required; `.rt-*` trim done 2026-09-25.
+
+### 2026-09-23 — Web UI: complete `@radix-ui/themes` → shadcn/ui migration
+
+- **Area:** web UI / App shell / settings / dialogs / pickers
+- **Summary:** Removed all `@radix-ui/themes` imports from `web/src` (including `Theme` wrapper and `styles.css` in `App.tsx`). Replaced with `@/components/ui/*` (Button, Dialog, Select, Tabs, Switch, Checkbox, ScrollArea, DropdownMenu, etc.) and Tailwind layout primitives; callouts use bordered status panels.
+- **Rationale:** Finish Phase 5 of the shadcn migration; theming stays on `--mc-*` / `data-ui-theme` without Radix Themes runtime.
+- **Key files / symbols:** `app/App.tsx`, `app/AppHeader.tsx`, `app/dialogs/*`, `components/settings-*.tsx`, `session-picker.tsx`, `side-chats-picker.tsx`, `inbox-panel.tsx`, `ops-ui.tsx`, `cockpit-bar.tsx`, `session-sidebar.tsx`, `error-banner.tsx`, `bulletin-strip.tsx`, `initial-run-prompt-view.tsx`.
+- **Follow-ups:** Invalid Theme props cleaned 2026-09-25.
+
+### 2026-09-23 — Web UI phases 2–4 (thread, dialogs split, shadcn migration start)
+
+- **Area:** web UI / thread / dialogs / settings / terminal
+- **Summary:** Thread pane supports `localStorage` flag `finally-a-value-bot_thread_ui` (`legacy` | `next`, default `next`): `next` uses Streamdown markdown and shadcn agent tool cards. `AppDialogs` split into `web/src/app/dialogs/*` with thin orchestrator; confirm/new-persona/auth dialogs on shadcn; queue desktop table uses `@tanstack/react-table` legacy + `DataTable`. Terminal xterm theme reads `--mc-*` tokens.
+- **Rationale:** Presentation-only overhaul aligned with shadcn/tokens; keep assistant-ui thread behavior and scroll logic unchanged.
+- **Key files / symbols:** `markdown-stream.tsx`, `agent-blocks.tsx`, `thread-ui-mode.ts`, `app/dialogs/*.tsx`, `data-table.tsx`, `xterm-theme.ts`, `settings-runtime.tsx`, `settings-persona.tsx`.
+- **Follow-ups:** Phase 5 — migrate remaining `@radix-ui/themes` in settings panels, inbox, session/side-chats pickers, and dialog shells to shadcn Dialog.
+
+### 2026-09-24 — Schedules dialog width and overflow
+
+- **Area:** web UI / dialogs
+- **Summary:** Removed the default `sm:max-w-sm` from shared `DialogContent` (it was overriding every dialog’s larger `max-w-[…]` on desktop). Schedules now opens at up to 920px with a viewport max-height, scrollable list, and stacked rows so long prompts/paths wrap instead of stretching the panel sideways.
+- **Rationale:** `cn`/`twMerge` cannot drop a conflicting `sm:` variant when the override is unprefixed, so operator dialogs stayed ~384px wide while list rows with shell paths blew past 10k px.
+- **Key files / symbols:** `web/src/components/ui/dialog.tsx` `DialogContent`; `web/src/app/dialogs/schedules-dialog.tsx`.
+- **Follow-ups:** Other operator dialogs inherit the wider default automatically; spot-check Queue / Settings / Artifacts on a large viewport.
+
+### 2026-09-23 — Cockpit launcher, bulletin stack, bookmark cards
+
+- **Area:** web UI / header / bulletin / cockpit
+- **Summary:** Desktop header uses the same **Cockpit** launcher as mobile (icon + label + busy badge) instead of the text status chip. Bulletin strip is a single stacked column (label+title, then preview); the separate Show full button is gone — click the bar to expand. Cockpit bookmarks are larger multi-line cards with a trash control; new bookmark previews store up to 480 characters.
+- **Rationale:** Status-chip vs mobile launcher mismatched the same control; side-by-side title/preview wasted horizontal space and duplicated the expand affordance; chip bookmarks truncated away the useful context.
+- **Key files / symbols:** `AppHeader` cockpit launch; `BulletinStrip` stacked layout; `CockpitBar` bookmark cards + `onRemoveBookmark`; `truncate_chars(..., 480)` in `api_persona_bookmarks_post`.
+- **Follow-ups:** Existing bookmarks keep their shorter stored preview until re-bookmarked.
+
+### 2026-09-23 — Persona sidebar and dialog polish
+
+- **Area:** web UI / sidebar / dialogs
+- **Summary:** Persona list no longer scrolls sideways; long names truncate with a tooltip. New persona uses a Radix dialog with duplicate/reserved-name validation instead of `window.prompt`. Integrations bot-instance delete uses `useConfirmDialog` instead of `window.confirm`. Removed the duplicate cockpit launcher from the bulletin strip (the header status chip and mobile header button already open it).
+- **Rationale:** Radix Themes sets `.rt-ScrollAreaViewport > * { width: fit-content }`, and the default `scrollbars="both"` let the widest row widen the list; the name's `truncate` sat inside an unconstrained `inline-flex`. Native prompt/confirm dialogs broke theme and focus handling.
+- **Key files / symbols:** `.mc-persona-list` in `styles.css`; `SessionSidebar`; `NewPersonaDialog`; `use-persona-session.onCreatePersona(name)`; `settings-integrations.removeBotInstance`.
+- **Follow-ups:** None.
+
+### 2026-09-23 — Persona rename/delete live in Settings
+
+- **Area:** web UI / settings / personas
+- **Summary:** Sidebar persona rows are select-only (plus **+ New**). Rename and delete for the active persona live under **Settings → Overview → Active persona**, backed by `POST /api/personas/rename` and the existing delete API. The reserved `default` persona cannot be renamed or deleted.
+- **Rationale:** Destructive/edit controls next to every sidebar row were easy to miss or tap by accident after the hover-reveal pass; Settings already owns persona-scoped configuration.
+- **Key files / symbols:** `Database::rename_persona`; `api_personas_rename`; `SettingsPersonaPanel`; `use-persona-session.onRenamePersona`; sidebar delete removed from `SessionSidebar`.
+- **Follow-ups:** None.
+
+### 2026-09-23 — Cockpit / bulletin UI makeover
+
+- **Area:** web UI / cockpit / settings / mobile
+- **Summary:** Bulletin focus is always visible in an in-flow strip under the header. The cockpit is a slim session-status panel (memo + bookmarks + queue) opened from the strip on desktop or a bottom sheet on mobile. Chat context depth and dense delivery moved to Settings → Agent engine (“Run context”). Side-chat “Add to main chat”, persona delete, and sidebar toggle got interaction polish.
+- **Rationale:** The old floating cockpit hid the bulletin, buried persona knobs under session status, and reflowed/jittered on mobile scroll. Settings already owned persona-scoped engine config.
+- **Key files / symbols:** `BulletinStrip`, `MobileSheet`, slimmed `CockpitBar`, `SettingsRunContextPanel`; `App.tsx` strip wiring; `IconSidebar`; `.mc-bulletin-strip` / `.mc-sheet` / `.mc-subthread-promote` / `.mc-persona-delete` in `styles.css`.
+- **Follow-ups:** Optional desktop keyboard shortcut to open cockpit; verify Radix Dialog bottom-sheet animation on older iOS Safari.
+
 ### 2026-09-21 — Promote side-chat assistant reply to main timeline
 
 - **Area:** web UI / side chat

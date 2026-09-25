@@ -1,5 +1,6 @@
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogClose } from '@/components/ui/dialog'
 import React from 'react'
-import { Button, Dialog, Flex, Text } from '@radix-ui/themes'
 import type { InstallationStatus, QueueLane } from '../types'
 
 export type CockpitStatusChipProps = {
@@ -85,13 +86,13 @@ export function MobileOpsSheet({
   }
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Content maxWidth="400px" className="mc-mobile-ops-sheet">
-        <Dialog.Title>Operator tools</Dialog.Title>
-        <Dialog.Description size="2" color="gray" mb="3">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="mc-mobile-ops-sheet max-w-[400px]">
+        <DialogTitle>Operator tools</DialogTitle>
+        <DialogDescription className="mb-3">
           Queue, schedules, memory, and diagnostics.
-        </Dialog.Description>
-        <Flex direction="column" gap="2">
+        </DialogDescription>
+        <div className="flex flex-col gap-2">
           <button
             type="button"
             className="mc-inbox-launch mc-inbox-launch--sheet cursor-pointer"
@@ -105,44 +106,44 @@ export function MobileOpsSheet({
               </span>
             ) : null}
           </button>
-          <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenQueue)}>
+          <Button variant="secondary" className="cursor-pointer justify-start" onClick={pick(onOpenQueue)}>
             Queue
           </Button>
-          <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenSchedules)}>
+          <Button variant="secondary" className="cursor-pointer justify-start" onClick={pick(onOpenSchedules)}>
             Schedules
           </Button>
-          <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenPrinciples)}>
+          <Button variant="secondary" className="cursor-pointer justify-start" onClick={pick(onOpenPrinciples)}>
             Principles
           </Button>
-          <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenArtifacts)}>
+          <Button variant="secondary" className="cursor-pointer justify-start" onClick={pick(onOpenArtifacts)}>
             Artifacts
           </Button>
           {terminalAvailable && onOpenTerminal ? (
-            <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenTerminal)}>
+            <Button variant="secondary" className="cursor-pointer justify-start" onClick={pick(onOpenTerminal)}>
               Terminal
             </Button>
           ) : null}
-          <Button variant="soft" className="cursor-pointer justify-start" onClick={pick(onOpenMemory)}>
+          <Button variant="secondary" className="cursor-pointer justify-start" onClick={pick(onOpenMemory)}>
             Memory
           </Button>
           <Button
-            variant="soft"
+            variant="secondary"
             className="cursor-pointer justify-start"
             disabled={agentHistoryDisabled}
             onClick={pick(onOpenAgentHistory)}
           >
             Last agent run
           </Button>
-        </Flex>
-        <Flex justify="end" mt="4">
-          <Dialog.Close>
-            <Button variant="soft" color="gray">
+        </div>
+        <div className="flex justify-end mt-4">
+          <DialogClose>
+            <Button variant="outline">
               Close
             </Button>
-          </Dialog.Close>
-        </Flex>
-      </Dialog.Content>
-    </Dialog.Root>
+          </DialogClose>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -152,6 +153,7 @@ export type ShortcutsDialogProps = {
 }
 
 const SHORTCUTS = [
+  { keys: 'Cmd/Ctrl + K', action: 'Open command palette' },
   { keys: '?', action: 'Show keyboard shortcuts' },
   { keys: '/', action: 'Focus message composer' },
   { keys: 'Esc', action: 'Dismiss quoted reply' },
@@ -161,28 +163,28 @@ const SHORTCUTS = [
 
 export function ShortcutsDialog({ open, onOpenChange }: ShortcutsDialogProps) {
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Content maxWidth="440px">
-        <Dialog.Title>Keyboard shortcuts</Dialog.Title>
-        <Dialog.Description size="2" color="gray" mb="3">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-[440px]">
+        <DialogTitle>Keyboard shortcuts</DialogTitle>
+        <DialogDescription className="mb-3">
           Desktop only. Composer must be focused for send shortcut.
-        </Dialog.Description>
+        </DialogDescription>
         <ul className="mc-shortcuts-list">
           {SHORTCUTS.map((row, i) => (
             <li key={`${row.keys}-${i}`} className="mc-shortcuts-row">
               <kbd className="mc-shortcuts-kbd">{row.keys}</kbd>
-              <Text size="2">{row.action}</Text>
+              <span>{row.action}</span>
             </li>
           ))}
         </ul>
-        <Flex justify="end" mt="4">
-          <Dialog.Close>
-            <Button variant="soft" color="gray">
+        <div className="flex justify-end mt-4">
+          <DialogClose>
+            <Button variant="outline">
               Close
             </Button>
-          </Dialog.Close>
-        </Flex>
-      </Dialog.Content>
-    </Dialog.Root>
+          </DialogClose>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }

@@ -1,5 +1,5 @@
 import React from 'react'
-import { Button, Text } from '@radix-ui/themes'
+import { Button } from '@/components/ui/button'
 
 export type EmptyStateProps = {
   title: string
@@ -18,16 +18,12 @@ export function EmptyState({
 }: EmptyStateProps) {
   return (
     <div className={`mc-empty-state ${className ?? ''}`.trim()}>
-      <Text size="2" weight="medium" className="block text-[color:var(--mc-text-primary)]">
-        {title}
-      </Text>
+      <span className="block text-sm font-medium text-[color:var(--mc-text-primary)]">{title}</span>
       {description ? (
-        <Text size="1" color="gray" className="mt-1 block">
-          {description}
-        </Text>
+        <span className="mt-1 block text-xs text-muted-foreground">{description}</span>
       ) : null}
       {actionLabel && onAction ? (
-        <Button size="1" variant="soft" className="mt-3 cursor-pointer" onClick={onAction}>
+        <Button variant="secondary" size="sm" className="mt-3 cursor-pointer" onClick={onAction}>
           {actionLabel}
         </Button>
       ) : null}

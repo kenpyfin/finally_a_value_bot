@@ -1,4 +1,13 @@
 @import "tailwindcss";
+@source "../node_modules/streamdown/dist/*.js";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "@fontsource/jetbrains-mono/700.css";
+
+@custom-variant dark (&:is(.dark *));
 
 html,
 body,
@@ -12,14 +21,7 @@ body {
   margin: 0;
   min-height: 100%;
   color: var(--mc-text-primary);
-  font-family:
-    "Instrument Sans",
-    "SF Pro Text",
-    "SF Pro Display",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--font-sans);
   font-optical-sizing: auto;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -27,6 +29,7 @@ body {
 }
 
 :root {
+  /* Product tokens (source of truth). Dark-first defaults. */
   --mc-bg-main: #02110d;
   --mc-bg-sidebar: #03110d;
   --mc-bg-panel: #071a14;
@@ -39,7 +42,44 @@ body {
   --mc-surface-elevated: #071a14;
   --mc-accent: #34d399;
   --mc-accent-hsl: 145 63% 52%;
-  --mc-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --mc-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  --mc-destructive: #ef4444;
+  --mc-radius: 0.5rem;
+
+  /* shadcn tokens — bridged from --mc-* so both systems share one palette */
+  --background: var(--mc-bg-main);
+  --foreground: var(--mc-text-primary);
+  --card: var(--mc-bg-panel);
+  --card-foreground: var(--mc-text-primary);
+  --popover: var(--mc-bg-panel);
+  --popover-foreground: var(--mc-text-primary);
+  --primary: var(--mc-accent);
+  --primary-foreground: #02110d;
+  --secondary: var(--mc-bg-sidebar);
+  --secondary-foreground: var(--mc-text-primary);
+  --muted: color-mix(in srgb, var(--mc-bg-panel) 80%, var(--mc-border-soft));
+  --muted-foreground: var(--mc-text-muted);
+  --accent: color-mix(in srgb, var(--mc-accent) 18%, var(--mc-bg-panel));
+  --accent-foreground: var(--mc-text-primary);
+  --destructive: var(--mc-destructive);
+  --border: var(--mc-border-soft);
+  --input: var(--mc-border-strong);
+  --ring: var(--mc-accent);
+  --chart-1: var(--mc-accent);
+  --chart-2: var(--mc-text-muted);
+  --chart-3: var(--mc-text-faint);
+  --chart-4: var(--mc-border-strong);
+  --chart-5: var(--mc-border-soft);
+  --radius: var(--mc-radius);
+  --sidebar: var(--mc-bg-sidebar);
+  --sidebar-foreground: var(--mc-text-primary);
+  --sidebar-primary: var(--mc-accent);
+  --sidebar-primary-foreground: #02110d;
+  --sidebar-accent: color-mix(in srgb, var(--mc-accent) 14%, var(--mc-bg-sidebar));
+  --sidebar-accent-foreground: var(--mc-text-primary);
+  --sidebar-border: var(--mc-border-soft);
+  --sidebar-ring: var(--mc-accent);
 }
 
 html:not(.dark) {
@@ -53,6 +93,9 @@ html:not(.dark) {
   --mc-text-faint: #94a3b8;
   --mc-surface-main: #f8fafc;
   --mc-surface-elevated: #ffffff;
+  --mc-destructive: #dc2626;
+  --primary-foreground: #ffffff;
+  --sidebar-primary-foreground: #ffffff;
 }
 
 html.dark {
@@ -493,20 +536,6 @@ html:not(.dark) .aui-assistant-action-bar-root button {
   border-radius: 8px;
 }
 
-html.dark .rt-BaseButton:where(.rt-variant-solid) {
-  background-color: var(--mc-accent);
-  border-color: color-mix(in srgb, var(--mc-accent) 66%, #15201f);
-  color: #06110f;
-}
-
-html.dark .rt-BaseButton:where(.rt-variant-solid):hover {
-  filter: brightness(1.06);
-}
-
-html.dark .rt-BaseButton:where(.rt-variant-solid):active {
-  filter: brightness(0.96);
-}
-
 html:not(.dark) .aui-root {
   --aui-thread-max-width: 100%;
 }
@@ -805,16 +834,6 @@ html:not(.dark) .aui-composer-send:hover {
 
 .mc-msg-time-right {
   padding-right: 6px;
-}
-
-.mc-msg-meta-row {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.mc-msg-meta-row-user {
-  justify-content: flex-end;
 }
 
 .mc-bookmark-btn {
@@ -1191,13 +1210,47 @@ html:not(.dark) .aui-composer-send:hover {
 }
 
 .mc-subthread-promote {
-  font-size: 0.72rem;
-  padding: 0.2rem 0.45rem;
-  opacity: 0.85;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  height: auto;
+  min-height: 2rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--mc-border-soft);
+  border-radius: 0.45rem;
+  background: color-mix(in srgb, var(--mc-bg-panel) 80%, transparent);
+  color: var(--mc-text-primary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  opacity: 0.92;
+  transition:
+    color 150ms ease,
+    opacity 150ms ease,
+    background-color 150ms ease,
+    border-color 150ms ease;
 }
 
 .mc-subthread-promote:hover:not(:disabled) {
   opacity: 1;
+  color: var(--mc-accent);
+  border-color: color-mix(in srgb, var(--mc-accent) 40%, transparent);
+  background: color-mix(in srgb, var(--mc-accent) 10%, transparent);
+}
+
+.mc-subthread-promote:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.mc-subthread-promote:focus-visible {
+  outline: 2px solid var(--mc-accent);
+  outline-offset: 2px;
 }
 
 .mc-subthread-plain,
@@ -1386,11 +1439,6 @@ html:not(.dark) .aui-composer-send:hover {
   background: color-mix(in srgb, var(--mc-text-primary, #e2e8f0) 8%, transparent);
 }
 
-.mc-msg-meta-row .aui-assistant-action-bar-root,
-.mc-msg-meta-row .aui-user-action-bar-root {
-  position: static;
-}
-
 /* Thread layout: messages scroll; composer docked below (not sticky inside scroll). */
 .mc-thread-shell {
   position: relative;
@@ -1557,11 +1605,8 @@ html:not(.dark) .mc-upload-hint {
   }
 }
 
-.mc-cockpit .mc-cockpit-bookmark-btn {
-  max-width: 20rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.mc-cockpit .mc-cockpit-bookmark-card {
+  width: 100%;
 }
 
 html:not(.dark) .mc-msg-time {
@@ -1625,33 +1670,6 @@ html:not(.dark) .mc-msg-time {
     animation: none;
     opacity: 0.7;
   }
-}
-
-.mc-history-loading {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  flex: 1;
-  gap: 12px;
-  min-height: 0;
-}
-
-.mc-history-loading-indicator {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.mc-history-loading-indicator .mc-assistant-placeholder-dot {
-  width: 8px;
-  height: 8px;
-}
-
-.mc-history-loading-text {
-  font-size: 13px;
-  color: var(--mc-text-muted);
-  letter-spacing: 0.01em;
 }
 
 .tool-card {
@@ -1974,18 +1992,6 @@ html.dark *::-webkit-scrollbar-thumb:hover {
     padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
   }
 
-  .rt-DialogScrollPadding {
-    padding-left: max(0.625rem, env(safe-area-inset-left, 0px));
-    padding-right: max(0.625rem, env(safe-area-inset-right, 0px));
-    padding-top: max(0.625rem, env(safe-area-inset-top, 0px));
-    padding-bottom: max(0.625rem, env(safe-area-inset-bottom, 0px));
-  }
-
-  .rt-DialogContent {
-    max-width: calc(100vw - 1.25rem) !important;
-    max-height: min(90dvh, 100%) !important;
-  }
-
   html.dark .aui-user-message-root,
   html:not(.dark) .aui-user-message-root {
     margin-left: auto;
@@ -2006,11 +2012,12 @@ html.dark *::-webkit-scrollbar-thumb:hover {
     max-width: 100%;
   }
 
-  .mc-cockpit-bookmark-btn {
-    max-width: min(100%, 18rem);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .mc-cockpit-bookmark-card {
+    width: 100%;
+  }
+
+  .mc-cockpit-bookmark-preview {
+    -webkit-line-clamp: 6;
   }
 
   .mc-msg-meta-row-desktop {
@@ -2054,6 +2061,14 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   .mc-bookmark-btn {
     min-width: 2.75rem;
     min-height: 2.75rem;
+  }
+
+  .mc-subthread-promote {
+    width: auto;
+    min-width: 0;
+    min-height: 2.75rem;
+    padding: 0.45rem 0.85rem;
+    font-size: 0.8125rem;
   }
 
   @media (hover: none) {
@@ -2302,8 +2317,7 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   max-width: 13.75rem;
 }
 
-.mc-session-picker-btn,
-.mc-session-picker .rt-BaseButton {
+.mc-session-picker-btn {
   min-height: 2.1rem;
   min-width: 2.1rem;
   color: var(--mc-text-muted);
@@ -2468,8 +2482,7 @@ html.dark *::-webkit-scrollbar-thumb:hover {
     min-height: 2.5rem;
   }
 
-  .mc-session-picker-btn,
-  .mc-session-picker .rt-BaseButton {
+  .mc-session-picker-btn {
     min-height: 2.5rem;
     min-width: 2.5rem;
   }
@@ -2652,4 +2665,394 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   border: 1px solid var(--mc-border-soft, var(--gray-6));
   background: var(--mc-bg-input, var(--color-background));
   color: var(--mc-text, inherit);
+}
+
+/* Bulletin strip: always-visible focus under the header (fixed height on mobile). */
+.mc-bulletin-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  min-height: 2.5rem;
+  padding: 0.35rem 0.15rem;
+  border-bottom: 1px solid var(--mc-border-soft);
+  background: color-mix(in srgb, var(--mc-bg-panel) 92%, transparent);
+}
+
+.mc-bulletin-strip[data-expanded='true'] {
+  height: auto;
+  min-height: 2.5rem;
+}
+
+.mc-bulletin-strip-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.2rem;
+  border: 0;
+  background: transparent;
+  padding: 0.15rem 0.15rem;
+  min-height: 2.25rem;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.mc-bulletin-strip-main:focus-visible {
+  outline: 2px solid var(--mc-accent);
+  outline-offset: 2px;
+  border-radius: 0.35rem;
+}
+
+.mc-bulletin-strip-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.mc-bulletin-strip-label {
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--mc-text-muted);
+}
+
+.mc-bulletin-strip-title {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--mc-text-primary);
+}
+
+.mc-bulletin-strip-chevron {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  color: var(--mc-text-muted);
+  line-height: 1;
+}
+
+.mc-bulletin-strip-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
+  line-height: 1.35;
+  color: var(--mc-text-muted);
+}
+
+.mc-bulletin-strip-body {
+  min-width: 0;
+  max-height: min(40vh, 320px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--mc-text-primary);
+  padding-top: 0.15rem;
+}
+
+.mc-bulletin-strip-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+  padding-top: 0.1rem;
+}
+
+.mc-bulletin-strip-cockpit {
+  min-height: 2rem;
+  padding: 0 0.5rem;
+  font-size: 0.75rem;
+}
+
+.mc-cockpit-dropdown {
+  box-shadow: 0 8px 24px color-mix(in srgb, #000 18%, transparent);
+}
+
+.mc-cockpit-memo {
+  font-size: 0.75rem;
+}
+
+.mc-cockpit-bookmark-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.mc-cockpit-bookmark-card {
+  display: flex;
+  align-items: stretch;
+  gap: 0.35rem;
+  border: 1px solid var(--mc-border-soft);
+  border-radius: 0.55rem;
+  background: var(--mc-bg-panel);
+  overflow: hidden;
+}
+
+.mc-cockpit-bookmark-jump {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  border: 0;
+  background: transparent;
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  cursor: pointer;
+  color: var(--mc-text-primary);
+}
+
+.mc-cockpit-bookmark-jump:hover {
+  background: color-mix(in srgb, var(--mc-accent) 8%, transparent);
+}
+
+.mc-cockpit-bookmark-role {
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--mc-text-muted);
+}
+
+.mc-cockpit-bookmark-preview {
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: var(--mc-text-primary);
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mc-cockpit-bookmark-note {
+  font-size: 0.72rem;
+  color: var(--mc-text-muted);
+  font-style: italic;
+}
+
+.mc-cockpit-bookmark-delete {
+  flex-shrink: 0;
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  min-height: 2.75rem;
+  border: 0;
+  border-left: 1px solid var(--mc-border-soft);
+  background: transparent;
+  color: var(--mc-text-muted);
+  cursor: pointer;
+}
+
+.mc-cockpit-bookmark-delete:hover {
+  color: #f87171;
+  background: color-mix(in srgb, #f87171 12%, transparent);
+}
+
+.mc-cockpit-bookmark-delete:focus-visible {
+  outline: 2px solid var(--mc-accent);
+  outline-offset: -2px;
+}
+
+/* Persona list: keep rows within sidebar width so long names truncate. */
+.mc-persona-list {
+  overflow-x: hidden;
+}
+
+.mc-persona-list > * {
+  min-width: 0;
+}
+
+/* Settings → Agent engine: run context blocks */
+.mc-run-context-block {
+  border: 1px solid var(--mc-border-soft);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  background: color-mix(in srgb, var(--mc-bg-panel) 70%, transparent);
+}
+
+.mc-run-context-delivery {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.mc-run-context-switch-row {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding-top: 0.15rem;
+}
+
+/* Mobile bottom sheet panel (shadcn Sheet + .mc-sheet). */
+.mc-sheet {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--mc-bg-main);
+  border-color: var(--mc-border-soft);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.mc-sheet-handle {
+  width: 2.25rem;
+  height: 0.25rem;
+  margin: 0.5rem auto 0.15rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mc-text-muted) 45%, transparent);
+  flex-shrink: 0;
+}
+
+.mc-sheet-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.85rem 0.5rem;
+  border-bottom: 1px solid var(--mc-border-soft);
+  flex-shrink: 0;
+}
+
+.mc-sheet-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--mc-text-primary);
+}
+
+.mc-sheet-description {
+  display: none;
+}
+
+.mc-sheet-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.65rem 0.25rem 1rem;
+}
+
+.mc-bulletin-sheet-body {
+  padding: 0.5rem 0.85rem 1rem;
+}
+
+@media (max-width: 767px) {
+  .mc-bulletin-strip {
+    align-items: center;
+    height: 2.5rem;
+    min-height: 2.5rem;
+    padding-top: 0;
+    padding-bottom: 0;
+    padding-left: max(0.35rem, env(safe-area-inset-left, 0px));
+    padding-right: max(0.35rem, env(safe-area-inset-right, 0px));
+  }
+
+  .mc-bulletin-strip-main {
+    min-height: 2.5rem;
+    justify-content: center;
+  }
+
+  .mc-bulletin-strip-preview,
+  .mc-bulletin-strip-body {
+    display: none;
+  }
+
+  .mc-cockpit-memo {
+    font-size: 16px;
+  }
+
+  .mc-run-context-delivery {
+    flex-direction: column;
+  }
+
+  .mc-run-context-switch-row {
+    width: 100%;
+    justify-content: flex-start;
+    padding-top: 0.35rem;
+  }
+}
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: "Geist Variable", "Instrument Sans", "SF Pro Text", system-ui, sans-serif;
+  --font-mono: var(--mc-font-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Dark appearance uses html.dark; --mc-* theme blocks already set surfaces/accent.
+   shadcn tokens stay bridged via :root aliases — no separate .dark palette needed. */
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

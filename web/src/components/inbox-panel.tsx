@@ -1,5 +1,6 @@
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogClose } from '@/components/ui/dialog'
 import React from 'react'
-import { Button, Dialog, Flex, Text } from '@radix-ui/themes'
 import type { Persona, PersonaTodo } from '../types'
 
 export type InboxUnreadItem = {
@@ -76,32 +77,32 @@ export function InboxPanel({
     appearance === 'dark' ? { borderColor: 'var(--mc-border-soft)' } : { borderColor: 'var(--gray-6)' }
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Content style={{ maxWidth: 720 }}>
-        <Dialog.Title>Inbox</Dialog.Title>
-        <Dialog.Description size="2" mb="3">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-[720px]">
+        <DialogTitle>Inbox</DialogTitle>
+        <DialogDescription className="mb-3">
           New bot messages across personas and open operator todos from conversations.
-        </Dialog.Description>
+        </DialogDescription>
 
-        <Flex align="center" justify="between" gap="3" mb="3" wrap="wrap">
-          <Text size="2" color="gray">
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+          <span>
             {unread.length} unread · {todos.length} open todos
-          </Text>
-          <Button size="1" variant="soft" disabled={loading} onClick={onRefresh}>
+          </span>
+          <Button size="sm" variant="secondary" disabled={loading} onClick={onRefresh}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </Button>
-        </Flex>
+        </div>
 
-        <Flex direction="column" gap="4">
+        <div className="flex flex-col gap-4">
           <section>
-            <Text size="2" weight="medium" className="mb-2 block">
+            <span className="font-medium mb-2 block">
               New messages
-            </Text>
+            </span>
             <div className="rounded-lg border p-3" style={borderStyle}>
               {unread.length === 0 ? (
-                <Text size="2" color="gray">
+                <span>
                   No unread bot messages.
-                </Text>
+                </span>
               ) : (
                 <ul className="list-none space-y-2">
                   {unread.map((item) => (
@@ -112,14 +113,14 @@ export function InboxPanel({
                     >
                       <div className="min-w-0 flex-1">
                         <span className="block truncate font-medium">{item.personaName}</span>
-                        <Text size="1" color="gray" className="block truncate">
+                        <span className="block truncate">
                           {sessionLabel(item.sessionId, item.sessionTitle)}
                           {item.lastBotMessageAt ? ` · ${formatWhen(item.lastBotMessageAt)}` : ' · recent'}
-                        </Text>
+                        </span>
                       </div>
                       <Button
-                        size="1"
-                        variant="soft"
+                        size="sm"
+                        variant="secondary"
                         onClick={() => {
                           onOpenTarget({
                             personaId: item.personaId,
@@ -138,14 +139,14 @@ export function InboxPanel({
           </section>
 
           <section>
-            <Text size="2" weight="medium" className="mb-2 block">
+            <span className="font-medium mb-2 block">
               Todos
-            </Text>
+            </span>
             <div className="rounded-lg border p-3" style={borderStyle}>
               {todos.length === 0 ? (
-                <Text size="2" color="gray">
+                <span>
                   No open todos. The agent can create them with add_todo.
-                </Text>
+                </span>
               ) : (
                 <ul className="list-none space-y-2">
                   {todos.map((todo) => {
@@ -159,19 +160,19 @@ export function InboxPanel({
                         style={itemBorder}
                       >
                         <div className="min-w-0 flex-1">
-                          <Text size="2" weight="medium" className="block">
+                          <span className="font-medium block">
                             {todo.title}
-                          </Text>
-                          <Text size="1" color="gray" className="block">
+                          </span>
+                          <span className="block">
                             {personaName(personas, todo.persona_id)}
                             {` · ${sessionLabel(sessionId, sessionTitle)}`}
                             {todo.source_hint ? ` · ${todo.source_hint}` : ''}
                             {todo.updated_at ? ` · ${formatWhen(todo.updated_at)}` : ''}
-                          </Text>
+                          </span>
                         </div>
                         <Button
-                          size="1"
-                          variant="soft"
+                          size="sm"
+                          variant="secondary"
                           onClick={() => {
                             onOpenTarget({
                               personaId: todo.persona_id,
@@ -183,8 +184,8 @@ export function InboxPanel({
                           Open
                         </Button>
                         <Button
-                          size="1"
-                          variant="solid"
+                          size="sm"
+                          variant="default"
                           disabled={busyTodoId === todo.id}
                           onClick={() => onCompleteTodo(todo.id)}
                         >
@@ -197,16 +198,16 @@ export function InboxPanel({
               )}
             </div>
           </section>
-        </Flex>
+        </div>
 
-        <Flex justify="end" mt="4">
-          <Dialog.Close>
-            <Button variant="soft" color="gray">
+        <div className="flex justify-end mt-4">
+          <DialogClose>
+            <Button variant="outline">
               Close
             </Button>
-          </Dialog.Close>
-        </Flex>
-      </Dialog.Content>
-    </Dialog.Root>
+          </DialogClose>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }

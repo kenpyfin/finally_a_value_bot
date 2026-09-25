@@ -1,15 +1,10 @@
+import { Button } from '@/components/ui/button'
+import { Textarea } from '@/components/ui/textarea'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectSeparator, SelectValue } from '@/components/ui/select'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '@/components/ui/dropdown-menu'
+import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogClose } from '@/components/ui/dialog'
 import React, { useCallback, useState } from 'react'
-import {
-  Button,
-  Checkbox,
-  Dialog,
-  DropdownMenu,
-  Flex,
-  IconButton,
-  Select,
-  Text,
-  TextArea,
-} from '@radix-ui/themes'
 import { ConfirmDialog } from './confirm-dialog'
 import { IconMoreVertical } from './icons'
 import type { ChatSession } from '../types'
@@ -84,36 +79,31 @@ export function SessionPicker({
   }, [activeSessionId, onDeleteSession])
 
   return (
-    <Flex
-      align="center"
-      className="mc-session-picker"
-      data-compact={compact ? 'true' : 'false'}
-      style={{ minWidth: 0 }}
-    >
-      <Select.Root
-        size="2"
+    <div className="flex items-center mc-session-picker" data-compact={compact ? 'true' : 'false'}
+      style={{ minWidth: 0 }}>
+      <Select
         value={activeSessionId ?? '__main__'}
         onValueChange={(val) => onSelectSession(val === '__main__' ? null : val)}
         disabled={loading}
       >
-        <Select.Trigger variant="ghost" className="mc-session-picker-trigger cursor-pointer">
-          {currentLabel}
-        </Select.Trigger>
-        <Select.Content position="popper" sideOffset={4}>
-          <Select.Item value="__main__">Main chat</Select.Item>
-          {sessions.length > 0 && <Select.Separator />}
+        <SelectTrigger className="mc-session-picker-trigger cursor-pointer border-0 bg-transparent shadow-none hover:bg-muted">
+          <SelectValue>{currentLabel}</SelectValue>
+        </SelectTrigger>
+        <SelectContent position="popper" sideOffset={4}>
+          <SelectItem value="__main__">Main chat</SelectItem>
+          {sessions.length > 0 && <SelectSeparator />}
           {sessions.map((s) => (
-            <Select.Item key={s.id} value={s.id}>
+            <SelectItem key={s.id} value={s.id}>
               {s.title}
               {s.mirror_main_chat ? ' · main' : ''} ({formatRelativeTime(s.last_active_at)})
-            </Select.Item>
+            </SelectItem>
           ))}
-        </Select.Content>
-      </Select.Root>
+        </SelectContent>
+      </Select>
 
       <Button
         variant="ghost"
-        size="2"
+        size="default"
         className="mc-session-picker-btn cursor-pointer"
         onClick={() => setNewDialogOpen(true)}
       >
@@ -128,36 +118,36 @@ export function SessionPicker({
       </Button>
 
       {activeSessionId && activeSession ? (
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger>
-            <IconButton
+        <DropdownMenu>
+          <DropdownMenuTrigger>
+            <Button
               variant="ghost"
-              size="2"
+              size="default"
               className="mc-session-picker-btn cursor-pointer"
               aria-label="Session actions"
             >
               <IconMoreVertical />
-            </IconButton>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Content>
-            <DropdownMenu.Item
-              color="red"
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem
+              variant="destructive"
               onSelect={() => setDeleteConfirmOpen(true)}
             >
               Delete session
-            </DropdownMenu.Item>
-          </DropdownMenu.Content>
-        </DropdownMenu.Root>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       ) : null}
 
-      <Dialog.Root open={newDialogOpen} onOpenChange={setNewDialogOpen}>
-        <Dialog.Content maxWidth="420px">
-          <Dialog.Title>New session</Dialog.Title>
-          <Dialog.Description size="2" color="gray">
+      <Dialog open={newDialogOpen} onOpenChange={setNewDialogOpen}>
+        <DialogContent className="max-w-[420px]">
+          <DialogTitle>New session</DialogTitle>
+          <DialogDescription>
             Describe a focus area to spin up context from your vault and skills.
-          </Dialog.Description>
-          <Flex direction="column" gap="3" mt="4">
-            <TextArea
+          </DialogDescription>
+          <div className="flex flex-col gap-3 mt-4">
+            <Textarea
               placeholder="e.g. Refactor the auth module to use JWT..."
               value={intentDraft}
               onChange={(e) => setIntentDraft(e.target.value)}
@@ -169,39 +159,37 @@ export function SessionPicker({
                 }
               }}
             />
-            <Text size="1" color="gray">
+            <span className="text-xs text-muted-foreground">
               Max 500 characters. Press Cmd+Enter to create.
-            </Text>
-            <Text as="label" size="2">
-              <Flex gap="2" align="start">
-                <Checkbox
-                  checked={mirrorMainChatDraft}
-                  onCheckedChange={(checked) => setMirrorMainChatDraft(checked === true)}
-                />
-                <span>
-                  Include messages in main chat
-                  <Text as="div" size="1" color="gray">
-                    Off by default — session history stays isolated unless you enable this.
-                  </Text>
+            </span>
+            <label className="flex cursor-pointer gap-2 items-start text-sm">
+              <Checkbox
+                checked={mirrorMainChatDraft}
+                onCheckedChange={(checked) => setMirrorMainChatDraft(checked === true)}
+              />
+              <span>
+                Include messages in main chat
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Off by default — session history stays isolated unless you enable this.
                 </span>
-              </Flex>
-            </Text>
-          </Flex>
-          <Flex gap="3" mt="4" justify="end">
-            <Dialog.Close>
-              <Button variant="soft" color="gray">
+              </span>
+            </label>
+          </div>
+          <div className="flex gap-3 mt-4 justify-end">
+            <DialogClose>
+              <Button variant="outline">
                 Cancel
               </Button>
-            </Dialog.Close>
+            </DialogClose>
             <Button
               onClick={() => void handleCreate()}
               disabled={!intentDraft.trim() || intentDraft.length > 500 || creating}
             >
               {creating ? 'Creating…' : 'Create session'}
             </Button>
-          </Flex>
-        </Dialog.Content>
-      </Dialog.Root>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <ConfirmDialog
         open={deleteConfirmOpen}
@@ -213,6 +201,6 @@ export function SessionPicker({
         loading={deleting}
         onConfirm={handleConfirmDelete}
       />
-    </Flex>
+    </div>
   )
 }

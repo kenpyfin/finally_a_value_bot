@@ -1,5 +1,8 @@
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from '@/components/ui/select'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Callout, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import type { LlmCatalogModel, LlmConfigResponse, LlmLiveCatalogResponse, LlmProviderOption } from '../types'
 
@@ -271,9 +274,9 @@ export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null
 
   if (!llm?.ok) {
     return (
-      <Text size="2" color="gray">
+      <span>
         Could not load LLM configuration.
-      </Text>
+      </span>
     )
   }
 
@@ -284,8 +287,8 @@ export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null
   }
 
   return (
-    <Flex direction="column" gap="3">
-      <Text size="1" color="gray">
+    <div className="flex flex-col gap-3">
+      <span>
         Put API keys in repo-root <code className="text-xs">.env</code> only (never in this UI).
         Provider and model are saved for{' '}
         {activePersonaId != null && activePersonaId > 0 ? (
@@ -298,54 +301,52 @@ export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null
         )}
         . Model lists load live from the provider API; curated cost hints are shown when the id
         matches. Thinking toggles stay shared across personas.
-      </Text>
+      </span>
 
-      <Flex direction="column" gap="2">
-        <Text size="2" weight="medium">
+      <div className="flex flex-col gap-2">
+        <span className="font-medium">
           Provider
-        </Text>
+        </span>
         {(llm.providers ?? []).length === 0 ? (
-          <Callout.Root color="orange" size="1" variant="soft">
-            <Callout.Text>
+          <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
               No provider API keys found in <code className="text-xs">.env</code>. Add keys such as{' '}
               <code className="text-xs">ANTHROPIC_API_KEY</code>,{' '}
               <code className="text-xs">OPENAI_API_KEY</code>, or{' '}
               <code className="text-xs">XAI_API_KEY</code>, then reload this page.
-            </Callout.Text>
-          </Callout.Root>
+            </div>
         ) : (
           <>
-            <Select.Root value={selectedProvider} onValueChange={onProviderChange}>
-              <Select.Trigger placeholder="Select provider" />
-              <Select.Content>
+            <Select value={selectedProvider} onValueChange={onProviderChange}>
+              <SelectTrigger placeholder="Select provider" ><SelectValue /></SelectTrigger>
+              <SelectContent>
                 {(llm.providers ?? []).map((p: LlmProviderOption) => (
-                  <Select.Item key={p.id} value={p.id}>
+                  <SelectItem key={p.id} value={p.id}>
                     {p.label}
-                  </Select.Item>
+                  </SelectItem>
                 ))}
-              </Select.Content>
-            </Select.Root>
+              </SelectContent>
+            </Select>
             {activeProviderEntry ? (
               isLocalProvider ? (
-                <Text size="1" color="green">
+                <span>
                   Local provider — no API key required.
-                </Text>
+                </span>
               ) : (
-                <Text size="1" color="green">
+                <span>
                   API key found in .env ({activeProviderEntry.api_key_env_hints.join(' or ')})
-                </Text>
+                </span>
               )
             ) : null}
           </>
         )}
-      </Flex>
+      </div>
 
       {isLocalProvider ? (
-        <Flex direction="column" gap="2">
-          <Text size="2" weight="medium">
+        <div className="flex flex-col gap-2">
+          <span className="font-medium">
             Server URL
-          </Text>
-          <TextField.Root
+          </span>
+          <Input
             placeholder={
               selectedProvider === 'ollama'
                 ? 'http://127.0.0.1:11434/v1'
@@ -354,60 +355,60 @@ export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null
             value={serverUrl}
             onChange={(e) => setServerUrl(e.target.value)}
           />
-          <Text size="1" color="gray">
+          <span>
             OpenAI-compatible API base (include <code className="text-xs">/v1</code>). Saved in the
             app database — not read from <code className="text-xs">.env</code>.
-          </Text>
-        </Flex>
+          </span>
+        </div>
       ) : null}
 
-      <Flex direction="column" gap="2">
-        <Flex align="center" justify="between" gap="3">
-          <Text size="2" weight="medium">
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-3">
+          <span className="font-medium">
             Model
-          </Text>
+          </span>
           <Button
-            size="1"
-            variant="soft"
+            size="sm"
+            variant="secondary"
             type="button"
             disabled={loadingModels || (llm.providers ?? []).length === 0}
             onClick={() => void loadLiveModels()}
           >
             {loadingModels ? 'Loading…' : 'Refresh models'}
           </Button>
-        </Flex>
+        </div>
         {!useCustom && selectedModel && catalogForProvider.some((m) => m.id === selectedModel) ? (
-          <Select.Root value={selectedModel} onValueChange={setSelectedModel}>
-            <Select.Trigger placeholder="Select model" />
-            <Select.Content>
+          <Select value={selectedModel} onValueChange={setSelectedModel}>
+            <SelectTrigger placeholder="Select model" ><SelectValue /></SelectTrigger>
+            <SelectContent>
               {catalogForProvider.filter((m) => m.id).map((m) => (
-                <Select.Item key={m.id} value={m.id}>
+                <SelectItem key={m.id} value={m.id}>
                   {catalogLabel(m)}
-                </Select.Item>
+                </SelectItem>
               ))}
-            </Select.Content>
-          </Select.Root>
+            </SelectContent>
+          </Select>
         ) : (
-          <TextField.Root
+          <Input
             placeholder="Custom model id"
             value={customModel}
             onChange={(e) => setCustomModel(e.target.value)}
           />
         )}
         {modelsNotice ? (
-          <Text size="1" color={catalogSource === 'live' ? 'green' : 'gray'}>
+          <span>
             {modelsNotice}
-          </Text>
+          </span>
         ) : (
-          <Text size="1" color="gray">
+          <span>
             {catalogSource === 'live'
               ? 'Showing live models from the provider API.'
               : 'Showing curated fallback until the provider API responds.'}
-          </Text>
+          </span>
         )}
         {llm.custom_model_allowed ? (
           <Button
-            size="1"
+            size="sm"
             variant="ghost"
             type="button"
             onClick={() => {
@@ -418,54 +419,54 @@ export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null
             {useCustom ? 'Use catalog list' : 'Use custom model id'}
           </Button>
         ) : null}
-      </Flex>
+      </div>
 
       {(useCustom ? customModel : selectedCatalog) ? (
         <div
           className="rounded-md border p-3 text-sm"
           style={{ borderColor: 'var(--gray-6)' }}
         >
-          <Text size="1" weight="bold" className="mb-1 block">
+          <span className="font-semibold mb-1 block">
             Cost reference
-          </Text>
+          </span>
           {useCustom ? (
-            <Text size="1" color="gray">
+            <span>
               Custom model - check your provider&apos;s pricing page.
-            </Text>
+            </span>
           ) : selectedCatalog ? (
-            <Flex direction="column" gap="1">
-              <Text size="1">
+            <div className="flex flex-col gap-1">
+              <span>
                 Tier: <span className="capitalize">{selectedCatalog.cost_tier}</span>
-              </Text>
-              <Text size="1" color="gray">
+              </span>
+              <span>
                 {selectedCatalog.cost_summary}
-              </Text>
-            </Flex>
+              </span>
+            </div>
           ) : null}
           {llm.cost_reference_note ? (
-            <Text size="1" color="gray" className="mt-2 block">
+            <span className="mt-2 block">
               {llm.cost_reference_note}
-            </Text>
+            </span>
           ) : null}
         </div>
       ) : null}
 
       <div className="rounded-md border p-3" style={{ borderColor: 'var(--gray-6)' }}>
-        <Text size="2" weight="bold" className="mb-1 block">
+        <span className="font-semibold mb-1 block">
           Thinking
-        </Text>
-        <Flex direction="column" gap="2">
-          <Flex align="center" justify="between" gap="3">
-            <Flex direction="column" gap="1" style={{ flex: 1 }}>
-              <Text size="2">Enable extended thinking</Text>
-              <Text size="1" color="gray">
+        </span>
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-col gap-1" style={{ flex: 1 }}>
+              <span>Enable extended thinking</span>
+              <span>
                 {thinkingSupported
                   ? 'Sends provider thinking config (Gemini thinkingLevel / thinkingBudget).'
                   : 'Currently supported for Google (Gemini API) only.'}
-              </Text>
-            </Flex>
+              </span>
+            </div>
             <Switch
-              size="2"
+              size="default"
               checked={thinkingEnabled}
               disabled={!thinkingSupported}
               onCheckedChange={(checked) => {
@@ -473,33 +474,33 @@ export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null
                 if (!checked) setShowThinking(false)
               }}
             />
-          </Flex>
-          <Flex align="center" justify="between" gap="3">
-            <Flex direction="column" gap="1" style={{ flex: 1 }}>
-              <Text size="2">Show thinking in replies</Text>
-              <Text size="1" color="gray">
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-col gap-1" style={{ flex: 1 }}>
+              <span>Show thinking in replies</span>
+              <span>
                 When enabled, reasoning is included in channel output instead of being hidden.
-              </Text>
-            </Flex>
+              </span>
+            </div>
             <Switch
-              size="2"
+              size="default"
               checked={showThinking}
               disabled={!thinkingEnabled}
               onCheckedChange={setShowThinking}
             />
-          </Flex>
-        </Flex>
+          </div>
+        </div>
       </div>
 
-      <Flex gap="2" align="center" wrap="wrap">
+      <div className="flex gap-2 items-center flex-wrap">
         <Button
-          size="2"
+          size="default"
           disabled={saving || (llm.providers ?? []).length === 0}
           onClick={() => void saveSelection()}
         >
           {saving ? 'Saving…' : 'Save provider & model'}
         </Button>
-        <Text size="1" color="gray">
+        <span>
           Active:{' '}
           <span className="font-mono">
             {llm.provider?.label ?? llm.provider?.id} / {llm.model}
@@ -510,14 +511,12 @@ export function SettingsLlmPanel({ api, onError, onSaved, activePersonaId = null
             : llm.provider_source === 'app_settings' && llm.model_source === 'app_settings'
               ? ' (saved in app)'
               : ' (auto-selected - save to confirm)'}
-        </Text>
-      </Flex>
+        </span>
+      </div>
 
       {saveNotice ? (
-        <Callout.Root color="green" size="1" variant="soft">
-          <Callout.Text>{saveNotice}</Callout.Text>
-        </Callout.Root>
+        <div role="status" className="rounded-lg border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-900 dark:text-green-100">{saveNotice}</div>
       ) : null}
-    </Flex>
+    </div>
   )
 }

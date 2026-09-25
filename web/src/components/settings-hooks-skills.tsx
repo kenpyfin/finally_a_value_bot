@@ -1,5 +1,10 @@
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Badge } from '@/components/ui/badge'
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from '@/components/ui/select'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Badge, Button, Checkbox, Flex, Select, Switch, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import type { HookDefinition, PersonaHookSkillPolicy, SkillCatalogEntry } from '../types'
 
@@ -95,6 +100,28 @@ function hookStatusLabel(
     return { text: 'Allowed', color: 'green' }
   }
   return { text: 'Available', color: 'green' }
+}
+
+const STATUS_BADGE_CLASS: Record<'gray' | 'green' | 'orange' | 'red' | 'blue', string> = {
+  gray: 'border-border text-muted-foreground',
+  green: 'border-emerald-500/40 text-emerald-600 dark:text-emerald-400',
+  orange: 'border-amber-500/40 text-amber-700 dark:text-amber-400',
+  red: 'border-destructive/40 text-destructive',
+  blue: 'border-sky-500/40 text-sky-700 dark:text-sky-400',
+}
+
+function StatusBadge({
+  text,
+  color,
+}: {
+  text: string
+  color: keyof typeof STATUS_BADGE_CLASS
+}) {
+  return (
+    <Badge variant="outline" className={STATUS_BADGE_CLASS[color]}>
+      {text}
+    </Badge>
+  )
 }
 
 function hookPayloadSummary(hook: HookDefinition): string | null {
@@ -437,29 +464,29 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
   }
 
   return (
-    <Flex direction="column" gap="3">
-      <Text size="2" weight="bold">
+    <div className="flex flex-col gap-3">
+      <span className="font-semibold">
         Persona policy {activePersonaId != null ? `(persona #${activePersonaId})` : ''}
-      </Text>
+      </span>
       {activePersonaId == null ? (
-        <Text size="1" color="gray">
+        <span>
           Select a persona to edit per-persona hook/skill availability.
-        </Text>
+        </span>
       ) : (
-        <Flex direction="column" gap="3">
-          <Text size="1" color="gray">
+        <div className="flex flex-col gap-3">
+          <span>
             Default is allow-all. Turn on restriction below, pick hooks/skills with checkboxes in
             the catalogs, then save. Clear all and save to block everything in that category.
             Hook creation and enable/disable are handled by the agent via the{' '}
             <code>create-hook</code> skill.
-          </Text>
+          </span>
 
-          <Flex direction="column" gap="1">
-            <Flex align="center" justify="between" gap="2" wrap="wrap">
-              <Text as="label" size="2">
-                <Flex align="center" gap="2">
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <label>
+                <div className="flex items-center gap-2">
                   <Switch
-                    size="1"
+                    size="sm"
                     checked={restrictHooks}
                     disabled={saving}
                     onCheckedChange={(checked) => {
@@ -470,45 +497,45 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                     }}
                   />
                   Restrict hooks to selected
-                </Flex>
-              </Text>
+                </div>
+              </label>
               {restrictHooks ? (
-                <Flex gap="2">
+                <div className="flex gap-2">
                   <Button
-                    size="1"
-                    variant="soft"
+                    size="sm"
+                    variant="secondary"
                     disabled={saving || hooks.length === 0}
                     onClick={() => setAllHookIds(true)}
                   >
                     Select all hooks
                   </Button>
                   <Button
-                    size="1"
-                    variant="soft"
+                    size="sm"
+                    variant="secondary"
                     disabled={saving}
                     onClick={() => setAllHookIds(false)}
                   >
                     Clear hooks
                   </Button>
-                </Flex>
+                </div>
               ) : null}
-            </Flex>
+            </div>
             {restrictHooks ? (
-              <Text size="1" color="gray">
+              <span>
                 {selectedHookIds.size} of {hooks.length} hooks allowed
                 {hooks.length === 0 ? ' — create hooks via agent first' : ''}
-              </Text>
+              </span>
             ) : (
-              <Text size="1" color="gray">All hooks allowed for this persona.</Text>
+              <span>All hooks allowed for this persona.</span>
             )}
-          </Flex>
+          </div>
 
-          <Flex direction="column" gap="1">
-            <Flex align="center" justify="between" gap="2" wrap="wrap">
-              <Text as="label" size="2">
-                <Flex align="center" gap="2">
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <label>
+                <div className="flex items-center gap-2">
                   <Switch
-                    size="1"
+                    size="sm"
                     checked={restrictSkills}
                     disabled={saving}
                     onCheckedChange={(checked) => {
@@ -519,79 +546,79 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                     }}
                   />
                   Restrict skills to selected
-                </Flex>
-              </Text>
+                </div>
+              </label>
               {restrictSkills ? (
-                <Flex gap="2">
+                <div className="flex gap-2">
                   <Button
-                    size="1"
-                    variant="soft"
+                    size="sm"
+                    variant="secondary"
                     disabled={saving || skills.length === 0}
                     onClick={() => setAllSkillNames(true)}
                   >
                     Select all skills
                   </Button>
                   <Button
-                    size="1"
-                    variant="soft"
+                    size="sm"
+                    variant="secondary"
                     disabled={saving}
                     onClick={() => setAllSkillNames(false)}
                   >
                     Clear skills
                   </Button>
-                </Flex>
+                </div>
               ) : null}
-            </Flex>
+            </div>
             {restrictSkills ? (
-              <Text size="1" color="gray">
+              <span>
                 {selectedSkillNames.size} of {skills.length} skills allowed
-              </Text>
+              </span>
             ) : (
-              <Text size="1" color="gray">All skills allowed for this persona.</Text>
+              <span>All skills allowed for this persona.</span>
             )}
-          </Flex>
+          </div>
 
-          <Flex gap="2" wrap="wrap">
+          <div className="flex gap-2 flex-wrap">
             <Button
-              size="1"
+              size="sm"
               disabled={saving || (!policyDirty && !restrictHooks && !restrictSkills)}
               onClick={() => void savePersonaPolicy(false)}
             >
               Save policy
             </Button>
             <Button
-              size="1"
-              variant="soft"
+              size="sm"
+              variant="secondary"
               disabled={saving}
               onClick={() => void savePersonaPolicy(true)}
             >
               Allow all (reset defaults)
             </Button>
-          </Flex>
-          <Text size="1" color="gray">
+          </div>
+          <span>
             Saved: hooks {policy?.uses_default_hooks ? 'allow-all' : 'restricted'}; skills{' '}
             {policy?.uses_default_skills ? 'allow-all' : 'restricted'}.
             {policyDirty ? ' Unsaved changes.' : ''}
-          </Text>
-        </Flex>
+          </span>
+        </div>
       )}
 
       {activePersonaId != null ? (
-        <Text as="label" size="2">
-          <Flex align="center" gap="2">
+        <label>
+          <div className="flex items-center gap-2">
             <Checkbox
-              size="1"
+              size="sm"
               checked={showAllPersonas}
               disabled={saving}
               onCheckedChange={(checked) => setShowAllPersonas(checked === true)}
             />
             Show all personas (include hooks/skills unavailable for this persona)
-          </Flex>
-        </Text>
+          </div>
+        </label>
       ) : null}
 
-      <Text size="2" weight="bold">Hooks catalog</Text>
-      <Text size="1" color="gray">
+      <span className="font-semibold">Hooks catalog</span>
+      <span>
         {activePersonaId != null
           ? showAllPersonas
             ? `Showing all ${hooks.length} hooks (${hooksAvailableCount} available for persona #${activePersonaId})`
@@ -601,18 +628,18 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
           ? ' · checkboxes when hook restriction is on'
           : ''}
         . Change lifecycle event per hook below; other fields are still managed via the agent.
-      </Text>
-      <TextField.Root
+      </span>
+      <Input
         value={hookFilter}
         placeholder="Filter hooks by name, event, action, matcher, or scope"
         onChange={(e) => setHookFilter(e.target.value)}
       />
       {hooks.length === 0 ? (
-        <Text size="1" color="gray">No hooks defined yet.</Text>
+        <span>No hooks defined yet.</span>
       ) : filteredHooks.length === 0 ? (
-        <Text size="1" color="gray">No hooks match the current filter.</Text>
+        <span>No hooks match the current filter.</span>
       ) : (
-        <Flex direction="column" gap="2" className="max-h-[420px] overflow-y-auto">
+        <div className="flex flex-col gap-2 max-h-[420px] overflow-y-auto">
           {filteredHooks.map((hook) => {
             const payloadSummary = hookPayloadSummary(hook)
             const status = hookStatusLabel(
@@ -626,15 +653,10 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
             const eventDirty = hookEventDirty(hook)
             const hookSaving = savingHookId === hook.id
             return (
-              <Flex
-                key={hook.id}
-                align="start"
-                gap="2"
-                className="rounded-md border border-[var(--gray-a6)] p-2"
-              >
+              <div className="flex items-start gap-2 rounded-md border border-[var(--gray-a6)] p-2" key={hook.id}>
                 {activePersonaId != null && restrictHooks ? (
                   <Checkbox
-                    size="1"
+                    size="sm"
                     className="mt-0.5"
                     checked={selectedHookIds.has(hook.id)}
                     disabled={saving}
@@ -643,56 +665,54 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                     }
                   />
                 ) : null}
-                <Flex direction="column" gap="1" className="min-w-0 flex-1">
-                  <Flex align="center" gap="2" wrap="wrap">
-                    <Text size="2" weight="medium">
+                <div className="flex flex-col gap-1 min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-medium">
                       #{hook.id} {hook.name}
-                    </Text>
+                    </span>
                     {status ? (
-                      <Badge size="1" color={status.color} variant="soft">
-                        {status.text}
-                      </Badge>
+                      <StatusBadge text={status.text} color={status.color} />
                     ) : null}
                     {!hook.enabled ? (
-                      <Badge size="1" color="gray" variant="outline">
+                      <Badge variant="outline">
                         Off
                       </Badge>
                     ) : null}
-                    <Badge size="1" variant="outline">
+                    <Badge variant="outline">
                       {hook.is_global ? 'Global scope' : 'Persona scope'}
                     </Badge>
-                  </Flex>
-                  <Flex align="center" gap="2" wrap="wrap">
-                    <Text size="1" weight="medium">
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-medium">
                       Event
-                    </Text>
-                    <Select.Root
-                      size="1"
+                    </span>
+                    <Select
+                      size="sm"
                       value={eventValue}
                       disabled={saving || hookSaving}
                       onValueChange={(value) => setHookEventDraft(hook.id, value)}
                     >
-                      <Select.Trigger className="min-w-[10rem]" />
-                      <Select.Content>
+                      <SelectTrigger className="min-w-[10rem]" ><SelectValue /></SelectTrigger>
+                      <SelectContent>
                         {HOOK_LIFECYCLE_EVENTS.map((event) => (
-                          <Select.Item key={event} value={event} title={HOOK_EVENT_HINTS[event]}>
+                          <SelectItem key={event} value={event} title={HOOK_EVENT_HINTS[event]}>
                             {event}
-                          </Select.Item>
+                          </SelectItem>
                         ))}
-                      </Select.Content>
-                    </Select.Root>
+                      </SelectContent>
+                    </Select>
                     {eventDirty ? (
                       <>
                         <Button
-                          size="1"
+                          size="sm"
                           disabled={saving || hookSaving}
                           onClick={() => void saveHookEvent(hook)}
                         >
                           {hookSaving ? 'Saving…' : 'Save event'}
                         </Button>
                         <Button
-                          size="1"
-                          variant="soft"
+                          size="sm"
+                          variant="secondary"
                           disabled={saving || hookSaving}
                           onClick={() => revertHookEventDraft(hook.id)}
                         >
@@ -700,39 +720,39 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                         </Button>
                       </>
                     ) : (
-                      <Text size="1" color="gray" title={HOOK_EVENT_HINTS[eventValue as HookLifecycleEvent]}>
+                      <span title={HOOK_EVENT_HINTS[eventValue as HookLifecycleEvent]}>
                         {HOOK_EVENT_HINTS[eventValue as HookLifecycleEvent]}
-                      </Text>
+                      </span>
                     )}
-                  </Flex>
-                  <Flex gap="2" wrap="wrap">
-                    <Badge size="1" variant="soft">
+                  </div>
+                  <div className="flex gap-2 flex-wrap">
+                    <Badge variant="secondary">
                       {hook.action_type}
                     </Badge>
                     {hook.matcher ? (
-                      <Badge size="1" color="orange" variant="soft">
+                      <Badge variant="secondary">
                         matcher: {hook.matcher}
                       </Badge>
                     ) : null}
-                  </Flex>
-                  <Text size="1" color="gray">
+                  </div>
+                  <span>
                     Scope: {hookScopeLabel(hook)}
                     {updated ? ` · Updated ${updated}` : ''}
-                  </Text>
+                  </span>
                   {payloadSummary ? (
-                    <Text size="1" className="break-words">
+                    <span className="break-words">
                       {payloadSummary}
-                    </Text>
+                    </span>
                   ) : null}
-                </Flex>
-              </Flex>
+                </div>
+              </div>
             )
           })}
-        </Flex>
+        </div>
       )}
 
-      <Text size="2" weight="bold">Skills catalog</Text>
-      <Text size="1" color="gray">
+      <span className="font-semibold">Skills catalog</span>
+      <span>
         {activePersonaId != null
           ? showAllPersonas
             ? `Showing all ${skillsTotal} skills (${skillsAvailableCount} available for persona #${activePersonaId}, ${skillsRemoteCount} remote)`
@@ -743,18 +763,18 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
           : ''}
         . Skills only under <code>shared/workspace/</code> are not listed — move them to{' '}
         <code>skills/</code>.
-      </Text>
-      <TextField.Root
+      </span>
+      <Input
         value={skillFilter}
         placeholder="Filter skills by name, description, platforms, or source"
         onChange={(e) => setSkillFilter(e.target.value)}
       />
       {skills.length === 0 ? (
-        <Text size="1" color="gray">No skills discovered under workspace/skills.</Text>
+        <span>No skills discovered under workspace/skills.</span>
       ) : filteredSkills.length === 0 ? (
-        <Text size="1" color="gray">No skills match the current filter.</Text>
+        <span>No skills match the current filter.</span>
       ) : (
-        <Flex direction="column" gap="2" className="max-h-[420px] overflow-y-auto">
+        <div className="flex flex-col gap-2 max-h-[420px] overflow-y-auto">
           {filteredSkills.map((skill) => {
             const updated = formatUpdatedAt(skill.updated_at)
             const blocked =
@@ -772,15 +792,10 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                       ? { text: 'Allowed', color: 'green' as const }
                       : { text: 'Available', color: 'green' as const }
             return (
-              <Flex
-                key={skill.name}
-                align="start"
-                gap="2"
-                className="rounded-md border border-[var(--gray-a6)] p-2"
-              >
+              <div className="flex items-start gap-2 rounded-md border border-[var(--gray-a6)] p-2" key={skill.name}>
                 {activePersonaId != null && restrictSkills ? (
                   <Checkbox
-                    size="1"
+                    size="sm"
                     className="mt-0.5"
                     checked={selectedSkillNames.has(skill.name)}
                     disabled={saving}
@@ -789,61 +804,59 @@ export function SettingsHooksSkillsPanel({ api, onError, activePersonaId }: Prop
                     }
                   />
                 ) : null}
-                <Flex direction="column" gap="1" className="min-w-0 flex-1">
-                  <Flex align="center" gap="2" wrap="wrap">
-                    <Text size="2" weight="medium">
+                <div className="flex flex-col gap-1 min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-medium">
                       {skill.name}
-                    </Text>
+                    </span>
                     {status ? (
-                      <Badge size="1" color={status.color} variant="soft">
-                        {status.text}
-                      </Badge>
+                      <StatusBadge text={status.text} color={status.color} />
                     ) : null}
                     {skill.remote ? (
-                      <Badge size="1" color="gray" variant="outline">
+                      <Badge variant="outline">
                         Remote
                       </Badge>
                     ) : null}
                     {skill.version ? (
-                      <Badge size="1" variant="outline">
+                      <Badge variant="outline">
                         v{skill.version}
                       </Badge>
                     ) : null}
-                  </Flex>
-                  <Text size="1">{skill.description}</Text>
+                  </div>
+                  <span>{skill.description}</span>
                   {skill.when_to_use ? (
-                    <Text size="1" color="gray">
+                    <span>
                       When to use: {skill.when_to_use}
-                    </Text>
+                    </span>
                   ) : null}
-                  <Flex gap="2" wrap="wrap">
+                  <div className="flex gap-2 flex-wrap">
                     {skill.source ? (
-                      <Badge size="1" variant="soft">
+                      <Badge variant="secondary">
                         source: {skill.source}
                       </Badge>
                     ) : null}
                     {(skill.platforms ?? []).map((platform) => (
-                      <Badge key={platform} size="1" color="blue" variant="soft">
+                      <Badge key={platform} variant="outline" className={STATUS_BADGE_CLASS.blue}>
                         {platform}
                       </Badge>
                     ))}
                     {(skill.deps ?? []).length > 0 ? (
-                      <Badge size="1" color="orange" variant="soft">
+                      <Badge variant="secondary">
                         deps: {(skill.deps ?? []).join(', ')}
                       </Badge>
                     ) : null}
-                  </Flex>
+                  </div>
                   {updated ? (
-                    <Text size="1" color="gray">
+                    <span>
                       Updated {updated}
-                    </Text>
+                    </span>
                   ) : null}
-                </Flex>
-              </Flex>
+                </div>
+              </div>
             )
           })}
-        </Flex>
+        </div>
       )}
-    </Flex>
+    </div>
   )
 }

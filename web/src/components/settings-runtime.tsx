@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Flex, Switch, Text } from '@radix-ui/themes'
+import { Switch } from '@/components/ui/switch'
 import { SettingsPanelSkeleton } from './skeleton'
 import type { RuntimeConfigResponse } from '../types'
 
@@ -61,63 +61,54 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
   const sources = runtime?.sources ?? {}
 
   return (
-    <Flex direction="column" gap="4">
-      <Flex align="center" justify="between" gap="3" wrap="wrap">
-        <Flex direction="column" gap="1" style={{ flex: 1, minWidth: 200 }}>
-          <Text size="2" weight="medium">
-            Verbose pipeline logging
-          </Text>
-          <Text size="1" color="gray">
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-[200px] flex-1 flex-col gap-1">
+          <span className="text-sm font-medium">Verbose pipeline logging</span>
+          <span className="text-xs text-muted-foreground">
             When on: verbose shell logs appear in chat (including background-job completion
             messages). When off: full logs are kept for the agent only. Applies immediately (
             {sourceLabel(sources.tool_output_debug)}).
-          </Text>
-        </Flex>
+          </span>
+        </div>
         <Switch
-          size="2"
           checked={runtime?.tool_output_debug ?? false}
           disabled={savingKey != null}
           onCheckedChange={(checked) =>
             void patchRuntime({ tool_output_debug: checked }, 'tool_output_debug')
           }
         />
-      </Flex>
+      </div>
 
-      <Flex align="center" justify="between" gap="3" wrap="wrap">
-        <Flex direction="column" gap="1" style={{ flex: 1, minWidth: 200 }}>
-          <Text size="2" weight="medium">
-            Post-tool evaluator (PTE)
-          </Text>
-          <Text size="1" color="gray">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-[200px] flex-1 flex-col gap-1">
+          <span className="text-sm font-medium">Post-tool evaluator (PTE)</span>
+          <span className="text-xs text-muted-foreground">
             After each tool iteration, ask a sidecar model whether the session goal is fulfilled.
             Can exit early or add latency on tool-heavy runs. Uses the local delegate endpoint when
             configured, else Perplexity. Applies immediately (
             {sourceLabel(sources.post_tool_evaluator_enabled)}).
-          </Text>
-        </Flex>
+          </span>
+        </div>
         <Switch
-          size="2"
           checked={runtime?.post_tool_evaluator_enabled ?? false}
           disabled={savingKey != null}
           onCheckedChange={(checked) =>
             void patchRuntime({ post_tool_evaluator_enabled: checked }, 'post_tool_evaluator_enabled')
           }
         />
-      </Flex>
+      </div>
 
-      <Flex align="center" justify="between" gap="3" wrap="wrap">
-        <Flex direction="column" gap="1" style={{ flex: 1, minWidth: 200 }}>
-          <Text size="2" weight="medium">
-            Pre-delivery quality (PDQE)
-          </Text>
-          <Text size="1" color="gray">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-[200px] flex-1 flex-col gap-1">
+          <span className="text-sm font-medium">Pre-delivery quality (PDQE)</span>
+          <span className="text-xs text-muted-foreground">
             Before the user sees a reply, judge the draft against the session goal. On fail with
             sufficient confidence, injects feedback and retries once. Applies immediately (
             {sourceLabel(sources.response_quality_evaluator_enabled)}).
-          </Text>
-        </Flex>
+          </span>
+        </div>
         <Switch
-          size="2"
           checked={runtime?.response_quality_evaluator_enabled ?? false}
           disabled={savingKey != null}
           onCheckedChange={(checked) =>
@@ -127,7 +118,7 @@ export function SettingsRuntimePanel({ api, onError }: Props) {
             )
           }
         />
-      </Flex>
-    </Flex>
+      </div>
+    </div>
   )
 }

@@ -470,6 +470,13 @@ struct PersonaDeleteRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PersonaRenameRequest {
+    chat_id: Option<i64>,
+    persona_id: i64,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ContactsBindRequest {
     #[allow(dead_code)]
     chat_id: Option<i64>,
@@ -4761,7 +4768,7 @@ async fn api_persona_bookmarks_post(
     } else {
         "user"
     };
-    let preview = truncate_chars(message.content.trim(), 280);
+    let preview = truncate_chars(message.content.trim(), 480);
     let note_clean = body
         .note
         .as_deref()
@@ -5768,6 +5775,38 @@ async fn api_personas_delete(
         "ok": true,
         "deleted": deleted,
         "message": if deleted { "Persona deleted" } else { "Persona not found or cannot delete default" },
+    })))
+}
+
+async fn api_personas_rename(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<PersonaRenameRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let persona_id = body.persona_id;
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Persona name cannot be empty".into(),
+        ));
+    }
+    let name_for_msg = name.clone();
+    call_blocking(state.app_state.db.clone(), move |db| {
+        db.rename_persona(chat_id, persona_id, &name)
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "persona_id": persona_id,
+        "name": name_for_msg,
+        "message": format!("Persona renamed to '{name_for_msg}'"),
     })))
 }
 
@@ -9217,6 +9256,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/personas/switch", post(api_personas_switch))
         .route("/api/personas/create", post(api_personas_create))
         .route("/api/personas/delete", post(api_personas_delete))
+        .route("/api/personas/rename", post(api_personas_rename))
         .route(
             "/api/chat_sessions",
             get(api_chat_sessions_list).post(api_chat_sessions_create),

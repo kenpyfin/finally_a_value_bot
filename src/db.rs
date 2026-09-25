@@ -6888,6 +6888,66 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Renames a persona within a chat. Rejects empty names, the reserved `default` persona,
+    /// and collisions with an existing name in the same chat.
+    pub fn rename_persona(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        new_name: &str,
+    ) -> Result<(), FinallyAValueBotError> {
+        use rusqlite::OptionalExtension;
+        let name = new_name.trim();
+        if name.is_empty() {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Persona name cannot be empty".into(),
+            ));
+        }
+        if name == "default" {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Cannot rename a persona to the reserved name 'default'".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let current: String = conn
+            .query_row(
+                "SELECT name FROM personas WHERE id = ?1 AND chat_id = ?2",
+                params![persona_id, chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| FinallyAValueBotError::ToolExecution("Persona not found".into()))?;
+        if current == "default" {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Cannot rename the default persona".into(),
+            ));
+        }
+        if current == name {
+            return Ok(());
+        }
+        let conflict: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM personas WHERE chat_id = ?1 AND name = ?2",
+                params![chat_id, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if conflict.is_some() {
+            return Err(FinallyAValueBotError::ToolExecution(format!(
+                "A persona named '{name}' already exists"
+            )));
+        }
+        let rows = conn.execute(
+            "UPDATE personas SET name = ?1 WHERE id = ?2 AND chat_id = ?3",
+            params![name, persona_id, chat_id],
+        )?;
+        if rows == 0 {
+            return Err(FinallyAValueBotError::ToolExecution(
+                "Persona not found".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn get_persona_by_name(
         &self,
         chat_id: i64,

@@ -1,5 +1,14 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
-import { Button, Dialog, Flex, Text, TextField } from '@radix-ui/themes'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { AUTH_REQUIRED_EVENT, sanitizeHttpHeaderValue, setStoredAuthToken } from '../api/client'
 
 type AuthContextValue = {
@@ -63,33 +72,31 @@ export function AuthDialog() {
     useAuth()
 
   return (
-    <Dialog.Root open={authRequired} onOpenChange={(open) => !open && setAuthRequired(false)}>
-      <Dialog.Content>
-        <Dialog.Title>API token required</Dialog.Title>
-        <Dialog.Description size="2" mb="3">
-          This server requires an API token. Use the same value as <code>WEB_AUTH_TOKEN</code> in
-          your .env.
-        </Dialog.Description>
-        <Flex direction="column" gap="3">
-          <TextField.Root
-            type="password"
-            placeholder="Paste API token"
-            value={authTokenInput}
-            onChange={(e) => setAuthTokenInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') submitAuthToken()
-            }}
-          />
-          <Flex gap="2" justify="end">
-            <Dialog.Close>
-              <Button variant="soft" color="gray">
-                Cancel
-              </Button>
-            </Dialog.Close>
-            <Button onClick={submitAuthToken}>Save token</Button>
-          </Flex>
-        </Flex>
-      </Dialog.Content>
-    </Dialog.Root>
+    <Dialog open={authRequired} onOpenChange={(open) => !open && setAuthRequired(false)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>API token required</DialogTitle>
+          <DialogDescription>
+            This server requires an API token. Use the same value as <code>WEB_AUTH_TOKEN</code> in
+            your .env.
+          </DialogDescription>
+        </DialogHeader>
+        <Input
+          type="password"
+          placeholder="Paste API token"
+          value={authTokenInput}
+          onChange={(e) => setAuthTokenInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') submitAuthToken()
+          }}
+        />
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setAuthRequired(false)}>
+            Cancel
+          </Button>
+          <Button onClick={submitAuthToken}>Save token</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

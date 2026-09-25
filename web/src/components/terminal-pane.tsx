@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import { Button, Flex, Text } from '@radix-ui/themes'
+import { Button } from '@/components/ui/button'
+import { xtermThemeFromCss } from '@/lib/xterm-theme'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { Terminal } from '@xterm/xterm'
@@ -85,16 +86,12 @@ export function TerminalPane({ active, onError }: TerminalPaneProps) {
         throw new Error('Terminal container unavailable')
       }
 
+      const xtermTheme = xtermThemeFromCss()
       const term = new Terminal({
         cursorBlink: true,
         fontFamily: '"JetBrains Mono", ui-monospace, monospace',
         fontSize: 13,
-        theme: {
-          background: '#12141a',
-          foreground: '#e8eaef',
-          cursor: '#7c9cff',
-          selectionBackground: '#3a4460',
-        },
+        theme: xtermTheme,
         allowProposedApi: true,
       })
       const fitAddon = new FitAddon()
@@ -224,41 +221,40 @@ export function TerminalPane({ active, onError }: TerminalPaneProps) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2">
-      <Flex justify="between" align="center" gap="2" wrap="wrap">
-        <Text size="1" color="gray" className="font-mono">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="font-mono text-xs text-muted-foreground">
           {sessionRef.current?.sessionId
             ? `session ${sessionRef.current.sessionId.slice(0, 8)}`
             : 'no session'}
           {statusMessage ? ` · ${statusMessage}` : ''}
-        </Text>
-        <Flex gap="2">
+        </span>
+        <div className="flex gap-2">
           <Button
-            size="1"
-            variant="soft"
+            size="sm"
+            variant="secondary"
             disabled={connectionState === 'connecting'}
             onClick={() => void connect()}
           >
             Reconnect
           </Button>
           <Button
-            size="1"
-            variant="soft"
-            color="red"
+            size="sm"
+            variant="destructive"
             disabled={connectionState === 'idle' || connectionState === 'closed'}
             onClick={disconnect}
           >
             Disconnect
           </Button>
-        </Flex>
-      </Flex>
+        </div>
+      </div>
       <div
         ref={containerRef}
-        className="min-h-[min(60vh,480px)] flex-1 overflow-hidden rounded-md border border-[color:var(--mc-border-soft)] bg-[#12141a] p-1"
+        className="min-h-[min(60vh,480px)] flex-1 overflow-hidden rounded-md border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)] p-1"
         aria-label="Interactive terminal"
       />
-      <Text size="1" color="gray">
+      <p className="text-xs text-muted-foreground">
         State: {connectionState}. Requires WEB_AUTH_TOKEN and WEB_TERMINAL_ENABLED on the gateway host.
-      </Text>
+      </p>
     </div>
   )
 }

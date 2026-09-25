@@ -1,24 +1,18 @@
-import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { Button } from '@/components/ui/button'
+import { Textarea } from '@/components/ui/textarea'
+import { Select } from '@/components/ui/select'
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { EmptyState } from './empty-state'
-import { Button, Flex, Select, Switch, Text, TextArea } from '@radix-ui/themes'
 import { api } from '../api/client'
+import { MobileSheet } from './mobile-sheet'
+import { IconTrash } from './icons'
 import {
   OPERATOR_MEMO_MAX_CHARS,
   type InstallationStatus,
   type PersonaBulletinFocus,
-  type PersonaBulletinHistorySuffix,
-  type PersonaDenseDeliveryInfo,
   type PersonaMessageBookmark,
   type QueueLane,
 } from '../types'
-
-function historyDepthSelectValue(hs: PersonaBulletinHistorySuffix | null): string {
-  if (hs == null) return '6'
-  const u = hs.min_user.effective
-  const a = hs.min_assistant.effective
-  if (u === a && (u === 2 || u === 6 || u === 10)) return String(u)
-  return 'custom'
-}
 
 function operatorMemoCharCount(s: string): number {
   return Array.from(s.trim()).length
@@ -36,9 +30,6 @@ function StatusSep() {
 const cockpitLinkClass =
   'm-0 inline-flex cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left font-inherit text-[13px] text-[color:var(--mc-text-primary)] underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
 
-const cockpitToggleClass =
-  'cursor-pointer text-[color:var(--mc-text-muted)] transition-colors hover:text-[color:var(--mc-text-primary)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--mc-accent)]'
-
 const controlsPanelClass = 'rounded-md border border-[color:var(--mc-border-soft)] p-3'
 
 /** Radix Select portals its listbox to `document.body`; clicks there are outside `expandedRootRef`. */
@@ -50,6 +41,18 @@ function isPointerOnRadixSelectOverlay(target: EventTarget | null): boolean {
   )
 }
 
+function useIsMobile(): boolean {
+  const [isMobile, setIsMobile] = useState(false)
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)')
+    const sync = () => setIsMobile(mq.matches)
+    sync()
+    mq.addEventListener('change', sync)
+    return () => mq.removeEventListener('change', sync)
+  }, [])
+  return isMobile
+}
+
 export type CockpitBarProps = {
   appearance: 'dark' | 'light'
   statusText: string
@@ -59,49 +62,44 @@ export type CockpitBarProps = {
   backgroundActiveCount: number
   installationStatus: InstallationStatus | null
   onQueueClick: () => void
-  bulletinFocus: PersonaBulletinFocus | null
+  /** Kept for API stability; bulletin now lives in BulletinStrip. */
+  bulletinFocus?: PersonaBulletinFocus | null
   bookmarks: PersonaMessageBookmark[]
   /** Used when jumping to a bookmarked message. */
   activePersonaId: number | null
   /** Jump to message in the main thread (replaces bookmark reader dialog). */
   onJumpToBookmark?: (messageId: string) => void | Promise<void>
-  /** GET bulletin `history_suffix`; null when unavailable. */
-  historySuffix: PersonaBulletinHistorySuffix | null
+  /** Remove a bookmark without closing the cockpit. */
+  onRemoveBookmark?: (messageId: string) => void | Promise<void | boolean>
   /** Server-stored operator memo (may be null). */
   operatorMemoServer: string | null
-  denseDelivery: PersonaDenseDeliveryInfo | null
   /** Reload bulletin after PATCH (same persona). */
   reloadBulletin: () => Promise<void>
   /** Short status line updates after successful saves. */
   onBulletinStatus?: (message: string) => void
-  floating?: boolean
-  /** Controlled expand state (optional). */
+  /** Controlled expand state. */
   expanded?: boolean
   onExpandedChange?: (expanded: boolean) => void
 }
 
 /**
- * Operational strip: session activity, queue, background jobs, setup readiness.
- * Collapsed by default; expand from the centered control. Separate from tooling (Settings, etc.).
+ * Session status panel: queue, background jobs, setup readiness, operator memo, bookmarks.
+ * Bulletin focus and persona run-context knobs live elsewhere (BulletinStrip / Settings).
  */
 export const CockpitBar = React.memo(function CockpitBar({
-  appearance,
   statusText,
   queueLane,
   otherPersonasPending = 0,
   backgroundActiveCount,
   installationStatus,
   onQueueClick,
-  bulletinFocus,
   bookmarks,
   activePersonaId,
   onJumpToBookmark,
-  historySuffix,
+  onRemoveBookmark,
   operatorMemoServer,
-  denseDelivery,
   reloadBulletin,
   onBulletinStatus,
-  floating = false,
   expanded: expandedControlled,
   onExpandedChange,
 }: CockpitBarProps) {
@@ -114,22 +112,15 @@ export const CockpitBar = React.memo(function CockpitBar({
     },
     [expandedControlled, onExpandedChange],
   )
-  const [depthBusy, setDepthBusy] = useState(false)
-  const [depthError, setDepthError] = useState('')
   const [memoDraft, setMemoDraft] = useState('')
   const [memoBusy, setMemoBusy] = useState(false)
   const [memoError, setMemoError] = useState('')
-  const [deliveryBusy, setDeliveryBusy] = useState(false)
-  const [deliveryError, setDeliveryError] = useState('')
-  const [bulletinFullOpen, setBulletinFullOpen] = useState(false)
   const expandedRootRef = useRef<HTMLDivElement | null>(null)
   const panelId = useId()
-  const toggleId = `${panelId}-toggle`
+  const isMobile = useIsMobile()
   const pending = queueLane?.pending ?? 0
   const oldestWaitMs = queueLane?.oldest_wait_ms ?? 0
   const queueError = queueLane?.last_error
-
-  const depthSelectValue = useMemo(() => historyDepthSelectValue(historySuffix), [historySuffix])
 
   useEffect(() => {
     setMemoDraft(operatorMemoServer ?? '')
@@ -140,31 +131,6 @@ export const CockpitBar = React.memo(function CockpitBar({
   const memoDirty = memoDraftTrimmed !== serverMemoTrimmed
   const memoCharCount = operatorMemoCharCount(memoDraft)
   const memoTooLong = memoCharCount > OPERATOR_MEMO_MAX_CHARS
-
-  const applyDepthPreset = useCallback(
-    async (v: string) => {
-      if (activePersonaId == null || v === 'custom') return
-      setDepthBusy(true)
-      setDepthError('')
-      try {
-        const body: Record<string, unknown> = {
-          recent_history_min_user: Number(v),
-          recent_history_min_assistant: Number(v),
-        }
-        await api(`/api/personas/${activePersonaId}/bulletin`, {
-          method: 'PATCH',
-          body: JSON.stringify(body),
-        })
-        await reloadBulletin()
-        onBulletinStatus?.('Chat context depth updated')
-      } catch (e) {
-        setDepthError(e instanceof Error ? e.message : String(e))
-      } finally {
-        setDepthBusy(false)
-      }
-    },
-    [activePersonaId, reloadBulletin, onBulletinStatus],
-  )
 
   const saveMemo = useCallback(async () => {
     if (activePersonaId == null) return
@@ -196,27 +162,6 @@ export const CockpitBar = React.memo(function CockpitBar({
     onBulletinStatus,
   ])
 
-  const applyDenseDelivery = useCallback(
-    async (enabled: boolean) => {
-      if (activePersonaId == null) return
-      setDeliveryBusy(true)
-      setDeliveryError('')
-      try {
-        await api(`/api/personas/${activePersonaId}/bulletin`, {
-          method: 'PATCH',
-          body: JSON.stringify({ dense_delivery_enabled: enabled }),
-        })
-        await reloadBulletin()
-        onBulletinStatus?.(enabled ? 'Dense delivery on' : 'Dense delivery off')
-      } catch (e) {
-        setDeliveryError(e instanceof Error ? e.message : String(e))
-      } finally {
-        setDeliveryBusy(false)
-      }
-    },
-    [activePersonaId, reloadBulletin, onBulletinStatus],
-  )
-
   const onMemoBlur = useCallback(() => {
     if (!memoDirty || memoBusy || memoTooLong) return
     void saveMemo()
@@ -233,15 +178,6 @@ export const CockpitBar = React.memo(function CockpitBar({
         ? `idle${otherHint}${queueError ? ' (!)' : ''}`
         : `idle${queueError ? ' (!)' : ''}`
 
-  const bulletinFullText = bulletinFocus
-    ? `${bulletinFocus.title ? `${bulletinFocus.title}\n` : ''}${bulletinFocus.content}`
-    : 'No bulletin focus yet.'
-
-  const bulletinPreview =
-    bulletinFullText.length > 160 && !bulletinFullOpen
-      ? `${bulletinFullText.slice(0, 160).trim()}…`
-      : bulletinFullText
-
   const needsRestart =
     installationStatus != null &&
     (installationStatus.requires_restart_for_env_changes ??
@@ -254,7 +190,7 @@ export const CockpitBar = React.memo(function CockpitBar({
   }, [expandedControlled, expandedInternal])
 
   useEffect(() => {
-    if (!expanded) return
+    if (!expanded || isMobile) return
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null
       if (!target) return
@@ -266,370 +202,231 @@ export const CockpitBar = React.memo(function CockpitBar({
     return () => {
       window.removeEventListener('pointerdown', onPointerDown)
     }
-  }, [expanded, setExpanded])
+  }, [expanded, isMobile, setExpanded])
 
-  const stripClass = floating
-    ? 'rounded-xl border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/90 backdrop-blur'
-    : 'border-t border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/40'
-
-  if (!expanded) {
-    return (
-      <button
-        id={toggleId}
-        type="button"
-        className={`mc-cockpit w-full px-4 py-1 ${stripClass} ${cockpitToggleClass}`}
-        aria-expanded={false}
-        aria-controls={panelId}
-        title="Show session status"
-        onClick={() => setExpanded(true)}
-      >
-        <span className="sr-only">Show session status</span>
-        <div className="flex">
-          <span className="mx-auto flex h-7 w-full items-center justify-center rounded-md">
-            <svg
-              className="size-3.5 shrink-0 transition-transform duration-150"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-            >
-              <path d="M6 9l6 6 6-6" />
-            </svg>
+  const body = (
+    <div id={panelId} className="space-y-3 px-3 pb-1 md:px-4">
+      <div className="mc-cockpit-status-strip flex min-h-[32px] flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-snug max-md:grid max-md:grid-cols-2 max-md:gap-2">
+        <span className="font-medium max-md:col-span-2 shrink-0">
+          {statusText}
+        </span>
+        <StatusSep />
+        <button type="button" className={cockpitLinkClass} title={queueError ?? 'Open run queue'} onClick={onQueueClick}>
+          <span className="text-[color:var(--mc-text-muted)]">Queue</span>
+          <span
+            className={
+              pending > 0 || queueError
+                ? 'font-medium text-amber-500'
+                : 'font-medium text-[color:var(--mc-text-muted)]'
+            }
+          >
+            {queueLabel}
           </span>
+        </button>
+        <StatusSep />
+        <button
+          type="button"
+          className={cockpitLinkClass}
+          title="Open run queue and background jobs"
+          onClick={onQueueClick}
+        >
+          <span className="text-[color:var(--mc-text-muted)]">Background</span>
+          <span
+            className={
+              backgroundActiveCount > 0
+                ? 'font-medium text-blue-500'
+                : 'font-medium text-[color:var(--mc-text-muted)]'
+            }
+          >
+            {backgroundActiveCount > 0 ? `${backgroundActiveCount} active` : 'none'}
+          </span>
+        </button>
+        {installationStatus ? (
+          <>
+            <StatusSep />
+            <div className="flex min-w-0 flex-wrap items-center gap-2 max-md:col-span-2">
+              <span className="font-medium">
+                LLM {installationStatus.llm_ready ? 'ready' : 'missing'}
+              </span>
+              <span className="font-medium">
+                Channels {installationStatus.channel_ready ? 'ready' : 'missing'}
+              </span>
+              {needsRestart ? (
+                <span className="font-medium">
+                  Restart needed
+                </span>
+              ) : null}
+            </div>
+          </>
+        ) : (
+          <>
+            <StatusSep />
+            <span className="max-md:col-span-2">
+              Setup loading…
+            </span>
+          </>
+        )}
+      </div>
+      {queueError ? (
+        <span className="leading-snug">
+          Queue error: {queueError}
+        </span>
+      ) : null}
+      {needsRestart ? (
+        <span className="leading-snug">
+          Restart the process after changing API keys or runtime settings in .env.
+        </span>
+      ) : !queueError ? (
+        <span className="leading-snug">
+          Session signals update on poll. Open the queue for run details.
+        </span>
+      ) : null}
+
+      <div className="space-y-3">
+        <div className={`${controlsPanelClass} space-y-3`}>
+          <div>
+            <span className="font-medium">
+              Operator memo
+            </span>
+            <span className="mt-1 block leading-snug">
+              Short steering note for this persona (system prompt). Separate from tiered memory and the header
+              Memory JSON editor.
+            </span>
+            <Textarea
+              className="mc-cockpit-memo mt-2 min-h-[72px] font-mono text-xs"
+              value={memoDraft}
+              onChange={(e) => setMemoDraft(e.target.value)}
+              onBlur={onMemoBlur}
+              disabled={activePersonaId == null || memoBusy}
+              placeholder="What the operator cares about for the next runs…"
+            />
+            <div className="flex mt-1 justify-between items-center flex-wrap gap-2 max-md:flex-col max-md:items-stretch">
+              <span>
+                {memoCharCount} / {OPERATOR_MEMO_MAX_CHARS}
+              </span>
+              <div className="flex gap-2 max-md:w-full max-md:justify-end">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={activePersonaId == null || memoBusy || !memoDirty || memoTooLong}
+                  onClick={() => void saveMemo()}
+                >
+                  {memoBusy ? 'Saving…' : 'Save memo'}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  disabled={activePersonaId == null || memoBusy || serverMemoTrimmed.length === 0}
+                  onClick={() => {
+                    setMemoDraft('')
+                    void (async () => {
+                      if (activePersonaId == null) return
+                      setMemoBusy(true)
+                      setMemoError('')
+                      try {
+                        await api(`/api/personas/${activePersonaId}/bulletin`, {
+                          method: 'PATCH',
+                          body: JSON.stringify({ operator_memo: '' }),
+                        })
+                        await reloadBulletin()
+                        onBulletinStatus?.('Operator memo cleared')
+                      } catch (e) {
+                        setMemoError(e instanceof Error ? e.message : String(e))
+                      } finally {
+                        setMemoBusy(false)
+                      }
+                    })()
+                  }}
+                >
+                  Clear
+                </Button>
+              </div>
+            </div>
+            {memoError ? (
+              <span className="mt-1">
+                {memoError}
+              </span>
+            ) : null}
+          </div>
         </div>
-      </button>
+
+        <div className={controlsPanelClass}>
+          <span className="font-medium">
+            Bookmarks
+          </span>
+          {bookmarks.length > 0 ? (
+            <div className="mc-cockpit-bookmark-list mt-2">
+              {bookmarks.slice(0, 12).map((b) => (
+                <div key={b.message_id} className="mc-cockpit-bookmark-card">
+                  <button
+                    type="button"
+                    className="mc-cockpit-bookmark-jump"
+                    onClick={() => {
+                      setExpanded(false)
+                      void onJumpToBookmark?.(b.message_id)
+                    }}
+                    title="Jump to message in chat"
+                  >
+                    <span className="mc-cockpit-bookmark-role">{b.role}</span>
+                    <span className="mc-cockpit-bookmark-preview">{b.content_preview}</span>
+                    {b.note ? (
+                      <span className="mc-cockpit-bookmark-note">{b.note}</span>
+                    ) : null}
+                  </button>
+                  {onRemoveBookmark ? (
+                    <button
+                      type="button"
+                      className="mc-cockpit-bookmark-delete"
+                      title="Remove bookmark"
+                      aria-label="Remove bookmark"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void onRemoveBookmark(b.message_id)
+                      }}
+                    >
+                      <IconTrash className="size-3.5" />
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState
+              title="No bookmarks yet"
+              description="Bookmark messages from the thread to jump back to them here."
+              className="mt-2"
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  )
+
+  if (isMobile) {
+    return (
+      <MobileSheet
+        open={expanded}
+        onOpenChange={setExpanded}
+        title="Session status"
+        description="Queue, background jobs, memo, and bookmarks."
+      >
+        {body}
+      </MobileSheet>
     )
   }
 
+  if (!expanded) return null
+
   return (
-    <>
-      {floating ? (
-        <button
-          type="button"
-          className="fixed inset-0 z-[35] bg-black/30 md:hidden"
-          aria-label="Close session status"
-          onClick={() => setExpanded(false)}
-        />
-      ) : null}
-      <div
-        ref={expandedRootRef}
-        className={`mc-cockpit py-2 ${stripClass} ${
-          floating
-            ? 'max-md:fixed max-md:inset-x-2 max-md:top-[calc(env(safe-area-inset-top,0px)+3.5rem)] max-md:z-[40] max-md:max-h-[min(58dvh,480px)] max-md:overflow-y-auto max-md:overscroll-contain'
-            : ''
-        }`}
-        role="region"
-        aria-label="Session status"
-      >
-      <div className="flex">
-        <button
-          id={toggleId}
-          type="button"
-          className={`flex h-7 w-full cursor-pointer items-center justify-center border-0 bg-transparent px-4 transition-colors ${cockpitToggleClass}`}
-          aria-expanded={expanded}
-          aria-controls={panelId}
-          title="Hide session status"
-          onClick={() => setExpanded(false)}
-        >
-          <span className="sr-only">Hide session status</span>
-          <svg
-            className="size-3.5 shrink-0 -rotate-180 transition-transform duration-150"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <path d="M6 9l6 6 6-6" />
-          </svg>
-        </button>
-      </div>
-
-      {expanded ? (
-        <div id={panelId} aria-labelledby={toggleId} className="space-y-3 px-3 pb-1 md:px-4">
-          <div className="mc-cockpit-status-strip flex min-h-[32px] flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-snug max-md:grid max-md:grid-cols-2 max-md:gap-2">
-            <Text size="1" color="gray" weight="medium" className="max-md:col-span-2 shrink-0">
-              {statusText}
-            </Text>
-            <StatusSep />
-            <button type="button" className={cockpitLinkClass} title={queueError ?? 'Open run queue'} onClick={onQueueClick}>
-              <span className="text-[color:var(--mc-text-muted)]">Queue</span>
-              <span
-                className={
-                  pending > 0 || queueError
-                    ? 'font-medium text-amber-500'
-                    : 'font-medium text-[color:var(--mc-text-muted)]'
-                }
-              >
-                {queueLabel}
-              </span>
-            </button>
-            <StatusSep />
-            <button
-              type="button"
-              className={cockpitLinkClass}
-              title="Open run queue and background jobs"
-              onClick={onQueueClick}
-            >
-              <span className="text-[color:var(--mc-text-muted)]">Background</span>
-              <span
-                className={
-                  backgroundActiveCount > 0
-                    ? 'font-medium text-blue-500'
-                    : 'font-medium text-[color:var(--mc-text-muted)]'
-                }
-              >
-                {backgroundActiveCount > 0 ? `${backgroundActiveCount} active` : 'none'}
-              </span>
-            </button>
-            {installationStatus ? (
-              <>
-                <StatusSep />
-                <div className="flex min-w-0 flex-wrap items-center gap-2 max-md:col-span-2">
-                  <Text size="1" color={installationStatus.llm_ready ? 'green' : 'orange'} weight="medium">
-                    LLM {installationStatus.llm_ready ? 'ready' : 'missing'}
-                  </Text>
-                  <Text size="1" color={installationStatus.channel_ready ? 'green' : 'orange'} weight="medium">
-                    Channels {installationStatus.channel_ready ? 'ready' : 'missing'}
-                  </Text>
-                  {needsRestart ? (
-                    <Text size="1" color="orange" weight="medium">
-                      Restart needed
-                    </Text>
-                  ) : null}
-                </div>
-              </>
-            ) : (
-              <>
-                <StatusSep />
-                <Text size="1" color="gray" className="max-md:col-span-2">
-                  Setup loading…
-                </Text>
-              </>
-            )}
-          </div>
-          {queueError ? (
-            <Text size="1" color="red" className="leading-snug">
-              Queue error: {queueError}
-            </Text>
-          ) : null}
-          {needsRestart ? (
-            <Text size="1" color="orange" className="leading-snug">
-              Restart the process after changing API keys or runtime settings in .env.
-            </Text>
-          ) : !queueError ? (
-            <Text size="1" color="gray" className="leading-snug">
-              Session signals update on poll. Open the queue for run details.
-            </Text>
-          ) : null}
-
-          <div className="space-y-3">
-            <div className={`${controlsPanelClass} space-y-4`}>
-              <div>
-                <Text size="1" weight="medium">
-                  Chat context depth
-                </Text>
-                <Text size="1" color="gray" className="mt-1 block leading-snug">
-                  Minimum user and assistant dialogue turns kept at the tail of each run. Set{' '}
-                  <code className="text-[11px]">MAX_HISTORY_MESSAGES</code> ≥ user + assistant mins when turns
-                  alternate.
-                </Text>
-                {historySuffix ? (
-                  <Flex mt="2" direction="column" gap="1">
-                    <Select.Root
-                      value={depthSelectValue}
-                      onValueChange={(v) => void applyDepthPreset(v)}
-                      disabled={activePersonaId == null || depthBusy}
-                    >
-                      <Select.Trigger className="w-full md:max-w-xs" />
-                      <Select.Content position="popper">
-                        <Select.Item value="2">Compact (2 / 2)</Select.Item>
-                        <Select.Item value="6">Standard (6 / 6)</Select.Item>
-                        <Select.Item value="10">Deep (10 / 10)</Select.Item>
-                        {depthSelectValue === 'custom' ? (
-                          <Select.Item value="custom">
-                            Custom ({historySuffix.min_user.effective} / {historySuffix.min_assistant.effective})
-                          </Select.Item>
-                        ) : null}
-                      </Select.Content>
-                    </Select.Root>
-                    {depthError ? (
-                      <Text size="1" color="red">
-                        {depthError}
-                      </Text>
-                    ) : (
-                      <Text size="1" color="gray">
-                        Effective: {historySuffix.min_user.effective} user, {historySuffix.min_assistant.effective}{' '}
-                        assistant
-                        {historySuffix.min_user.persona_override != null ||
-                        historySuffix.min_assistant.persona_override != null
-                          ? ' (persona override)'
-                          : ''}
-                      </Text>
-                    )}
-                  </Flex>
-                ) : (
-                  <Text size="1" color="gray" className="mt-1">
-                    Load bulletin to edit depth.
-                  </Text>
-                )}
-              </div>
-
-              <div className="border-t border-[color:var(--mc-border-soft)] pt-3">
-                <Text size="1" weight="medium">
-                  Operator memo
-                </Text>
-                <Text size="1" color="gray" className="mt-1 block leading-snug">
-                  Short steering note for this persona (system prompt). Separate from tiered memory and the header
-                  Memory JSON editor.
-                </Text>
-                <TextArea
-                  className="mt-2 min-h-[72px] font-mono text-xs"
-                  value={memoDraft}
-                  onChange={(e) => setMemoDraft(e.target.value)}
-                  onBlur={onMemoBlur}
-                  disabled={activePersonaId == null || memoBusy}
-                  placeholder="What the operator cares about for the next runs…"
-                />
-                <Flex mt="1" justify="between" align="center" wrap="wrap" gap="2" className="max-md:flex-col max-md:items-stretch">
-                  <Text size="1" color={memoTooLong ? 'red' : 'gray'}>
-                    {memoCharCount} / {OPERATOR_MEMO_MAX_CHARS}
-                  </Text>
-                  <Flex gap="2" className="max-md:w-full max-md:justify-end">
-                    <Button
-                      type="button"
-                      size="1"
-                      variant="soft"
-                      disabled={activePersonaId == null || memoBusy || !memoDirty || memoTooLong}
-                      onClick={() => void saveMemo()}
-                    >
-                      {memoBusy ? 'Saving…' : 'Save memo'}
-                    </Button>
-                    <Button
-                      type="button"
-                      size="1"
-                      variant="ghost"
-                      disabled={activePersonaId == null || memoBusy || serverMemoTrimmed.length === 0}
-                      onClick={() => {
-                        setMemoDraft('')
-                        void (async () => {
-                          if (activePersonaId == null) return
-                          setMemoBusy(true)
-                          setMemoError('')
-                          try {
-                            await api(`/api/personas/${activePersonaId}/bulletin`, {
-                              method: 'PATCH',
-                              body: JSON.stringify({ operator_memo: '' }),
-                            })
-                            await reloadBulletin()
-                            onBulletinStatus?.('Operator memo cleared')
-                          } catch (e) {
-                            setMemoError(e instanceof Error ? e.message : String(e))
-                          } finally {
-                            setMemoBusy(false)
-                          }
-                        })()
-                      }}
-                    >
-                      Clear
-                    </Button>
-                  </Flex>
-                </Flex>
-                {memoError ? (
-                  <Text size="1" color="red" className="mt-1">
-                    {memoError}
-                  </Text>
-                ) : null}
-              </div>
-
-              <div className="border-t border-[color:var(--mc-border-soft)] pt-3">
-                <Flex align="center" justify="between" gap="3" wrap="wrap">
-                  <Flex direction="column" gap="1" style={{ flex: 1, minWidth: 200 }}>
-                    <Text size="1" weight="medium">
-                      Dense delivery (short message + PDF link)
-                    </Text>
-                    <Text size="1" color="gray" className="leading-snug">
-                      Spill over the channel cap to PDF, upload to catbox, then send a summary with a
-                      public HTTPS URL. Needed for WeCom/Telegram long reports.
-                    </Text>
-                    {denseDelivery?.enabled ? (
-                      <Text size="1" color="gray">
-                        Caps: messaging {denseDelivery.messaging_max_chars} chars, web{' '}
-                        {denseDelivery.web_max_chars} chars
-                      </Text>
-                    ) : null}
-                    {deliveryError ? (
-                      <Text size="1" color="red">
-                        {deliveryError}
-                      </Text>
-                    ) : null}
-                  </Flex>
-                  <Switch
-                    size="2"
-                    checked={denseDelivery?.enabled ?? false}
-                    disabled={activePersonaId == null || deliveryBusy}
-                    onCheckedChange={(checked) => void applyDenseDelivery(checked)}
-                  />
-                </Flex>
-              </div>
-            </div>
-
-            <div className={controlsPanelClass}>
-              <Flex justify="between" align="center" gap="2">
-                <Text size="1" weight="medium">
-                  Bulletin
-                </Text>
-                {bulletinFullText.length > 160 ? (
-                  <Button
-                    type="button"
-                    size="1"
-                    variant="ghost"
-                    onClick={() => setBulletinFullOpen((v) => !v)}
-                  >
-                    {bulletinFullOpen ? 'Show less' : 'Show full'}
-                  </Button>
-                ) : null}
-              </Flex>
-              <div className="mt-1 whitespace-pre-wrap text-xs text-[color:var(--gray-11)]">{bulletinPreview}</div>
-            </div>
-
-            <div className={controlsPanelClass}>
-              <Text size="1" weight="medium">
-                Bookmarks
-              </Text>
-              {bookmarks.length > 0 ? (
-                <div className="mt-1 flex flex-wrap gap-1.5">
-                  {bookmarks.slice(0, 8).map((b) => (
-                    <button
-                      key={b.message_id}
-                      type="button"
-                      className="mc-cockpit-bookmark-btn rounded border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-panel)] px-2 py-1 text-left text-xs text-[color:var(--mc-text-primary)] hover:bg-[color:var(--mc-surface-main)]"
-                      onClick={() => {
-                        setExpanded(false)
-                        void onJumpToBookmark?.(b.message_id)
-                      }}
-                      title="Jump to message in chat"
-                    >
-                      [{b.role}] {b.content_preview}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <EmptyState
-                  title="No bookmarks yet"
-                  description="Bookmark messages from the thread to jump back to them here."
-                  className="mt-2"
-                />
-              )}
-            </div>
-          </div>
-        </div>
-      ) : null}
-      </div>
-    </>
+    <div
+      ref={expandedRootRef}
+      className="mc-cockpit mc-cockpit-dropdown absolute left-0 right-0 top-full z-30 mt-1 max-h-[min(70vh,560px)] overflow-y-auto overscroll-contain rounded-xl border border-[color:var(--mc-border-soft)] bg-[color:var(--mc-bg-main)]/95 py-2 shadow-lg backdrop-blur"
+      role="region"
+      aria-label="Session status"
+    >
+      {body}
+    </div>
   )
 })

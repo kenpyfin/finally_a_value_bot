@@ -1,5 +1,14 @@
 import React from 'react'
-import { AlertDialog, Button, Flex } from '@radix-ui/themes'
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
 
 export type ConfirmDialogProps = {
   open: boolean
@@ -25,32 +34,27 @@ export function ConfirmDialog({
   onConfirm,
 }: ConfirmDialogProps) {
   return (
-    <AlertDialog.Root open={open} onOpenChange={onOpenChange}>
-      <AlertDialog.Content maxWidth="420px">
-        <AlertDialog.Title>{title}</AlertDialog.Title>
-        <AlertDialog.Description size="2">{description}</AlertDialog.Description>
-        <Flex gap="3" mt="4" justify="end">
-          <AlertDialog.Cancel>
-            <Button variant="soft" color="gray" disabled={loading}>
-              {cancelLabel}
-            </Button>
-          </AlertDialog.Cancel>
-          <AlertDialog.Action>
-            <Button
-              color={destructive ? 'red' : undefined}
-              variant="solid"
-              disabled={loading}
-              onClick={(e) => {
-                e.preventDefault()
-                void onConfirm()
-              }}
-            >
-              {loading ? 'Working…' : confirmLabel}
-            </Button>
-          </AlertDialog.Action>
-        </Flex>
-      </AlertDialog.Content>
-    </AlertDialog.Root>
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent className="max-w-[420px]">
+        <AlertDialogHeader>
+          <AlertDialogTitle>{title}</AlertDialogTitle>
+          <AlertDialogDescription>{description}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={loading}>{cancelLabel}</AlertDialogCancel>
+          <Button
+            variant={destructive ? 'destructive' : 'default'}
+            disabled={loading}
+            onClick={(e) => {
+              e.preventDefault()
+              void onConfirm()
+            }}
+          >
+            {loading ? 'Working…' : confirmLabel}
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   )
 }
 

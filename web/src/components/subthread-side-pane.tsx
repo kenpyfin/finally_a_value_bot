@@ -1,6 +1,4 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { api, makeHeaders } from '../api/client'
 import type {
   BackendMessage,
@@ -8,7 +6,9 @@ import type {
   SideChatTurn,
 } from '../types'
 import { ConfirmDialog } from './confirm-dialog'
-import { MarkdownTable } from './markdown-table'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { MarkdownStream } from '@/components/markdown-stream'
 import { makeReplySnippet } from '../lib/reply-quote'
 
 export type SubthreadSidePaneProps = {
@@ -393,26 +393,30 @@ export function SubthreadSidePane({
         </div>
         <div className="mc-subthread-header-actions">
           {onDelete ? (
-            <button
+            <Button
               type="button"
-              className="mc-subthread-delete"
+              variant="ghost"
+              size="sm"
+              className="mc-subthread-delete h-8"
               onClick={() => setDeleteConfirmOpen(true)}
               aria-label="Delete side chat"
               title="Delete side chat"
               disabled={sending}
             >
               Delete
-            </button>
+            </Button>
           ) : null}
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-sm"
             className="mc-subthread-close"
             onClick={onClose}
             aria-label="Close side chat"
             title="Close"
           >
             ×
-          </button>
+          </Button>
         </div>
       </header>
 
@@ -442,42 +446,37 @@ export function SubthreadSidePane({
                   turn.role === 'user' ? 'mc-subthread-bubble mc-subthread-bubble-user' : 'mc-subthread-bubble'
                 }
               >
-                <div className="mc-subthread-bubble-role">
-                  {turn.role === 'user' ? 'You' : 'Assistant'}
-                  {turn.streaming ? ' · streaming' : ''}
+                <div className="mc-subthread-bubble-role flex flex-wrap items-center gap-2">
+                  <span>{turn.role === 'user' ? 'You' : 'Assistant'}</span>
+                  {turn.streaming ? (
+                    <Badge variant="secondary" className="text-[10px]">
+                      streaming
+                    </Badge>
+                  ) : null}
                 </div>
                 {turn.role === 'assistant' ? (
                   <div className="mc-subthread-markdown">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        table: MarkdownTable,
-                        a: (props) => {
-                          const mergedRel = [props.rel, 'noopener', 'noreferrer']
-                            .filter(Boolean)
-                            .join(' ')
-                          return <a {...props} target="_blank" rel={mergedRel} />
-                        },
-                      }}
-                    >
+                    <MarkdownStream streaming={!!turn.streaming}>
                       {turn.content || (turn.streaming ? '…' : '')}
-                    </ReactMarkdown>
+                    </MarkdownStream>
                   </div>
                 ) : (
                   <div className="mc-subthread-plain">{turn.content}</div>
                 )}
                 {canPromote ? (
                   <div className="mc-subthread-bubble-actions">
-                    <button
+                    <Button
                       type="button"
-                      className="mc-msg-action-btn mc-subthread-promote"
+                      variant="secondary"
+                      size="sm"
+                      className="mc-subthread-promote"
                       onClick={() => void handleAddToMainChat(turn.id)}
                       disabled={promoting || sending || promotingTurnId != null}
                       title="Add this reply to the main chat"
                       aria-label="Add to main chat"
                     >
                       {promoting ? 'Adding…' : 'Add to main chat'}
-                    </button>
+                    </Button>
                   </div>
                 ) : null}
               </div>
@@ -507,18 +506,19 @@ export function SubthreadSidePane({
         <div className="mc-subthread-composer-actions">
           <span className="mc-subthread-status">{status}</span>
           {sending ? (
-            <button type="button" className="mc-subthread-send" onClick={cancel}>
+            <Button type="button" variant="outline" size="sm" className="mc-subthread-send" onClick={cancel}>
               Stop
-            </button>
+            </Button>
           ) : (
-            <button
+            <Button
               type="button"
+              size="sm"
               className="mc-subthread-send mc-subthread-send-primary"
               onClick={() => void send()}
               disabled={!draft.trim() || chatId == null || personaId == null}
             >
               Send
-            </button>
+            </Button>
           )}
         </div>
       </div>

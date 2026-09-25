@@ -1,18 +1,28 @@
+import { Button } from '@/components/ui/button'
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ChatModelAdapter, ChatModelRunOptions, ChatModelRunResult } from '@assistant-ui/react'
-import { Button, Callout, Flex, Theme } from '@radix-ui/themes'
-import '@radix-ui/themes/styles.css'
-import '@assistant-ui/react-ui/styles/index.css'
+import '../aui-layout.css'
 import '../styles.css'
+import { toast } from 'sonner'
 import { api, makeHeaders } from '../api/client'
+import { BulletinStrip } from '../components/bulletin-strip'
 import { CockpitBar } from '../components/cockpit-bar'
+import { CommandPalette, useCommandPaletteOpenState } from '../components/command-palette'
 import { SessionSidebar } from '../components/session-sidebar'
 import { SubthreadSidePane } from '../components/subthread-side-pane'
 import { ThreadPane } from '../components/thread-pane'
 import { useConfirmDialog } from '../components/confirm-dialog'
+import { NewPersonaDialog } from '../components/new-persona-dialog'
 import { ErrorBanner } from '../components/error-banner'
 import { StatusRegion } from '../components/status-region'
 import { MobileOpsSheet, ShortcutsDialog } from '../components/ops-ui'
+import { Toaster } from '../components/ui/sonner'
+import { TooltipProvider } from '../components/ui/tooltip'
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from '../components/ui/resizable'
 import { AppHeader } from './AppHeader'
 import { AppDialogs } from './AppDialogs'
 import { AuthDialog } from '../context/AuthContext'
@@ -81,19 +91,6 @@ const UI_THEME_OPTIONS: { key: UiTheme; label: string; color: string }[] = [
   { key: 'orange', label: 'Orange', color: '#fb923c' },
   { key: 'indigo', label: 'Indigo', color: '#818cf8' },
 ]
-
-const RADIX_ACCENT_BY_THEME: Record<UiTheme, string> = {
-  green: 'green',
-  blue: 'blue',
-  slate: 'gray',
-  amber: 'amber',
-  violet: 'violet',
-  rose: 'ruby',
-  cyan: 'cyan',
-  teal: 'teal',
-  orange: 'orange',
-  indigo: 'indigo',
-}
 
 function readAppearance(): Appearance {
   const saved = localStorage.getItem('finally-a-value-bot_appearance')
@@ -395,6 +392,7 @@ export function App({
     handleCreateSession,
     handleDeleteSession,
     onCreatePersona,
+    onRenamePersona,
     onDeletePersona,
     newSchedulePersonaId,
     setNewSchedulePersonaId,
@@ -405,9 +403,9 @@ export function App({
     personaBookmarks,
     bulletinHistorySuffix,
     bulletinOperatorMemo,
-    denseDelivery,
     loadPersonaBulletin,
     reloadPersonaBulletin,
+    removePersonaBookmark,
     toggleMessageBookmark,
   } = ops
 
@@ -642,8 +640,9 @@ export function App({
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const { open: commandPaletteOpen, setOpen: setCommandPaletteOpen } = useCommandPaletteOpenState()
+  const [newPersonaOpen, setNewPersonaOpen] = useState(false)
   const [mobileChatHeaderCollapsed, setMobileChatHeaderCollapsed] = useState(false)
-  const [threadScrolledDown, setThreadScrolledDown] = useState(false)
   const [cockpitExpanded, setCockpitExpanded] = useState(false)
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState<boolean>(readDesktopSidebarOpen)
   const [desktopSidebarWidth, setDesktopSidebarWidth] = useState<number>(readDesktopSidebarWidth)
@@ -1234,6 +1233,14 @@ export function App({
   }, [appearance])
 
   useEffect(() => {
+    if (statusText === 'Done') toast.success('Run complete')
+    else if (statusText === 'Error') toast.error('Run failed')
+    else if (statusText === 'Memory saved') toast.success('Memory saved')
+    else if (statusText === 'Queued') toast.message('Queued')
+    else if (statusText === 'Read-only channel') toast.warning('Read-only channel')
+  }, [statusText])
+
+  useEffect(() => {
     saveUiTheme(uiTheme)
     document.documentElement.setAttribute('data-ui-theme', uiTheme)
   }, [uiTheme])
@@ -1782,10 +1789,6 @@ export function App({
     setMobileChatHeaderCollapsed((prev) => (prev === opts.collapseHeader ? prev : opts.collapseHeader))
   }, [])
 
-  const handleThreadScrolledDownChange = useCallback((scrolledDown: boolean) => {
-    setThreadScrolledDown((prev) => (prev === scrolledDown ? prev : scrolledDown))
-  }, [])
-
   const handleShowShortcuts = useCallback(() => {
     setShortcutsOpen(true)
   }, [])
@@ -1844,8 +1847,13 @@ export function App({
   }, [])
 
   const handleCreatePersonaClick = useCallback(() => {
-    void onCreatePersona()
-  }, [onCreatePersona])
+    setNewPersonaOpen(true)
+  }, [])
+
+  const handleRenamePersona = useCallback(
+    (id: number, name: string) => onRenamePersona(id, name),
+    [onRenamePersona],
+  )
 
   const handleDeletePersonaClick = useCallback((id: number) => {
     void onDeletePersona(id)
@@ -2005,18 +2013,39 @@ export function App({
     ],
   )
 
-  const radixAccent = RADIX_ACCENT_BY_THEME[uiTheme] ?? 'green'
-
   return (
-    <Theme
-      appearance={appearance}
-      accentColor={radixAccent as never}
-      grayColor="slate"
-      radius="large"
-      panelBackground="translucent"
-      scaling="100%"
-    >
+    <TooltipProvider delayDuration={250}>
+      <Toaster appearance={appearance} position="bottom-right" richColors closeButton />
       <AuthDialog />
+      <CommandPalette
+        open={commandPaletteOpen}
+        onOpenChange={setCommandPaletteOpen}
+        personas={personas}
+        chatSessions={chatSessions}
+        sideChats={sideChats}
+        actions={{
+          onOpenSettings: handleOpenSettings,
+          onOpenInbox: handleOpenInbox,
+          onOpenOps: handleOpenMobileOps,
+          onOpenTerminal: terminalAvailable ? handleOpenTerminal : undefined,
+          terminalAvailable,
+          onToggleAppearance: toggleAppearance,
+          appearance,
+          onToggleSidebar: handleToggleDesktopSidebar,
+          onToggleCockpit: handleToggleCockpit,
+          onShowShortcuts: handleShowShortcuts,
+          onCreateSession: () => {
+            void handleCreateSession('New session', true)
+          },
+          onSelectPersona: handlePersonaSelect,
+          onSelectSession: (id) => {
+            void handleSelectSession(id)
+          },
+          onSelectSideChat: (id) => {
+            void handleSelectSideChat(id)
+          },
+        }}
+      />
 
       <div
         className={
@@ -2053,7 +2082,6 @@ export function App({
                 selectedPersonaId={activePersonaId}
                 onPersonaSelect={handlePersonaSelect}
                 onCreatePersona={handleCreatePersonaClick}
-                onDeletePersona={handleDeletePersonaClick}
                 onCloseRequest={handleCloseMobileNav}
               />
             </div>
@@ -2077,7 +2105,6 @@ export function App({
                 selectedPersonaId={activePersonaId}
                 onPersonaSelect={handlePersonaSelect}
                 onCreatePersona={handleCreatePersonaClick}
-                onDeletePersona={handleDeletePersonaClick}
               />
               <div
                 role="separator"
@@ -2122,74 +2149,54 @@ export function App({
                   : 'relative flex min-h-0 min-w-0 flex-1 flex-col bg-[linear-gradient(to_bottom,#f8fafc,white_20%)]'
               }
             >
-              <div
-                className={`pointer-events-none absolute left-0 right-0 top-2 z-20 flex justify-center px-2 transition-all duration-200 ease-out ${
-                  !cockpitExpanded &&
-                  (threadScrolledDown || activeSideChat != null || mobileChatHeaderCollapsed)
-                    ? '-translate-y-3 scale-95 opacity-0'
-                    : 'translate-y-0 scale-100 opacity-100'
-                }`}
-              >
-                <div
-                  className={`w-full max-w-5xl ${
-                    !cockpitExpanded &&
-                    (threadScrolledDown || activeSideChat != null || mobileChatHeaderCollapsed)
-                      ? 'pointer-events-none'
-                      : 'pointer-events-auto'
-                  }`}
-                >
-                  <CockpitBar
-                    appearance={appearance}
-                    statusText={statusText}
-                    queueLane={queueLane}
-                    otherPersonasPending={otherPersonasPending}
-                    backgroundActiveCount={backgroundActiveCount}
-                    installationStatus={installationStatus}
-                    onQueueClick={handleQueueClick}
-                    bulletinFocus={bulletinFocus}
-                    bookmarks={personaBookmarks}
-                    activePersonaId={activePersonaId}
-                    onJumpToBookmark={revealMessageInThread}
-                    historySuffix={bulletinHistorySuffix}
-                    operatorMemoServer={bulletinOperatorMemo}
-                    denseDelivery={denseDelivery}
-                    reloadBulletin={reloadPersonaBulletin}
-                    onBulletinStatus={handleBulletinStatus}
-                    onExpandedChange={setCockpitExpanded}
-                    expanded={cockpitExpanded}
-                    floating
-                  />
-                </div>
+              <div className="relative z-20 mx-auto w-full max-w-5xl shrink-0 px-2 md:px-3">
+                <BulletinStrip bulletinFocus={bulletinFocus} hideCockpitLauncher />
+                <CockpitBar
+                  appearance={appearance}
+                  statusText={statusText}
+                  queueLane={queueLane}
+                  otherPersonasPending={otherPersonasPending}
+                  backgroundActiveCount={backgroundActiveCount}
+                  installationStatus={installationStatus}
+                  onQueueClick={handleQueueClick}
+                  bookmarks={personaBookmarks}
+                  activePersonaId={activePersonaId}
+                  onJumpToBookmark={revealMessageInThread}
+                  onRemoveBookmark={removePersonaBookmark}
+                  operatorMemoServer={bulletinOperatorMemo}
+                  reloadBulletin={reloadPersonaBulletin}
+                  onBulletinStatus={handleBulletinStatus}
+                  onExpandedChange={setCockpitExpanded}
+                  expanded={cockpitExpanded}
+                />
               </div>
-              <div className="mx-auto w-full max-w-5xl px-2 pt-6 md:px-3 md:pt-8">
+              <div className="mx-auto w-full max-w-5xl px-2 pt-2 md:px-3">
                 <StatusRegion message={statusText} />
                 {installationStatus != null &&
                 !onboardingDismissed &&
                 (!installationStatus.llm_ready || !installationStatus.channel_ready) ? (
-                  <Callout.Root color="orange" size="1" variant="soft" className="mb-2">
-                    <Flex direction="column" gap="2">
-                      <Callout.Text>
+                  <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100 mb-2">
+                    <div className="flex flex-col gap-2">
+                      <span>
                         Finish setup: configure <code className="text-xs">.env</code> with at least one channel (Telegram or Discord) and LLM keys, then restart the gateway if needed. See Settings for status.
-                      </Callout.Text>
-                      <Flex gap="2" align="center" wrap="wrap">
-                        <Button size="1" variant="solid" onClick={handleOpenSettings}>
+                      </span>
+                      <div className="flex gap-2 items-center flex-wrap">
+                        <Button size="sm" variant="default" onClick={handleOpenSettings}>
                           Open Settings
                         </Button>
                         <Button
-                          size="1"
-                          variant="soft"
+                          size="sm"
+                          variant="secondary"
                           onClick={handleDismissOnboarding}
                         >
                           Dismiss
                         </Button>
-                      </Flex>
-                    </Flex>
-                  </Callout.Root>
+                      </div>
+                    </div>
+                  </div>
                 ) : null}
                 {replayNotice ? (
-                  <Callout.Root color="orange" size="1" variant="soft">
-                    <Callout.Text>{replayNotice}</Callout.Text>
-                  </Callout.Root>
+                  <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">{replayNotice}</div>
                 ) : null}
                 {error ? (
                   <ErrorBanner
@@ -2201,65 +2208,109 @@ export function App({
               </div>
 
               <div className="flex min-h-0 min-w-0 flex-1 flex-col px-0 pb-1 md:px-1">
-                <div className="mc-thread-with-subthread min-h-0 min-w-0 flex-1">
-                  <div className="mc-thread-main">
-                    <ThreadPane
-                      key={runtimeKey}
-                      adapter={adapter}
-                      initialMessages={historySeed}
-                      runtimeKey={runtimeKey}
-                      isStreaming={pendingRunsForActivePersona.length > 0}
-                      historyLoading={historyLoading}
-                      historyHasMore={historyHasMore}
-                      historyLoadingMore={historyLoadingMore}
-                      onLoadMoreHistory={loadMoreHistory}
-                      draftText={activeDraftText}
-                      onDraftTextChange={handleDraftTextChange}
-                      bookmarkedMessageIds={bookmarkedMessageIds}
-                      onToggleBookmark={toggleMessageBookmark}
-                      onReplyToMessage={handleReplyToMessage}
-                      onDeleteMessage={handleDeleteMessage}
-                      onSaveMessageEdit={handleSaveMessageEdit}
-                      onOpenSubthread={handleOpenSubthread}
-                      editingMessageId={editingMessageId}
-                      onEditingMessageIdChange={setEditingMessageId}
-                      activeSubthreadMessageId={activeSideChat?.anchorMessageId ?? null}
-                      pendingReply={activePendingReply}
-                      onDismissPendingReply={handleDismissPendingReply}
-                      onMobileThreadScroll={handleMobileThreadScroll}
-                      onThreadScrolledDownChange={handleThreadScrolledDownChange}
-                      targetScrollMessageId={targetScrollMessageId}
-                      onTargetScrollHandled={handleTargetScrollHandled}
-                      onShowShortcuts={handleShowShortcuts}
-                      uploadHint={
-                        statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
-                          ? statusText
-                          : undefined
-                      }
-                    />
+                {activeSideChat ? (
+                  <ResizablePanelGroup
+                    id="finally-a-value-bot-thread-subthread"
+                    orientation="horizontal"
+                    className="mc-thread-with-subthread min-h-0 min-w-0 flex-1"
+                  >
+                    <ResizablePanel defaultSize="62" minSize="35" className="mc-thread-main min-h-0 min-w-0">
+                      <ThreadPane
+                        key={runtimeKey}
+                        adapter={adapter}
+                        initialMessages={historySeed}
+                        runtimeKey={runtimeKey}
+                        isStreaming={pendingRunsForActivePersona.length > 0}
+                        historyLoading={historyLoading}
+                        historyHasMore={historyHasMore}
+                        historyLoadingMore={historyLoadingMore}
+                        onLoadMoreHistory={loadMoreHistory}
+                        draftText={activeDraftText}
+                        onDraftTextChange={handleDraftTextChange}
+                        bookmarkedMessageIds={bookmarkedMessageIds}
+                        onToggleBookmark={toggleMessageBookmark}
+                        onReplyToMessage={handleReplyToMessage}
+                        onDeleteMessage={handleDeleteMessage}
+                        onSaveMessageEdit={handleSaveMessageEdit}
+                        onOpenSubthread={handleOpenSubthread}
+                        editingMessageId={editingMessageId}
+                        onEditingMessageIdChange={setEditingMessageId}
+                        activeSubthreadMessageId={activeSideChat?.anchorMessageId ?? null}
+                        pendingReply={activePendingReply}
+                        onDismissPendingReply={handleDismissPendingReply}
+                        onMobileThreadScroll={handleMobileThreadScroll}
+                        targetScrollMessageId={targetScrollMessageId}
+                        onTargetScrollHandled={handleTargetScrollHandled}
+                        onShowShortcuts={handleShowShortcuts}
+                        uploadHint={
+                          statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
+                            ? statusText
+                            : undefined
+                        }
+                      />
+                    </ResizablePanel>
+                    <ResizableHandle withHandle className="hidden md:flex" />
+                    <ResizablePanel defaultSize="38" minSize="22" className="min-h-0 min-w-0">
+                      <SubthreadSidePane
+                        key={activeSideChat.id}
+                        chatId={chatId}
+                        personaId={activePersonaId}
+                        sessionId={activeSideChat.sessionId ?? activeSessionId}
+                        sideChatId={activeSideChat.id}
+                        anchorMessageId={activeSideChat.anchorMessageId}
+                        anchorMessage={activeSideChat.anchorMessage}
+                        historySuffix={bulletinHistorySuffix}
+                        turns={activeTurns}
+                        onTurnsChange={setActiveTurns}
+                        draft={activeDraft}
+                        onDraftChange={setActiveDraft}
+                        onDraftLocalChange={setActiveDraftLocal}
+                        onSendComplete={refreshAfterSend}
+                        onAddToMainChat={handleAddSideChatTurnToMain}
+                        onDelete={() => deleteSideChat(activeSideChat.id)}
+                        onClose={closeSideChatPane}
+                      />
+                    </ResizablePanel>
+                  </ResizablePanelGroup>
+                ) : (
+                  <div className="mc-thread-with-subthread min-h-0 min-w-0 flex-1">
+                    <div className="mc-thread-main">
+                      <ThreadPane
+                        key={runtimeKey}
+                        adapter={adapter}
+                        initialMessages={historySeed}
+                        runtimeKey={runtimeKey}
+                        isStreaming={pendingRunsForActivePersona.length > 0}
+                        historyLoading={historyLoading}
+                        historyHasMore={historyHasMore}
+                        historyLoadingMore={historyLoadingMore}
+                        onLoadMoreHistory={loadMoreHistory}
+                        draftText={activeDraftText}
+                        onDraftTextChange={handleDraftTextChange}
+                        bookmarkedMessageIds={bookmarkedMessageIds}
+                        onToggleBookmark={toggleMessageBookmark}
+                        onReplyToMessage={handleReplyToMessage}
+                        onDeleteMessage={handleDeleteMessage}
+                        onSaveMessageEdit={handleSaveMessageEdit}
+                        onOpenSubthread={handleOpenSubthread}
+                        editingMessageId={editingMessageId}
+                        onEditingMessageIdChange={setEditingMessageId}
+                        activeSubthreadMessageId={null}
+                        pendingReply={activePendingReply}
+                        onDismissPendingReply={handleDismissPendingReply}
+                        onMobileThreadScroll={handleMobileThreadScroll}
+                        targetScrollMessageId={targetScrollMessageId}
+                        onTargetScrollHandled={handleTargetScrollHandled}
+                        onShowShortcuts={handleShowShortcuts}
+                        uploadHint={
+                          statusText.startsWith('Uploading') || statusText.startsWith('Sending message')
+                            ? statusText
+                            : undefined
+                        }
+                      />
+                    </div>
                   </div>
-                  {activeSideChat ? (
-                    <SubthreadSidePane
-                      key={activeSideChat.id}
-                      chatId={chatId}
-                      personaId={activePersonaId}
-                      sessionId={activeSideChat.sessionId ?? activeSessionId}
-                      sideChatId={activeSideChat.id}
-                      anchorMessageId={activeSideChat.anchorMessageId}
-                      anchorMessage={activeSideChat.anchorMessage}
-                      historySuffix={bulletinHistorySuffix}
-                      turns={activeTurns}
-                      onTurnsChange={setActiveTurns}
-                      draft={activeDraft}
-                      onDraftChange={setActiveDraft}
-                      onDraftLocalChange={setActiveDraftLocal}
-                      onSendComplete={refreshAfterSend}
-                      onAddToMainChat={handleAddSideChatTurnToMain}
-                      onDelete={() => deleteSideChat(activeSideChat.id)}
-                      onClose={closeSideChatPane}
-                    />
-                  ) : null}
-                </div>
+                )}
               </div>
             </div>
           </main>
@@ -2284,6 +2335,10 @@ export function App({
           bindings,
           updateChannelPersonaPolicy,
           reloadInstallationStatus: loadSettings,
+          onPersonaBulletinChanged: reloadPersonaBulletin,
+          onCreatePersona: handleCreatePersonaClick,
+          onRenamePersona: handleRenamePersona,
+          onDeletePersona: handleDeletePersonaClick,
         }}
         queue={{
           open: queueDialogOpen,
@@ -2468,6 +2523,12 @@ export function App({
         }}
       />
       {confirmDialog}
+      <NewPersonaDialog
+        open={newPersonaOpen}
+        onOpenChange={setNewPersonaOpen}
+        existingNames={personas.map((p) => p.name)}
+        onCreate={onCreatePersona}
+      />
       <MobileOpsSheet
         open={mobileOpsOpen}
         onOpenChange={setMobileOpsOpen}
@@ -2487,6 +2548,7 @@ export function App({
         agentHistoryDisabled={activePersonaId == null}
       />
       <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
-    </Theme>
+      </TooltipProvider>
+    
   )
 }

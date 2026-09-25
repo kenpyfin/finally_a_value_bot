@@ -1,4 +1,4 @@
-import { Flex, ScrollArea, Text } from '@radix-ui/themes'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import React, { useMemo } from 'react'
 
 /** Matches `initial_llm_request_v1` from the gateway snapshot. */
@@ -141,19 +141,19 @@ export function InitialRunPromptView({ jsonText }: Props) {
   const messageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 0
 
   return (
-    <ScrollArea type="auto" scrollbars="vertical" className="max-h-[min(72vh,560px)] w-full">
-      <Flex direction="column" gap="4" className="pr-3 pb-1">
+    <ScrollArea className="max-h-[min(72vh,560px)] w-full">
+      <div className="flex flex-col gap-4 pr-3 pb-1">
         {parsed.schema ? (
-          <Text size="1" color="gray">
+          <span>
             Schema: <code className="text-xs">{parsed.schema}</code>
-          </Text>
+          </span>
         ) : null}
 
         {typeof parsed.system_prompt === 'string' ? (
           <section>
-            <Text size="4" weight="bold" className="mb-2 block tracking-tight">
+            <span className="text-lg font-semibold mb-2 block tracking-tight">
               System prompt
-            </Text>
+            </span>
             <div className={panel}>
               <pre className={preBody}>{parsed.system_prompt}</pre>
             </div>
@@ -161,11 +161,11 @@ export function InitialRunPromptView({ jsonText }: Props) {
         ) : null}
 
         <section>
-          <Text size="4" weight="bold" className="mb-2 block tracking-tight">
+          <span className="text-lg font-semibold mb-2 block tracking-tight">
             Tools (first turn)
-          </Text>
+          </span>
           {tools.length > 0 ? (
-            <Flex wrap="wrap" gap="2" className={`${panel} p-3`}>
+            <div className={`flex flex-wrap gap-2 ${panel} p-3`}>
               {tools.map((name) => (
                 <code
                   key={name}
@@ -174,39 +174,39 @@ export function InitialRunPromptView({ jsonText }: Props) {
                   {name}
                 </code>
               ))}
-            </Flex>
+            </div>
           ) : (
-            <Text size="2" color="gray" className={`block ${panel} p-3`}>
+            <span className={`block ${panel} p-3`}>
               None - conversational turn (no tools on first call).
-            </Text>
+            </span>
           )}
         </section>
 
         <section>
-          <Flex direction="column" gap="1" className="mb-2">
-            <Text size="4" weight="bold" className="block tracking-tight">
+          <div className="flex flex-col gap-1 mb-2">
+            <span className="text-lg font-semibold block tracking-tight">
               Messages
-            </Text>
-            <Text size="1" color="gray">
+            </span>
+            <span>
               {messageCount} message{messageCount === 1 ? '' : 's'} sent to the model on the first
               call (full text below). Identity and Tier 1 are in the system prompt above.
               Tier 2/3 memory, operator memo, and bookmarks appear in the message labeled{' '}
               <code className="text-xs">persona context</code> when included.
-            </Text>
+            </span>
             {!hasPersonaContext && messageCount > 0 ? (
-              <Text size="1" color="amber">
+              <span className="text-amber-600 dark:text-amber-500">
                 No <code className="text-xs">[persona_context]</code> block in this snapshot - memory
                 / memo / bookmarks were empty or removed before the LLM call (e.g. token trim).
-              </Text>
+              </span>
             ) : null}
-          </Flex>
+          </div>
           <div className={panel}>
             <pre className={`max-h-[min(52vh,480px)] overflow-auto ${preBody}`}>
               {messagesTranscript}
             </pre>
           </div>
         </section>
-      </Flex>
+      </div>
     </ScrollArea>
   )
 }

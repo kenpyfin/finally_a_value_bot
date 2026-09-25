@@ -1,5 +1,6 @@
+import { Button } from '@/components/ui/button'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '@/components/ui/dropdown-menu'
 import React, { useCallback, useState } from 'react'
-import { Button, DropdownMenu, Flex, Text } from '@radix-ui/themes'
 import { ConfirmDialog } from './confirm-dialog'
 import { IconSideChat } from './icons'
 import type { ChatSession, SideChatSummary } from '../types'
@@ -62,12 +63,12 @@ export function SideChatsPicker({
   const deleteTarget = deleteId ? sideChats.find((s) => s.id === deleteId) : null
 
   return (
-    <Flex align="center" gap="1" className="mc-side-chats-picker" style={{ minWidth: 0 }}>
-      <DropdownMenu.Root open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenu.Trigger>
+    <div className="flex items-center gap-1 mc-side-chats-picker" style={{ minWidth: 0 }}>
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+        <DropdownMenuTrigger>
           <Button
             variant="ghost"
-            size="2"
+            size="default"
             className="mc-side-chats-btn cursor-pointer"
             disabled={loading}
             title="Browse side chats"
@@ -81,10 +82,10 @@ export function SideChatsPicker({
               </span>
             ) : null}
           </Button>
-        </DropdownMenu.Trigger>
-        <DropdownMenu.Content style={{ minWidth: 280, maxWidth: 380 }}>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent style={{ minWidth: 280, maxWidth: 380 }}>
           {sideChats.length === 0 ? (
-            <DropdownMenu.Item disabled>No side chats yet</DropdownMenu.Item>
+            <DropdownMenuItem disabled>No side chats yet</DropdownMenuItem>
           ) : (
             sideChats.map((sc) => (
               <div key={sc.id} className="mc-side-chat-menu-row">
@@ -96,14 +97,14 @@ export function SideChatsPicker({
                     onSelect(sc.id)
                   }}
                 >
-                  <Text size="2" className="truncate" as="div">
+                  <div className="truncate text-sm">
                     {activeSideChatId === sc.id ? '● ' : ''}
                     {sideChatLabel(sc, sessions)}
-                  </Text>
-                  <Text size="1" color="gray" as="div">
+                  </div>
+                  <div className="text-xs text-muted-foreground">
                     {formatRelativeTime(sc.updated_at)}
                     {sc.turn_count > 0 ? ` · ${sc.turn_count} turns` : ''}
-                  </Text>
+                  </div>
                 </button>
                 <button
                   type="button"
@@ -120,8 +121,8 @@ export function SideChatsPicker({
               </div>
             ))
           )}
-        </DropdownMenu.Content>
-      </DropdownMenu.Root>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       <ConfirmDialog
         open={deleteId != null}
@@ -139,6 +140,6 @@ export function SideChatsPicker({
         loading={deleting}
         onConfirm={() => void handleConfirmDelete()}
       />
-    </Flex>
+    </div>
   )
 }

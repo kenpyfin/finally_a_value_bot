@@ -31,7 +31,7 @@ import {
   Thread,
   UserMessage,
   makeMarkdownText,
-} from '@assistant-ui/react-ui'
+} from './aui-thread'
 import remarkGfm from 'remark-gfm'
 import { historiesEqual, isHistoryPrepend } from '../lib/history-sync'
 import {
@@ -47,13 +47,16 @@ import {
 import { centerMessageInViewport, flashMessageElement } from '../lib/reveal-message'
 import { messageTextForClipboard, parseReplyForDisplay, type DisplayReplyQuote, type PendingReplyQuote } from '../lib/reply-quote'
 import { MarkdownTable } from './markdown-table'
+import { AgentToolCallBlock } from './agent-blocks'
+import { StreamdownMessageText } from './markdown-stream'
+import { useThreadUiMode } from '../lib/thread-ui-mode'
 import { copyTextToClipboard } from '../lib/copy-to-clipboard'
 import { messageGroupClass, messageGroupPosition } from '../lib/message-group'
 
 import { formatMessageTimestamp, formatMessageTimestampTitle } from '../lib/format-message-time'
 
-/** Module-scoped so ThreadPane re-renders do not remount every markdown message. */
-const MarkdownText = makeMarkdownText({
+/** Module-scoped so ThreadPane re-renders do not remount every markdown message (legacy UI). */
+const LegacyMarkdownText = makeMarkdownText({
   remarkPlugins: [remarkGfm],
   components: {
     img: ({ alt, className, ...props }) => (
@@ -938,6 +941,9 @@ export const ThreadPane = React.memo(function ThreadPane({
   uploadHint,
   onShowShortcuts,
 }: ThreadPaneProps) {
+  const threadUi = useThreadUiMode()
+  const MarkdownTextComponent = threadUi === 'next' ? StreamdownMessageText : LegacyMarkdownText
+  const ToolFallbackComponent = threadUi === 'next' ? AgentToolCallBlock : ToolCallCard
   const [mobileActionMessageId, setMobileActionMessageId] = React.useState<string | null>(null)
   const onMobileMessageTap = React.useCallback((messageId: string) => {
     setMobileActionMessageId((prev) => (messageId && prev === messageId ? null : messageId || null))
@@ -1240,8 +1246,8 @@ export const ThreadPane = React.memo(function ThreadPane({
               allowFeedbackNegative: false,
               allowFeedbackPositive: false,
               components: {
-                Text: MarkdownText,
-                ToolFallback: ToolCallCard,
+                Text: MarkdownTextComponent,
+                ToolFallback: ToolFallbackComponent,
               },
             },
             userMessage: { allowEdit: false },

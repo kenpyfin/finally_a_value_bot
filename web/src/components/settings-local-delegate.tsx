@@ -1,5 +1,7 @@
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from '@/components/ui/select'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Callout, Flex, Select, Text, TextField } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import type { LocalDelegateConfigResponse } from '../types'
 
@@ -201,14 +203,14 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
 
   if (!config?.ok) {
     return (
-      <Text size="2" color="gray">
+      <span>
         Could not load local delegate configuration.
-      </Text>
+      </span>
     )
   }
 
   return (
-    <Flex direction="column" gap="3">
+    <div className="flex flex-col gap-3">
       <div className="mc-multimodel-stepper" aria-label="Setup progress">
         {steps.map((step) => {
           const done =
@@ -227,51 +229,49 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
         })}
       </div>
 
-      <Text size="1" color="gray">
+      <span>
         Configure a local OpenAI-compatible server for Classic · Cost routing (read-only discovery
         and delegated sub-jobs) and PTE/PDQE sidecars. Enable cost routing from Settings → Agent
         engine (per persona, or the global inherit default).
-      </Text>
+      </span>
 
       {!localToolsOk ? (
-        <Callout.Root color="orange" size="1" variant="soft" role="alert">
-          <Callout.Text>
+        <div role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
             Tool calling is not verified for the local model. Run the test below before using
             Classic · Cost routing. Until verified, cost routing runs use the cloud model only.
-          </Callout.Text>
-        </Callout.Root>
+          </div>
       ) : null}
 
       <div
         className="rounded-md border p-3"
         style={{ borderColor: 'var(--gray-6)' }}
       >
-        <Text size="2" weight="bold" className="mb-1 block">
+        <span className="font-semibold mb-1 block">
           Local model
-        </Text>
-        <Text size="1" color="gray" className="mb-2 block">
+        </span>
+        <span className="mb-2 block">
           OpenAI-compatible server (llama.cpp, vLLM, Ollama).
-        </Text>
-        <Flex direction="column" gap="2">
-          <TextField.Root
+        </span>
+        <div className="flex flex-col gap-2">
+          <Input
             placeholder="http://127.0.0.1:8080/v1"
             value={localBaseUrl}
             onChange={(e) => setLocalBaseUrl(e.target.value)}
           />
-          <Flex gap="2" wrap="wrap" align="center">
+          <div className="flex gap-2 flex-wrap items-center">
             {!useCustomModel && availableModels.length > 0 ? (
-              <Select.Root value={localModel} onValueChange={setLocalModel}>
-                <Select.Trigger placeholder="Select model" style={{ flex: 1, minWidth: 160 }} />
-                <Select.Content>
+              <Select value={localModel} onValueChange={setLocalModel}>
+                <SelectTrigger placeholder="Select model" style={{ flex: 1, minWidth: 160 }} ><SelectValue /></SelectTrigger>
+                <SelectContent>
                   {availableModels.map((id) => (
-                    <Select.Item key={id} value={id}>
+                    <SelectItem key={id} value={id}>
                       {id}
-                    </Select.Item>
+                    </SelectItem>
                   ))}
-                </Select.Content>
-              </Select.Root>
+                </SelectContent>
+              </Select>
             ) : (
-              <TextField.Root
+              <Input
                 placeholder="qwen2.5-coder-14b-instruct"
                 value={localModel}
                 onChange={(e) => setLocalModel(e.target.value)}
@@ -279,7 +279,7 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
               />
             )}
             <Button
-              size="1"
+              size="sm"
               variant="outline"
               className="cursor-pointer"
               disabled={loadingModels || !localBaseUrl.trim()}
@@ -287,10 +287,10 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
             >
               {loadingModels ? 'Loading…' : 'Refresh models'}
             </Button>
-          </Flex>
+          </div>
           {availableModels.length > 0 ? (
             <Button
-              size="1"
+              size="sm"
               variant="ghost"
               type="button"
               onClick={() => setUseCustomModel((v) => !v)}
@@ -299,17 +299,17 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
             </Button>
           ) : null}
           {modelsNotice ? (
-            <Text size="1" color="gray" role="status">
+            <span role="status">
               {modelsNotice}
-            </Text>
+            </span>
           ) : localBaseUrl.trim() ? (
-            <Text size="1" color="gray">
+            <span>
               Enter the server URL, then refresh to load models from{' '}
               <code className="text-xs">/v1/models</code>.
-            </Text>
+            </span>
           ) : null}
           <Button
-            size="1"
+            size="sm"
             variant="outline"
             className="cursor-pointer"
             disabled={testing}
@@ -317,50 +317,44 @@ export function SettingsLocalDelegatePanel({ api, onError }: Props) {
           >
             {testing ? 'Testing…' : 'Test local server'}
           </Button>
-          <Text
-            size="1"
-            color={localToolsOk ? 'green' : 'gray'}
-            role="status"
-            aria-live="polite"
-          >
+          <span role="status"
+            aria-live="polite">
             Tool calling: {localToolsOk ? 'verified' : 'not verified — run test'}
             {testNotice ? ` — ${testNotice}` : ''}
-          </Text>
+          </span>
           {testPassed === false ? (
-            <Text size="1" color="red" role="status">
+            <span role="status">
               Last test did not pass. Check URL, model name, and server logs.
-            </Text>
+            </span>
           ) : null}
-        </Flex>
+        </div>
       </div>
 
       <div
         className="rounded-md border p-3"
         style={{ borderColor: 'var(--gray-6)' }}
       >
-        <Text size="2" weight="bold" className="mb-1 block">
+        <span className="font-semibold mb-1 block">
           Strategy (main loop)
-        </Text>
-        <Text size="1" color="gray">
+        </span>
+        <span>
           Uses{' '}
           <span className="font-mono">
             {config.strategy_provider ?? 'anthropic'} / {config.strategy_model ?? 'claude-sonnet'}
           </span>{' '}
           from Settings → Agent engine. Cost routing sends read-only tool chains to the local model above.
-        </Text>
+        </span>
       </div>
 
-      <Flex gap="2" align="center" wrap="wrap">
-        <Button size="2" className="cursor-pointer" disabled={saving} onClick={() => void save()}>
+      <div className="flex gap-2 items-center flex-wrap">
+        <Button size="default" className="cursor-pointer" disabled={saving} onClick={() => void save()}>
           {saving ? 'Saving…' : 'Save local delegate settings'}
         </Button>
-      </Flex>
+      </div>
 
       {saveNotice ? (
-        <Callout.Root color="green" size="1" variant="soft">
-          <Callout.Text role="status">{saveNotice}</Callout.Text>
-        </Callout.Root>
+        <div role="status" className="rounded-lg border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-900 dark:text-green-100">{saveNotice}</div>
       ) : null}
-    </Flex>
+    </div>
   )
 }

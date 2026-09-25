@@ -1,10 +1,11 @@
+import { Select } from '@/components/ui/select'
 import { Component, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { Callout, Flex, Text } from '@radix-ui/themes'
 import { SettingsPanelSkeleton } from './skeleton'
 import { SettingsLlmPanel } from './settings-llm'
 import { SettingsLocalDelegatePanel } from './settings-local-delegate'
 import { SettingsCursorPanel } from './settings-cursor'
 import { SettingsGeminiAdkPanel } from './settings-gemini-adk'
+import { SettingsRunContextPanel } from './settings-run-context'
 import type {
   CursorEngineConfigResponse,
   GeminiAdkConfigResponse,
@@ -18,6 +19,7 @@ type Props = {
   onError: (message: string) => void
   activePersonaId: number | null
   personas: Persona[]
+  onPersonaBulletinChanged?: () => void | Promise<void>
 }
 
 type EngineId = 'classic' | 'classic_cost_routing' | 'gemini_adk' | 'cursor'
@@ -65,19 +67,23 @@ class ConfigPanelErrorBoundary extends Component<{ children: ReactNode }, { mess
   render() {
     if (this.state.message) {
       return (
-        <Callout.Root color="orange" size="1" variant="soft">
-          <Callout.Text>
+        <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
             Engine knobs failed to render ({this.state.message}). The engine selection above is
             unchanged — pick another engine or reload Settings.
-          </Callout.Text>
-        </Callout.Root>
+          </div>
       )
     }
     return this.props.children
   }
 }
 
-export function SettingsAgentEnginePanel({ api, onError, activePersonaId, personas }: Props) {
+export function SettingsAgentEnginePanel({
+  api,
+  onError,
+  activePersonaId,
+  personas,
+  onPersonaBulletinChanged,
+}: Props) {
   const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null)
   const [cursorStatus, setCursorStatus] = useState<CursorEngineConfigResponse | null>(null)
   const [geminiStatus, setGeminiStatus] = useState<GeminiAdkConfigResponse | null>(null)
@@ -223,23 +229,31 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
   const busy = savingKey != null
 
   return (
-    <Flex direction="column" gap="4">
-      <Flex direction="column" gap="2">
-        <Text size="2" weight="medium">
+    <div className="flex flex-col gap-4">
+      <SettingsRunContextPanel
+        api={api}
+        onError={onError}
+        activePersonaId={activePersonaId}
+        personaName={personaName}
+        onPersonaBulletinChanged={onPersonaBulletinChanged}
+      />
+
+      <div className="flex flex-col gap-2">
+        <span className="font-medium">
           Agent engine
-        </Text>
+        </span>
         {activePersonaId == null ? (
-          <Text size="1" color="gray">
+          <span>
             Select a persona in the sidebar to set its engine. Choosing an engine saves it and shows
             its settings below.
-          </Text>
+          </span>
         ) : (
-          <Text size="1" color="gray">
+          <span>
             Engine for <span className="font-medium">{personaName}</span>. Click to save —
             settings for that engine appear below. New personas default to Single turn.
-          </Text>
+          </span>
         )}
-        <Flex gap="2" wrap="wrap">
+        <div className="flex gap-2 flex-wrap">
           {ENGINE_OPTIONS.map((opt) => (
             <button
               key={opt.id}
@@ -256,57 +270,49 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
               {opt.label}
             </button>
           ))}
-        </Flex>
+        </div>
 
         {saveNotice ? (
-          <Callout.Root color="green" size="1" variant="soft">
-            <Callout.Text role="status">{saveNotice}</Callout.Text>
-          </Callout.Root>
+          <div role="status" className="rounded-lg border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-900 dark:text-green-100">{saveNotice}</div>
         ) : null}
 
         {costRoutingSelected && !localReady ? (
-          <Callout.Root color="orange" size="1" variant="soft" role="alert">
-            <Callout.Text>
+          <div role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
               {!localConfigured
                 ? 'Cost routing is selected but no local URL/model is configured. Runs use the cloud model only until you configure Local delegate below.'
                 : !toolsOk
                   ? 'Cost routing is selected but local tool calling is not verified. Runs use the cloud model only until you run Test in Local delegate.'
                   : 'Cost routing is selected but the local delegate is not ready. Runs use the cloud model only.'}
-            </Callout.Text>
-          </Callout.Root>
+            </div>
         ) : null}
 
         {selectedEngine === 'cursor' && cursorStatus && !cursorStatus.engine_ready ? (
-          <Callout.Root color="orange" size="1" variant="soft">
-            <Callout.Text>
+          <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
               Cursor engine is active but not ready ({cursorStatus.sidecar_reachable ? 'sidecar up' : 'sidecar down'}
               , API key {cursorStatus.api_key_configured ? 'ok' : 'missing'}, health{' '}
               {cursorStatus.sdk_runner_ok ? 'verified' : 'not verified'}). Finish setup in the Cursor
               panel below.
-            </Callout.Text>
-          </Callout.Root>
+            </div>
         ) : null}
 
         {selectedEngine === 'gemini_adk' && geminiStatus && !geminiStatus.engine_ready ? (
-          <Callout.Root color="orange" size="1" variant="soft">
-            <Callout.Text>
+          <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
               Gemini ADK is active but not ready (API key{' '}
               {geminiStatus.api_key_configured ? 'ok' : 'missing'}). Set GEMINI_API_KEY in .env and
               finish setup in the Gemini ADK panel below.
-            </Callout.Text>
-          </Callout.Root>
+            </div>
         ) : null}
-      </Flex>
+      </div>
 
       <ConfigPanelErrorBoundary key={selectedEngine}>
         {selectedEngine === 'classic' ? (
           <SettingsLlmPanel api={api} onError={onError} activePersonaId={activePersonaId} />
         ) : null}
         {selectedEngine === 'classic_cost_routing' ? (
-          <Flex direction="column" gap="4">
+          <div className="flex flex-col gap-4">
             <SettingsLlmPanel api={api} onError={onError} activePersonaId={activePersonaId} />
             <SettingsLocalDelegatePanel api={api} onError={onError} />
-          </Flex>
+          </div>
         ) : null}
         {selectedEngine === 'cursor' ? (
           <SettingsCursorPanel
@@ -323,6 +329,6 @@ export function SettingsAgentEnginePanel({ api, onError, activePersonaId, person
           />
         ) : null}
       </ConfigPanelErrorBoundary>
-    </Flex>
+    </div>
   )
 }
