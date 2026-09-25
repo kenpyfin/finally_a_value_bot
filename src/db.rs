@@ -554,6 +554,20 @@ pub struct PersonaMessageBookmark {
     pub note: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Session of the underlying message when it still exists; `None` for main chat or missing.
+    pub session_id: Option<String>,
+    /// Timestamp of the underlying message when it still exists.
+    pub message_timestamp: Option<String>,
+    /// True when the bookmarked message row was deleted.
+    pub missing: bool,
+}
+
+/// Paginated message window with cursor flags for older/newer pages.
+#[derive(Debug, Clone)]
+pub struct MessagePage {
+    pub messages: Vec<StoredMessage>,
+    pub has_older: bool,
+    pub has_newer: bool,
 }
 
 /// Side chat (sub-thread) anchored to an assistant message; turns are not main timeline.
@@ -4728,14 +4742,19 @@ impl Database {
     ) -> Result<Vec<PersonaMessageBookmark>, FinallyAValueBotError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT chat_id, persona_id, message_id, role, content_preview, note, created_at, updated_at
-             FROM persona_message_bookmarks
-             WHERE chat_id = ?1 AND persona_id = ?2
-             ORDER BY updated_at DESC
+            "SELECT b.chat_id, b.persona_id, b.message_id, b.role, b.content_preview, b.note,
+                    b.created_at, b.updated_at, m.session_id, m.timestamp,
+                    CASE WHEN m.id IS NULL THEN 1 ELSE 0 END
+             FROM persona_message_bookmarks b
+             LEFT JOIN messages m
+               ON m.chat_id = b.chat_id AND m.persona_id = b.persona_id AND m.id = b.message_id
+             WHERE b.chat_id = ?1 AND b.persona_id = ?2
+             ORDER BY b.updated_at DESC
              LIMIT ?3",
         )?;
         let items = stmt
             .query_map(params![chat_id, persona_id, limit as i64], |row| {
+                let missing_i: i64 = row.get(10)?;
                 Ok(PersonaMessageBookmark {
                     chat_id: row.get(0)?,
                     persona_id: row.get(1)?,
@@ -4745,6 +4764,9 @@ impl Database {
                     note: row.get(5)?,
                     created_at: row.get(6)?,
                     updated_at: row.get(7)?,
+                    session_id: row.get(8)?,
+                    message_timestamp: row.get(9)?,
+                    missing: missing_i != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -5140,36 +5162,51 @@ impl Database {
         Ok(Some(count as usize))
     }
 
-    /// Window of messages around a target id (older pad + target + newer).
-    pub fn get_messages_around_id(
-        &self,
+    fn resolve_message_cursor(
+        conn: &rusqlite::Connection,
         chat_id: i64,
         persona_id: i64,
         message_id: &str,
-        before: usize,
-        after: usize,
-        session_id: Option<&str>,
-    ) -> Result<Option<Vec<StoredMessage>>, FinallyAValueBotError> {
-        let conn = self.conn.lock().unwrap();
-        let target: Option<(String, Option<String>)> = match conn.query_row(
+    ) -> Result<Option<(String, Option<String>)>, FinallyAValueBotError> {
+        match conn.query_row(
             "SELECT timestamp, session_id FROM messages
              WHERE chat_id = ?1 AND persona_id = ?2 AND id = ?3",
             params![chat_id, persona_id, message_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ) {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e.into()),
-        };
-        let Some((ts, msg_session)) = target else {
-            return Ok(None);
-        };
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 
-        let older = if let Some(sid) = session_id
+    fn effective_message_scope(
+        session_id: Option<&str>,
+        msg_session: Option<String>,
+    ) -> Option<String> {
+        session_id
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or(msg_session.clone())
-        {
+            .or(msg_session)
+    }
+
+    /// Older messages strictly before `message_id` (oldest first). `has_older` when more exist.
+    pub fn get_messages_before_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Option<(Vec<StoredMessage>, bool)>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let Some((ts, msg_session)) =
+            Self::resolve_message_cursor(&conn, chat_id, persona_id, message_id)?
+        else {
+            return Ok(None);
+        };
+        let fetch = (limit + 1) as i64;
+        let mut older = if let Some(sid) = Self::effective_message_scope(session_id, msg_session) {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
@@ -5179,7 +5216,7 @@ impl Database {
                  LIMIT ?6"
             ))?;
             let rows = stmt.query_map(
-                params![chat_id, persona_id, sid, ts, message_id, before as i64],
+                params![chat_id, persona_id, sid, ts, message_id, fetch],
                 stored_message_from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -5194,17 +5231,134 @@ impl Database {
                  LIMIT ?5"
             ))?;
             let rows = stmt.query_map(
-                params![chat_id, persona_id, ts, message_id, before as i64],
+                params![chat_id, persona_id, ts, message_id, fetch],
                 stored_message_from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let has_older = older.len() > limit;
+        if has_older {
+            older.truncate(limit);
+        }
+        older.reverse();
+        Ok(Some((older, has_older)))
+    }
 
-        let newer_incl = if let Some(sid) = session_id
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or(msg_session)
-        {
+    /// Newer messages strictly after `message_id` (oldest first). `has_newer` when more exist.
+    pub fn get_messages_after_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Option<(Vec<StoredMessage>, bool)>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let Some((ts, msg_session)) =
+            Self::resolve_message_cursor(&conn, chat_id, persona_id, message_id)?
+        else {
+            return Ok(None);
+        };
+        let fetch = (limit + 1) as i64;
+        let mut newer = if let Some(sid) = Self::effective_message_scope(session_id, msg_session) {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3
+                   AND (timestamp > ?4 OR (timestamp = ?4 AND id > ?5))
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?6"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, sid, ts, message_id, fetch],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                   AND (timestamp > ?3 OR (timestamp = ?3 AND id > ?4))
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, ts, message_id, fetch],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let has_newer = newer.len() > limit;
+        if has_newer {
+            newer.truncate(limit);
+        }
+        Ok(Some((newer, has_newer)))
+    }
+
+    /// Window of messages around a target id (older pad + target + newer).
+    pub fn get_messages_around_id(
+        &self,
+        chat_id: i64,
+        persona_id: i64,
+        message_id: &str,
+        before: usize,
+        after: usize,
+        session_id: Option<&str>,
+    ) -> Result<Option<MessagePage>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let Some((ts, msg_session)) =
+            Self::resolve_message_cursor(&conn, chat_id, persona_id, message_id)?
+        else {
+            return Ok(None);
+        };
+        let scope = Self::effective_message_scope(session_id, msg_session);
+
+        let mut older = if let Some(ref sid) = scope {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2 AND session_id = ?3
+                   AND (timestamp < ?4 OR (timestamp = ?4 AND id < ?5))
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?6"
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    chat_id,
+                    persona_id,
+                    sid,
+                    ts,
+                    message_id,
+                    (before + 1) as i64
+                ],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLS}
+                 FROM messages
+                 WHERE chat_id = ?1 AND persona_id = ?2
+                   AND {MAIN_CHAT_MESSAGE_VISIBILITY}
+                   AND (timestamp < ?3 OR (timestamp = ?3 AND id < ?4))
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(
+                params![chat_id, persona_id, ts, message_id, (before + 1) as i64],
+                stored_message_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let has_older = older.len() > before;
+        if has_older {
+            older.truncate(before);
+        }
+        older.reverse();
+
+        let mut newer_incl = if let Some(ref sid) = scope {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {MESSAGE_SELECT_COLS}
                  FROM messages
@@ -5214,7 +5368,7 @@ impl Database {
                  LIMIT ?6"
             ))?;
             let rows = stmt.query_map(
-                params![chat_id, persona_id, sid, ts, message_id, (after + 1) as i64],
+                params![chat_id, persona_id, sid, ts, message_id, (after + 2) as i64],
                 stored_message_from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -5229,17 +5383,52 @@ impl Database {
                  LIMIT ?5"
             ))?;
             let rows = stmt.query_map(
-                params![chat_id, persona_id, ts, message_id, (after + 1) as i64],
+                params![chat_id, persona_id, ts, message_id, (after + 2) as i64],
                 stored_message_from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        // newer_incl includes the target; after+2 means target + after + 1 extra for has_newer.
+        let has_newer = newer_incl.len() > after + 1;
+        if has_newer {
+            newer_incl.truncate(after + 1);
+        }
 
-        let mut older = older;
-        older.reverse(); // oldest first
         let mut out = older;
         out.extend(newer_incl);
-        Ok(Some(out))
+        Ok(Some(MessagePage {
+            messages: out,
+            has_older,
+            has_newer,
+        }))
+    }
+
+    /// Recent messages for a focused session (oldest first), with `has_older` from overfetch.
+    pub fn get_recent_messages_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<StoredMessage>, bool), FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_SELECT_COLS}
+             FROM messages
+             WHERE session_id = ?1
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?2"
+        ))?;
+        let mut messages = stmt
+            .query_map(
+                params![session_id, (limit + 1) as i64],
+                stored_message_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_older = messages.len() > limit;
+        if has_older {
+            messages.truncate(limit);
+        }
+        messages.reverse();
+        Ok((messages, has_older))
     }
 
     pub fn add_persona_todo(
@@ -8160,6 +8349,11 @@ mod tests {
         assert_eq!(items[0].message_id, "m-bookmark-1");
         assert_eq!(items[0].content_preview, "bookmark me updated");
         assert_eq!(items[0].note.as_deref(), Some("still important"));
+        assert!(!items[0].missing);
+        assert_eq!(
+            items[0].message_timestamp.as_deref(),
+            Some("2024-01-01T00:00:01Z")
+        );
 
         assert!(db
             .delete_persona_message_bookmark(100, pid, "m-bookmark-1")
@@ -8167,6 +8361,111 @@ mod tests {
         assert!(!db
             .delete_persona_message_bookmark(100, pid, "m-bookmark-1")
             .unwrap());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_message_cursor_pagination_before_after_around() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 200);
+        for i in 1..=10 {
+            db.store_message(&StoredMessage {
+                id: format!("m{i}"),
+                chat_id: 200,
+                persona_id: pid,
+                session_id: None,
+                sender_name: "alice".into(),
+                content: format!("msg {i}"),
+                is_from_bot: false,
+                timestamp: format!("2024-01-01T00:00:{i:02}Z"),
+                origin: crate::db::message_origin_interactive(),
+            })
+            .unwrap();
+        }
+
+        let (before, has_older) = db
+            .get_messages_before_id(200, pid, "m5", 2, None)
+            .unwrap()
+            .expect("cursor exists");
+        assert_eq!(
+            before.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m3", "m4"]
+        );
+        assert!(has_older);
+
+        let (after, has_newer) = db
+            .get_messages_after_id(200, pid, "m5", 2, None)
+            .unwrap()
+            .expect("cursor exists");
+        assert_eq!(
+            after.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m6", "m7"]
+        );
+        assert!(has_newer);
+
+        let page = db
+            .get_messages_around_id(200, pid, "m5", 2, 2, None)
+            .unwrap()
+            .expect("around exists");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m3", "m4", "m5", "m6", "m7"]
+        );
+        assert!(page.has_older);
+        assert!(page.has_newer);
+
+        let edge = db
+            .get_messages_around_id(200, pid, "m1", 2, 2, None)
+            .unwrap()
+            .expect("around m1");
+        assert!(!edge.has_older);
+        assert!(edge.has_newer);
+        assert_eq!(edge.messages[0].id, "m1");
+
+        let tip = db
+            .get_messages_around_id(200, pid, "m10", 2, 2, None)
+            .unwrap()
+            .expect("around m10");
+        assert!(tip.has_older);
+        assert!(!tip.has_newer);
+
+        assert!(db
+            .get_messages_before_id(200, pid, "missing", 2, None)
+            .unwrap()
+            .is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_persona_message_bookmark_missing_flag_when_message_deleted() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 101);
+        db.store_message(&StoredMessage {
+            id: "m-gone".into(),
+            chat_id: 101,
+            persona_id: pid,
+            session_id: None,
+            sender_name: "alice".into(),
+            content: "soon gone".into(),
+            is_from_bot: false,
+            timestamp: "2024-01-01T00:00:01Z".into(),
+            origin: crate::db::message_origin_interactive(),
+        })
+        .unwrap();
+        db.upsert_persona_message_bookmark(101, pid, "m-gone", "user", "soon gone", None)
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DELETE FROM messages WHERE id = ?1", params!["m-gone"])
+                .unwrap();
+        }
+        let items = db.list_persona_message_bookmarks(101, pid, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].missing);
+        assert!(items[0].message_timestamp.is_none());
         cleanup(&dir);
     }
 

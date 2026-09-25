@@ -27,7 +27,16 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-25 — Cursor-based chat history windows for bookmark jumps
+
+- **Area:** web UI / history API / bookmarks
+- **Summary:** Replaced tip-counted `historyVisibleLimit` pagination with cursor windows (`before_id` / `after_id` / `around_id` + `has_older` / `has_newer`). Bookmark jumps load a light anchored window around the target; Load earlier / Load newer / Jump to latest navigate without dumping the whole timeline. Poller no longer clobbers anchored views. Bookmark list joins message `session_id` / timestamp / `missing`.
+- **Rationale:** Scroll-to-bookmark could not survive chopped history; arming the target before fetch raced a short frame retry; tip refreshes wiped around-message windows.
+- **Key files / symbols:** `MessagePage`, `get_messages_before_id`, `get_messages_after_id`, `get_messages_around_id` in `src/db.rs`; `api_history` in `src/web.rs`; `use-chat-history.ts` (`historyMode`, `loadWindowAround`, `jumpToLatest`); `revealMessageInThread` in `App.tsx`; `LoadNewerMessages` / `JumpToLatestPill` / ThreadPane props; cockpit bookmark cards.
+- **Follow-ups:** Optional session title on bookmark cards; infinite scroll instead of buttons.
+
 ### 2026-09-25 — Fix queue dialog blank page after shadcn migration
+
 
 - **Area:** web UI / queue / dialogs
 - **Summary:** Queue dialog crashed into a blank page when opened. Fixed by always mounting shadcn `DialogContent` (controlled `open` only), removing the broken TanStack `DataTable`/`getRowId` path from the queue view (plain HTML tables for runs + background jobs), and applying the same DialogContent mount fix to other dialogs that used `{open ? <DialogContent/> : null}`.

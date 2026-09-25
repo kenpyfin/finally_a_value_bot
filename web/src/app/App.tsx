@@ -299,6 +299,9 @@ type LoadHistoryFn = (
     aroundId?: string
     aroundBefore?: number
     aroundAfter?: number
+    beforeId?: string
+    afterId?: string
+    replace?: boolean
   },
 ) => Promise<void>
 
@@ -411,13 +414,19 @@ export function App({
 
   const {
     historySeed,
-    historyHasMore,
+    historyMode,
+    historyHasOlder,
+    historyHasNewer,
+    newMessagesPending,
     historyLoadingMore,
+    historyLoadingNewer,
     historyLoading,
     setHistoryLoading,
     loadHistory,
-    loadMoreHistory,
-    ensureMessageVisible,
+    loadOlder,
+    loadNewer,
+    jumpToLatest,
+    loadWindowAround,
     resetHistoryPagination,
     handleReplyToMessage,
     handleDismissPendingReply,
@@ -460,10 +469,13 @@ export function App({
   // Armed message id for a bookmark/anchor jump. ThreadPane performs the centered
   // scroll (with auto-scroll-to-bottom suppressed) once the element is mounted.
   const [targetScrollMessageId, setTargetScrollMessageId] = useState<string | null>(null)
+  // Suppress auto-scroll while history is loading for a jump (before target is armed).
+  const [jumpSuppressAutoScroll, setJumpSuppressAutoScroll] = useState(false)
 
   const handleTargetScrollHandled = useCallback(
     (found: boolean) => {
       setTargetScrollMessageId(null)
+      setJumpSuppressAutoScroll(false)
       if (found) {
         setStatusText('Jumped to message')
       } else {
@@ -477,13 +489,12 @@ export function App({
   const revealMessageInThread = useCallback(
     async (messageId: string) => {
       if (!messageId) return
-      // Arm the jump first so ThreadPane suppresses auto-scroll-to-bottom before any
-      // history reset happens.
-      setTargetScrollMessageId(messageId)
       if (findMessageElement(messageId)) {
-        // Already mounted; ThreadPane's effect will center it on the state change.
+        setJumpSuppressAutoScroll(true)
+        setTargetScrollMessageId(messageId)
         return
       }
+      setJumpSuppressAutoScroll(true)
       setStatusText('Loading message…')
       try {
         const meta = await api<{
@@ -500,26 +511,46 @@ export function App({
           await handleSelectSession(sessionId)
         }
         if (findMessageElement(messageId)) {
-          // Mounted after session switch; ThreadPane effect (initialMessages dep) handles it.
+          setTargetScrollMessageId(messageId)
           return
         }
-        const { ok } = await ensureMessageVisible(messageId)
+        const { ok } = await loadWindowAround(messageId, sessionId)
         if (!ok) {
-          setTargetScrollMessageId(null)
+          setJumpSuppressAutoScroll(false)
+          setStatusText('Idle')
+          return
+        }
+        // Arm after the window is loaded so the scroll effect does not time out mid-fetch.
+        setTargetScrollMessageId(messageId)
+      } catch (e) {
+        setJumpSuppressAutoScroll(false)
+        setTargetScrollMessageId(null)
+        const msg = e instanceof Error ? e.message : String(e)
+        if (/not found/i.test(msg)) {
+          setStatusText('Idle')
+          requestConfirm({
+            title: 'Bookmarked message missing',
+            description:
+              'This bookmarked message was deleted. Remove the bookmark from your list?',
+            confirmLabel: 'Remove bookmark',
+            destructive: true,
+            onConfirm: async () => {
+              await removePersonaBookmark(messageId)
+            },
+          })
+        } else {
+          setError(msg)
           setStatusText('Idle')
         }
-        // On success, ThreadPane centers the message and calls onTargetScrollHandled.
-      } catch (e) {
-        setTargetScrollMessageId(null)
-        setError(e instanceof Error ? e.message : String(e))
-        setStatusText('Idle')
       }
     },
     [
       activePersonaId,
       activeSessionId,
-      ensureMessageVisible,
       handleSelectSession,
+      loadWindowAround,
+      removePersonaBookmark,
+      requestConfirm,
       setError,
       setStatusText,
     ],
@@ -942,6 +973,10 @@ export function App({
         const messageText = pendingReply ? formatReplyForSend(pendingReply, userText) : userText
         if (!messageText.trim() && attachments.length === 0) return
 
+        if (historyMode === 'anchored') {
+          await jumpToLatest()
+        }
+
         setStatusText(attachments.length > 0 ? 'Sending message…' : 'Sending...')
         setReplayNotice('')
         setError('')
@@ -1220,7 +1255,7 @@ export function App({
         }
       },
     }),
-    [chatId, selectedSessionReadOnly, activePersonaId, formatReplyForSend, loadHistory, loadPersonaBulletin],
+    [chatId, selectedSessionReadOnly, activePersonaId, formatReplyForSend, historyMode, jumpToLatest, loadHistory, loadPersonaBulletin],
   )
 
   const toggleAppearance = useCallback((): void => {
@@ -2222,9 +2257,15 @@ export function App({
                         runtimeKey={runtimeKey}
                         isStreaming={pendingRunsForActivePersona.length > 0}
                         historyLoading={historyLoading}
-                        historyHasMore={historyHasMore}
+                        historyMode={historyMode}
+                        historyHasOlder={historyHasOlder}
+                        historyHasNewer={historyHasNewer}
                         historyLoadingMore={historyLoadingMore}
-                        onLoadMoreHistory={loadMoreHistory}
+                        historyLoadingNewer={historyLoadingNewer}
+                        newMessagesPending={newMessagesPending}
+                        onLoadOlder={loadOlder}
+                        onLoadNewer={loadNewer}
+                        onJumpToLatest={jumpToLatest}
                         draftText={activeDraftText}
                         onDraftTextChange={handleDraftTextChange}
                         bookmarkedMessageIds={bookmarkedMessageIds}
@@ -2240,6 +2281,7 @@ export function App({
                         onDismissPendingReply={handleDismissPendingReply}
                         onMobileThreadScroll={handleMobileThreadScroll}
                         targetScrollMessageId={targetScrollMessageId}
+                        suppressAutoScroll={jumpSuppressAutoScroll}
                         onTargetScrollHandled={handleTargetScrollHandled}
                         onShowShortcuts={handleShowShortcuts}
                         uploadHint={
@@ -2282,9 +2324,15 @@ export function App({
                         runtimeKey={runtimeKey}
                         isStreaming={pendingRunsForActivePersona.length > 0}
                         historyLoading={historyLoading}
-                        historyHasMore={historyHasMore}
+                        historyMode={historyMode}
+                        historyHasOlder={historyHasOlder}
+                        historyHasNewer={historyHasNewer}
                         historyLoadingMore={historyLoadingMore}
-                        onLoadMoreHistory={loadMoreHistory}
+                        historyLoadingNewer={historyLoadingNewer}
+                        newMessagesPending={newMessagesPending}
+                        onLoadOlder={loadOlder}
+                        onLoadNewer={loadNewer}
+                        onJumpToLatest={jumpToLatest}
                         draftText={activeDraftText}
                         onDraftTextChange={handleDraftTextChange}
                         bookmarkedMessageIds={bookmarkedMessageIds}
@@ -2300,6 +2348,7 @@ export function App({
                         onDismissPendingReply={handleDismissPendingReply}
                         onMobileThreadScroll={handleMobileThreadScroll}
                         targetScrollMessageId={targetScrollMessageId}
+                        suppressAutoScroll={jumpSuppressAutoScroll}
                         onTargetScrollHandled={handleTargetScrollHandled}
                         onShowShortcuts={handleShowShortcuts}
                         uploadHint={

@@ -23,6 +23,8 @@ import {
 } from '@assistant-ui/react'
 import { ThreadWelcomeHints } from './thread-welcome-hints'
 import { LoadEarlierMessages } from './load-earlier-messages'
+import { LoadNewerMessages } from './load-newer-messages'
+import { JumpToLatestPill } from './jump-to-latest-pill'
 import { ScrollToLatest } from './scroll-to-latest'
 import {
   AssistantMessage,
@@ -783,10 +785,19 @@ export type ThreadPaneProps = {
   isStreaming?: boolean
   /** If true, show a loading indicator while initial chat history is being fetched. */
   historyLoading?: boolean
+  /** Live tip vs anchored around-message window. */
+  historyMode?: 'live' | 'anchored'
   /** When true, older messages exist above the current window. */
-  historyHasMore?: boolean
+  historyHasOlder?: boolean
+  /** When true, newer messages exist below the current (anchored) window. */
+  historyHasNewer?: boolean
   historyLoadingMore?: boolean
-  onLoadMoreHistory?: () => void | Promise<void>
+  historyLoadingNewer?: boolean
+  /** Tip has advanced while the thread is anchored. */
+  newMessagesPending?: boolean
+  onLoadOlder?: () => void | Promise<void>
+  onLoadNewer?: () => void | Promise<void>
+  onJumpToLatest?: () => void | Promise<void>
   onDraftTextChange?: (text: string) => void
   bookmarkedMessageIds?: Set<string>
   onToggleBookmark?: (messageId: string, role: 'user' | 'assistant') => void
@@ -809,6 +820,8 @@ export type ThreadPaneProps = {
   onThreadScrolledDownChange?: (scrolledDown: boolean) => void
   /** When set, the thread centers this message and suppresses auto-scroll-to-bottom (bookmark jump). */
   targetScrollMessageId?: string | null
+  /** Suppress auto-scroll while a jump is fetching history (before target is armed). */
+  suppressAutoScroll?: boolean
   /** Called once the target message has been centered (true) or could not be found (false). */
   onTargetScrollHandled?: (found: boolean) => void
   /** Shown under the composer during multipart uploads (e.g. "Uploading photo.png (10.2 MB)…"). */
@@ -919,9 +932,15 @@ export const ThreadPane = React.memo(function ThreadPane({
   draftText,
   isStreaming = false,
   historyLoading = false,
-  historyHasMore = false,
+  historyMode = 'live',
+  historyHasOlder = false,
+  historyHasNewer = false,
   historyLoadingMore = false,
-  onLoadMoreHistory,
+  historyLoadingNewer = false,
+  newMessagesPending = false,
+  onLoadOlder,
+  onLoadNewer,
+  onJumpToLatest,
   onDraftTextChange,
   bookmarkedMessageIds,
   onToggleBookmark,
@@ -937,6 +956,7 @@ export const ThreadPane = React.memo(function ThreadPane({
   onMobileThreadScroll,
   onThreadScrolledDownChange,
   targetScrollMessageId = null,
+  suppressAutoScroll = false,
   onTargetScrollHandled,
   uploadHint,
   onShowShortcuts,
@@ -970,6 +990,7 @@ export const ThreadPane = React.memo(function ThreadPane({
   const runtimeKeyChangedThisRender = lastRuntimeKeyRef.current !== runtimeKey
   const holdStillForPrepend =
     !targetScrollMessageId &&
+    !suppressAutoScroll &&
     !runtimeKeyChangedThisRender &&
     (pendingScrollRestoreRef.current != null ||
       isHistoryPrepend(lastInitialMessagesRef.current, initialMessages))
@@ -985,7 +1006,7 @@ export const ThreadPane = React.memo(function ThreadPane({
     const prev = lastInitialMessagesRef.current
     const prepend =
       !runtimeKeyChanged && isHistoryPrepend(prev, initialMessages)
-    const jumping = targetScrollMessageIdRef.current != null
+    const jumping = targetScrollMessageIdRef.current != null || suppressAutoScroll
     const vp = viewportRef.current
     if (
       prepend &&
@@ -1032,7 +1053,7 @@ export const ThreadPane = React.memo(function ThreadPane({
         lastViewportScrollTopRef.current = el.scrollTop
       })
     }
-  }, [initialMessages, runtime, runtimeKey, isStreaming])
+  }, [initialMessages, runtime, runtimeKey, isStreaming, suppressAutoScroll])
 
   React.useLayoutEffect(() => {
     if (targetScrollMessageId) {
@@ -1044,13 +1065,18 @@ export const ThreadPane = React.memo(function ThreadPane({
     }
   }, [targetScrollMessageId])
 
-  // Bookmark / jump: center the target message once it is mounted, retrying across a few
-  // frames while history settles. Auto-scroll-to-bottom is disabled (see Thread.Viewport
-  // props below) so this scroll is not clobbered by assistant-ui.
+  // Bookmark / jump: center the target message once it is in the message data and mounted.
+  // Wait for the id to appear in initialMessages (history fetch), then retry DOM mount for
+  // up to ~2s — do not use a fixed short frame budget that races the network.
   React.useEffect(() => {
     if (!targetScrollMessageId) return
+    const inData = initialMessages.some((m) => m.id === targetScrollMessageId)
+    if (!inData) {
+      // History not loaded yet; keep waiting (effect re-runs when initialMessages changes).
+      return
+    }
     let cancelled = false
-    let attempts = 0
+    const started = Date.now()
     const tryScroll = () => {
       if (cancelled) return
       const vp = viewportRef.current
@@ -1060,15 +1086,12 @@ export const ThreadPane = React.memo(function ThreadPane({
       if (vp && msgEl instanceof HTMLElement) {
         centerMessageInViewport(vp, msgEl)
         flashMessageElement(msgEl)
-        // Guard the scroll-direction detector so the programmatic jump does not
-        // toggle the mobile header, and record the new position.
         scrollGuardUntilRef.current = Date.now() + 700
         lastViewportScrollTopRef.current = vp.scrollTop
         onTargetScrollHandled?.(true)
         return
       }
-      attempts += 1
-      if (attempts < 40) {
+      if (Date.now() - started < 2000) {
         requestAnimationFrame(tryScroll)
       } else {
         onTargetScrollHandled?.(false)
@@ -1221,7 +1244,7 @@ export const ThreadPane = React.memo(function ThreadPane({
     [],
   )
 
-  const handleLoadMoreHistory = React.useCallback(() => {
+  const handleLoadOlder = React.useCallback(() => {
     const vp = viewportRef.current
     if (vp && targetScrollMessageIdRef.current == null) {
       if (pendingScrollRestoreRef.current == null) {
@@ -1232,8 +1255,15 @@ export const ThreadPane = React.memo(function ThreadPane({
         uncoverViewportRef.current = coverViewport(vp)
       }
     }
-    void onLoadMoreHistory?.()
-  }, [onLoadMoreHistory])
+    void onLoadOlder?.()
+  }, [onLoadOlder])
+
+  const handleLoadNewer = React.useCallback(() => {
+    void onLoadNewer?.()
+  }, [onLoadNewer])
+
+  const suppressScroll =
+    Boolean(targetScrollMessageId) || suppressAutoScroll || holdStillForPrepend
 
   return (
     <ThreadPaneUiContext.Provider value={uiContextValue}>
@@ -1273,10 +1303,10 @@ export const ThreadPane = React.memo(function ThreadPane({
             <ThreadPrimitive.Viewport
               ref={bindThreadViewport}
               className="aui-thread-viewport mc-thread-viewport"
-              autoScroll={targetScrollMessageId || holdStillForPrepend ? false : undefined}
+              autoScroll={suppressScroll ? false : undefined}
               scrollToBottomOnInitialize={false}
-              scrollToBottomOnRunStart={targetScrollMessageId || holdStillForPrepend ? false : undefined}
-              scrollToBottomOnThreadSwitch={targetScrollMessageId == null}
+              scrollToBottomOnRunStart={suppressScroll ? false : undefined}
+              scrollToBottomOnThreadSwitch={!suppressScroll}
             >
               <PrependScrollLock
                 viewportRef={viewportRef}
@@ -1286,10 +1316,10 @@ export const ThreadPane = React.memo(function ThreadPane({
                 lastViewportScrollTopRef={lastViewportScrollTopRef}
                 uncoverRef={uncoverViewportRef}
               />
-              {historyHasMore && onLoadMoreHistory ? (
+              {historyHasOlder && onLoadOlder ? (
                 <LoadEarlierMessages
                   loading={historyLoadingMore}
-                  onLoadMore={handleLoadMoreHistory}
+                  onLoadMore={handleLoadOlder}
                 />
               ) : null}
               <ThreadWelcomeHints onShowShortcuts={onShowShortcuts} />
@@ -1300,8 +1330,20 @@ export const ThreadPane = React.memo(function ThreadPane({
                 }}
               />
               <Thread.FollowupSuggestions />
+              {historyHasNewer && onLoadNewer ? (
+                <LoadNewerMessages
+                  loading={historyLoadingNewer}
+                  onLoadMore={handleLoadNewer}
+                />
+              ) : null}
             </ThreadPrimitive.Viewport>
             )}
+            {historyMode === 'anchored' && onJumpToLatest ? (
+              <JumpToLatestPill
+                newMessagesPending={newMessagesPending}
+                onJump={onJumpToLatest}
+              />
+            ) : null}
             <div className="mc-thread-composer-stack">
               {!historyLoading ? (
                 <div className="mc-scroll-to-latest-wrap">

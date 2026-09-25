@@ -29,8 +29,8 @@ use crate::chat_queue::{QueueEnqueueMeta, QueueRemoveOutcome, QueueSource};
 use crate::claude::{Message, MessageContent};
 use crate::config::Config;
 use crate::db::{
-    call_blocking, ChannelBotInstance, ChannelPersonaMode, JobHeartbeat, Persona, StoredMessage,
-    BOT_INSTANCE_WEB,
+    call_blocking, ChannelBotInstance, ChannelPersonaMode, JobHeartbeat, Persona,
+    PersonaMessageBookmark, StoredMessage, BOT_INSTANCE_WEB,
 };
 use crate::final_delivery_dedupe::{ensure_visible_turn_text, failed_turn_notice};
 use crate::hook_executor::validate_command_payload;
@@ -331,6 +331,12 @@ struct HistoryQuery {
     /// Newer messages to include with around_id (default 15).
     #[serde(default)]
     around_after: Option<usize>,
+    /// Cursor: return messages strictly older than this id (ignores day).
+    #[serde(default)]
+    before_id: Option<String>,
+    /// Cursor: return messages strictly newer than this id (ignores day).
+    #[serde(default)]
+    after_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -738,8 +744,9 @@ async fn api_history(
     let persona_id = resolve_history_persona_id(&state, chat_id, query.persona_id).await?;
     let cid2 = chat_id;
     let pid = persona_id;
+    let page_limit = requested_limit.unwrap_or(30).clamp(1, 100);
 
-    let messages = if let Some(ref around_id) = query.around_id {
+    let (messages, has_older, has_newer) = if let Some(ref around_id) = query.around_id {
         let around_id = around_id.trim().to_string();
         if around_id.is_empty() {
             return Err((StatusCode::BAD_REQUEST, "around_id is required".into()));
@@ -747,22 +754,55 @@ async fn api_history(
         let before = query.around_before.unwrap_or(15).clamp(0, 100);
         let after = query.around_after.unwrap_or(15).clamp(0, 100);
         let session_id = query.session_id.clone();
-        call_blocking(state.app_state.db.clone(), move |db| {
+        let page = call_blocking(state.app_state.db.clone(), move |db| {
             db.get_messages_around_id(cid2, pid, &around_id, before, after, session_id.as_deref())
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "message not found".into()))?
-    } else if let Some(ref sid) = query.session_id {
-        let session_id = sid.clone();
-        call_blocking(state.app_state.db.clone(), move |db| {
-            db.get_all_messages_for_session(&session_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "message not found".into()))?;
+        (page.messages, page.has_older, page.has_newer)
+    } else if let Some(ref before_id) = query.before_id {
+        let before_id = before_id.trim().to_string();
+        if before_id.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "before_id is required".into()));
+        }
+        let session_id = query.session_id.clone();
+        let (msgs, older) = call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_messages_before_id(cid2, pid, &before_id, page_limit, session_id.as_deref())
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "message not found".into()))?;
+        // A before_id page is older than the current window, so newer messages exist.
+        (msgs, older, true)
+    } else if let Some(ref after_id) = query.after_id {
+        let after_id = after_id.trim().to_string();
+        if after_id.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "after_id is required".into()));
+        }
+        let session_id = query.session_id.clone();
+        let (msgs, newer) = call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_messages_after_id(cid2, pid, &after_id, page_limit, session_id.as_deref())
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "message not found".into()))?;
+        // An after_id page is newer than the current window, so older messages exist.
+        (msgs, true, newer)
+    } else if let Some(ref sid) = query.session_id {
+        let session_id = sid.clone();
+        if requested_day.is_some() {
+            // Day filter is main-chat only; session path ignores day.
+        }
+        let (msgs, older) = call_blocking(state.app_state.db.clone(), move |db| {
+            db.get_recent_messages_for_session(&session_id, page_limit)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (msgs, older, false)
     } else if let Some(ref day) = requested_day {
         let (from_date, to_date) = day_range(day);
-        call_blocking(state.app_state.db.clone(), move |db| {
+        let msgs = call_blocking(state.app_state.db.clone(), move |db| {
             db.get_messages_for_date_range(
                 cid2,
                 pid,
@@ -772,19 +812,33 @@ async fn api_history(
             )
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (msgs, false, false)
     } else {
+        // Live window: latest N. When no limit is given, return the full timeline (legacy).
         match requested_limit {
-            Some(limit) => call_blocking(state.app_state.db.clone(), move |db| {
-                db.get_recent_messages(cid2, pid, limit, false)
-            })
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-            None => call_blocking(state.app_state.db.clone(), move |db| {
-                db.get_all_messages(cid2, pid)
-            })
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            Some(_) => {
+                let fetch = page_limit + 1;
+                let mut msgs = call_blocking(state.app_state.db.clone(), move |db| {
+                    db.get_recent_messages(cid2, pid, fetch, false)
+                })
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let older = msgs.len() > page_limit;
+                if older {
+                    let skip = msgs.len() - page_limit;
+                    msgs = msgs.into_iter().skip(skip).collect();
+                }
+                (msgs, older, false)
+            }
+            None => {
+                let msgs = call_blocking(state.app_state.db.clone(), move |db| {
+                    db.get_all_messages(cid2, pid)
+                })
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                (msgs, false, false)
+            }
         }
     };
 
@@ -807,6 +861,8 @@ async fn api_history(
         day = ?requested_day,
         limit = ?requested_limit,
         returned_messages = items.len(),
+        has_older = has_older,
+        has_newer = has_newer,
         duration_ms = start.elapsed().as_millis(),
         "History fetched"
     );
@@ -816,6 +872,8 @@ async fn api_history(
         "chat_id": chat_id,
         "persona_id": persona_id,
         "messages": items,
+        "has_older": has_older,
+        "has_newer": has_newer,
     })))
 }
 
@@ -3645,6 +3703,20 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     }
 }
 
+fn bookmark_to_json(b: &PersonaMessageBookmark) -> serde_json::Value {
+    json!({
+        "message_id": b.message_id,
+        "role": b.role,
+        "content_preview": b.content_preview,
+        "note": b.note,
+        "created_at": b.created_at,
+        "updated_at": b.updated_at,
+        "session_id": b.session_id,
+        "message_timestamp": b.message_timestamp,
+        "missing": b.missing,
+    })
+}
+
 fn normalize_persona_scope_ids(ids: &[i64]) -> Vec<i64> {
     let mut out: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
     out.sort_unstable();
@@ -4415,16 +4487,7 @@ async fn api_persona_bulletin_get(
     });
     let bookmarks_json: Vec<serde_json::Value> = bookmarks
         .into_iter()
-        .map(|b| {
-            json!({
-                "message_id": b.message_id,
-                "role": b.role,
-                "content_preview": b.content_preview,
-                "note": b.note,
-                "created_at": b.created_at,
-                "updated_at": b.updated_at,
-            })
-        })
+        .map(|b| bookmark_to_json(&b))
         .collect();
 
     let pid4 = path.persona_id;
@@ -4710,16 +4773,7 @@ async fn api_persona_bookmarks_get(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let bookmarks_json: Vec<serde_json::Value> = bookmarks
         .into_iter()
-        .map(|b| {
-            json!({
-                "message_id": b.message_id,
-                "role": b.role,
-                "content_preview": b.content_preview,
-                "note": b.note,
-                "created_at": b.created_at,
-                "updated_at": b.updated_at,
-            })
-        })
+        .map(|b| bookmark_to_json(&b))
         .collect();
     Ok(Json(json!({
         "ok": true,
@@ -4801,6 +4855,9 @@ async fn api_persona_bookmarks_post(
             "role": role,
             "content_preview": preview,
             "note": note_clean,
+            "session_id": message.session_id,
+            "message_timestamp": message.timestamp,
+            "missing": false,
         }
     })))
 }

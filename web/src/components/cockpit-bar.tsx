@@ -358,39 +358,75 @@ export const CockpitBar = React.memo(function CockpitBar({
           </span>
           {bookmarks.length > 0 ? (
             <div className="mc-cockpit-bookmark-list mt-2">
-              {bookmarks.slice(0, 12).map((b) => (
-                <div key={b.message_id} className="mc-cockpit-bookmark-card">
-                  <button
-                    type="button"
-                    className="mc-cockpit-bookmark-jump"
-                    onClick={() => {
-                      setExpanded(false)
-                      void onJumpToBookmark?.(b.message_id)
-                    }}
-                    title="Jump to message in chat"
+              {bookmarks.slice(0, 12).map((b) => {
+                const missing = Boolean(b.missing)
+                const when = b.message_timestamp
+                  ? new Date(b.message_timestamp).toLocaleString(undefined, {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })
+                  : null
+                const scope = missing
+                  ? 'deleted'
+                  : b.session_id
+                    ? 'session'
+                    : 'main'
+                return (
+                  <div
+                    key={b.message_id}
+                    className={
+                      missing
+                        ? 'mc-cockpit-bookmark-card mc-cockpit-bookmark-card--missing'
+                        : 'mc-cockpit-bookmark-card'
+                    }
                   >
-                    <span className="mc-cockpit-bookmark-role">{b.role}</span>
-                    <span className="mc-cockpit-bookmark-preview">{b.content_preview}</span>
-                    {b.note ? (
-                      <span className="mc-cockpit-bookmark-note">{b.note}</span>
-                    ) : null}
-                  </button>
-                  {onRemoveBookmark ? (
                     <button
                       type="button"
-                      className="mc-cockpit-bookmark-delete"
-                      title="Remove bookmark"
-                      aria-label="Remove bookmark"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        void onRemoveBookmark(b.message_id)
+                      className="mc-cockpit-bookmark-jump"
+                      disabled={missing}
+                      onClick={() => {
+                        if (missing) return
+                        setExpanded(false)
+                        void onJumpToBookmark?.(b.message_id)
                       }}
+                      title={missing ? 'Message was deleted' : 'Jump to message in chat'}
                     >
-                      <IconTrash className="size-3.5" />
+                      <span className="mc-cockpit-bookmark-meta">
+                        <span className="mc-cockpit-bookmark-role">{b.role}</span>
+                        <span className="mc-cockpit-bookmark-scope">{scope}</span>
+                        {when ? (
+                          <span className="mc-cockpit-bookmark-when">{when}</span>
+                        ) : null}
+                      </span>
+                      <span className="mc-cockpit-bookmark-preview">{b.content_preview}</span>
+                      {b.note ? (
+                        <span className="mc-cockpit-bookmark-note">{b.note}</span>
+                      ) : null}
+                      {missing ? (
+                        <span className="mc-cockpit-bookmark-missing-hint">
+                          Message no longer exists
+                        </span>
+                      ) : null}
                     </button>
-                  ) : null}
-                </div>
-              ))}
+                    {onRemoveBookmark ? (
+                      <button
+                        type="button"
+                        className="mc-cockpit-bookmark-delete"
+                        title="Remove bookmark"
+                        aria-label="Remove bookmark"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void onRemoveBookmark(b.message_id)
+                        }}
+                      >
+                        <IconTrash className="size-3.5" />
+                      </button>
+                    ) : null}
+                  </div>
+                )
+              })}
             </div>
           ) : (
             <EmptyState

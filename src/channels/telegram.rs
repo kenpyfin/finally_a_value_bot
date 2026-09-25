@@ -5817,6 +5817,9 @@ pub(super) fn format_bookmarks_section(bookmarks: &[PersonaMessageBookmark]) -> 
     let mut lines = Vec::new();
     let mut n = 0usize;
     for b in bookmarks {
+        if b.missing {
+            continue;
+        }
         // Assistant turns already appear in prior_turn history; bulletin focus lives once
         // in `[persona_context]` — do not re-inject assistant previews here.
         if b.role.eq_ignore_ascii_case("assistant") {
@@ -7781,6 +7784,9 @@ mod tests {
                 note: None,
                 created_at: String::new(),
                 updated_at: String::new(),
+                session_id: None,
+                message_timestamp: None,
+                missing: false,
             },
             PersonaMessageBookmark {
                 chat_id: 1,
@@ -7791,6 +7797,9 @@ mod tests {
                 note: None,
                 created_at: String::new(),
                 updated_at: String::new(),
+                session_id: None,
+                message_timestamp: None,
+                missing: false,
             },
         ];
         let section = format_bookmarks_section(&bookmarks).unwrap();

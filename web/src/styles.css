@@ -2466,6 +2466,88 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   }
 }
 
+.mc-load-newer {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  max-width: var(--aui-thread-max-width, 42rem);
+  margin: 0 auto;
+  padding: 0.5rem 1rem 0.25rem;
+  flex-shrink: 0;
+  overflow-anchor: none;
+}
+
+.mc-load-newer-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--mc-border-soft);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mc-bg-panel) 72%, transparent);
+  color: var(--mc-text-muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 1.2;
+  padding: 0.4rem 0.85rem;
+  transition:
+    color 150ms ease,
+    background-color 150ms ease,
+    border-color 150ms ease;
+}
+
+.mc-load-newer-btn:hover:not(:disabled) {
+  color: var(--mc-text-primary);
+  border-color: var(--mc-border-strong);
+  background: color-mix(in srgb, var(--mc-accent) 10%, var(--mc-bg-panel));
+}
+
+.mc-load-newer-btn:focus-visible {
+  outline: 2px solid var(--mc-accent);
+  outline-offset: 2px;
+}
+
+.mc-load-newer-btn:disabled {
+  cursor: wait;
+  opacity: 0.85;
+}
+
+.mc-jump-to-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 5.75rem;
+  transform: translateX(-50%);
+  z-index: 12;
+  pointer-events: none;
+}
+
+.mc-jump-to-latest-btn {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--mc-accent) 45%, var(--mc-border-soft));
+  background: color-mix(in srgb, var(--mc-accent) 18%, var(--mc-bg-main));
+  color: var(--mc-text-primary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.4rem 0.9rem;
+  box-shadow: 0 4px 14px color-mix(in srgb, black 18%, transparent);
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease;
+}
+
+.mc-jump-to-latest-btn:hover {
+  background: color-mix(in srgb, var(--mc-accent) 28%, var(--mc-bg-main));
+  border-color: var(--mc-accent);
+}
+
+.mc-jump-to-latest-btn:focus-visible {
+  outline: 2px solid var(--mc-accent);
+  outline-offset: 2px;
+}
+
 @media (max-width: 767px) {
   .mc-session-controls {
     gap: 0.5rem;
@@ -2797,6 +2879,18 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   overflow: hidden;
 }
 
+.mc-cockpit-bookmark-card--missing {
+  opacity: 0.72;
+}
+
+.mc-cockpit-bookmark-card--missing .mc-cockpit-bookmark-jump {
+  cursor: default;
+}
+
+.mc-cockpit-bookmark-card--missing .mc-cockpit-bookmark-jump:hover {
+  background: transparent;
+}
+
 .mc-cockpit-bookmark-jump {
   flex: 1;
   min-width: 0;
@@ -2812,8 +2906,20 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   color: var(--mc-text-primary);
 }
 
-.mc-cockpit-bookmark-jump:hover {
+.mc-cockpit-bookmark-jump:disabled {
+  cursor: default;
+}
+
+.mc-cockpit-bookmark-jump:hover:not(:disabled) {
   background: color-mix(in srgb, var(--mc-accent) 8%, transparent);
+}
+
+.mc-cockpit-bookmark-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.55rem;
+  width: 100%;
 }
 
 .mc-cockpit-bookmark-role {
@@ -2822,6 +2928,17 @@ html.dark *::-webkit-scrollbar-thumb:hover {
   letter-spacing: 0.03em;
   text-transform: uppercase;
   color: var(--mc-text-muted);
+}
+
+.mc-cockpit-bookmark-scope,
+.mc-cockpit-bookmark-when {
+  font-size: 0.65rem;
+  color: var(--mc-text-faint);
+}
+
+.mc-cockpit-bookmark-missing-hint {
+  font-size: 0.7rem;
+  color: var(--mc-destructive);
 }
 
 .mc-cockpit-bookmark-preview {

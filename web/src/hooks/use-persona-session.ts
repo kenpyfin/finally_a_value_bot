@@ -21,7 +21,17 @@ export type UsePersonaSessionOptions = {
     cid?: number | null,
     personaId?: number | null,
     day?: string | null,
-    opts?: { force?: boolean; limitOverride?: number; sessionId?: string | null },
+    opts?: {
+      force?: boolean
+      limitOverride?: number
+      sessionId?: string | null
+      aroundId?: string
+      aroundBefore?: number
+      aroundAfter?: number
+      beforeId?: string
+      afterId?: string
+      replace?: boolean
+    },
   ) => Promise<void>
   resetHistoryPagination: () => void
   loadPersonaBulletin: (pid: number) => Promise<void>

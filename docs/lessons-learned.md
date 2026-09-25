@@ -1,4 +1,31 @@
+# Lessons Learned Log
+
+Running record of incidents and durable fixes. Newest first.
+
+## Template
+
+```markdown
+### YYYY-MM-DD — Short title
+
+- **Symptom:**
+- **Root cause:**
+- **Fix:**
+- **Prevention:**
+- **Files/refs:**
+```
+
+---
+
+### 2026-09-25 — Bookmark jump raced pagination and poller clobber
+
+- **Symptom:** Jumping to a bookmarked message either failed with “Could not find that message in the chat window” or briefly scrolled then snapped back to the live tip. Deep history behind “Load earlier messages” was unreachable without loading hundreds of tip messages.
+- **Root cause:** (1) `targetScrollMessageId` was armed before the network `around_id` / session fetch finished; ThreadPane gave up after ~40 animation frames (~0.66s). (2) History state was a single `historyVisibleLimit` counted from the newest message — after an `around_id` window, “Load earlier” refetched the *latest* N and jumped away; there was no Load newer. (3) The 5s/30s history poller and run-complete reloads called `loadHistory` without cursors and replaced the anchored window with the tip. (4) Nearby bookmarks used `messages_from` + `HISTORY_REVEAL_CAP=300`, loading up to 300 messages at once.
+- **Fix:** Cursor-based windows: `/api/history` supports `before_id` / `after_id` / `around_id` with `has_older` / `has_newer`. Frontend `live` vs `anchored` modes; Load older/newer prepend/append; Jump to latest; poller skips replace while anchored (sets `newMessagesPending`). Reveal loads the window first, then arms the scroll target; scroll effect waits for the id in `initialMessages` then retries DOM mount for ~2s. Sending while anchored jumps to latest first.
+- **Prevention:** Never arm a scroll target before the message is in thread data. Never represent “window around X” as “latest N”. Background history refresh must not overwrite an intentional anchored window.
+- **Files/refs:** `get_messages_before_id` / `get_messages_after_id` / `MessagePage` in `src/db.rs`; `api_history` in `src/web.rs`; `use-chat-history.ts` (`historyMode`, `loadWindowAround`); `revealMessageInThread` in `web/src/app/App.tsx`; scroll effect + LoadNewer / JumpToLatest in `web/src/components/thread-pane.tsx`. Cross-ref 2026-09-09 (prepend lock) and 2026-09-05 (auto-scroll clobber).
+
 ### 2026-09-15 — Permission-denied for missing ORIGIN files drove uninformed finds
+
 
 - **Symptom:** Agent hung / timed out on `find /home/ken/big_storage … -name Sourdough-Journal-Post-Pipeline.md` after `read_file ORIGIN/…` returned “Permission denied”.
 - **Root cause:** (1) `resolve_tool_path` always mapped `ORIGIN/` to `shared/ORIGIN`, ignoring persona-local `shared/personas/{chat}/{persona}/ORIGIN` where the SOP lived. (2) `is_under` canonicalized existing roots to absolute paths but left missing relative paths relative, so in-scope missing files failed `starts_with` and looked like permission errors — the model then searched the whole disk.

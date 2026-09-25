@@ -478,6 +478,9 @@ export type PersonaMessageBookmark = {
   note?: string | null
   created_at?: string
   updated_at?: string
+  session_id?: string | null
+  message_timestamp?: string | null
+  missing?: boolean
 }
 
 export type SideChatSummary = {
