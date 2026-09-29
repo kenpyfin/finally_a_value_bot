@@ -2292,7 +2292,7 @@ export function App({
                       />
                     </ResizablePanel>
                     <ResizableHandle withHandle className="hidden md:flex" />
-                    <ResizablePanel defaultSize="38" minSize="22" className="min-h-0 min-w-0">
+                    <ResizablePanel defaultSize="38" minSize="22" className="h-full min-h-0 min-w-0">
                       <SubthreadSidePane
                         key={activeSideChat.id}
                         chatId={chatId}

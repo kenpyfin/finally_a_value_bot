@@ -63,27 +63,37 @@ export async function fetchBackgroundJobsSnapshot(chatId: number): Promise<Backg
   return { jobs, activeCount: activeCountFromApi ?? activeByStatus }
 }
 
-export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> {
-  const query = new URLSearchParams({ chat_id: String(chatId) })
-  const data = await api<{
-    personas?: {
-      id: number
-      name: string
-      is_active: boolean
-      last_bot_message_at?: string | null
-      last_bot_message_session_id?: string | null
-      last_bot_message_session_title?: string | null
-    }[]
-  }>(`/api/personas?${query.toString()}`)
-  const list = Array.isArray(data.personas) ? data.personas : []
-  return list.map((p) => ({
+export type PersonaApiRow = {
+  id: number
+  name: string
+  is_active: boolean
+  last_bot_message_at?: string | null
+  last_bot_message_session_id?: string | null
+  last_bot_message_session_title?: string | null
+  last_read_at?: string | null
+  agent_engine_override?: string | null
+  agent_engine_effective?: string
+}
+
+export function mapPersonaApiRow(p: PersonaApiRow): Persona {
+  return {
     id: p.id,
     name: p.name,
     is_active: p.is_active,
     last_bot_message_at: p.last_bot_message_at ?? null,
     last_bot_message_session_id: p.last_bot_message_session_id ?? null,
     last_bot_message_session_title: p.last_bot_message_session_title ?? null,
-  }))
+    last_read_at: p.last_read_at ?? null,
+    agent_engine_override: p.agent_engine_override,
+    agent_engine_effective: p.agent_engine_effective,
+  }
+}
+
+export async function fetchPersonasSnapshot(chatId: number): Promise<Persona[]> {
+  const query = new URLSearchParams({ chat_id: String(chatId) })
+  const data = await api<{ personas?: PersonaApiRow[] }>(`/api/personas?${query.toString()}`)
+  const list = Array.isArray(data.personas) ? data.personas : []
+  return list.map(mapPersonaApiRow)
 }
 
 export type OpsPollBundle = {
@@ -100,14 +110,7 @@ export type OpsPollApiResponse = {
   jobs?: BackgroundJobItem[]
   active_count?: number
   personas_included?: boolean
-  personas?: {
-    id: number
-    name: string
-    is_active: boolean
-    last_bot_message_at?: string | null
-    last_bot_message_session_id?: string | null
-    last_bot_message_session_title?: string | null
-  }[]
+  personas?: PersonaApiRow[]
 }
 
 export async function fetchOpsPollBundle(
@@ -132,14 +135,7 @@ export async function fetchOpsPollBundle(
     queueLanes: Array.isArray(data.lanes) ? data.lanes : [],
     backgroundActiveCount: activeCountFromApi ?? activeByStatus,
     backgroundJobs: jobs,
-    personasSnapshot: list.map((p) => ({
-      id: p.id,
-      name: p.name,
-      is_active: p.is_active,
-      last_bot_message_at: p.last_bot_message_at ?? null,
-      last_bot_message_session_id: p.last_bot_message_session_id ?? null,
-      last_bot_message_session_title: p.last_bot_message_session_title ?? null,
-    })),
+    personasSnapshot: list.map(mapPersonaApiRow),
     personasIncluded,
   }
 }

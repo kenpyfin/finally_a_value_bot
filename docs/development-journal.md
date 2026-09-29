@@ -27,6 +27,14 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-26 — Side chat resize grows with the split; unread cursors are server-side
+
+- **Area:** web UI / side chat / inbox unread
+- **Summary:** The side chat pane fills its resizable column, so dragging the split wider grows the pane (it already shrank). Persona unread dots use `persona_read_cursors` on the gateway instead of `localStorage`, so every browser on this bot shares the same read state.
+- **Rationale:** `.mc-subthread-pane` was `width: min(420px, 100%)`, which capped growth. Read cursors in `finally-a-value-bot_persona_last_read_v1` never left the browser, so another device did not show the same dots.
+- **Key files / symbols:** `.mc-subthread-pane` in `web/src/styles.css`; `persona_read_cursors`, `apply_persona_read_cursors` in `src/db.rs`; `api_personas_read` (`POST /api/personas/read`) in `src/web.rs`; `syncMissingReadCursors` / `markPersonaRead` in `web/src/hooks/use-persona-session.ts`; `last_read_at` on `Persona`.
+- **Follow-ups:** None.
+
 ### 2026-09-25 — Cursor-based chat history windows for bookmark jumps
 
 - **Area:** web UI / history API / bookmarks

@@ -18,6 +18,8 @@ export type Persona = {
   /** Session that produced the latest bot message; null/undefined = main chat. */
   last_bot_message_session_id?: string | null
   last_bot_message_session_title?: string | null
+  /** Server cursor for sidebar unread dots. Shared across browsers on this gateway. */
+  last_read_at?: string | null
   agent_engine_override?: string | null
   agent_engine_effective?: string
 }

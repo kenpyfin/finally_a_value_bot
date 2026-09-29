@@ -1025,8 +1025,10 @@ html:not(.dark) .aui-composer-send:hover {
 .mc-subthread-pane {
   display: flex;
   flex-direction: column;
-  width: min(420px, 100%);
-  min-width: 280px;
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  height: 100%;
   border-left: 1px solid var(--mc-border-soft);
   background: color-mix(in srgb, var(--mc-bg-panel) 88%, transparent);
   min-height: 0;

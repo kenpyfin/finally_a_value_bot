@@ -2535,6 +2535,13 @@ async fn api_ops_poll(
             .into_iter()
             .map(|row| (row.persona_id, row))
             .collect();
+        let cid4 = chat_id;
+        let read_rows = call_blocking(state.app_state.db.clone(), move |database| {
+            database.list_persona_read_cursors(cid4)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let read_by_persona: HashMap<i64, String> = read_rows.into_iter().collect();
         Some(
             persona_rows
                 .iter()
@@ -2547,6 +2554,7 @@ async fn api_ops_poll(
                         "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
                         "last_bot_message_session_id": last.and_then(|r| r.session_id.clone()),
                         "last_bot_message_session_title": last.and_then(|r| r.session_title.clone()),
+                        "last_read_at": read_by_persona.get(&p.id),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -3498,6 +3506,14 @@ async fn api_personas(
         .map(|row| (row.persona_id, row))
         .collect();
 
+    let cid4 = chat_id;
+    let read_rows = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_read_cursors(cid4)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let read_by_persona: HashMap<i64, String> = read_rows.into_iter().collect();
+
     let global_engine = state.app_state.runtime_toggles.agent_engine();
     let items: Vec<serde_json::Value> = personas
         .iter()
@@ -3515,6 +3531,7 @@ async fn api_personas(
                 "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
                 "last_bot_message_session_id": last.and_then(|r| r.session_id.clone()),
                 "last_bot_message_session_title": last.and_then(|r| r.session_title.clone()),
+                "last_read_at": read_by_persona.get(&p.id),
                 "agent_engine_override": p.agent_engine_override,
                 "agent_engine_effective": effective.as_str(),
             })
@@ -3525,6 +3542,88 @@ async fn api_personas(
         "ok": true,
         "chat_id": chat_id,
         "personas": items,
+    })))
+}
+
+#[derive(Deserialize)]
+struct PersonaReadCursorItem {
+    persona_id: i64,
+    last_read_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PersonaReadCursorsRequest {
+    chat_id: Option<i64>,
+    /// When true, an existing cursor is left unchanged (first-visit baseline).
+    if_absent: Option<bool>,
+    items: Vec<PersonaReadCursorItem>,
+}
+
+fn normalize_read_cursor(raw: Option<&str>) -> Result<String, (StatusCode, String)> {
+    let dt = match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "last_read_at must be an RFC3339 timestamp".into(),
+                )
+            })?
+            .with_timezone(&chrono::Utc),
+        None => chrono::Utc::now(),
+    };
+    Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+async fn api_personas_read(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Json(body): Json<PersonaReadCursorsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    if body.items.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "items is required".into()));
+    }
+    if body.items.len() > 200 {
+        return Err((StatusCode::BAD_REQUEST, "too many read cursors".into()));
+    }
+    let chat_id = resolve_chat_id_for_web(body.chat_id, &state.app_state.config)?;
+    ensure_web_binding_for_universal(&state, chat_id).await?;
+    let only_if_absent = body.if_absent.unwrap_or(false);
+    let mut updates = Vec::with_capacity(body.items.len());
+    for item in &body.items {
+        if item.persona_id <= 0 {
+            return Err((StatusCode::BAD_REQUEST, "persona_id is required".into()));
+        }
+        let stamp = normalize_read_cursor(item.last_read_at.as_deref())?;
+        updates.push((item.persona_id, stamp));
+    }
+    let outcome = call_blocking(state.app_state.db.clone(), move |db| {
+        db.apply_persona_read_cursors(chat_id, only_if_absent, &updates)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let stored = match outcome {
+        Ok(rows) => rows,
+        Err(persona_id) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("persona {persona_id} not found"),
+            ));
+        }
+    };
+    let cursors: Vec<serde_json::Value> = stored
+        .into_iter()
+        .map(|(persona_id, last_read_at)| {
+            json!({
+                "persona_id": persona_id,
+                "last_read_at": last_read_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "chat_id": chat_id,
+        "cursors": cursors,
     })))
 }
 
@@ -9310,6 +9409,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/reset", post(api_reset))
         .route("/api/delete_session", post(api_delete_session))
         .route("/api/personas", get(api_personas))
+        .route("/api/personas/read", post(api_personas_read))
         .route("/api/personas/switch", post(api_personas_switch))
         .route("/api/personas/create", post(api_personas_create))
         .route("/api/personas/delete", post(api_personas_delete))

@@ -29,6 +29,12 @@ describe('personasSnapshotEqual', () => {
     expect(personasSnapshotEqual(a, b)).toBe(true)
   })
 
+  it('returns false when last_read_at changes', () => {
+    const a = [persona({ id: 1, name: 'A', last_read_at: '2026-01-01T00:00:00.000Z' })]
+    const b = [persona({ id: 1, name: 'A', last_read_at: '2026-01-02T00:00:00.000Z' })]
+    expect(personasSnapshotEqual(a, b)).toBe(false)
+  })
+
   it('returns false when lengths differ', () => {
     expect(personasSnapshotEqual([persona({ id: 1, name: 'A' })], [])).toBe(false)
   })

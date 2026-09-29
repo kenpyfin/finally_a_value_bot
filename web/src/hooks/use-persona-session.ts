@@ -1,13 +1,13 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
+import { mapPersonaApiRow, type PersonaApiRow } from '../api/ops-fetch'
 import { HISTORY_PAGE_SIZE } from '../app/constants'
 import {
-  baselinePersonaLastReadIfMissing,
+  clearPersonaLastReadLocal,
   readPersonaLastReadAt,
   readStoredPersonaId,
   resolveStoredSessionId,
   toMs,
-  writePersonaLastReadAt,
   writeStoredPersonaId,
   writeStoredSessionForPersona,
 } from '../lib/persona-storage'
@@ -56,8 +56,8 @@ export function usePersonaSession({
   const [activePersonaId, setActivePersonaId] = useState<number | null>(null)
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([])
-  const [personaReadNonce, setPersonaReadNonce] = useState(0)
   const [newSchedulePersonaId, setNewSchedulePersonaId] = useState<number | null>(null)
+  const readCursorInflightRef = useRef<Set<string>>(new Set())
 
   const activeSessionIdRef = useRef<string | null>(null)
   activeSessionIdRef.current = activeSessionId
@@ -77,18 +77,72 @@ export function usePersonaSession({
         out[p.id] = false
         continue
       }
-      const lastReadMs = toMs(readPersonaLastReadAt(chatId, p.id))
+      const lastReadMs = toMs(p.last_read_at ?? readPersonaLastReadAt(chatId, p.id))
       out[p.id] = lastReadMs == null ? true : lastBotMs > lastReadMs
     }
     return out
-  }, [chatId, personas, activePersonaId, personaReadNonce])
+  }, [chatId, personas, activePersonaId])
+
+  const syncMissingReadCursors = useCallback(
+    async (
+      cid: number,
+      rows: { id: number; last_bot_message_at?: string | null; last_read_at?: string | null }[],
+    ) => {
+      const missing = rows.filter((p) => p.last_read_at == null)
+      if (missing.length === 0) return
+      const items = missing.map((p) => ({
+        persona_id: p.id,
+        last_read_at:
+          readPersonaLastReadAt(cid, p.id)
+          ?? p.last_bot_message_at
+          ?? new Date().toISOString(),
+      }))
+      const data = await api<{ cursors?: { persona_id: number; last_read_at: string }[] }>(
+        '/api/personas/read',
+        {
+          method: 'POST',
+          body: JSON.stringify({ chat_id: cid, if_absent: true, items }),
+        },
+      )
+      const byId = new Map((data.cursors ?? []).map((c) => [c.persona_id, c.last_read_at]))
+      setPersonas((prev) =>
+        prev.map((p) => {
+          const stamped = byId.get(p.id)
+          if (!stamped) return p
+          return { ...p, last_read_at: stamped }
+        }),
+      )
+      clearPersonaLastReadLocal(cid, missing.map((p) => p.id))
+    },
+    [],
+  )
 
   const markPersonaRead = useCallback(
     (personaId: number, chatIdOverride?: number | null) => {
       const cid = chatIdOverride ?? chatId
       if (cid == null) return
-      writePersonaLastReadAt(cid, personaId, new Date().toISOString())
-      setPersonaReadNonce((x) => x + 1)
+      const optimistic = new Date().toISOString()
+      setPersonas((prev) =>
+        prev.map((p) => (p.id === personaId ? { ...p, last_read_at: optimistic } : p)),
+      )
+      void api<{ cursors?: { persona_id: number; last_read_at: string }[] }>('/api/personas/read', {
+        method: 'POST',
+        body: JSON.stringify({
+          chat_id: cid,
+          if_absent: false,
+          items: [{ persona_id: personaId, last_read_at: optimistic }],
+        }),
+      })
+        .then((data) => {
+          const stamped = data.cursors?.find((c) => c.persona_id === personaId)?.last_read_at
+          if (!stamped) return
+          setPersonas((prev) =>
+            prev.map((p) => (p.id === personaId ? { ...p, last_read_at: stamped } : p)),
+          )
+        })
+        .catch(() => {
+          // Optimistic cursor stays until the next personas poll.
+        })
     },
     [chatId],
   )
@@ -98,29 +152,26 @@ export function usePersonaSession({
       if (cid == null) return null
       try {
         const query = new URLSearchParams({ chat_id: String(cid) })
-        const data = await api<{
-          personas?: {
-            id: number
-            name: string
-            is_active: boolean
-            last_bot_message_at?: string | null
-            last_bot_message_session_id?: string | null
-            last_bot_message_session_title?: string | null
-          }[]
-        }>(`/api/personas?${query.toString()}`)
+        const data = await api<{ personas?: PersonaApiRow[] }>(`/api/personas?${query.toString()}`)
         const list = Array.isArray(data.personas) ? data.personas : []
-        const personaList = list.map((p) => ({
-          id: p.id,
-          name: p.name,
-          is_active: p.is_active,
-          last_bot_message_at: p.last_bot_message_at ?? null,
-          last_bot_message_session_id: p.last_bot_message_session_id ?? null,
-          last_bot_message_session_title: p.last_bot_message_session_title ?? null,
-        }))
-        if (baselinePersonaLastReadIfMissing(cid, personaList)) {
-          setPersonaReadNonce((x) => x + 1)
+        const personaList = list.map(mapPersonaApiRow)
+        const missingRead = personaList.filter((p) => p.last_read_at == null)
+        const seeded = personaList.map((p) => {
+          if (p.last_read_at != null) return p
+          return {
+            ...p,
+            last_read_at:
+              readPersonaLastReadAt(cid, p.id)
+              ?? p.last_bot_message_at
+              ?? new Date().toISOString(),
+          }
+        })
+        setPersonas(seeded)
+        if (missingRead.length > 0) {
+          void syncMissingReadCursors(cid, missingRead).catch(() => {
+            // Poll or the next personas load retries while cursors are still absent.
+          })
         }
-        setPersonas(personaList)
         const active = list.find((p) => p.is_active)
         const defaultChoice = active ?? list[0]
         const storedId = readStoredPersonaId()
@@ -145,8 +196,21 @@ export function usePersonaSession({
         return null
       }
     },
-    [chatId, onPersonaLoaded],
+    [chatId, onPersonaLoaded, syncMissingReadCursors],
   )
+
+  useEffect(() => {
+    if (chatId == null) return
+    const missing = personas.filter((p) => p.last_read_at == null)
+    if (missing.length === 0) return
+    const key = `${chatId}:${missing.map((p) => p.id).sort((a, b) => a - b).join(',')}`
+    if (readCursorInflightRef.current.has(key)) return
+    readCursorInflightRef.current.add(key)
+    void syncMissingReadCursors(chatId, missing)
+      .catch(() => {
+        readCursorInflightRef.current.delete(key)
+      })
+  }, [chatId, personas, syncMissingReadCursors])
 
   const loadSessions = useCallback(
     async (cid?: number | null, personaId?: number | null): Promise<ChatSession[]> => {

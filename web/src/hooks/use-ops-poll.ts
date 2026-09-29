@@ -29,6 +29,7 @@ export function personasSnapshotEqual(a: Persona[], b: Persona[]): boolean {
       || (x.last_bot_message_at ?? null) !== (y.last_bot_message_at ?? null)
       || (x.last_bot_message_session_id ?? null) !== (y.last_bot_message_session_id ?? null)
       || (x.last_bot_message_session_title ?? null) !== (y.last_bot_message_session_title ?? null)
+      || (x.last_read_at ?? null) !== (y.last_read_at ?? null)
     ) {
       return false
     }

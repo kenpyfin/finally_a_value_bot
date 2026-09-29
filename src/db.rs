@@ -639,6 +639,23 @@ pub struct CursorAgentRun {
     pub tmux_session: Option<String>,
 }
 
+/// Later of two RFC3339 timestamps. Unparseable values lose to a parseable one.
+fn later_rfc3339(left: &str, right: &str) -> String {
+    let left_dt = DateTime::parse_from_rfc3339(left).ok();
+    let right_dt = DateTime::parse_from_rfc3339(right).ok();
+    match (left_dt, right_dt) {
+        (Some(a), Some(b)) => {
+            if b >= a {
+                right.to_string()
+            } else {
+                left.to_string()
+            }
+        }
+        (None, Some(_)) => right.to_string(),
+        _ => left.to_string(),
+    }
+}
+
 impl Database {
     pub fn new(data_dir: &str) -> Result<Self, FinallyAValueBotError> {
         let db_path = Path::new(data_dir).join("finally_a_value_bot.db");
@@ -925,6 +942,7 @@ impl Database {
         Self::migrate_persona_bulletin_and_bookmarks(&conn)?;
         Self::migrate_side_chats_schema(&conn)?;
         Self::migrate_persona_todos(&conn)?;
+        Self::migrate_persona_read_cursors(&conn)?;
         Self::migrate_workflow_learning_schema(&conn)?;
         Self::migrate_background_jobs_lease_schema(&conn)?;
         Self::migrate_background_jobs_shell_schema(&conn)?;
@@ -2082,6 +2100,20 @@ impl Database {
                 ON persona_todos(chat_id, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_persona_todos_persona_status
                 ON persona_todos(chat_id, persona_id, status);",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_persona_read_cursors(conn: &Connection) -> Result<(), FinallyAValueBotError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS persona_read_cursors (
+                chat_id INTEGER NOT NULL,
+                persona_id INTEGER NOT NULL,
+                last_read_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, persona_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_read_cursors_chat
+                ON persona_read_cursors(chat_id);",
         )?;
         Ok(())
     }
@@ -7061,6 +7093,71 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn list_persona_read_cursors(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<(i64, String)>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT persona_id, last_read_at
+             FROM persona_read_cursors
+             WHERE chat_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Writes read cursors for sidebar unread dots.
+    /// `only_if_absent` keeps an existing row (first-visit baseline).
+    /// Otherwise the stored time moves forward to the later of the two timestamps.
+    /// Returns `Err(persona_id)` when that persona is not in the chat; the transaction rolls back.
+    pub fn apply_persona_read_cursors(
+        &self,
+        chat_id: i64,
+        only_if_absent: bool,
+        updates: &[(i64, String)],
+    ) -> Result<Result<Vec<(i64, String)>, i64>, FinallyAValueBotError> {
+        use rusqlite::OptionalExtension;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut stored = Vec::with_capacity(updates.len());
+        for (persona_id, last_read_at) in updates {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM personas WHERE chat_id = ?1 AND id = ?2)",
+                params![chat_id, persona_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(Err(*persona_id));
+            }
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT last_read_at FROM persona_read_cursors WHERE chat_id = ?1 AND persona_id = ?2",
+                    params![chat_id, persona_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let next = match existing {
+                Some(prev) if only_if_absent => prev,
+                Some(prev) => later_rfc3339(&prev, last_read_at),
+                None => last_read_at.clone(),
+            };
+            tx.execute(
+                "INSERT INTO persona_read_cursors (chat_id, persona_id, last_read_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(chat_id, persona_id) DO UPDATE SET last_read_at = excluded.last_read_at",
+                params![chat_id, persona_id, next],
+            )?;
+            stored.push((*persona_id, next));
+        }
+        tx.commit()?;
+        Ok(Ok(stored))
     }
 
     pub fn create_persona(

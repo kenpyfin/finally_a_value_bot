@@ -74,6 +74,11 @@ export function resolveStoredSessionId(sessions: ChatSession[], personaId: numbe
   return match ? match.id : null
 }
 
+/**
+ * Browser-local read cursor from before cursors lived on the server.
+ * Used once to seed `/api/personas/read` so a device that already opened a
+ * persona does not flash every historical bot message as unread.
+ */
 export function readPersonaLastReadAt(chatId: number, personaId: number): string | null {
   if (typeof window === 'undefined') return null
   try {
@@ -88,35 +93,24 @@ export function readPersonaLastReadAt(chatId: number, personaId: number): string
   }
 }
 
-export function writePersonaLastReadAt(chatId: number, personaId: number, isoTimestamp: string): void {
+/** Drop migrated browser cursors so later reads come from the server. */
+export function clearPersonaLastReadLocal(chatId: number, personaIds: number[]): void {
   if (typeof window === 'undefined') return
   try {
     const raw = localStorage.getItem(PERSONA_LAST_READ_STORAGE_KEY)
-    const parsed: Record<string, unknown> = raw ? JSON.parse(raw) : {}
-    parsed[`${chatId}:${personaId}`] = isoTimestamp
-    localStorage.setItem(PERSONA_LAST_READ_STORAGE_KEY, JSON.stringify(parsed))
+    if (!raw) return
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    for (const personaId of personaIds) {
+      delete parsed[`${chatId}:${personaId}`]
+    }
+    if (Object.keys(parsed).length === 0) {
+      localStorage.removeItem(PERSONA_LAST_READ_STORAGE_KEY)
+    } else {
+      localStorage.setItem(PERSONA_LAST_READ_STORAGE_KEY, JSON.stringify(parsed))
+    }
   } catch {
     // ignore
   }
-}
-
-/**
- * Seed last-read for personas that have never been stamped so historical bot
- * messages are not treated as "new". Only later messages light the unread dot.
- */
-export function baselinePersonaLastReadIfMissing(
-  chatId: number,
-  personas: { id: number; last_bot_message_at?: string | null }[],
-): boolean {
-  if (typeof window === 'undefined') return false
-  let changed = false
-  const nowIso = new Date().toISOString()
-  for (const p of personas) {
-    if (readPersonaLastReadAt(chatId, p.id) != null) continue
-    writePersonaLastReadAt(chatId, p.id, p.last_bot_message_at ?? nowIso)
-    changed = true
-  }
-  return changed
 }
 
 export function toMs(iso: string | null | undefined): number | null {

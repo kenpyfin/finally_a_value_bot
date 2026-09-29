@@ -16,6 +16,14 @@ Running record of incidents and durable fixes. Newest first.
 
 ---
 
+### 2026-09-26 — Side chat split could shrink but not grow; unread dots were per browser
+
+- **Symptom:** Dragging the side-chat divider moved it both ways, but the side chat only got narrower. Unread persona dots on one browser did not appear on another.
+- **Root cause:** `.mc-subthread-pane` used `width: min(420px, 100%)`, so a wider resizable column left the pane at 420px while a narrower column shrank it. `personaHasNew` compared `last_bot_message_at` to `localStorage` key `finally-a-value-bot_persona_last_read_v1`, which is not shared across devices.
+- **Fix:** Pane is `width: 100%` of the resizable panel. Read cursors live in `persona_read_cursors` and ride on `GET /api/personas` and `/api/ops_poll` as `last_read_at`. `POST /api/personas/read` baselines missing rows (`if_absent`) from any legacy local timestamp, then `markPersonaRead` advances the server cursor.
+- **Prevention:** Resizable panel children must fill the panel (`width: 100%`); do not cap them with a fixed max that only yields when the parent is smaller. Cross-device UI state (read/unread) belongs in the gateway DB, not `localStorage`.
+- **Files/refs:** `.mc-subthread-pane` in `web/src/styles.css`; `apply_persona_read_cursors` in `src/db.rs`; `api_personas_read` in `src/web.rs`; `use-persona-session.ts`.
+
 ### 2026-09-25 — Bookmark jump raced pagination and poller clobber
 
 - **Symptom:** Jumping to a bookmarked message either failed with “Could not find that message in the chat window” or briefly scrolled then snapped back to the live tip. Deep history behind “Load earlier messages” was unreachable without loading hundreds of tip messages.
