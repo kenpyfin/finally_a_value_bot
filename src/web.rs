@@ -641,6 +641,54 @@ async fn api_health(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct SecretsForgetQuery {
+    name: String,
+    #[serde(default)]
+    skill: bool,
+}
+
+async fn api_secrets_list(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    let data_dir = state.app_state.config.runtime_data_dir();
+    let items: Vec<serde_json::Value> = crate::secret_vault::list_meta(&data_dir, chat_id)
+        .into_iter()
+        .map(|row| {
+            json!({
+                "name": row.name,
+                "kind": row.kind,
+                "skill": row.skill,
+                "created_at": row.created_at,
+                "scrubbed": row.scrubbed,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "secrets": items })))
+}
+
+async fn api_secrets_forget(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Query(query): Query<SecretsForgetQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_auth(&headers, state.auth_token.as_deref())?;
+    let chat_id = resolve_chat_id_for_web(None, &state.app_state.config)?;
+    let name = query.name.trim().to_ascii_uppercase();
+    crate::secret_vault::forget(
+        &state.app_state.config.runtime_data_dir(),
+        &state.app_state.config.skills_data_dir_absolute(),
+        chat_id,
+        &name,
+        query.skill,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({ "ok": true, "name": name })))
+}
+
 /// Single universal chat; no multi-chat concept. Web always uses this chat.
 fn resolve_chat_id_for_web(
     _chat_id: Option<i64>,
@@ -2513,12 +2561,13 @@ async fn api_ops_poll(
 
     let personas = if include_personas {
         let cid = chat_id;
-        let persona_rows: Vec<Persona> =
+        let mut persona_rows: Vec<Persona> =
             call_blocking(state.app_state.db.clone(), move |database| {
                 database.list_personas(cid)
             })
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let activity = order_personas_by_activity(&state, chat_id, &mut persona_rows).await?;
         let cid2 = chat_id;
         let active_id = call_blocking(state.app_state.db.clone(), move |database| {
             database.get_active_persona_id(cid2)
@@ -2551,6 +2600,7 @@ async fn api_ops_poll(
                         "id": p.id,
                         "name": p.name,
                         "is_active": active_id == Some(p.id),
+                        "last_message_at": activity.get(&p.id),
                         "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
                         "last_bot_message_session_id": last.and_then(|r| r.session_id.clone()),
                         "last_bot_message_session_title": last.and_then(|r| r.session_title.clone()),
@@ -2828,6 +2878,12 @@ async fn send_and_store_response_with_events(
                     Err(e) => format!("Error listing tasks: {e}"),
                 }
             }
+            SlashCommand::Secrets => crate::secret_vault::secrets_command_reply(
+                &state.app_state.config.runtime_data_dir(),
+                &state.app_state.config.skills_data_dir_absolute(),
+                chat_id,
+                &raw_text,
+            ),
             SlashCommand::Archive => {
                 let cid2 = chat_id;
                 let pid = persona_id;
@@ -2911,6 +2967,18 @@ async fn send_and_store_response_with_events(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some(run_id) = run_key {
+        state
+            .run_hub
+            .publish(
+                run_id,
+                "message_stored",
+                json!({ "persona_id": persona_id }).to_string(),
+                state.limits.run_history_limit,
+            )
+            .await;
+    }
 
     let agent_result = process_with_agent_with_events(
         &state.app_state,
@@ -3472,6 +3540,31 @@ async fn api_delete_session(
     })))
 }
 
+/// Both initial load and polling use the same activity ordering.
+async fn order_personas_by_activity(
+    state: &WebState,
+    chat_id: i64,
+    personas: &mut [Persona],
+) -> Result<HashMap<i64, String>, (StatusCode, String)> {
+    let rows = call_blocking(state.app_state.db.clone(), move |db| {
+        db.list_persona_last_message_at(chat_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let activity: HashMap<i64, String> = rows.into_iter().collect();
+    personas.sort_by_cached_key(|p| {
+        (
+            std::cmp::Reverse(
+                activity
+                    .get(&p.id)
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()),
+            ),
+            p.id,
+        )
+    });
+    Ok(activity)
+}
+
 async fn api_personas(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -3483,11 +3576,12 @@ async fn api_personas(
     ensure_web_binding_for_universal(&state, chat_id).await?;
     let cid = chat_id;
 
-    let personas: Vec<Persona> =
+    let mut personas: Vec<Persona> =
         call_blocking(state.app_state.db.clone(), move |db| db.list_personas(cid))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let activity = order_personas_by_activity(&state, chat_id, &mut personas).await?;
     let cid2 = chat_id;
     let active_id = call_blocking(state.app_state.db.clone(), move |db| {
         db.get_active_persona_id(cid2)
@@ -3528,7 +3622,8 @@ async fn api_personas(
                 "name": p.name,
                 "model_override": p.model_override,
                 "is_active": active_id == Some(p.id),
-                "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
+                "last_message_at": activity.get(&p.id),
+                        "last_bot_message_at": last.map(|r| r.last_bot_message_at.clone()),
                 "last_bot_message_session_id": last.and_then(|r| r.session_id.clone()),
                 "last_bot_message_session_title": last.and_then(|r| r.session_title.clone()),
                 "last_read_at": read_by_persona.get(&p.id),
@@ -9317,6 +9412,10 @@ fn build_router(web_state: WebState) -> Router {
             get(api_settings_get).patch(api_settings_patch),
         )
         .route("/api/llm", get(api_llm_get).patch(api_llm_patch))
+        .route(
+            "/api/secrets",
+            get(api_secrets_list).delete(api_secrets_forget),
+        )
         .route("/api/llm/models", get(api_llm_models_get))
         .route(
             "/api/multimodel",

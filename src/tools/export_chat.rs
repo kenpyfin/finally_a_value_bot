@@ -1,3 +1,4 @@
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,10 +7,12 @@ use serde_json::json;
 use super::{authorize_chat_access, default_persona_id_for_chat, schema_object, Tool, ToolResult};
 use crate::claude::ToolDefinition;
 use crate::db::{call_blocking, Database};
+use crate::safety_redaction::EnvSecretRedactor;
 
 pub struct ExportChatTool {
     db: Arc<Database>,
     data_dir: String,
+    env_redactor: Option<Arc<EnvSecretRedactor>>,
 }
 
 impl ExportChatTool {
@@ -17,8 +20,41 @@ impl ExportChatTool {
         ExportChatTool {
             db,
             data_dir: data_dir.to_string(),
+            env_redactor: None,
         }
     }
+
+    pub fn with_redactor(mut self, redactor: Arc<EnvSecretRedactor>) -> Self {
+        self.env_redactor = Some(redactor);
+        self
+    }
+}
+
+fn confine_export_path(
+    data_dir: &str,
+    requested: Option<&str>,
+    default_name: &str,
+) -> Result<PathBuf, String> {
+    let exports = PathBuf::from(data_dir).join("exports");
+    let raw = requested.unwrap_or(default_name).trim();
+    if raw.is_empty() {
+        return Err("Export path is empty".into());
+    }
+    let path = Path::new(raw);
+    if path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(
+            "Export path must be a file name inside the runtime exports directory. Absolute paths and '..' are not allowed."
+                .into(),
+        );
+    }
+    Ok(exports.join(path))
 }
 
 #[async_trait]
@@ -39,7 +75,7 @@ impl Tool for ExportChatTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Optional output file path. Defaults to data/exports/{chat_id}_{timestamp}.md"
+                        "description": "Optional file name under the runtime exports directory. Defaults to {chat_id}_{timestamp}.md. Absolute paths are rejected."
                     }
                 }),
                 &["chat_id"],
@@ -83,11 +119,15 @@ impl Tool for ExportChatTool {
         }
 
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let default_path = format!("{}/exports/{}_{}.md", self.data_dir, chat_id, timestamp);
-        let path = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&default_path);
+        let default_name = format!("{chat_id}_{timestamp}.md");
+        let path = match confine_export_path(
+            &self.data_dir,
+            input.get("path").and_then(|v| v.as_str()),
+            &default_name,
+        ) {
+            Ok(path) => path,
+            Err(e) => return ToolResult::error(e),
+        };
 
         // Build markdown
         let mut md = format!("# Chat Export: {chat_id}\n\n");
@@ -108,14 +148,15 @@ impl Tool for ExportChatTool {
             ));
         }
 
-        // Write file
-        let path = std::path::Path::new(path);
+        if let Some(redactor) = &self.env_redactor {
+            md = redactor.redact_with_patterns(&md);
+        }
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return ToolResult::error(format!("Failed to create directory: {e}"));
             }
         }
-        match std::fs::write(path, &md) {
+        match std::fs::write(&path, &md) {
             Ok(_) => ToolResult::success(format!(
                 "Exported {} messages to {}",
                 messages.len(),
@@ -183,15 +224,14 @@ mod tests {
         })
         .unwrap();
 
-        let out_path = dir.join("test_export.md");
         let tool = ExportChatTool::new(db, dir.to_str().unwrap());
         let result = tool
-            .execute(json!({"chat_id": 100, "path": out_path.to_str().unwrap()}))
+            .execute(json!({"chat_id": 100, "path": "test_export.md"}))
             .await;
         assert!(!result.is_error, "Error: {}", result.content);
         assert!(result.content.contains("2 messages"));
 
-        let content = std::fs::read_to_string(&out_path).unwrap();
+        let content = std::fs::read_to_string(dir.join("exports").join("test_export.md")).unwrap();
         assert!(content.contains("alice"));
         assert!(content.contains("hello"));
         assert!(content.contains("**Bot**"));
@@ -247,12 +287,11 @@ mod tests {
             origin: crate::db::message_origin_interactive(),
         })
         .unwrap();
-        let out_path = dir.join("control_export.md");
         let tool = ExportChatTool::new(db, dir.to_str().unwrap());
         let result = tool
             .execute(json!({
                 "chat_id": 200,
-                "path": out_path.to_str().unwrap(),
+                "path": "control_export.md",
                 "__finally_a_value_bot_auth": {
                     "caller_chat_id": 100,
                     "control_chat_ids": [100]
@@ -260,7 +299,8 @@ mod tests {
             }))
             .await;
         assert!(!result.is_error, "{}", result.content);
-        let content = std::fs::read_to_string(out_path).unwrap();
+        let content =
+            std::fs::read_to_string(dir.join("exports").join("control_export.md")).unwrap();
         assert!(content.contains("hello"));
         cleanup(&dir);
     }

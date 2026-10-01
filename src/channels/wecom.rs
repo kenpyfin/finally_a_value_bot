@@ -773,6 +773,12 @@ async fn handle_slash_command(
                 Err(e) => format!("Error listing tasks: {e}"),
             }
         }
+        SlashCommand::Secrets => crate::secret_vault::secrets_command_reply(
+            &app_state.config.runtime_data_dir(),
+            &app_state.config.skills_data_dir_absolute(),
+            chat_id,
+            text,
+        ),
         SlashCommand::Archive => {
             let pid = call_blocking(app_state.db.clone(), move |db| {
                 db.get_current_persona_id(chat_id)

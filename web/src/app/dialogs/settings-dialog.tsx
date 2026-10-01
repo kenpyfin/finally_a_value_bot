@@ -24,7 +24,91 @@ const SettingsIntegrationsPanel = React.lazy(() =>
   import('../../components/settings-integrations').then((m) => ({ default: m.SettingsIntegrationsPanel })),
 )
 
-export function SettingsDialog({ appearance, api, activePersonaId, personas, settings }: SettingsDialogProps) {
+type VaultSecretRow = {
+  name: string
+  kind: string
+  skill: string | null
+  created_at: string
+}
+
+function VaultedSecretsPanel({
+  api,
+  open,
+  chatId,
+}: {
+  api: SettingsDialogProps['api']
+  open: boolean
+  chatId: number | null
+}) {
+  const [items, setItems] = React.useState<VaultSecretRow[]>([])
+  const [error, setError] = React.useState('')
+  const [busyName, setBusyName] = React.useState<string | null>(null)
+
+  const load = React.useCallback(async () => {
+    try {
+      const data = await api<{ secrets: VaultSecretRow[] }>('/api/secrets')
+      setItems(data.secrets)
+      setError('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load vaulted secrets')
+    }
+  }, [api])
+
+  React.useEffect(() => {
+    if (open) void load()
+  }, [open, load])
+
+  async function forget(name: string) {
+    setBusyName(name)
+    try {
+      await api(`/api/secrets?name=${encodeURIComponent(name)}`, { method: 'DELETE' })
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not forget that secret')
+    } finally {
+      setBusyName(null)
+    }
+  }
+
+  return (
+    <section className="mb-4 rounded-lg border border-border p-3">
+      <h3 className="text-sm font-medium">Vaulted secrets</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Names stored for chat {chatId ?? '—'} after the agent calls vault_secret. Values stay in the
+        runtime secrets file and are not shown here.
+      </p>
+      {error ? <p className="mt-2 text-sm text-destructive">{error}</p> : null}
+      {items.length === 0 ? (
+        <p className="mt-2 text-sm text-muted-foreground">No vaulted secrets.</p>
+      ) : (
+        <ul className="mt-2 space-y-2">
+          {items.map((item) => (
+            <li key={item.name} className="flex items-center justify-between gap-3 text-sm">
+              <span>
+                <code className="text-xs">{item.name}</code>
+                <span className="ml-2 text-xs text-muted-foreground">
+                  {item.kind}
+                  {item.skill ? ` · ${item.skill}` : ''}
+                </span>
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={busyName === item.name}
+                onClick={() => void forget(item.name)}
+              >
+                Forget
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
+
+export function SettingsDialog({ appearance, api, chatId, activePersonaId, personas, settings }: SettingsDialogProps) {
   const settingsDialogOpen = settings.open
   const setSettingsDialogOpen = settings.onOpenChange
   const settingsError = settings.error
@@ -67,6 +151,7 @@ export function SettingsDialog({ appearance, api, activePersonaId, personas, set
           </TabsList>
           <React.Suspense fallback={<SettingsPanelSkeleton />}>
           <TabsContent value="overview">
+            <VaultedSecretsPanel api={api} open={settingsDialogOpen} chatId={chatId} />
             {onCreatePersona && onRenamePersona && onDeletePersona ? (
               <div className="mb-3">
                 <SettingsPersonaPanel

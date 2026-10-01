@@ -2457,15 +2457,15 @@ impl GeminiProvider {
 
     fn generate_url(&self) -> String {
         format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model, self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            self.model
         )
     }
 
     fn stream_url(&self) -> String {
         format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.model, self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.model
         )
     }
 }
@@ -2511,6 +2511,7 @@ impl LlmProvider for GeminiProvider {
                 .http
                 .post(&self.generate_url())
                 .header("Content-Type", "application/json")
+                .header("x-goog-api-key", &self.api_key)
                 .json(&request_body)
                 .send()
                 .await;
@@ -2595,6 +2596,7 @@ impl LlmProvider for GeminiProvider {
                 .http
                 .post(&self.stream_url())
                 .header("Content-Type", "application/json")
+                .header("x-goog-api-key", &self.api_key)
                 .json(&request_body)
                 .send()
                 .await;
@@ -4422,6 +4424,19 @@ mod tests {
             ResponseContentBlock::Text { text } => assert_eq!(text, ""),
             _ => panic!("Expected Text"),
         }
+    }
+
+    #[test]
+    fn gemini_urls_do_not_embed_the_api_key() {
+        let mut config = crate::config::test_config();
+        config.workspace_dir = "/tmp".into();
+        config.api_key = "super-secret-gemini-key".into();
+        config.model = "gemini-2.5-flash".into();
+        let provider = GeminiProvider::new(&config);
+        assert!(!provider.generate_url().contains("key="));
+        assert!(!provider.generate_url().contains("super-secret"));
+        assert!(!provider.stream_url().contains("key="));
+        assert!(!provider.stream_url().contains("super-secret"));
     }
 
     #[test]

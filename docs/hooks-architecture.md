@@ -20,7 +20,7 @@ Runtime entry point:
 
 ## Shipped hook catalog
 
-On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests from repository **`builtin_hooks/*.hook.json`** into SQLite (see `src/builtin_hooks.rs`). A fresh clone already includes six manifests:
+On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests from repository **`builtin_hooks/*.hook.json`** into SQLite (see `src/builtin_hooks.rs`). A fresh clone already includes seven manifests:
 
 | Manifest file | Event | `action_type` |
 |---------------|-------|---------------|
@@ -30,6 +30,7 @@ On startup/migrate, `Database::ensure_builtin_hook_definitions` syncs manifests 
 | `prestop-deferred-commitment-guard.hook.json` | PreStop | `builtin_deferred_commitment_guard` |
 | `postbatch-loop-guard.hook.json` | PostToolBatch | `builtin_loop_guard` |
 | `predelivery-dense-delivery-guard.hook.json` | PreDelivery | `builtin_dense_delivery_guard` |
+| `postdelivery-secret-vault-scrub.hook.json` | PostDelivery | `builtin_secret_vault_scrub` |
 
 Handlers run in Rust (`hook_runtime.rs`). Manifests are the install-time catalog, not subprocess scripts.
 
@@ -63,6 +64,7 @@ Supported `action_type` values:
 - `builtin_deferred_commitment_guard` (PreStop deferred-work guard; no-op when `stop_reason` is `ask_clarification`)
 - `builtin_loop_guard` (PostToolBatch discovery/edit loop guard)
 - `builtin_dense_delivery_guard` (PreDelivery persona-gated length spill: LLM summary + full-report PDF uploaded to a public HTTPS URL; no-op when the persona toggle is off)
+- `builtin_secret_vault_scrub` (PostDelivery: rewrite vaulted secret values out of this chat's stored messages and agent_history files)
 
 `pz_terminal_cleanup` is no longer a framework action type. PZ cleanup is implemented as a command hook script.
 
@@ -139,7 +141,7 @@ Command hooks may return `effects.memory_tier3_prune`; Rust applies writes via `
 
 ## Built-in Rust policy hooks
 
-`builtin_*` action types run inline in `hook_runtime.rs`. PostDelivery focus sync triggers `run_persona_focus_sync_after_delivery` when `builtin_persona_focus_sync` matches. PreDelivery `builtin_dense_delivery_guard` may replace `updated_assistant_text` after PDQE when the persona dense-delivery toggle is on and the reply exceeds the channel cap. The replacement is a natural LLM summary (extractive fallback) that offers the public PDF URL; the PDF is the full original report (env secrets redacted) uploaded to catbox, not an internal path.
+`builtin_*` action types run inline in `hook_runtime.rs`. PostDelivery focus sync triggers `run_persona_focus_sync_after_delivery` when `builtin_persona_focus_sync` matches. PostDelivery `builtin_secret_vault_scrub` calls `secret_vault::drain_pending_scrubs` for the current chat. PreDelivery `builtin_dense_delivery_guard` may replace `updated_assistant_text` after PDQE when the persona dense-delivery toggle is on and the reply exceeds the channel cap. The replacement is a natural LLM summary (extractive fallback) that offers the public PDF URL; the PDF is the full original report (env secrets redacted) uploaded to catbox, not an internal path.
 
 ## Separation from delivery safeguards
 

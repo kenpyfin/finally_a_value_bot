@@ -14,6 +14,7 @@ A new clone already contains these manifests (no manual setup):
 | `prestop-deferred-commitment-guard.hook.json` | PreStop | `builtin_deferred_commitment_guard` |
 | `postbatch-loop-guard.hook.json` | PostToolBatch | `builtin_loop_guard` |
 | `predelivery-dense-delivery-guard.hook.json` | PreDelivery | `builtin_dense_delivery_guard` |
+| `postdelivery-secret-vault-scrub.hook.json` | PostDelivery | `builtin_secret_vault_scrub` |
 
 Execution is implemented in Rust (`src/hook_runtime.rs`). Manifests declare **which** hooks exist and their lifecycle binding; they are not subprocess scripts.
 

@@ -67,6 +67,8 @@ export type PersonaApiRow = {
   id: number
   name: string
   is_active: boolean
+  /** Latest user or agent message, including sessions and side chats. */
+  last_message_at?: string | null
   last_bot_message_at?: string | null
   last_bot_message_session_id?: string | null
   last_bot_message_session_title?: string | null
@@ -80,6 +82,7 @@ export function mapPersonaApiRow(p: PersonaApiRow): Persona {
     id: p.id,
     name: p.name,
     is_active: p.is_active,
+    last_message_at: p.last_message_at ?? null,
     last_bot_message_at: p.last_bot_message_at ?? null,
     last_bot_message_session_id: p.last_bot_message_session_id ?? null,
     last_bot_message_session_title: p.last_bot_message_session_title ?? null,

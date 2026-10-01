@@ -1175,6 +1175,15 @@ async fn handle_message(
                     error!("schedule_cmd: failed to send response: {e}");
                 }
             }
+            SlashCommand::Secrets => {
+                let reply = crate::secret_vault::secrets_command_reply(
+                    &state.config.runtime_data_dir(),
+                    &state.config.skills_data_dir_absolute(),
+                    canonical_chat_id,
+                    &text,
+                );
+                send_response(&bot, msg.chat.id, &reply, msg.thread_id, None).await;
+            }
             SlashCommand::Archive => {
                 let pid = call_blocking(state.db.clone(), move |db| {
                     db.get_current_persona_id(canonical_chat_id)
@@ -1879,6 +1888,15 @@ pub async fn process_with_agent_with_events(
 ) -> anyhow::Result<AgentProcessResult> {
     let chat_id = context.chat_id;
     let persona_id = context.persona_id;
+    {
+        let scrub_db = state.db.clone();
+        let scrub_dir = state.config.runtime_data_dir();
+        let _ = call_blocking(scrub_db, move |db| {
+            crate::secret_vault::drain_pending_scrubs(db, &scrub_dir, chat_id);
+            Ok(())
+        })
+        .await;
+    }
     let global_engine = state.runtime_toggles.agent_engine();
     let run_engine = call_blocking(state.db.clone(), move |db| {
         Ok(
@@ -2573,6 +2591,18 @@ pub(crate) async fn process_classic_agent_with_events(
                 chat_id,
                 persona_id,
                 &record,
+                state.env_redactor.as_ref(),
+            );
+            let scrub_db = state.db.clone();
+            let scrub_dir = state.config.runtime_data_dir();
+            let _ = call_blocking(scrub_db, move |db| {
+                crate::secret_vault::drain_pending_scrubs(db, &scrub_dir, chat_id);
+                Ok(())
+            })
+            .await;
+            crate::secret_vault::scrub_vaulted_history_files(
+                &state.config.runtime_data_dir(),
+                chat_id,
             );
             let run_key_for_db = run_key.clone();
             tokio::spawn({
@@ -3210,11 +3240,12 @@ pub(crate) async fn process_classic_agent_with_events(
                 {
                     executed_tool_names.push(name.clone());
                     run_tool_names.push(name.clone());
+                    let log_input = crate::secret_vault::mask_tool_input_for_log(name, input);
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolStart {
                             tool_use_id: id.clone(),
                             name: name.clone(),
-                            input: input.clone(),
+                            input: log_input.clone(),
                         });
                     }
                     let _ = call_blocking(state.db.clone(), {
@@ -3232,7 +3263,8 @@ pub(crate) async fn process_classic_agent_with_events(
                     })
                     .await;
 
-                    let input_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                    let input_str =
+                        serde_json::to_string(&log_input).unwrap_or_else(|_| "{}".into());
                     let input_preview = if input_str.len() > 10000 {
                         format!("{}...", &input_str[..10000])
                     } else {
@@ -3272,7 +3304,7 @@ pub(crate) async fn process_classic_agent_with_events(
                             caller_channel: context.caller_channel.to_string(),
                             is_scheduled_task: context.is_scheduled_task,
                             tool_name: Some(name.clone()),
-                            tool_input: Some(hook_input_for_exec.clone()),
+                            tool_input: Some(log_input.clone()),
                             runtime_signals: Some(serde_json::json!({
                                 "requires_schedule_skill": missing_schedule_skill,
                                 "requires_modify_skill": missing_modify_skill,
@@ -3319,8 +3351,7 @@ pub(crate) async fn process_classic_agent_with_events(
                             history_tool_calls.push(ToolCallRecord {
                                 name: name.clone(),
                                 input_preview: state.env_redactor.redact(&truncate_preview(
-                                    &serde_json::to_string(&hook_input_for_exec)
-                                        .unwrap_or_default(),
+                                    &serde_json::to_string(&log_input).unwrap_or_default(),
                                     10000,
                                 )),
                                 result_preview: reason.to_string(),
@@ -3330,11 +3361,20 @@ pub(crate) async fn process_classic_agent_with_events(
                             continue;
                         }
                         if let Some(updated) = hook.updated_tool_input.clone() {
-                            hook_input_for_exec = updated;
+                            if !crate::secret_vault::tool_input_is_sensitive(name) {
+                                hook_input_for_exec = updated;
+                            }
                         }
                         hook_batch_contexts.extend(hook.additional_contexts.iter().cloned());
                     }
-                    executed_tool_inputs.push((name.clone(), hook_input_for_exec.clone()));
+                    executed_tool_inputs.push((
+                        name.clone(),
+                        if crate::secret_vault::tool_input_is_sensitive(name) {
+                            log_input.clone()
+                        } else {
+                            hook_input_for_exec.clone()
+                        },
+                    ));
 
                     let requested_skill_name = hook_input_for_exec
                         .get("skill_name")
@@ -3607,7 +3647,11 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
                     history_tool_calls.push(ToolCallRecord {
                         name: name.clone(),
                         input_preview: state.env_redactor.redact(&truncate_preview(
-                            &serde_json::to_string(&hook_input_for_exec).unwrap_or_default(),
+                            &serde_json::to_string(&crate::secret_vault::mask_tool_input_for_log(
+                                name,
+                                &hook_input_for_exec,
+                            ))
+                            .unwrap_or_default(),
                             10000,
                         )),
                         result_preview: state
@@ -3630,7 +3674,10 @@ Use the strategy model for mutations or delegate_local_subjob for discovery."
                             caller_channel: context.caller_channel.to_string(),
                             is_scheduled_task: context.is_scheduled_task,
                             tool_name: Some(name.clone()),
-                            tool_input: Some(hook_input_for_exec.clone()),
+                            tool_input: Some(crate::secret_vault::mask_tool_input_for_log(
+                                name,
+                                &hook_input_for_exec,
+                            )),
                             tool_output: Some(result.content.clone()),
                             tool_is_error: Some(result.is_error),
                             ..HookRunInput::default()
@@ -4803,7 +4850,16 @@ async fn finish_turn_with_quality_gate(
         chat_id,
         persona_id,
         &record,
+        state.env_redactor.as_ref(),
     );
+    let scrub_db = state.db.clone();
+    let scrub_dir = state.config.runtime_data_dir();
+    let _ = call_blocking(scrub_db, move |db| {
+        crate::secret_vault::drain_pending_scrubs(db, &scrub_dir, chat_id);
+        Ok(())
+    })
+    .await;
+    crate::secret_vault::scrub_vaulted_history_files(&state.config.runtime_data_dir(), chat_id);
     let run_key_for_db = run_key.to_string();
     let stop_reason_for_db = stop_reason_owned.clone();
     if let Err(e) = call_blocking(state.db.clone(), move |db| {
@@ -6062,6 +6118,7 @@ User messages from prior turns are wrapped in XML tags like <user_message contex
 - **Deprecated flat shared scratch:** do not write to `shared/scripts/` or `shared/parking/`; keep persona scratch under the persona cwd above.
 - **User skills directory:** `{skills_dir_display}` under the workspace data root. **Built-in skills** load from the checkout’s `builtin_skills/` directory on disk (override with `FINALLY_A_VALUE_BOT_BUILTIN_SKILLS`, or place `builtin_skills/` beside the parent of `WORKSPACE_DIR`); they are not copied into `skills/`.
 - **Where to put secrets:** Prefer skill-specific credentials in `skills/<skill-name>/.env`. Put bot-wide keys (e.g. `TELEGRAM_BOT_TOKEN`, `LLM_*`, `WORKSPACE_DIR`, `VAULT_ORIGIN_VAULT_REPO`, other `VAULT_*` consumed by the Rust binary) in the configuration `.env` at the configuration root.
+- **Sensitive information in user messages:** When the user pastes a password, login (username plus password), API key, token, OAuth refresh token, private key, recovery or 2FA code, card number, or bank detail, call `vault_secret` first in the turn, before any tool that needs the value. Pass `skill` when they name one (for example a Notion token). After that, refer to it as `$NAME` in `bash` / `run_skill_script` / `spawn_background_command`, or as `[SECRET:NAME]` in other tool inputs. Never repeat the value in replies, `send_message`, files, or memory. Do not call `vault_secret` when the user is only asking about secrets. Cursor's own shell cannot see the vault; use the bot `bash` tool for commands that need a secret. Usernames or emails alone are not secrets unless they are paired with a credential.
 - **Skill scripts and `.env`:** Many bundled skill scripts call `load_dotenv` on the skill folder’s `.env` to fill in variables that are **not** already set in the process environment. Values already exported by the bot (for example after loading the configuration `.env`) **take precedence**—the skill file does not override them by default. If a required variable is still missing, use the skill’s documented default or fix the env and tell the user clearly what is missing.
 
 The workspace (your working directory for file/bash/search tools) is persistent across sessions. Your workspace path is: {workspace_path}. Relative paths in read_file, write_file, edit_file, apply_search_replace, symbol_edit, glob, grep, and locate_file are resolved from this directory (locate_file also searches declared roots below).

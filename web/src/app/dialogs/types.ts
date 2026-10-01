@@ -207,6 +207,7 @@ export interface AppDialogsProps {
 export type SettingsDialogProps = {
   appearance: Appearance
   api: AppDialogsProps['api']
+  chatId: number | null
   activePersonaId: number | null
   personas: Persona[]
   settings: AppDialogsSettingsProps

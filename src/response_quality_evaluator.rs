@@ -353,6 +353,7 @@ pub fn log_pdqe_to_agent_history(ctx: &PostDeliveryEvalContext, step: &str, deta
         basename,
         step,
         detail,
+        None,
     ) {
         warn!(
             run_key = %ctx.run_key,

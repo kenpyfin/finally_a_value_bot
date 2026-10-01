@@ -27,6 +27,22 @@ specialized docs (see `.cursor/rules/development-journal.mdc`).
 
 ## Recent
 
+### 2026-09-30 — Personas ordered by latest message
+
+- **Area:** web / persona activity
+- **Summary:** Persona lists sort by the newest persisted user or agent message across main chat, sessions, and side chats. Empty personas appear last, with ID breaking timestamp ties. Sends and completed replies refresh activity without waiting for the persona polling throttle.
+- **Rationale:** ID order and bot-only activity did not reflect the most recently used conversation. Unread cursors and inbox links continue using bot-only metadata.
+- **Key files / symbols:** `src/db.rs` (`list_persona_last_message_at`); `src/web.rs` (`order_personas_by_activity`, both persona response paths, `message_stored` SSE event); web persona API mapping, ops polling, and send callbacks.
+- **Follow-ups:** Side chats retain their existing persistence behavior: user and assistant turns are saved together after completion.
+
+### 2026-09-29 — Agent-driven secret vault
+
+- **Area:** agent / safety / channels / web
+- **Summary:** When a user message contains a password, login, or API key, the agent calls `vault_secret`. The value is stored in `runtime/secrets/<chat_id>.env` (and optionally a skill `.env`), injected into bash and skill scripts, and replaced in that chat's messages and agent_history with `[SECRET:NAME stored in runtime/secrets/<chat_id>.env]`. `/secrets` and Settings → Overview list names only.
+- **Rationale:** Shape matching at ingest misses ordinary passwords. The model sees the value once on the turn it arrives; persisted history after that turn does not.
+- **Key files / symbols:** `src/secret_vault.rs` (`upsert`, `drain_pending_scrubs`, `resolve_placeholders`); `vault_secret` tool; `EnvSecretRedactor::register_trusted` / `redact_with_patterns`; `replace_literal_in_chat_messages`; `builtin_secret_vault_scrub`; `GET/DELETE /api/secrets`.
+- **Follow-ups:** Rotate keys already pushed to GitHub (`GEMINI_API_KEY`, `CONTRACTORTALK_PASSWORD`, and the local-history tokens listed in the secret-vault plan). Chat platforms still keep the original user message.
+
 ### 2026-09-26 — Side chat resize grows with the split; unread cursors are server-side
 
 - **Area:** web UI / side chat / inbox unread

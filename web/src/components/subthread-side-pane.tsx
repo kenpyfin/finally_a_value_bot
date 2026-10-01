@@ -24,6 +24,7 @@ export type SubthreadSidePaneProps = {
   draft: string
   onDraftChange: (draft: string) => void
   onDraftLocalChange?: (draft: string) => void
+  onMessageActivity?: () => void
   onSendComplete?: () => void | Promise<void>
   onAddToMainChat?: (turnId: string) => void | Promise<void>
   onDelete?: () => void | Promise<boolean>
@@ -118,6 +119,7 @@ export function SubthreadSidePane({
   draft,
   onDraftChange,
   onDraftLocalChange,
+  onMessageActivity,
   onSendComplete,
   onAddToMainChat,
   onDelete,
@@ -306,6 +308,7 @@ export function SubthreadSidePane({
         setStatus('Idle')
       }
       if (completed) {
+        onMessageActivity?.()
         await onSendComplete?.()
       }
     } catch (e) {
@@ -340,6 +343,7 @@ export function SubthreadSidePane({
     draft,
     onDraftChange,
     onDraftLocalChange,
+    onMessageActivity,
     onSendComplete,
     onTurnsChange,
     personaId,

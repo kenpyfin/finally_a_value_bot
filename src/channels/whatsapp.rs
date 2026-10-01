@@ -284,6 +284,22 @@ async fn process_webhook(state: &WhatsAppState, payload: WebhookPayload) -> anyh
                             )
                             .await;
                         }
+                        SlashCommand::Secrets => {
+                            let reply = crate::secret_vault::secrets_command_reply(
+                                &state.app_state.config.runtime_data_dir(),
+                                &state.app_state.config.skills_data_dir_absolute(),
+                                chat_id,
+                                &text,
+                            );
+                            send_whatsapp_message(
+                                &state.http_client,
+                                &state.access_token,
+                                &state.phone_number_id,
+                                &message.from,
+                                &reply,
+                            )
+                            .await;
+                        }
                         SlashCommand::Archive => {
                             let pid = call_blocking(state.app_state.db.clone(), move |db| {
                                 db.get_current_persona_id(chat_id)

@@ -231,6 +231,15 @@ impl EventHandler for Handler {
                     };
                     let _ = msg.channel_id.say(&ctx.http, &text).await;
                 }
+                SlashCommand::Secrets => {
+                    let reply = crate::secret_vault::secrets_command_reply(
+                        &self.app_state.config.runtime_data_dir(),
+                        &self.app_state.config.skills_data_dir_absolute(),
+                        canonical_chat_id,
+                        &text,
+                    );
+                    let _ = msg.channel_id.say(&ctx.http, &reply).await;
+                }
                 SlashCommand::Archive => {
                     let pid = call_blocking(self.app_state.db.clone(), move |db| {
                         db.get_current_persona_id(canonical_chat_id)

@@ -372,6 +372,15 @@ pub async fn run_hooks_for_event_async(
                     break;
                 }
             }
+            "builtin_secret_vault_scrub" => {
+                let data_dir = config.runtime_data_dir();
+                let chat_id = input.chat_id;
+                let _ = call_blocking(db.clone(), move |db| {
+                    crate::secret_vault::drain_pending_scrubs(db, &data_dir, chat_id);
+                    Ok(())
+                })
+                .await;
+            }
             "builtin_dense_delivery_guard" => {
                 if let Some(text) = input.assistant_text.as_deref() {
                     if let Some(updated) = crate::dense_delivery_guard::maybe_apply_dense_delivery(

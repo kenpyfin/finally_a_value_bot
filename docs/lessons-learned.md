@@ -16,6 +16,14 @@ Running record of incidents and durable fixes. Newest first.
 
 ---
 
+### 2026-09-29 — User-pasted secrets landed in agent history and committed chat exports
+
+- **Symptom:** API keys and passwords from chat showed up in `agent_history` markdown and in chat-export files that were committed and pushed. A pattern matcher at ingest could not catch logins that have no key-shaped prefix (for example "username / password").
+- **Root cause:** Inbound messages were stored and replayed raw. `EnvSecretRedactor` only knew `.env` values loaded at startup, and it never ran on `write_agent_history_run` or `export_chat`. `CURSOR_API_KEY` was on the non-secret allowlist. Gemini put `?key=` in the request URL, so HTTP errors copied the key into logs and history. Exports could be written to any path the agent chose, including the repo root.
+- **Fix:** The agent calls `vault_secret`, which stores the value in `runtime/secrets/<chat_id>.env` (and optionally `skills/<skill>/.env`). Tools receive it via process env or `[SECRET:NAME]`. After the turn, `drain_pending_scrubs` rewrites that chat's messages and agent_history files to a placeholder. Disk writers also run a live redactor plus strict known-format patterns. Exports are confined to the runtime exports directory.
+- **Prevention:** Do not add a second ingest regex as the only control for secrets. New disk sinks that persist chat or tool input must call `EnvSecretRedactor::redact_with_patterns`. Do not put credential env keys on `NON_SECRET_ENV_KEYS`. Do not put API keys in URLs.
+- **Files/refs:** `src/secret_vault.rs`, `src/tools/vault_secret.rs`, `src/safety_redaction.rs`, `write_agent_history_run` in `src/agent_history.rs`, `ExportChatTool` in `src/tools/export_chat.rs`, `GeminiProvider` in `src/llm.rs`, `builtin_hooks/postdelivery-secret-vault-scrub.hook.json`.
+
 ### 2026-09-26 — Side chat split could shrink but not grow; unread dots were per browser
 
 - **Symptom:** Dragging the side-chat divider moved it both ways, but the side chat only got narrower. Unread persona dots on one browser did not appear on another.

@@ -35,6 +35,19 @@ describe('personasSnapshotEqual', () => {
     expect(personasSnapshotEqual(a, b)).toBe(false)
   })
 
+  it('refreshes when user or side-chat activity changes without a bot reply', () => {
+    const a = [persona({ id: 1, name: 'A', last_message_at: '2026-01-01T00:00:00Z' })]
+    const b = [persona({ id: 1, name: 'A', last_message_at: '2026-01-02T00:00:00Z' })]
+    expect(personasSnapshotEqual(a, b)).toBe(false)
+  })
+
+  it('detects activity-driven reordering and treats absent activity as null', () => {
+    const a = persona({ id: 1, name: 'A' })
+    const b = persona({ id: 2, name: 'B' })
+    expect(personasSnapshotEqual([a, b], [b, a])).toBe(false)
+    expect(personasSnapshotEqual([a], [{ ...a, last_message_at: null }])).toBe(true)
+  })
+
   it('returns false when lengths differ', () => {
     expect(personasSnapshotEqual([persona({ id: 1, name: 'A' })], [])).toBe(false)
   })

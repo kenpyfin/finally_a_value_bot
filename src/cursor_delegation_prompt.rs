@@ -22,6 +22,7 @@ Bot tools are exposed via MCP server `finally-a-value-bot` (loopback). Tool name
 - **Prefer MCP** for persona-scoped files (`read_file`, `write_file`, `grep`, …), vault (`search_vault`, `read_file`), scheduler, bulletin (`update_bulletin_focus`), operator todos (`add_todo` / `list_todos` / `complete_todo`), channel delivery, and skills (`activate_skill`, `run_skill_script`).
 - Cursor built-ins (shell, search) exist; use MCP file tools for paths under the persona cwd and for vault/scheduler/bulletin/todo workflows.
 - **Skills:** metadata in the Agent Skills section below is routing only; call `activate_skill` before following procedural skill steps.
+- **Secrets:** if the user message contains a password, login, API key, or token, call MCP `vault_secret` before using it. Then use `$NAME` via the bot `bash` tool (not Cursor's native shell) or `[SECRET:NAME]` in other tool inputs. Never repeat the value.
 
 "#;
 

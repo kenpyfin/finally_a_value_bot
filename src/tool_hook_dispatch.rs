@@ -58,6 +58,7 @@ pub async fn dispatch_tool_with_hooks(
     let tool_shared_dir =
         tools::resolve_tool_working_dir(Path::new(ctx.state.config.working_dir()));
 
+    let log_input = crate::secret_vault::mask_tool_input_for_log(tool_name, &tool_input);
     let missing_schedule_skill = (tool_name == "schedule_task"
         || tool_name == "update_scheduled_task")
         && !*ctx.schedule_skill_activated;
@@ -79,7 +80,7 @@ pub async fn dispatch_tool_with_hooks(
             caller_channel: ctx.context.caller_channel.to_string(),
             is_scheduled_task: ctx.context.is_scheduled_task,
             tool_name: Some(tool_name.to_string()),
-            tool_input: Some(tool_input.clone()),
+            tool_input: Some(log_input.clone()),
             runtime_signals: Some(serde_json::json!({
                 "requires_schedule_skill": missing_schedule_skill,
                 "requires_modify_skill": missing_modify_skill,
@@ -116,7 +117,7 @@ pub async fn dispatch_tool_with_hooks(
             let record = ToolCallRecord {
                 name: tool_name.to_string(),
                 input_preview: ctx.state.env_redactor.redact(&truncate_preview(
-                    &serde_json::to_string(&tool_input).unwrap_or_default(),
+                    &serde_json::to_string(&log_input).unwrap_or_default(),
                     10000,
                 )),
                 result_preview: reason.to_string(),
@@ -130,7 +131,9 @@ pub async fn dispatch_tool_with_hooks(
             };
         }
         if let Some(updated) = hook.updated_tool_input.clone() {
-            tool_input = updated;
+            if !crate::secret_vault::tool_input_is_sensitive(tool_name) {
+                tool_input = updated;
+            }
         }
     }
 
@@ -174,7 +177,7 @@ pub async fn dispatch_tool_with_hooks(
     let record = ToolCallRecord {
         name: tool_name.to_string(),
         input_preview: ctx.state.env_redactor.redact(&truncate_preview(
-            &serde_json::to_string(&tool_input).unwrap_or_default(),
+            &serde_json::to_string(&log_input).unwrap_or_default(),
             10000,
         )),
         result_preview: ctx
@@ -198,7 +201,7 @@ pub async fn dispatch_tool_with_hooks(
             caller_channel: ctx.context.caller_channel.to_string(),
             is_scheduled_task: ctx.context.is_scheduled_task,
             tool_name: Some(tool_name.to_string()),
-            tool_input: Some(tool_input.clone()),
+            tool_input: Some(log_input.clone()),
             tool_output: Some(result.content.clone()),
             tool_is_error: Some(result.is_error),
             ..HookRunInput::default()
@@ -253,8 +256,14 @@ pub async fn dispatch_tool_with_hooks(
     }
 
     ctx.executed_tool_names.push(tool_name.to_string());
-    ctx.executed_tool_inputs
-        .push((tool_name.to_string(), tool_input));
+    ctx.executed_tool_inputs.push((
+        tool_name.to_string(),
+        if crate::secret_vault::tool_input_is_sensitive(tool_name) {
+            log_input
+        } else {
+            tool_input
+        },
+    ));
 
     ToolHookDispatchOutcome {
         result,

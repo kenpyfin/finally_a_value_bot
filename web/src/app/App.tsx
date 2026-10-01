@@ -1124,6 +1124,11 @@ export function App({
             for await (const evt of parseSseEvents(sseResp)) {
               if (options.abortSignal.aborted) break
 
+              if (evt.event === 'message_stored') {
+                void invalidateOps(chatIdForRun)
+                continue
+              }
+
               if (evt.event === 'status') {
                 const obj = parseJsonObject(evt.data)
                 const message = typeof obj?.message === 'string' ? obj.message : null
@@ -1251,11 +1256,11 @@ export function App({
             setPendingRuns((prev) => prev.filter((r) => r.runId !== runId))
           }
         } finally {
-          // No-op: keep existing structure for future error instrumentation.
+          void invalidateOps(chatId)
         }
       },
     }),
-    [chatId, selectedSessionReadOnly, activePersonaId, formatReplyForSend, historyMode, jumpToLatest, loadHistory, loadPersonaBulletin],
+    [chatId, selectedSessionReadOnly, activePersonaId, formatReplyForSend, historyMode, jumpToLatest, loadHistory, loadPersonaBulletin, invalidateOps],
   )
 
   const toggleAppearance = useCallback((): void => {
@@ -2307,6 +2312,7 @@ export function App({
                         draft={activeDraft}
                         onDraftChange={setActiveDraft}
                         onDraftLocalChange={setActiveDraftLocal}
+                        onMessageActivity={() => { void invalidateOps(chatId) }}
                         onSendComplete={refreshAfterSend}
                         onAddToMainChat={handleAddSideChatTurnToMain}
                         onDelete={() => deleteSideChat(activeSideChat.id)}

@@ -49,6 +49,7 @@ export function AppDialogs(props: AppDialogsProps) {
       <SettingsDialog
         appearance={appearance}
         api={api}
+        chatId={chatId}
         activePersonaId={activePersonaId}
         personas={personas}
         settings={settings}

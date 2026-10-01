@@ -33,6 +33,7 @@ pub mod sync_skills;
 pub mod tiered_memory;
 pub mod tool_cancel;
 pub mod vault_add;
+pub mod vault_secret;
 pub mod web_fetch;
 pub mod web_html;
 pub mod web_search;
@@ -128,6 +129,7 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "update_bulletin_focus"
         | "add_vault_item"
         | "sync_skills"
+        | "vault_secret"
         | "register_hook"
         | "schedule_task"
         | "update_scheduled_task"
@@ -281,6 +283,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     env_redactor: Arc<EnvSecretRedactor>,
+    runtime_data_dir: String,
 }
 
 /// Path to the mistaken nested copy agents sometimes create under tool cwd (`shared/workspace/`).
@@ -658,17 +661,26 @@ impl ToolRegistry {
         }
         let skills_data_dir = config.skills_data_dir();
         let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(bash::BashTool::new_with_safety(
-                config.working_dir(),
-                config.safety_execution_mode.clone(),
-                config.safety_risky_categories.clone(),
-                runtime_toggles.clone(),
-                env_redactor.clone(),
-            )),
+            Box::new(
+                bash::BashTool::new_with_safety(
+                    config.working_dir(),
+                    config.safety_execution_mode.clone(),
+                    config.safety_risky_categories.clone(),
+                    runtime_toggles.clone(),
+                    env_redactor.clone(),
+                )
+                .with_runtime_data_dir(config.runtime_data_dir()),
+            ),
             Box::new(read_file::ReadFileTool::new(config.working_dir())),
             Box::new(read_repo_map::ReadRepoMapTool::new(config.working_dir())),
-            Box::new(write_file::WriteFileTool::new(config.working_dir())),
-            Box::new(edit_file::EditFileTool::new(config.working_dir())),
+            Box::new(
+                write_file::WriteFileTool::new(config.working_dir())
+                    .with_redactor(env_redactor.clone()),
+            ),
+            Box::new(
+                edit_file::EditFileTool::new(config.working_dir())
+                    .with_redactor(env_redactor.clone()),
+            ),
             Box::new(apply_search_replace::ApplySearchReplaceTool::new(
                 config.working_dir(),
                 config.allow_fuzzy_search_replace,
@@ -729,9 +741,14 @@ impl ToolRegistry {
             Box::new(schedule::ResumeTaskTool::new(db.clone())),
             Box::new(schedule::CancelTaskTool::new(db.clone())),
             Box::new(schedule::GetTaskHistoryTool::new(db.clone())),
-            Box::new(export_chat::ExportChatTool::new(
-                db.clone(),
+            Box::new(
+                export_chat::ExportChatTool::new(db.clone(), &config.runtime_data_dir())
+                    .with_redactor(env_redactor.clone()),
+            ),
+            Box::new(vault_secret::VaultSecretTool::new(
                 &config.runtime_data_dir(),
+                config.skills_data_dir_absolute(),
+                env_redactor.clone(),
             )),
             Box::new(cursor_agent::CursorAgentTool::new(config, db.clone())),
             Box::new(cursor_agent::ListCursorAgentRunsTool::new(db.clone())),
@@ -741,11 +758,14 @@ impl ToolRegistry {
                 config.skill_discovery_dirs(),
                 db.clone(),
             )),
-            Box::new(run_skill_script::RunSkillScriptTool::new_with_dirs_and_db(
-                config.skill_discovery_dirs(),
-                db.clone(),
-                runtime_toggles.clone(),
-            )),
+            Box::new(
+                run_skill_script::RunSkillScriptTool::new_with_dirs_and_db(
+                    config.skill_discovery_dirs(),
+                    db.clone(),
+                    runtime_toggles.clone(),
+                )
+                .with_runtime_data_dir(config.runtime_data_dir()),
+            ),
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(tiered_memory::ReadTieredMemoryTool::new(
                 &config.runtime_data_dir(),
@@ -837,6 +857,7 @@ impl ToolRegistry {
         ToolRegistry {
             tools,
             env_redactor,
+            runtime_data_dir: config.runtime_data_dir(),
         }
     }
 
@@ -893,6 +914,20 @@ impl ToolRegistry {
         for tool in &self.tools {
             if tool.name() == name {
                 let started = Instant::now();
+                let input = if name == "vault_secret" {
+                    input
+                } else if let Some(auth) = auth_context_from_input(&input) {
+                    match crate::secret_vault::resolve_placeholders(
+                        &self.runtime_data_dir,
+                        auth.caller_chat_id,
+                        input,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(e) => return ToolResult::error(e),
+                    }
+                } else {
+                    input
+                };
                 let mut result = tool.execute(input).await;
                 result.content = self.env_redactor.redact(&result.content);
                 result.duration_ms = Some(started.elapsed().as_millis());

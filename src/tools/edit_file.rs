@@ -1,21 +1,30 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::claude::ToolDefinition;
+use crate::safety_redaction::EnvSecretRedactor;
 
 use super::{schema_object, Tool, ToolResult};
 
 pub struct EditFileTool {
     working_dir: PathBuf,
+    env_redactor: Option<Arc<EnvSecretRedactor>>,
 }
 
 impl EditFileTool {
     pub fn new(working_dir: &str) -> Self {
         Self {
             working_dir: PathBuf::from(working_dir),
+            env_redactor: None,
         }
+    }
+
+    pub fn with_redactor(mut self, redactor: Arc<EnvSecretRedactor>) -> Self {
+        self.env_redactor = Some(redactor);
+        self
     }
 }
 
@@ -108,6 +117,9 @@ impl Tool for EditFileTool {
         let new_content = content.replacen(old_string, new_string, 1);
         match tokio::fs::write(&resolved_path, new_content).await {
             Ok(()) => {
+                if let Some(redactor) = &self.env_redactor {
+                    redactor.register_skill_env_file(&resolved_path);
+                }
                 ToolResult::success(format!("Successfully edited {}", resolved_path.display()))
             }
             Err(e) => ToolResult::error(format!("Failed to write file: {e}")),

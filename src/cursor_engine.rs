@@ -1111,6 +1111,7 @@ async fn consume_sidecar_stream(
                             let name = event.name.unwrap_or_default();
                             let tool_use_id = uuid::Uuid::new_v4().to_string();
                             let input = event.input.unwrap_or(serde_json::json!({}));
+                            let input = crate::secret_vault::mask_tool_input_for_log(&name, &input);
                             if let Some(tx) = event_tx {
                                 let _ = tx.send(AgentEvent::ToolStart {
                                     tool_use_id: tool_use_id.clone(),

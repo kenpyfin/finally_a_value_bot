@@ -199,8 +199,10 @@ Run the bot on a host with tmux, or use inline bash for short commands."
             shell_escape_single(&ceiling)
         )
     };
+    let vault_source =
+        crate::secret_vault::vault_source_lines(&state.config.runtime_data_dir(), chat_id);
     let command_body = format!(
-        "#!/usr/bin/env bash\nset -uo pipefail\n{debug_export}{git_ceiling_export}cd {}\n{}\n",
+        "#!/usr/bin/env bash\nset -uo pipefail\n{debug_export}{git_ceiling_export}{vault_source}cd {}\n{}\n",
         shell_escape_single(&workdir_abs.to_string_lossy()),
         command.trim()
     );

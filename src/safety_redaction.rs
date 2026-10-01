@@ -1,7 +1,8 @@
-//! Literal secret redaction from env-like files on disk only (no regex heuristics).
+//! Literal secret redaction from env-like files, plus strict known-format patterns for disk sinks.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use tracing::info;
 
@@ -111,7 +112,6 @@ const NON_SECRET_ENV_KEYS: &[&str] = &[
     "RESPONSE_QUALITY_EVALUATOR_ENABLED",
     "BACKGROUND_SHELL_TMUX_ENABLED",
     "CURSOR_AGENT_TMUX_ENABLED",
-    "CURSOR_API_KEY",
     "BACKGROUND_SHELL_AUTO_RETRY_ON_FAILURE",
     "BACKGROUND_SHELL_AUTO_RETRY_MAX",
     "BACKGROUND_SHELL_AUTO_AGENT_ON_SUCCESS",
@@ -136,16 +136,18 @@ const PLACEHOLDER_VALUES: &[&str] = &[
     "password",
 ];
 
-/// Redacts only literal values parsed from env-like files at startup.
+const MIN_NEEDLE_ENTROPY: f64 = 3.0;
+
+/// Redacts literal values parsed from env-like files. Needles can be added after startup.
 #[derive(Debug, Clone)]
 pub struct EnvSecretRedactor {
-    needles: Vec<String>,
+    needles: Arc<RwLock<Vec<String>>>,
 }
 
 impl EnvSecretRedactor {
     pub fn empty() -> Self {
         Self {
-            needles: Vec::new(),
+            needles: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -182,6 +184,17 @@ impl EnvSecretRedactor {
             if root.is_dir() {
                 walk_for_env_files(root, &allowed_roots, 0, &mut env_files, &mut files_scanned);
             }
+        }
+        // `runtime` is skipped by the workspace walk, so load the per-chat vault explicitly.
+        let secrets_dir = PathBuf::from(config.runtime_data_dir()).join("secrets");
+        if secrets_dir.is_dir() {
+            walk_for_env_files(
+                &secrets_dir,
+                &allowed_roots,
+                0,
+                &mut env_files,
+                &mut files_scanned,
+            );
         }
 
         let mut value_set: HashSet<String> = HashSet::new();
@@ -226,31 +239,159 @@ impl EnvSecretRedactor {
             "Env-only secret redaction catalog built"
         );
 
-        Self { needles }
+        Self {
+            needles: Arc::new(RwLock::new(needles)),
+        }
     }
 
     pub fn redact(&self, text: &str) -> String {
-        if self.needles.is_empty() {
-            return text.to_string();
+        let needles = self.needles_snapshot();
+        redact_with_needles(text, &needles)
+    }
+
+    /// Needle redaction plus strict vendor key formats. Disk sinks only.
+    pub fn redact_with_patterns(&self, text: &str) -> String {
+        redact_known_key_formats(&self.redact(text))
+    }
+
+    /// Register a value the agent already judged sensitive. Low-entropy and short
+    /// values are skipped so ordinary words do not become global needles.
+    pub fn register_trusted(&self, value: &str) {
+        let trimmed = value.trim();
+        if trimmed.len() < DEFAULT_MIN_VALUE_LEN || is_non_secret_config_value(trimmed) {
+            return;
         }
-        let mut out = text.to_string();
-        for needle in &self.needles {
-            if needle.is_empty() {
-                continue;
-            }
-            if out.contains(needle) {
-                out = out.replace(needle, REDACTED);
+        if shannon_entropy(trimmed) < MIN_NEEDLE_ENTROPY {
+            return;
+        }
+        self.insert_needle(trimmed);
+    }
+
+    /// Re-read an env-like file under `skills/` and register credential values.
+    pub fn register_skill_env_file(&self, path: &Path) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !is_env_like_name(name) {
+            return;
+        }
+        let under_skills = path
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(part) if part == "skills"));
+        if !under_skills {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let min_value_len = min_value_len();
+        for (key, value) in parse_env_content(&content) {
+            if should_redact_env_key(&key) && should_redact_value(&value, min_value_len) {
+                self.insert_needle(&value);
             }
         }
-        out
+    }
+
+    fn insert_needle(&self, value: &str) {
+        let mut needles = self.needles.write().unwrap_or_else(|e| e.into_inner());
+        if needles.iter().any(|n| n == value) || needles.len() >= MAX_NEEDLES {
+            return;
+        }
+        needles.push(value.to_string());
+        let encoded = urlencoding::encode(value);
+        if encoded != value && !needles.iter().any(|n| n == encoded.as_ref()) {
+            needles.push(encoded.into_owned());
+        }
+        needles.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        needles.dedup();
+    }
+
+    fn needles_snapshot(&self) -> Vec<String> {
+        self.needles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     #[cfg(test)]
     pub fn from_needles(needles: Vec<String>) -> Self {
         let mut needles = needles;
         needles.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        Self { needles }
+        Self {
+            needles: Arc::new(RwLock::new(needles)),
+        }
     }
+}
+
+fn redact_with_needles(text: &str, needles: &[String]) -> String {
+    if needles.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for needle in needles {
+        if needle.is_empty() {
+            continue;
+        }
+        if out.contains(needle) {
+            out = out.replace(needle, REDACTED);
+        }
+    }
+    out
+}
+
+fn min_value_len() -> usize {
+    std::env::var("ENV_REDACT_MIN_VALUE_LEN")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| (4..=128).contains(&n))
+        .unwrap_or(DEFAULT_MIN_VALUE_LEN)
+}
+
+pub(crate) fn parse_env_assignments(content: &str) -> Vec<(String, String)> {
+    parse_env_content(content)
+}
+
+/// Shannon entropy in bits per character.
+pub fn shannon_entropy(value: &str) -> f64 {
+    let n = value.chars().count();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut counts = std::collections::HashMap::<char, usize>::new();
+    for c in value.chars() {
+        *counts.entry(c).or_insert(0) += 1;
+    }
+    let n = n as f64;
+    counts
+        .values()
+        .map(|count| {
+            let p = *count as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+fn redact_known_key_formats(text: &str) -> String {
+    use std::sync::OnceLock;
+    static RES: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    let res = RES.get_or_init(|| {
+        [
+            r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}",
+            r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9]{20,}",
+            r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,}",
+            r"(?<![A-Za-z0-9_-])ghp_[A-Za-z0-9]{20,}",
+            r"(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{20,}",
+            r"(?<![A-Za-z0-9_-])xox[baprs]-[A-Za-z0-9-]{10,}",
+            r"(?<![A-Za-z0-9_-])crsr_[A-Za-z0-9]{16,}",
+            r"(?<![A-Za-z0-9])[0-9]{8,10}:[A-Za-z0-9_-]{30,}",
+        ]
+        .into_iter()
+        .filter_map(|pat| regex::Regex::new(pat).ok())
+        .collect()
+    });
+    let mut out = text.to_string();
+    for re in res {
+        out = re.replace_all(&out, REDACTED).into_owned();
+    }
+    out
 }
 
 fn should_load_env_file(path: &Path) -> bool {
@@ -403,6 +544,9 @@ fn should_redact_value(value: &str, min_len: usize) -> bool {
     {
         return false;
     }
+    if shannon_entropy(trimmed) < MIN_NEEDLE_ENTROPY {
+        return false;
+    }
     true
 }
 
@@ -543,9 +687,32 @@ mod tests {
         assert!(should_redact_env_key("OPENAI_API_KEY"));
         assert!(should_redact_env_key("SOCIAL_TIKTOK_CLIENT_SECRET"));
         assert!(should_redact_env_key("CATBOX_USERHASH"));
+        assert!(should_redact_env_key("CURSOR_API_KEY"));
         assert!(!should_redact_env_key("WORKSPACE_DIR"));
         assert!(!should_redact_env_key("SOCIAL_TIKTOK_CLIENT_ID"));
         assert!(!should_redact_env_key("ORCHESTRATOR_MODEL"));
+    }
+
+    #[test]
+    fn register_trusted_redacts_immediately_and_skips_words() {
+        let redactor = EnvSecretRedactor::empty();
+        redactor.register_trusted("supersecret12345678");
+        assert!(redactor
+            .redact("leak supersecret12345678")
+            .contains(REDACTED));
+        redactor.register_trusted("password");
+        assert_eq!(redactor.redact("password"), "password");
+    }
+
+    #[test]
+    fn pattern_redaction_is_separate_from_chat_redaction() {
+        let redactor = EnvSecretRedactor::empty();
+        let key = "sk-abcdefghijklmnopqrstuvwxyz";
+        let input = format!("key {key} and task-and-risk");
+        let disk = redactor.redact_with_patterns(&input);
+        assert!(!disk.contains(key));
+        assert!(disk.contains("task-and-risk"));
+        assert!(redactor.redact(&input).contains(key));
     }
 
     #[test]

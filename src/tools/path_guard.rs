@@ -95,6 +95,14 @@ pub fn is_blocked(path: &Path) -> bool {
         }
     }
 
+    // Per-chat secret vault. Values must not be readable back into the agent context.
+    if components
+        .windows(2)
+        .any(|window| window[0].as_str() == "runtime" && window[1].as_str() == "secrets")
+    {
+        return true;
+    }
+
     // Check blocked subpaths (consecutive components)
     for subpath in BLOCKED_SUBPATHS {
         if subpath.len() <= components.len() {

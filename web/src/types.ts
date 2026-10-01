@@ -14,6 +14,8 @@ export type Persona = {
   id: number
   name: string
   is_active: boolean
+  /** Latest user or agent message, including sessions and side chats. */
+  last_message_at?: string | null
   last_bot_message_at?: string | null
   /** Session that produced the latest bot message; null/undefined = main chat. */
   last_bot_message_session_id?: string | null

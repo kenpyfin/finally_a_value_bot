@@ -517,6 +517,7 @@ pub fn append_pdqe_step_to_agent_history(
     basename: &str,
     step: &str,
     detail: &str,
+    redactor: Option<&crate::safety_redaction::EnvSecretRedactor>,
 ) -> std::io::Result<()> {
     if !is_valid_agent_history_filename(basename) {
         return Err(std::io::Error::new(
@@ -538,6 +539,9 @@ pub fn append_pdqe_step_to_agent_history(
             format!(" — {}", detail.trim())
         }
     ));
+    if let Some(redactor) = redactor {
+        content = redactor.redact_with_patterns(&content);
+    }
     std::fs::write(&path, content)
 }
 
@@ -548,6 +552,7 @@ pub fn write_agent_history_run(
     chat_id: i64,
     persona_id: i64,
     record: &AgentRunRecord,
+    redactor: &crate::safety_redaction::EnvSecretRedactor,
 ) -> Option<String> {
     let dir = history_dir(data_dir, chat_id, persona_id);
 
@@ -558,7 +563,7 @@ pub fn write_agent_history_run(
 
     let filename = format!("{}.md", record.timestamp.format("%Y%m%d-%H%M%S"));
     let path = dir.join(&filename);
-    let content = record.to_markdown();
+    let content = redactor.redact_with_patterns(&record.to_markdown());
 
     if let Err(e) = std::fs::write(&path, &content) {
         tracing::warn!("Failed to write agent history to {}: {e}", path.display());
@@ -789,7 +794,9 @@ mod tests {
             cloud_calls: 0,
             agent_engine: "classic".into(),
         };
-        let basename = write_agent_history_run(data_dir, chat_id, persona_id, &record).unwrap();
+        let redactor = crate::safety_redaction::EnvSecretRedactor::empty();
+        let basename =
+            write_agent_history_run(data_dir, chat_id, persona_id, &record, &redactor).unwrap();
         append_pdqe_step_to_agent_history(
             data_dir,
             chat_id,
@@ -797,6 +804,7 @@ mod tests {
             &basename,
             "quality_eval_started",
             "run-1",
+            None,
         )
         .unwrap();
         append_pdqe_step_to_agent_history(
@@ -806,6 +814,7 @@ mod tests {
             &basename,
             "quality_eval_pass",
             "confidence=0.95",
+            None,
         )
         .unwrap();
         let content = std::fs::read_to_string(

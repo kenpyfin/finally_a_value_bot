@@ -9,6 +9,7 @@ pub enum SlashCommand {
     Persona,
     Archive,
     Schedule,
+    Secrets,
 }
 
 /// Normalize message text for command detection: trim, slash-like and invisible chars so commands are recognized.
@@ -84,6 +85,9 @@ pub fn parse(text: &str) -> Option<SlashCommand> {
     {
         return Some(SlashCommand::Schedule);
     }
+    if lower == "/secrets" || lower.starts_with("/secrets ") || lower.starts_with("/secrets@") {
+        return Some(SlashCommand::Secrets);
+    }
     None
 }
 
@@ -124,6 +128,11 @@ mod tests {
         assert_eq!(parse("/scheduled_job"), Some(SlashCommand::Schedule));
         // Telegram group commands with @botname
         assert_eq!(parse("/schedule@MyBot"), Some(SlashCommand::Schedule));
+        assert_eq!(parse("/secrets"), Some(SlashCommand::Secrets));
+        assert_eq!(
+            parse("/secrets forget NOTION_TOKEN"),
+            Some(SlashCommand::Secrets)
+        );
         assert_eq!(
             parse("/jobs@FinallyAValueBot"),
             Some(SlashCommand::Schedule)

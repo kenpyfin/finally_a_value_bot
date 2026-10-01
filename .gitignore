@@ -30,4 +30,12 @@ shared/
 ORIGIN/
 
 docs/development-journal.md
+
+# Chat exports and per-chat secret vault (values must not be committed)
+*chat_export*.md
+chat-export-*.md
+email_scan_*.md
+recent_chat.md
+data/exports/
+workspace/runtime/secrets/
 builtin_skills/steel-browser/__pycache__/*

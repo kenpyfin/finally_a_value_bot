@@ -48,6 +48,7 @@ pub struct BashTool {
     safety_risky_categories: Vec<String>,
     runtime_toggles: Arc<RuntimeToggles>,
     env_redactor: Arc<EnvSecretRedactor>,
+    runtime_data_dir: String,
 }
 
 impl BashTool {
@@ -79,7 +80,13 @@ impl BashTool {
             safety_risky_categories,
             runtime_toggles,
             env_redactor,
+            runtime_data_dir: String::new(),
         }
+    }
+
+    pub fn with_runtime_data_dir(mut self, runtime_data_dir: impl Into<String>) -> Self {
+        self.runtime_data_dir = runtime_data_dir.into();
+        self
     }
 }
 
@@ -169,12 +176,21 @@ impl Tool for BashTool {
         info!("Executing bash: {}", self.env_redactor.redact(&command));
 
         let spec = shell_command(&command);
-        let cmd = build_command_with_env(
+        let mut cmd = build_command_with_env(
             &spec,
             Some(&working_dir),
             self.runtime_toggles.tool_output_debug(),
             Some(self.working_dir.as_path()),
         );
+        if let Some(auth) = super::auth_context_from_input(&input) {
+            if !self.runtime_data_dir.is_empty() {
+                crate::secret_vault::apply_chat_secret_env(
+                    &mut cmd,
+                    &self.runtime_data_dir,
+                    auth.caller_chat_id,
+                );
+            }
+        }
         let cancel = current_tool_cancel();
         let outcome = run_managed_command(cmd, timeout_secs, cancel.as_ref()).await;
 

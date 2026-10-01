@@ -664,6 +664,8 @@ impl Database {
         let conn = Connection::open(db_path)?;
         // PRAGMA journal_mode returns a row; use query_row to consume it (execute_batch fails with extra_check)
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        // Overwrite freed pages so replaced secret text does not linger in the database file.
+        let _: i64 = conn.query_row("PRAGMA secure_delete=ON", [], |r| r.get(0))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chats (
@@ -2246,6 +2248,79 @@ impl Database {
         Ok(true)
     }
 
+    /// Replace `needle` inside this chat's messages and bookmark previews.
+    /// When `token_boundary` is set, the needle must not sit inside a longer token.
+    pub fn replace_literal_in_chat_messages(
+        &self,
+        chat_id: i64,
+        needle: &str,
+        replacement: &str,
+        token_boundary: bool,
+    ) -> Result<usize, FinallyAValueBotError> {
+        if needle.is_empty() || needle.chars().count() < 6 {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, persona_id, content FROM messages
+             WHERE chat_id = ?1 AND instr(content, ?2) > 0",
+        )?;
+        let rows: Vec<(String, i64, String)> = stmt
+            .query_map(params![chat_id, needle], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut updated = 0usize;
+        for (id, persona_id, content) in rows {
+            let next = crate::secret_vault::replace_secret_text(
+                &content,
+                needle,
+                replacement,
+                token_boundary,
+            );
+            if next == content {
+                continue;
+            }
+            conn.execute(
+                "UPDATE messages SET content = ?1
+                 WHERE chat_id = ?2 AND persona_id = ?3 AND id = ?4",
+                params![next, chat_id, persona_id, id],
+            )?;
+            updated += 1;
+        }
+        let mut preview_stmt = conn.prepare(
+            "SELECT persona_id, message_id, content_preview FROM persona_message_bookmarks
+             WHERE chat_id = ?1 AND instr(content_preview, ?2) > 0",
+        )?;
+        let previews: Vec<(i64, String, String)> = preview_stmt
+            .query_map(params![chat_id, needle], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(preview_stmt);
+        let now = chrono::Utc::now().to_rfc3339();
+        for (persona_id, message_id, preview) in previews {
+            let next = crate::secret_vault::replace_secret_text(
+                &preview,
+                needle,
+                replacement,
+                token_boundary,
+            );
+            if next == preview {
+                continue;
+            }
+            let clipped: String = next.chars().take(280).collect();
+            conn.execute(
+                "UPDATE persona_message_bookmarks
+                 SET content_preview = ?1, updated_at = ?2
+                 WHERE chat_id = ?3 AND persona_id = ?4 AND message_id = ?5",
+                params![clipped, now, chat_id, persona_id, message_id],
+            )?;
+        }
+        Ok(updated)
+    }
+
     /// True when the **latest** row for this chat is a bot message with the same body as `content`
     /// and a recent timestamp. That usually means `send_message` already posted this text and the
     /// main agent is about to deliver the same final reply again.
@@ -3323,10 +3398,11 @@ impl Database {
                 | "builtin_deferred_commitment_guard"
                 | "builtin_loop_guard"
                 | "builtin_dense_delivery_guard"
+                | "builtin_secret_vault_scrub"
         );
         if !valid_action_type {
             return Err(FinallyAValueBotError::ToolExecution(format!(
-                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard, builtin_dense_delivery_guard",
+                "Unsupported action_type '{}'. Expected one of: block, add_context, command, prompt, builtin_persona_focus_sync, builtin_scheduler_policy_context, builtin_turn_skill_gate, builtin_deferred_commitment_guard, builtin_loop_guard, builtin_dense_delivery_guard, builtin_secret_vault_scrub",
                 action_type
             )));
         }
@@ -7059,6 +7135,35 @@ impl Database {
         Ok(personas)
     }
 
+    /// Latest persisted user or assistant message, including sessions and side chats.
+    pub fn list_persona_last_message_at(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<(i64, String)>, FinallyAValueBotError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "WITH activity AS (
+                SELECT persona_id, timestamp FROM messages WHERE chat_id = ?1
+                UNION ALL
+                SELECT sc.persona_id, t.created_at AS timestamp
+                FROM side_chats sc JOIN side_chat_turns t ON t.side_chat_id = sc.id
+                WHERE sc.chat_id = ?1 AND t.role IN ('user', 'assistant')
+             ), ranked AS (
+                SELECT persona_id, timestamp,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY persona_id
+                           ORDER BY julianday(timestamp) DESC, timestamp DESC
+                       ) AS rank
+                FROM activity
+             )
+             SELECT persona_id, timestamp FROM ranked WHERE rank = 1",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Latest bot message per persona in a chat: timestamp plus the session that message belongs to
     /// (`session_id` / title are `None` for main-chat messages).
     pub fn list_persona_last_bot_message_at(
@@ -7733,6 +7838,72 @@ mod tests {
     fn test_persona(db: &Database, chat_id: i64) -> i64 {
         db.upsert_chat(chat_id, None, "private").unwrap();
         db.get_or_create_default_persona(chat_id).unwrap()
+    }
+
+    #[test]
+    fn test_persona_activity_includes_all_messages_but_not_drafts() {
+        let (db, dir) = test_db();
+        let pid = test_persona(&db, 100);
+        assert!(db.list_persona_last_message_at(100).unwrap().is_empty());
+        for (id, bot, timestamp, session) in [
+            ("bot", true, "2026-01-01T00:00:00Z", None),
+            ("user", false, "2026-01-02T00:00:00Z", None),
+            ("session", false, "2026-01-03T00:00:00Z", Some("session")),
+        ] {
+            db.store_message(&StoredMessage {
+                id: id.into(),
+                chat_id: 100,
+                persona_id: pid,
+                session_id: session.map(str::to_owned),
+                sender_name: "test".into(),
+                content: "message".into(),
+                is_from_bot: bot,
+                timestamp: timestamp.into(),
+                origin: message_origin_interactive(),
+            })
+            .unwrap();
+            assert_eq!(
+                db.list_persona_last_message_at(100).unwrap(),
+                vec![(pid, timestamp.to_owned())]
+            );
+        }
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO side_chats
+                 (id, chat_id, persona_id, anchor_message_id, draft_text, created_at, updated_at)
+                 VALUES ('side', 100, ?1, 'user', 'unsent draft', '2026-01-04T00:00:00Z', '2026-01-09T00:00:00Z')",
+                params![pid],
+            ).unwrap();
+        }
+        assert_eq!(
+            db.list_persona_last_message_at(100).unwrap(),
+            vec![(pid, "2026-01-03T00:00:00Z".into())]
+        );
+        for (seq, role, timestamp) in [
+            (1, "user", "2026-01-05T00:00:00Z"),
+            (2, "assistant", "2026-01-06T00:00:00Z"),
+        ] {
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO side_chat_turns (id, side_chat_id, seq, role, content, created_at)
+                 VALUES (?1, 'side', ?2, ?3, 'message', ?4)",
+                    params![format!("turn-{seq}"), seq, role, timestamp],
+                )
+                .unwrap();
+            assert_eq!(
+                db.list_persona_last_message_at(100).unwrap(),
+                vec![(pid, timestamp.to_owned())]
+            );
+        }
+        assert!(db.list_persona_last_message_at(200).unwrap().is_empty());
+        assert_eq!(
+            db.list_persona_last_bot_message_at(100).unwrap()[0].last_bot_message_at,
+            "2026-01-01T00:00:00Z"
+        );
+        cleanup(&dir);
     }
 
     #[test]

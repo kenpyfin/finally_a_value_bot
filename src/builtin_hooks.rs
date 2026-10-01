@@ -285,7 +285,7 @@ mod tests {
     fn repo_catalog_has_five_shipped_manifests() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtin_hooks");
         let manifests = load_shipped_manifests(&dir).expect("load repo manifests");
-        assert_eq!(manifests.len(), 5);
+        assert_eq!(manifests.len(), 7);
         assert!(manifests
             .iter()
             .all(|m| m.action_type.starts_with("builtin_")));

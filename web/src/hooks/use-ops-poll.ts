@@ -26,6 +26,7 @@ export function personasSnapshotEqual(a: Persona[], b: Persona[]): boolean {
       x.id !== y.id
       || x.name !== y.name
       || x.is_active !== y.is_active
+      || (x.last_message_at ?? null) !== (y.last_message_at ?? null)
       || (x.last_bot_message_at ?? null) !== (y.last_bot_message_at ?? null)
       || (x.last_bot_message_session_id ?? null) !== (y.last_bot_message_session_id ?? null)
       || (x.last_bot_message_session_title ?? null) !== (y.last_bot_message_session_title ?? null)
@@ -118,6 +119,7 @@ export function useOpsPoll({
     async (chatIdOverride?: number | null) => {
       const id = chatIdOverride ?? chatId
       if (id == null) return
+      lastPersonasFetchMsRef.current = 0
       await queryClient.invalidateQueries({ queryKey: ['opsPoll', id] })
     },
     [chatId, queryClient],
